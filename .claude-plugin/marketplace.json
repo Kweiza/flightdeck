@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "flightdeck",
+  "description": "flightdeck — parallel session coordination for Claude Code and codex",
+  "owner": {
+    "name": "kweiza",
+    "email": "support@mintcinc.com"
+  },
+  "plugins": [
+    {
+      "name": "flightdeck",
+      "description": "Parallel session coordination — one self-hosted service that many sessions across machines register with: session board, work queue, merge queue, live dashboard",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
