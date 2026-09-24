@@ -69,10 +69,16 @@ func newHarnessAuth(t *testing.T, token string) *harness {
 	hs.srv = srv
 
 	hs.env = map[string]string{
-		"FD_URL":                 srv.URL,
-		"FD_STATE_DIR":           hs.state,
-		"FD_PROJECT":             hs.project,
-		"FD_LOG":                 "error",
+		"FD_URL":       srv.URL,
+		"FD_STATE_DIR": hs.state,
+		"FD_PROJECT":   hs.project,
+		"FD_LOG":       "error",
+		// ★ 클라이언트 제한 시간을 **넉넉히** 준다. 운영 기본값 5초(client.go)는 훅 예산에서 온
+		// 값이고, 이 하네스의 시험들이 재는 것은 그 제한이 아니라 CLI 의 동작이다.
+		// 실측(2026-09-24): 부하 평균 30~50 에서 이 서버의 요청 하나가 5초를 넘기자 CLI 가
+		// 「조정 서버 미도달」로 떨어져 선점·세션 열기가 준비 단계에서 실패했다(40회 중 8~10회).
+		// 상한은 degradeBudget(60초)보다 작게 둔다 — TestHarnessClientTimeoutFitsTheBudgets.
+		"FD_TIMEOUT":             harnessClientTimeout.String(),
 		"CLAUDE_CODE_SESSION_ID": "cc-session-uuid-1",
 		// ★ HOME 을 **기본 env 에서** 고정한다. FD_STATE_DIR 만으로는 부족하다 —
 		// 옛 채널 자리 재생이 ~/.local/state/flightdeck/outbox 를 후보로 삼아 거기 있는
@@ -268,6 +274,9 @@ func service0BoardOptions() service.BoardOptions {
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
+
+// harnessClientTimeout 은 하네스가 CLI 에 주는 제한 시간이다(FD_TIMEOUT).
+const harnessClientTimeout = 30 * time.Second
 
 // timeUnit 은 SSE 처럼 끝나지 않는 응답을 끊는 짧은 구간이다.
 const timeUnit = time.Second
