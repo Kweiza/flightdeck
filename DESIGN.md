@@ -1138,6 +1138,14 @@ rekey(§4)를 못 탄 채 MCP 가 새 cc 로 카드를 또 만든다 — 이 설
 
 ### 저장소의 다른 플러그인 훅 — grafik-bar 의 계약은 여기 적는다
 
+> **이 절은 역사 서술이다(2026-09-24).** grafik-bar 는 이 저장소에 없다. flightdeck 이 단독 저장소
+> [Kweiza/flightdeck](https://github.com/Kweiza/flightdeck) 로 분리될 때 grafik-bar 는 플러그인 모음
+> [kweiza-cc-plugins](https://github.com/Kweiza/kweiza-cc-plugins) 에 남았고, 아래가 말하는 관문
+> (`cmd/fd/repo_hooks_test.go` 의 grafik-bar 시험 13개, 저장소 전체 훅·스킬 관문의 grafik-bar·session-handoff
+> 몫)은 그 저장소의 독립 시험 모듈 `tests/` 로 옮겨 갔다. **지금 그 계약의 정본은 그 모듈의 주석이다.**
+> 아래는 분리 전까지의 계약과 근거이고, 그 안의 「이 저장소」는 kweiza-cc-plugins 를 가리킨다.
+> 제목은 그대로 둔다 — 옛 커밋·판단이 이 제목으로 이 자리를 가리킨다.
+
 `plugins/grafik-bar` 도 `SessionStart` 훅을 하나 갖는다(상태줄을 자기 자신으로 설치한다).
 그 플러그인에는 DESIGN 이 없고 Go 코드도 없다 — **그래서 계약을 이 문서에 얹는다.**
 따로 문서를 만들지 않는 이유는 그것을 무는 관문이 또 없기 때문이다: 이 저장소에 Go 모듈은

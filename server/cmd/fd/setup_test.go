@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -203,5 +205,80 @@ func TestPlanCarriesTheConfigWarning(t *testing.T) {
 	})))
 	if !strings.Contains(txt, "0644") {
 		t.Errorf("설정 경고가 계획에서 사라졌다:\n%s", txt)
+	}
+}
+
+// 서버 기동 명령은 **compose.yaml 이 있는 자리에서** 돈다.
+//
+// ★ 이 시험이 없어서 난 일: 안내가 `cd plugins/flightdeck && docker compose up -d` 였다 —
+// 개발 저장소의 루트에서만 맞는 경로다. /fd-setup 스킬은 이 명령을 승인받아 **세션의 작업
+// 디렉토리에서** 그대로 돌리므로, 플러그인 설치본에서는 compose 파일을 못 찾고 실패했다.
+// 저장소 분리(2026-09-24) 뒤에는 `docker compose up -d` 만 남아 같은 결함이 모양만 바꿨다.
+func TestServerStartRunsWhereTheComposeFileIs(t *testing.T) {
+	root := "/opt/fd plugin/0.39.0" // 공백 — 인용이 빠지면 cd 가 둘로 갈린다
+	p := PlanSetup(state(func(s *SetupState) { s.Reachable = false; s.PluginRoot = root }))
+	var start *SetupStep
+	for i := range p.Steps {
+		if strings.Contains(p.Steps[i].Command, "docker compose up -d") {
+			start = &p.Steps[i]
+		}
+	}
+	if start == nil {
+		t.Fatalf("서버가 안 닿는데 compose 기동 단계가 없다: %+v", p.Steps)
+	}
+	for _, want := range []string{"cd '" + root + "' && ", "FD_UID=$(id -u)", "FD_GID=$(id -g)", "docker compose up -d"} {
+		if !strings.Contains(start.Command, want) {
+			t.Errorf("기동 명령에 %q 가 없다: %s", want, start.Command)
+		}
+	}
+
+	// 자리를 모르면 지어내지 않는다 — 어디서 돌려야 하는지를 말로 남긴다.
+	p = PlanSetup(state(func(s *SetupState) { s.Reachable = false }))
+	for _, st := range p.Steps {
+		if strings.Contains(st.Command, "docker compose up -d") {
+			if strings.Contains(st.Command, "cd ") {
+				t.Errorf("플러그인 자리를 모르는데 cd 를 지어냈다: %s", st.Command)
+			}
+			if !strings.Contains(st.What, "compose.yaml") {
+				t.Errorf("자리를 모를 때 어디서 돌려야 하는지 안 말한다: %s", st.What)
+			}
+		}
+	}
+}
+
+// composeRoot 는 런처가 넘긴 FD_PLUGIN_ROOT 에 **compose.yaml 이 실제로 있을 때만** 그 자리를 낸다.
+func TestComposeRootNeedsTheComposeFile(t *testing.T) {
+	with := t.TempDir()
+	if err := os.WriteFile(filepath.Join(with, "compose.yaml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	without := t.TempDir()
+	for _, c := range []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"compose.yaml 이 있다", map[string]string{"FD_PLUGIN_ROOT": with}, with},
+		{"compose.yaml 이 없다", map[string]string{"FD_PLUGIN_ROOT": without}, ""},
+		{"변수가 없다", map[string]string{}, ""},
+		{"빈 값", map[string]string{"FD_PLUGIN_ROOT": "  "}, ""},
+	} {
+		if got := composeRoot(envOf(c.env)); got != c.want {
+			t.Errorf("%s: composeRoot = %q, 기대 %q", c.name, got, c.want)
+		}
+	}
+}
+
+// 런처는 자기가 빌드한 플러그인 트리를 바이너리에 알린다 — 그래야 fd setup 이 compose 자리를 안다.
+func TestLauncherExportsThePluginRoot(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(pluginRoot(t), "bin", "fd"))
+	if err != nil {
+		t.Fatalf("bin/fd 를 못 읽었다: %v", err)
+	}
+	s := string(raw)
+	exp := strings.Index(s, `export FD_PLUGIN_ROOT="$plugin_root"`)
+	ex := strings.LastIndex(s, `exec "$bin" "$@"`)
+	if exp < 0 || ex < 0 || exp > ex {
+		t.Fatalf("bin/fd 가 exec 전에 FD_PLUGIN_ROOT 를 내보내지 않는다(export@%d exec@%d)", exp, ex)
 	}
 }
