@@ -77,11 +77,15 @@ func TestKoreanIsIdentity(t *testing.T) {
 
 func TestTextTranslatesBoardLines(t *testing.T) {
 	cases := map[string]string{
-		"잡혀 있는 작업 3건 (선점 기준이다 — 세션의 생사가 아니다)":                                       "Claimed work: 3 (counted by claims — not by whether a session is alive)",
-		"land · 너는 2번째다 (줄 행 2 · 자원 landing)":                                       "land · you are #2 in line (row 2 · resource landing)",
-		"land · 네 차례다 — landing 를 쥐었다 (줄 행 1)":                                      "land · your turn — you hold landing (row 1)",
-		" 01M3ADY6… add-rate-limit · ● 활동 4초 전":                                     " 01M3ADY6… add-rate-limit · ● active 4s ago",
-		"큐 열림 3건(최고령 1시간 5분)":                                                       "Queue: 3 open (oldest 1h 5m)",
+		"잡혀 있는 작업 3건 (선점 기준이다 — 세션의 생사가 아니다)":   "Claimed work: 3 (counted by claims — not by whether a session is alive)",
+		"land · 너는 2번째다 (줄 행 2 · 자원 landing)":   "land · you are #2 in line (row 2 · resource landing)",
+		"land · 네 차례다 — landing 를 쥐었다 (줄 행 1)":  "land · your turn — you hold landing (row 1)",
+		" 01M3ADY6… add-rate-limit · ● 활동 4초 전": " 01M3ADY6… add-rate-limit · ● active 4s ago",
+		"큐 열림 3건(최고령 1시간 5분)":                   "Queue: 3 open (oldest 1h 5m)",
+		"● 활동 방금":               "● active just now",
+		"· 열림 방금":               "· opened just now",
+		"1 ← 01M3AF (점유 중, 방금)": "1 ← 01M3AF (holding, just now)",
+		"2 ← 01M3AG (대기 방금)":    "2 ← 01M3AG (queued just now)",
 		"   api · claude · add-rate-limit +0 · active · 경로 2: a.go, b.go · tool 8초": "   api · claude · add-rate-limit +0 · active · paths (2): a.go, b.go · tool 8s",
 	}
 	for in, want := range cases {
