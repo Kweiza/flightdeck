@@ -30,6 +30,11 @@ var catalog = [][2]string{
 	{"최근 판단(검색어 없음)", "Recent judgments (no query)"},
 	{"최근 판단 ", "latest judgment "},
 	{"● 활동 {} 전", "● active {1} ago"},
+	// web.Age 는 1초 미만을 「방금」으로 낸다(「N초 전」꼴이 아니다) — 새 카드가 막 생긴 순간이다.
+	{"● 활동 방금", "● active just now"},
+	{"· 열림 방금", "· opened just now"},
+	{"(점유 중, 방금)", "(holding, just now)"},
+	{"(대기 방금)", "(queued just now)"},
 	{"○ 활동 없음", "○ no activity"},
 	{"(꼬리표 없음)", "(no label)"},
 	{"(라벨 없음)", "(no label)"},
