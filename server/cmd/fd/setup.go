@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -105,6 +106,10 @@ type SetupState struct {
 	Docker    bool   // docker 가 PATH 에 있나
 	Endpoint  Endpoint
 	Reachable bool // healthz 가 답했나
+
+	// PluginRoot 는 compose.yaml 이 있는 플러그인 트리다(composeRoot). 비면 모른다.
+	// 서버 기동 명령이 그 자리로 cd 한다 — /fd-setup 은 명령을 세션의 작업 디렉토리에서 돌린다.
+	PluginRoot string
 }
 
 // SetupStep 은 사람에게 보여 주고 승인을 받을 명령 하나다.
@@ -217,11 +222,25 @@ func goInstallStep(s SetupState, why string) SetupStep {
 // ★ **둘을 구분해서 낸다.** 이 레포에는 상시 실행의 정식 방법이 없다(systemd·launchd 정의가
 // 하나도 없다). docker compose 만 재시작 정책을 갖고 있으므로 그것을 지원 경로로,
 // 포그라운드 실행은 "지금만"으로 이름 붙인다. 없는 것을 있는 척하지 않는다.
+//
+// ★ compose 명령은 **compose.yaml 이 있는 자리에서** 돌아야 한다. /fd-setup 은 이 명령을
+// 세션의 작업 디렉토리에서 그대로 돌리므로, 자리를 알면 cd 를 명령에 박는다. 모르면
+// 지어내지 않고 어디서 돌려야 하는지를 What 에 말로 남긴다.
+// FD_UID·FD_GID 는 compose 가 기본 1000 으로 채우는 값이다 — 호스트 사용자가 아니면 DB 를
+// 열되 못 쓰고 git 이 소유권을 의심한다(compose.yaml 주석).
 func serverStartSteps(s SetupState) []SetupStep {
 	if s.Docker {
+		const up = "FD_UID=$(id -u) FD_GID=$(id -g) docker compose up -d"
+		if s.PluginRoot != "" {
+			return []SetupStep{{
+				What:    "서버 기동(지원되는 상시 실행 경로)",
+				Command: "cd " + setupShellQuote(s.PluginRoot) + " && " + up,
+				Why:     "restart 정책이 있어 재부팅·크래시를 넘긴다. DB 는 ~/.flightdeck 에 붙는다",
+			}}
+		}
 		return []SetupStep{{
 			What:    "서버 기동(지원되는 상시 실행 경로 — flightdeck 루트, compose.yaml 이 있는 자리에서)",
-			Command: "docker compose up -d",
+			Command: up,
 			Why:     "restart 정책이 있어 재부팅·크래시를 넘긴다. DB 는 ~/.flightdeck 에 붙는다",
 		}}
 	}
@@ -364,6 +383,25 @@ func (a *App) runSetup(ctx context.Context, args []string, out io.Writer) int {
 	return 0
 }
 
+// composeRoot 는 런처가 넘긴 플러그인 트리(FD_PLUGIN_ROOT)에 compose.yaml 이 **실제로 있을 때만**
+// 그 자리를 낸다. 없으면 빈 문자열이다 — 있는 척 cd 를 박으면 명령이 엉뚱한 자리에서 실패한다.
+func composeRoot(get func(string) (string, bool)) string {
+	v, ok := get("FD_PLUGIN_ROOT")
+	root := strings.TrimSpace(v)
+	if !ok || root == "" {
+		return ""
+	}
+	if fi, err := os.Stat(filepath.Join(root, "compose.yaml")); err != nil || fi.IsDir() {
+		return ""
+	}
+	return root
+}
+
+// setupShellQuote 는 POSIX 셸의 작은따옴표 인용이다(service/pick.go 의 shellQuote 와 같은 규칙).
+func setupShellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // observeSetup 은 판정에 필요한 값을 **실제로 잰다.** 판정은 안 한다(PlanSetup 이 한다).
 func (a *App) observeSetup(ctx context.Context) SetupState {
 	st := SetupState{
@@ -372,6 +410,8 @@ func (a *App) observeSetup(ctx context.Context) SetupState {
 		GoOutput: commandOutput(ctx, "go", "version"),
 		Docker:   lookPath("docker"),
 		Endpoint: a.cli.Endpoint,
+
+		PluginRoot: composeRoot(a.env),
 	}
 	// 도달성은 healthz 로 잰다 — 인증 게이트 앞이라 토큰 없이도 답한다.
 	if _, err := a.cli.Healthz(ctx); err == nil {
