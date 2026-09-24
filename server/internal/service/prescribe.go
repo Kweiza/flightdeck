@@ -404,15 +404,20 @@ func (s *Service) Prescriptions(ctx context.Context, sessionID string) (Prescrib
 		WorkspaceClaims: idsOrEmpty(in.WorkspaceClaims),
 		Closed:          claimViewIDs(in.Closed),
 	}
+	// ★ **키마다 한 행이다(2026-09-24).** 묶인 outside 는 칸 하나로 나가지만 경로마다 키가 있고,
+	//   억제(firedKeys)·확인(ackPrescriptions)·축별 발화 수가 전부 이 행을 키로 읽는다.
+	//   대표 키 하나만 남기면 나머지 경로가 다음 턴에 다시 뜨고, 확인에서도 빠진다.
 	for _, p := range shown {
-		row := axes
-		row.Key, row.Reason = p.Key, p.Reason
-		s.st.LogEvent(ctx, eventPrescribe, sess.Project, sessionID, row)
+		for _, k := range p.Keys() {
+			row := axes
+			row.Key, row.Reason = k, p.Reason
+			s.st.LogEvent(ctx, eventPrescribe, sess.Project, sessionID, row)
+		}
 	}
 	if folded > 0 {
 		keys := make([]string, 0, folded)
 		for _, p := range all[len(shown):] {
-			keys = append(keys, p.Key)
+			keys = append(keys, p.Keys()...)
 		}
 		// since 는 위에서 물려받기를 거친 값이다 — 접힘이 이어지는 동안 같은 창이 계속
 		// 실려 나가고, 그래서 밀린 것이 다 나갈 때까지 창이 안 밀린다.

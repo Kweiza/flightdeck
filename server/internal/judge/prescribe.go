@@ -62,6 +62,10 @@ func AckedByLand(key string) bool {
 // ★ **위 시나리오는 실측으로 반증됐다**(fd-prescribe-threshold-baseline, 2026-08-04.
 // 발화 55건·33시간). outside 는 전 기간 통틀어 **2건** 떴고 둘 다 확인됐다 —
 // "리팩터 한 턴이 outside 수십 건을 쏟는다"는 일이 일어난 적이 없다.
+// ★★ **2026-09-22 부터 그 일이 났다** — 한 턴에 7~52 경로가 밖으로 접혔다. 그 폭주는 이제 이
+// 상수가 아니라 outsidePrescriptions 가 막는다: 한 턴의 outside 를 처방 하나로 묶으므로
+// outside 는 몇 경로든 **칸 하나**다(키는 경로마다 남는다 — Prescription.Also). 이 상수는 아래
+// 개정대로 overlap 폭주의 한 턴 읽기 양 제한으로 남는다.
 // 실제로 접힌 것은 처방이 뜬 턴 35개 중 **2개**뿐이고, 한 턴의 최대 발화는 6건이었다.
 //
 // ★ **재측(2026-08-06) — 위 "35턴 중 2개"는 이제 낡았다.** 표본이 발화 55건에서 239건으로
@@ -265,6 +269,16 @@ type Prescription struct {
 	Key    string `json:"key"`    // 억제 단위이자 전이 식별자
 	Reason string `json:"reason"` // 왜 떴는가. 시험이 단정하는 축이다
 	Text   string `json:"text"`   // 세션에게 낼 문구
+
+	// Also 는 이 처방이 **함께 덮는** 나머지 키다 — 묶인 outside 의 둘째 경로부터.
+	// 표시는 칸 하나지만 억제·확인(ack)·축별 발화 수는 키마다 따로 남아야 하므로,
+	// 기록하는 쪽은 Key 가 아니라 Keys() 를 돈다.
+	Also []string `json:"also,omitempty"`
+}
+
+// Keys 는 이 처방이 덮는 키 전부다(Key 가 맨 앞).
+func (p Prescription) Keys() []string {
+	return append([]string{p.Key}, p.Also...)
 }
 
 // Prescribe 는 지금 내야 할 처방 전부를 낸다. 표시 상한은 FoldPrescriptions 가 건다.
@@ -506,10 +520,21 @@ func sameConversation(a, b string) bool {
 	return a != "" && a == b
 }
 
-// ③ 선점한 항목의 선언 경로 밖 — 경로마다 1회.
+// ③ 선점한 항목의 선언 경로 밖 — 경로마다 1회, **한 턴에 한 처방**.
 //
 // ★ 선언 경로가 하나도 없으면 이 축은 **안 돈다.** 빈 선언에 대고 "밖"을 판정할 수 없고,
 // 빈 선언을 "전부 밖"으로 접으면 paths 를 안 적은 항목 하나가 첫 턴에 처방을 쏟는다.
+//
+// ★ **한 턴의 밖 경로는 처방 하나로 묶는다(2026-09-24).** 앞선 판은 경로마다 처방 한 줄을
+// 냈고, 그 근거는 「리팩터 한 턴이 outside 수십 건을 쏟는 일은 일어난 적이 없다」였다
+// (PrescribeMax 주석). 2026-09-22 이후 그 일이 났다 — 한 턴에 7·17·22·52 경로가 밖으로
+// 접혔고, 상한 3 때문에 같은 지시가 경로만 바꿔 수십 턴을 이어 갔다. 세션은 이 처방에
+// 잘 반응한다(첫 발화 세션의 83%가 60분 안에 판단을 남겼다) — 그래서 **조각마다 같은 답을
+// 다시 썼다**(둘째 이후 outside 턴에도 9번 중 8번). 원인은 하나(범위가 넓어졌다)이므로
+// 처방도 하나로 낸다: 칸 하나, 전모 한 번, 판단 한 번.
+//
+// 잃는 것이 없게 한다: 억제·확인·축별 발화 수는 **키 단위**로 그대로다(Also·Keys()).
+// 경로가 하나면 문구도 예전 그대로다.
 func outsidePrescriptions(in PrescribeInput) []Prescription {
 	sx := syntaxFor(in.Harness)
 	declared := declaredPaths(in.Claims)
@@ -517,27 +542,55 @@ func outsidePrescriptions(in PrescribeInput) []Prescription {
 		return nil
 	}
 	ids := claimIDs(in.Claims)
-	var out []Prescription
+	var paths []string
 	for _, p := range in.TurnPaths {
 		if PathsOverlap([]string{p}, declared) {
 			continue
 		}
-		key := PrescribeOutside + ":" + p
-		if suppressed(in, key) {
+		if suppressed(in, PrescribeOutside+":"+p) {
 			continue
 		}
-		out = append(out, Prescription{
-			Key:    key,
+		paths = append(paths, p)
+	}
+	switch len(paths) {
+	case 0:
+		return nil
+	case 1:
+		p := paths[0]
+		return []Prescription{{
+			Key:    PrescribeOutside + ":" + p,
 			Reason: fmt.Sprintf("%s 는 선점 항목 %s 의 선언 경로(%s) 밖이다", p, ids, strings.Join(declared, " ")),
 			Text: fmt.Sprintf(
 				"%s 는 선점한 %s 가 선언한 경로 밖이다 — 남이 보는 겹침 판정의 입력이 낡았다.\n"+
 					"  → 같은 작업이면 "+sx.NoteDecide+" 으로 범위가 왜 늘었는지 남겨라.\n"+
 					"  → 별개 작업이면 "+sx.AddWithPath+" 로 항목을 만들어라.",
 				p, ids, p),
-		})
+		}}
 	}
-	return out
+	also := make([]string, 0, len(paths)-1)
+	for _, p := range paths[1:] {
+		also = append(also, PrescribeOutside+":"+p)
+	}
+	listed := strings.Join(clipList(paths, outsideGroupListMax), ", ")
+	return []Prescription{{
+		Key:  PrescribeOutside + ":" + paths[0],
+		Also: also,
+		Reason: fmt.Sprintf("경로 %d개가 선점 항목 %s 의 선언 경로(%s) 밖이다: %s",
+			len(paths), ids, strings.Join(declared, " "), listed),
+		Text: fmt.Sprintf(
+			"경로 %d개가 선점한 %s 가 선언한 경로 밖이다 — 남이 보는 겹침 판정의 입력이 낡았다.\n"+
+				"  %s\n"+
+				"  → 같은 작업이면 "+sx.NoteDecide+" 으로 범위가 왜 늘었는지 **한 번에** 남겨라.\n"+
+				"  → 별개 작업이면 "+sx.Add+" 로 항목을 만들어라.",
+			len(paths), ids, listed),
+	}}
 }
+
+// outsideGroupListMax 는 묶인 outside 문구에 경로를 몇 개까지 적는가다. 넘는 것은 「외 N개」다.
+//
+// 수는 다 싣는다(사유·키) — 줄이는 것은 문구의 목록뿐이다. 52 경로를 한 줄씩 적으면
+// 묶기 전에 막으려던 「한 턴에 읽을 양」이 문구 안에서 되살아난다.
+const outsideGroupListMax = 5
 
 // ④ 선점 없이 편집 — 세션당 1회.
 //

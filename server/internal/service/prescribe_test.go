@@ -77,19 +77,14 @@ func TestPrescriptionsAreEmittedOnceAcrossCalls(t *testing.T) {
 func TestFoldedPrescriptionsAreNotRecordedAndComeBack(t *testing.T) {
 	svc, st := newSvc(t)
 
-	paths := []string{"a/1.go", "b/2.go", "c/3.go", "d/4.go", "e/5.go"}
-	sess := openSessionForPrescribeTest(t, svc)
-	claimItemForPrescribeTest(t, svc, st, sess, "fd-x", []string{"internal/judge"})
-	for _, p := range paths {
-		touchPathForPrescribeTest(t, st, sess, p)
-	}
+	sess, retouch := foldingTurnForTest(t, svc, st)
 
 	res, err := svc.Prescriptions(ctx(), sess)
 	if err != nil {
 		t.Fatalf("호출 실패: %v", err)
 	}
 	if res.Folded == 0 {
-		t.Fatalf("5개 경로가 선언 밖인데 안 접혔다: shown=%d", len(res.Shown))
+		t.Fatalf("상대 다섯과 겹쳤는데 안 접혔다: shown=%d", len(res.Shown))
 	}
 	evs, _ := st.ListSessionEvents(ctx(), sess, "prescribe", time.Time{})
 	if len(evs) != len(res.Shown) {
@@ -107,11 +102,9 @@ func TestFoldedPrescriptionsAreNotRecordedAndComeBack(t *testing.T) {
 		folded[p.Key] = true
 	}
 
-	// 둘째 턴 — 같은 다섯을 전부 다시 만진다. 표시됐던 셋은 눌려 있어야 하고,
+	// 둘째 턴 — 같은 자리를 다시 만진다. 표시됐던 셋은 눌려 있어야 하고,
 	// 접혔던 둘은 올라와야 한다.
-	for _, p := range paths {
-		touchPathForPrescribeTest(t, st, sess, p)
-	}
+	retouch()
 	second, err := svc.Prescriptions(ctx(), sess)
 	if err != nil {
 		t.Fatalf("둘째 호출 실패: %v", err)
