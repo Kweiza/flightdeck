@@ -19,6 +19,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/kweiza/flightdeck/internal/lang"
+
 	"github.com/kweiza/flightdeck/internal/service"
 )
 
@@ -89,6 +91,14 @@ func run(args []string, env func(string) (string, bool), stdin io.Reader, stdout
 	if len(args) == 0 {
 		fmt.Fprint(stderr, usage)
 		return 2
+	}
+	// ★ 언어는 **출력 경계**에서 입힌다(internal/lang). 클라이언트 명령의 stdout 을 줄 단위로
+	// 번역한다. mcp·hook 의 stdout 은 JSON 계약이라 여기서 감싸지 않는다 — 그 둘은 JSON 을
+	// 만들기 전의 글에 따로 입힌다(mcpsrv.Server·App.lang). stderr 는 로그라 안 건드린다.
+	if a0 := args[0]; a0 != "mcp" && a0 != "hook" && a0 != "serve" {
+		lw := lang.FromEnv(env).Writer(stdout)
+		defer lw.Flush()
+		stdout = lw
 	}
 	ctx := context.Background()
 

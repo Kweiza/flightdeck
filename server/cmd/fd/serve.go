@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/kweiza/flightdeck/internal/api"
+	"github.com/kweiza/flightdeck/internal/lang"
 	"github.com/kweiza/flightdeck/internal/service"
 	"github.com/kweiza/flightdeck/internal/store"
 	"github.com/kweiza/flightdeck/internal/web"
@@ -239,7 +240,7 @@ func runServe(args []string, env func(string) (string, bool), log *slog.Logger) 
 
 	svc := service.New(st, log)
 	token := envOr(env, "FD_TOKEN", "")
-	webH := web.New(svc, web.WithLogger(log))
+	webH := web.New(svc, web.WithLogger(log), web.WithLang(lang.FromEnv(env)))
 	// ★ watcher 를 buildHandler 보다 먼저 만든다 — api.Options.SelfUpdate 콜백이
 	// 감시기의 Status() 를 물어야 하므로, 조립 시점에 감시기가 이미 있어야 한다.
 	watcher := newServeWatcher(log, env, home, path)

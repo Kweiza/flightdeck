@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kweiza/flightdeck/internal/buildinfo"
+	"github.com/kweiza/flightdeck/internal/lang"
 	"github.com/kweiza/flightdeck/internal/mcpsrv"
 	"github.com/kweiza/flightdeck/internal/model"
 	"github.com/kweiza/flightdeck/internal/service"
@@ -27,8 +28,11 @@ type App struct {
 	machine string
 	// harness 는 **선언된** 하네스다(DESIGN 「14. 하네스 축」). 빈 값은 「미상」이고
 	// claude 로 접지 않는다 — 환경으로는 못 가르기 때문이다.
-	harness    string
-	notice     string // 도구가 스스로 못 한 것. 침묵하지 않는다
+	harness string
+	notice  string // 도구가 스스로 못 한 것. 침묵하지 않는다
+	// lang 은 훅이 세션에 넣는 글의 언어다(FD_LANG). 훅 stdout 은 JSON 계약이라
+	// 줄 단위 writer 로 못 감싸고, JSON 을 만들기 전의 글에 입힌다(hook.go).
+	lang       lang.Lang
 	machineSrc string // machine-id 를 읽은 자리. doctor 가 찍는다 — 값이 갈리면 여기가 원인이다
 	beaconDir  string // 창 비콘 디렉토리(BeaconDir). mcp.go 가 mcpsrv.WithBeaconDir 에 그대로 넘긴다
 	// beaconSrc 는 그 자리를 **고른 사유**다. machineSrc 가 선례다 — 값이 예상과 다를 때
@@ -106,6 +110,7 @@ func newApp(env func(string) (string, bool), log *slog.Logger, cwd string, stdin
 		binDir:     binDir,
 		binSrc:     binSrc,
 		notice:     warn,
+		lang:       lang.FromEnv(env),
 		host:       host,
 		stdin:      stdin,
 		now:        func() time.Time { return time.Now().UTC() },

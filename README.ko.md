@@ -165,8 +165,13 @@ codex                      # 한 번은 TUI 로 띄워 "Hooks need review" 를 �
 | `FD_LEDGER_HOST` | 서버 | 원장 백업 자리(기본 `~/.flightdeck-ledger`) |
 | `FD_URL` | 세션 | 서버 주소(기본 `http://127.0.0.1:7420`) |
 | `FD_STATE_DIR` | 세션 | 상태 파일(아웃박스·캐시·머신 id)을 한 자리로 모은다 |
+| `FD_LANG` | 서버 · 세션 | 출력 언어. `en` 이면 영어로 낸다(기본 한국어). 서버 쪽은 대시보드, 세션 쪽은 CLI·훅·MCP 결과다 |
 
 각 변수의 함정과 이유는 [서버 운영](docs/server.ko.md)에 있다.
+
+`FD_LANG=en` 은 **출력 경계에서** 옮긴다 — 보드, 대시보드, add·next·pick·note·finish·show, land,
+꼬리, Stop 처방이 1차 범위다. 번역표(`server/internal/lang/catalog.go`)에 없는 줄은 **줄째 한국어로**
+남는다(반쪽 번역을 안 낸다). `fd doctor`·로그인 화면·드문 진단 문구는 아직 한국어다.
 
 ## 여러 저장소
 
