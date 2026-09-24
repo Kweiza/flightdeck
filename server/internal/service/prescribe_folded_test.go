@@ -2,8 +2,11 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/kweiza/flightdeck/internal/store"
 )
 
 // 접힘이 **원장에서 다시 측정 가능한가**를 잠근다.
@@ -17,6 +20,27 @@ import (
 // 그래서 접힌 턴은 **자기 이름의 이벤트 하나**를 남긴다. `emittedKeys` 가 `kind='prescribe'`
 // 로 거르므로 억제 축은 안 건드리고, `store/prescribe_reach.go` 도 `kind IN
 // ('prescribe','prescribe_ack')` 라 확인율에도 안 섞인다 — 그 격리가 이 설계의 조건이다.
+
+// foldingTurnForTest 는 **접히는 턴**을 만든다 — 상대 다섯과 같은 경로가 겹쳐 overlap 이 다섯 뜬다.
+//
+// ★ 앞선 판은 「선언 밖 경로 다섯」으로 접힘을 만들었다. 2026-09-24 에 한 턴의 outside 가 처방
+// 하나로 묶이면서(judge.outsidePrescriptions) 그 준비는 칸 하나가 됐고 접힘이 사라졌다.
+// 이 시험들이 재는 것은 outside 가 아니라 **접힘 기구**(원장 흔적 · 창 물려받기 · 복귀)이므로,
+// 상대마다 키가 따로인 overlap 으로 다섯을 만든다. 이 세션은 그 경로를 덮는 항목을 쥐어
+// unclaimed·outside 가 끼지 않게 한다. retouch 는 이 세션이 같은 자리를 다시 만지는 것이다.
+func foldingTurnForTest(t *testing.T, svc *Service, st *store.Store) (sess string, retouch func()) {
+	t.Helper()
+	repo := newRepo(t)
+	sess = openSession(t, svc, "p", repo, repo, "cc-1", "처방시험").Session.ID
+	claimItemForPrescribeTest(t, svc, st, sess, "fd-x", []string{"shared"})
+	const path = "shared/x.go"
+	for i := range 5 {
+		other := openSession(t, svc, "p", repo, repo, fmt.Sprintf("cc-남%d", i), "남의 대화").Session.ID
+		touchPathForPrescribeTest(t, st, other, path)
+	}
+	touchPathForPrescribeTest(t, st, sess, path)
+	return sess, func() { touchPathForPrescribeTest(t, st, sess, path) }
+}
 
 // foldedPayloadOf 는 접힘 이벤트 하나를 읽는다. **재측 레시피 그 자체다** —
 // 사람이 원장에서 접힘을 다시 재려면 정확히 이 모양을 읽게 된다.
@@ -43,19 +67,14 @@ func foldedPayloadOf(t *testing.T, payload string) struct {
 func TestFoldedTurnLeavesALedgerTrace(t *testing.T) {
 	svc, st := newSvc(t)
 
-	paths := []string{"a/1.go", "b/2.go", "c/3.go", "d/4.go", "e/5.go"}
-	sess := openSessionForPrescribeTest(t, svc)
-	claimItemForPrescribeTest(t, svc, st, sess, "fd-x", []string{"internal/judge"})
-	for _, p := range paths {
-		touchPathForPrescribeTest(t, st, sess, p)
-	}
+	sess, _ := foldingTurnForTest(t, svc, st)
 
 	res, err := svc.Prescriptions(ctx(), sess)
 	if err != nil {
 		t.Fatalf("호출 실패: %v", err)
 	}
 	if res.Folded == 0 {
-		t.Fatalf("다섯이 선언 밖인데 안 접혔다 — 이 시험의 전제가 깨졌다: shown=%d", len(res.Shown))
+		t.Fatalf("상대 다섯과 겹쳤는데 안 접혔다 — 이 시험의 전제가 깨졌다: shown=%d", len(res.Shown))
 	}
 
 	evs, err := st.ListSessionEvents(ctx(), sess, "prescribe_folded", time.Time{})
@@ -115,19 +134,14 @@ func TestFoldedTurnLeavesALedgerTrace(t *testing.T) {
 func TestFoldedTurnKeepsTheWindowUntilTheBacklogDrains(t *testing.T) {
 	svc, st := newSvc(t)
 
-	paths := []string{"a/1.go", "b/2.go", "c/3.go", "d/4.go", "e/5.go"}
-	sess := openSessionForPrescribeTest(t, svc)
-	claimItemForPrescribeTest(t, svc, st, sess, "fd-x", []string{"internal/judge"})
-	for _, p := range paths {
-		touchPathForPrescribeTest(t, st, sess, p)
-	}
+	sess, _ := foldingTurnForTest(t, svc, st)
 
 	first, err := svc.Prescriptions(ctx(), sess)
 	if err != nil {
 		t.Fatalf("첫 턴 실패: %v", err)
 	}
 	if first.Folded == 0 {
-		t.Fatalf("다섯이 선언 밖인데 안 접혔다 — 이 시험의 전제가 깨졌다: shown=%d", len(first.Shown))
+		t.Fatalf("상대 다섯과 겹쳤는데 안 접혔다 — 이 시험의 전제가 깨졌다: shown=%d", len(first.Shown))
 	}
 	foldedKeys := map[string]bool{}
 	for _, p := range first.All[len(first.Shown):] {
