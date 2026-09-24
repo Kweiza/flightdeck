@@ -57,7 +57,7 @@ fd pick detail --project search-api   # the worktree commands point at that repo
 ```
 
 `fd move <id> --project <member>` moves an existing item too — and references that named the item as a
-prerequisite are **rewritten to the new project** (the relationship follows it).
+prerequisite, and the judgments linked to it, are **rewritten to the new project**, and its revision history moves with it (the relationships follow it).
 
 **5. Exclusive resources are one per workspace.**
 
