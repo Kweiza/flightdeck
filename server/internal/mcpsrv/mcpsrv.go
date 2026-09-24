@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/kweiza/flightdeck/internal/judge"
+	"github.com/kweiza/flightdeck/internal/lang"
 	"github.com/kweiza/flightdeck/internal/model"
 	"github.com/kweiza/flightdeck/internal/service"
 	"github.com/kweiza/flightdeck/internal/store"
@@ -59,6 +60,10 @@ type Server struct {
 	id Identity
 
 	beaconDir string // 창 비콘을 둘 디렉토리. 빈 값이면 심지 않는다(WithBeaconDir 참고)
+
+	// lang 은 도구 결과 글의 언어다(FD_LANG, 기동 시 1회). 결과를 JSON 으로 싸기 직전에
+	// 입힌다 — 렌더 함수들은 한국어만 알고, 번역은 출력 경계의 일이다(internal/lang).
+	lang lang.Lang
 
 	mu        sync.Mutex
 	sessionID string // 게으르게 연다. 도구를 한 번도 안 부르면 세션 행도 안 생긴다
@@ -230,7 +235,7 @@ func New(be Backend, log *slog.Logger, opts ...Option) *Server {
 			"머신 id 를 hostname 으로 정했다 — 진입점이 보관하는 안정 id 와 달라 세션이 갈린다")
 	}
 
-	s := &Server{be: be, log: log, now: b.now, id: id}
+	s := &Server{be: be, log: log, now: b.now, id: id, lang: lang.FromEnv(b.getenv)}
 	if len(id.Missing) > 0 {
 		// 기동 로그에도 남긴다. 배너는 도구를 부른 세션만 보고,
 		// 아무도 안 부르면 "왜 조정이 안 되나"에 답할 자리가 로그뿐이다.
@@ -429,6 +434,9 @@ func (s *Server) toolsCall(ctx context.Context, id json.RawMessage, params json.
 			"이 서버의 도구: "+strings.Join(ToolNames(), " · "))
 	}
 	res := s.callTool(ctx, p.Name, p.Arguments)
+	for i := range res.Content {
+		res.Content[i].Text = s.lang.Text(res.Content[i].Text)
+	}
 	return okResponse(id, res)
 }
 

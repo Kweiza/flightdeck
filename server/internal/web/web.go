@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kweiza/flightdeck/internal/lang"
 	"github.com/kweiza/flightdeck/internal/service"
 )
 
@@ -58,6 +59,7 @@ type handler struct {
 	refresh int
 	ssePath string
 	mux     *http.ServeMux
+	lang    lang.Lang
 }
 
 // Option 은 선택 설정이다.
@@ -88,6 +90,14 @@ func WithRefresh(sec int) Option {
 			h.refresh = sec
 		}
 	}
+}
+
+// WithLang 은 화면 언어를 바꾼다(FD_LANG). 한국어가 기본이다.
+//
+// ★ 템플릿을 언어별로 두 벌 만들지 않는다 — 두 벌은 반드시 표류한다. 렌더가 끝난 문서의
+// 텍스트 노드와 보이는 속성만 옮긴다(internal/lang). 표에 없는 문장은 한국어로 남는다.
+func WithLang(l lang.Lang) Option {
+	return func(h *handler) { h.lang = l }
 }
 
 // WithSSEPath 는 SSE 경로를 바꾼다. **빈 문자열이면 SSE 를 아예 안 건다** —
@@ -192,7 +202,7 @@ func (h *handler) render(r *http.Request, w http.ResponseWriter, page Page, stat
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	if _, err := buf.WriteTo(w); err != nil {
+	if _, err := w.Write(h.lang.HTML(buf.Bytes())); err != nil {
 		// 클라이언트가 끊은 경우가 대부분이라 WARN 이다. 다만 삼키지 않는다 —
 		// 삼키면 "안 보낸 것"과 "보냈는데 끊긴 것"이 구분되지 않는다.
 		h.log.WarnContext(r.Context(), "대시보드 응답 전송 중단",

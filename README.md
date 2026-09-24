@@ -30,9 +30,11 @@ The same board is also served as a read-only dashboard at <http://localhost:7420
 
 <sub>Captured from a demo server loaded with synthetic data (`my-app`).</sub>
 
-> **flightdeck speaks Korean.** The board, prescriptions, refusals and `fd doctor` are all in Korean.
-> The docs quote that output verbatim and explain it in English, so what you read is what you will see.
-> In the board above: no items are claimed, 4 queue items are open, and the landing lane is empty.
+> **flightdeck speaks Korean by default. Set `FD_LANG=en` for English.** The board, the dashboard,
+> pick/land replies and overlap prescriptions then come out in English; lines the translation table
+> does not cover yet (`fd doctor`, the login page, rarer diagnostics) stay in Korean, whole. The docs
+> below quote the default Korean output and explain it in English. In the board above: no items are
+> claimed, 4 queue items are open, and the landing lane is empty.
 
 ## Highlights
 
@@ -170,8 +172,14 @@ The server reads environment variables through compose; sessions read `~/.flight
 | `FD_LEDGER_HOST` | server | Where the ledger backup goes (default `~/.flightdeck-ledger`) |
 | `FD_URL` | session | Server address (default `http://127.0.0.1:7420`) |
 | `FD_STATE_DIR` | session | Put the state files (outbox, caches, machine id) in one place |
+| `FD_LANG` | server · session | Output language. `en` for English (default Korean). The server side covers the dashboard; the session side covers the CLI, hooks and MCP replies |
 
 The traps behind each one are in [Running the server](docs/server.md).
+
+`FD_LANG=en` translates **at the output boundary**: the board, the dashboard, add · next · pick · note ·
+finish · show, land, the tail and Stop prescriptions are covered first. A line the table
+(`server/internal/lang/catalog.go`) does not cover stays in Korean as a whole — no half-translated
+lines. `fd doctor`, the login page and rarer diagnostics are still Korean.
 
 ## Several repositories
 

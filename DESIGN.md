@@ -3880,3 +3880,38 @@ reachability) 어디에도 훅이 없다(전량 확인). codex 를 호출해서 
    | `01M1AMMK…` | 0.32.0 | **1건**(`probe-after.txt`) |
 
    같은 창의 claude 세션은 양쪽 판 모두에서 발자국을 냈다 — 대조군이 성립한다.
+
+## 15. 언어 축 — 출력 경계에서 옮긴다 (2026-09-25)
+
+기본 출력은 한국어다. `FD_LANG=en` 이면 영어로 낸다. 서버 프로세스의 값은 대시보드에, 세션 쪽
+프로세스(CLI·훅·MCP)의 값은 그 출력에 걸린다 — 둘은 따로 읽는다. 모르는 값은 한국어다.
+
+**문장을 만드는 자리를 고치지 않는다.** 한국어 문장 수천 줄이 그 자리마다 판정의 근거를 주석으로
+달고 있고, 시험이 그 문장을 그대로 잠근다. 호출부마다 언어를 끼우면 그 둘을 한꺼번에 흔든다.
+그래서 번역은 **출력 경계 넷**에서 한 표(`server/internal/lang/catalog.go`)로 한다:
+
+| 경계 | 자리 |
+|---|---|
+| CLI stdout | `main.go` 가 클라이언트 명령의 stdout 을 줄 단위 writer 로 감싼다(`mcp`·`hook`·`serve` 는 제외 — JSON 계약·로그다) |
+| 훅 | `emitContext`·`emitBlock` 직전의 글(`App.lang`) — JSON 을 만든 뒤에 옮기면 이스케이프를 깬다 |
+| MCP | `tools/call` 결과의 text 블록(`Server.lang`) |
+| 대시보드 | 렌더가 끝난 문서의 텍스트 노드와 보이는 속성(placeholder·title·aria-label·alt), `<script>` 안은 문자열 리터럴만 |
+
+**줄마다 전부 아니면 원문이다.** 규칙을 다 돌고도 한글이 남은 줄은 원래 한국어 줄로 되돌린다.
+표에 없는 문장 안에서 단어 규칙(표 머리·버튼용 「경로」「항목」)만 맞으면 "Paths 실재: … 지금 이
+Item은 …" 같은 반쪽 줄이 나왔고(표면 시험이 잡았다), 반쪽 줄은 원문보다 나쁘다. 대가: 사용자가
+한국어로 쓴 제목·판단이 든 줄은 틀까지 한국어로 남는다.
+
+**번역은 출력을 못 막는다.** 규칙이 패닉하면 원문을 낸다. 첫 빌드에서 표 해석 버그 하나가
+SessionStart 훅을 죽였다 — 훅은 fail-open 이 계약이고 번역은 그보다 아래다.
+
+1차 범위는 처음 만나는 표면이다: 보드(status·SessionStart), add·next·pick·note·finish·show,
+land 세 갈래, pick(leave), 꼬리, Stop 처방(overlap·outside·lifecycle), 대시보드 한 장, MCP 의
+board·land. `TestEnglishSurfacesHaveNoHangul`·`TestEnglishMCPToolResults` 가 이 표면을 한글 0자로
+잰다. 문장이 바뀌어 표가 빗나가면 그 시험이 빨개진다.
+
+### 아직 아님
+
+- `fd doctor`, 로그인 화면(`LoginScreen` 은 api 미들웨어가 부르는 자리라 언어가 안 닿는다),
+  드문 진단·거절 문구, 플래그 도움말(stderr).
+- 도구 설명(`tools/list`)은 에이전트가 읽는 글이라 옮기지 않았다.

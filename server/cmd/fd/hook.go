@@ -326,7 +326,7 @@ func (a *App) hookSessionStart(ctx context.Context, p HookPayload, out io.Writer
 	cc := a.ccSessionID(p.SessionID)
 	if cc == "" {
 		in.Notice = strings.TrimSpace(in.Notice + " " + a.sessionEnvName() + " 도 훅 페이로드의 session_id 도 못 읽었다 — 이 세션은 등록되지 않는다(fd doctor 가 그 축을 잰다).")
-		emitContext(out, "SessionStart", RenderSessionStart(in))
+		emitContext(out, "SessionStart", a.lang.Text(RenderSessionStart(in)))
 		return
 	}
 
@@ -494,7 +494,7 @@ func (a *App) hookSessionStart(ctx context.Context, p HookPayload, out io.Writer
 		in.BoardStale = !reachable
 		in.Asks, in.Blocked = v.Asks, v.Blocked
 	}
-	emitContext(out, "SessionStart", RenderSessionStart(in))
+	emitContext(out, "SessionStart", a.lang.Text(RenderSessionStart(in)))
 }
 
 // findWindow 는 내 조상 사슬 위의 비콘을 찾는다.
@@ -597,7 +597,7 @@ func (a *App) hookUserPrompt(ctx context.Context, p HookPayload, out io.Writer) 
 	if b.Len() == 0 {
 		return
 	}
-	emitContext(out, "UserPromptSubmit", "flightdeck 미확인:\n"+strings.TrimRight(b.String(), "\n"))
+	emitContext(out, "UserPromptSubmit", a.lang.Text("flightdeck 미확인:\n"+strings.TrimRight(b.String(), "\n")))
 }
 
 // hookPostTool 은 tool 신호와 **미커밋 발자국**을 남긴다.
@@ -776,11 +776,11 @@ func (a *App) hookStop(ctx context.Context, p HookPayload, perr error, out io.Wr
 		if text != "" {
 			reason += "\n\n" + text // 처방을 잃지 않는다 — block 턴에서 additionalContext 는 안 나간다
 		}
-		emitBlock(out, reason)
+		emitBlock(out, a.lang.Text(reason))
 		return
 	}
 	if text != "" {
-		emitContext(out, "Stop", text)
+		emitContext(out, "Stop", a.lang.Text(text))
 	}
 }
 
