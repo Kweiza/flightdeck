@@ -24,6 +24,12 @@ Open a new session and the board appears before you type anything:
 랜딩 레인 0건(질의는 돌았다)
 ```
 
+The same board is also served as a read-only dashboard at <http://localhost:7420>:
+
+![flightdeck dashboard](docs/images/dashboard.png)
+
+<sub>Captured from a demo server loaded with synthetic data (`my-app`).</sub>
+
 > **flightdeck speaks Korean.** The board, prescriptions, refusals and `fd doctor` are all in Korean.
 > The docs quote that output verbatim and explain it in English, so what you read is what you will see.
 > In the board above: no items are claimed, 4 queue items are open, and the landing lane is empty.
@@ -240,3 +246,7 @@ A push that changes code bumps `version` in `.claude-plugin/plugin.json` too —
 flightdeck grew inside the plugin collection [kweiza-cc-plugins](https://github.com/Kweiza/kweiza-cc-plugins)
 as `plugins/flightdeck`, and was split out here on 2026-09-24 at 0.38.3. Earlier history, and the commit
 shas that the docs and code comments cite, live in that repository.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

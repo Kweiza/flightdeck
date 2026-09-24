@@ -23,6 +23,12 @@
 랜딩 레인 0건(질의는 돌았다)
 ```
 
+같은 보드가 <http://localhost:7420> 에 읽기 전용 대시보드로도 뜬다.
+
+![flightdeck 대시보드](docs/images/dashboard.png)
+
+<sub>데모 서버에 합성 데이터(`my-app`)를 넣고 찍은 화면이다.</sub>
+
 ## 특징
 
 - **락 대신 선점** — `pick` 이 큐 항목을 집으면 그 id 가 그대로 브랜치·워크트리 이름이 된다.
@@ -227,3 +233,7 @@ go test ./...                                         # 수 분 걸린다
 flightdeck 은 플러그인 모음 [kweiza-cc-plugins](https://github.com/Kweiza/kweiza-cc-plugins) 의
 `plugins/flightdeck` 에서 자랐고 2026-09-24 에 0.38.3 을 기준으로 여기로 분리됐다. 그전의 이력과,
 문서·코드 주석이 인용하는 커밋 sha 는 그 저장소에 있다.
+
+## 라이선스
+
+MIT — [LICENSE](LICENSE) 를 보라.
