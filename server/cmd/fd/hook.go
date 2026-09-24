@@ -556,27 +556,42 @@ func (a *App) pruneWindows() {
 	}
 }
 
+// userPromptBudget 은 user-prompt 훅이 **네트워크에 쓰는 시간의 상한**이다.
+//
+// ★ 하네스 제한(hooks.json 의 UserPromptSubmit timeout 5초)보다 짧아야 한다. 요청마다 걸리는
+// 클라이언트 제한(FD_TIMEOUT 기본 5초)이 하네스 제한과 같아서, 서버가 느리면 클라이언트가
+// 스스로 물러나기 전에 하네스가 훅을 죽였다 — 그러면 같은 턴의 다른 플러그인 UPS 훅까지
+// **묶음째** 취소되고(2026-09-24 실측: 취소가 든 UPS 묶음 436개가 전부 묶음 전체 취소) 사람은
+// 5초를 기다린다. 이 상한 안에서 못 끝나면 알림 없이 조용히 물러난다(훅은 세션을 막지 않는다).
+// 프로세스 기동·런처의 소스 훑기 몫으로 1초를 남긴다 — TestUserPromptBudgetFitsTheHookTimeout.
+const userPromptBudget = 4 * time.Second
+
 // hookUserPrompt 는 prompt 신호를 남기고 미확인 알림만 주입한다.
 //
 // 보드 전체를 매 프롬프트마다 넣지 않는다 — 컨텍스트 예산이 이 설계의 제약이고,
 // 매번 넣으면 세션이 그것을 읽지 않게 되어 알림 자체가 무의미해진다.
+//
+// ★ **보드를 부르지 않는다(2026-09-24).** 앞선 판은 미확인(ask·blocked)만 쓰면서 보드 전체
+// (dashboard.json)를 불렀고, 서버는 그 조회마다 세션 카드 파생(git worktree list · 세션마다
+// 미커밋 경로)을 통째로 돌았다. 대화 기록 전수로 flightdeck UPS 433건이 제한 시간에 취소됐고,
+// 그중 419건은 prompt 신호가 이미 원장에 남은 뒤였다 — 늦은 것은 이 조회였다. 지금은 응답
+// 꼬리와 같은 꼬리 전용 표면(/api/v1/notices — 파생을 안 돈다)을 읽는다(recentNotes).
+// 그 판정대로 **다른 세션이 남긴 것만** 낸다 — 자기가 남긴 blocked 는 자기에게 미확인이 아니다.
 func (a *App) hookUserPrompt(ctx context.Context, p HookPayload, out io.Writer) {
+	ctx, cancel := context.WithTimeout(ctx, userPromptBudget)
+	defer cancel()
 	sess := a.beatFromHook(ctx, p, model.SignalPrompt, nil)
 	if sess == "" {
 		return
 	}
-	// 자기 프로젝트만이다 — 위 SessionStart 갈래와 같은 판정(프롬프트마다 도는 자리다).
-	v, _, err := a.Board(ctx, sess, BoardQuery{})
+	notes, err := a.recentNotes(ctx)
 	if err != nil {
-		a.log.Warn("프롬프트 훅에서 보드 조회 실패", "error", err.Error())
+		a.log.Warn("프롬프트 훅에서 미확인 조회 실패", "error", err.Error())
 		return
 	}
 	var b strings.Builder
-	for _, j := range v.Asks {
-		fmt.Fprintf(&b, "[ask] %s\n", clip(firstLine(j.Title, j.Body), 200))
-	}
-	for _, j := range v.Blocked {
-		fmt.Fprintf(&b, "[blocked] %s\n", clip(firstLine(j.Title, j.Body), 200))
+	for _, j := range notes {
+		fmt.Fprintf(&b, "[%s] %s\n", j.Kind, clip(firstLine(j.Title, j.Body), 200))
 	}
 	if b.Len() == 0 {
 		return
