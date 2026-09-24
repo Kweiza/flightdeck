@@ -540,8 +540,9 @@ func sameWorktree(x, y string) bool {
 // 그 지연은 매 도구 호출마다 사람이 기다리는 시간이다.
 //
 // ★ 그리고 그 훅 중에서도 **session-start 하나다.** 같은 hooks.json 에서 async 가 아닌 것,
-// 곧 사람이 그 시간을 통째로 기다리는 것은 셋이다 — user-prompt 2초 · stop 3초 ·
-// session-start 10초. 앞의 둘은 예산이 가장 작으면서 매 프롬프트·매 턴 끝마다 돈다.
+// 곧 사람이 그 시간을 통째로 기다리는 것은 셋이다 — user-prompt 5초 · stop 5초 ·
+// session-start 10초(2026-09-24 hooks.json 기준 — 앞의 둘은 한때 2초·3초였다).
+// 앞의 둘은 예산이 가장 작으면서 매 프롬프트·매 턴 끝마다 돈다.
 // 나머지 셋(post-tool · pre-compact · session-end)은 async:true 라 예산 논거가 다르지만
 // post-tool 은 편집마다 돈다 — 횟수 쪽에서 걸린다. 그래서 "상한 없이 자라는 디렉토리를
 // 훑는다"를 감당하는 자리가 여섯 중 여기뿐이다. 여기가 먼저 눈에 띄어서가 아니다.
