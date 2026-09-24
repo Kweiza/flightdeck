@@ -17,18 +17,24 @@ import (
 // 그래서 축을 푸는 정식 갈래(unpinnedEnv)를 뒀고, 여기서 **그 갈래가 제 일을 하는지**와
 // **더 큰 사고를 새로 열지 않는지**를 함께 단정한다.
 
-// 비시험 코드가 읽는 환경 키 전수(2026-08-04 조사).
+// 비시험 코드가 읽는 환경 키 전수(2026-08-04 조사, 2026-09-24 에 코드 훑기로 채움).
 //
 // ★ 목록을 여기 박아 두는 이유는 **새 축이 생겼을 때 알아채기 위해서**다.
-// 코드가 새 환경 키를 읽기 시작하면 이 시험이 빨개지고, 그때 "하네스가 이 축도
-// 고정하는가 / 고정하면 무엇이 안 보이게 되는가"를 한 번은 묻게 된다.
-// 묻지 않으면 다음 사각은 다음 사고로만 드러난다.
+// 코드가 새 환경 키를 읽기 시작하면 TestEveryEnvKeyTheCodeReadsIsInventoried(env_axis_scan_test.go)
+// 가 비시험 코드의 문자열 리터럴을 훑어 빨개지고, 그때 "하네스가 이 축도 고정하는가 / 고정하면
+// 무엇이 안 보이게 되는가"를 한 번은 묻게 된다. 묻지 않으면 다음 사각은 다음 사고로만 드러난다.
+// (2026-09-24 전까지 이 약속은 거짓이었다 — 하네스 키 ⊆ 목록만 봐서 codex 축 넷이 목록 없이 들어왔다.)
+//
+// ★ 하네스가 고정하지 않은 키는 **없는 값**으로 결정적이다 — envOf 는 닫힌 맵이라 프로세스 환경을
+// 안 물려받는다. 그래서 CODEX_* 가 없는 하네스는 늘 Claude Code 갈래를 돈다. codex 갈래를 보려면
+// 그 키를 넣은 env 로 따로 돌려라(고정하면 Claude Code 갈래가 안 보이게 된다).
 var knownEnvAxes = []string{
 	"CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SSE_PORT",
 	"CLAUDE_ENV_FILE", "CLAUDE_PLUGIN_DATA", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR",
-	"FD_ADDR", "FD_DB", "FD_LOG", "FD_PLUGIN_ROOT", "FD_PROJECT", "FD_SESSION", "FD_STATE_DIR",
+	"CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED", "CODEX_SESSION_ID", "CODEX_THREAD_ID",
+	"FD_ADDR", "FD_DB", "FD_LEDGER", "FD_LOG", "FD_PLUGIN_ROOT", "FD_PROJECT", "FD_SESSION", "FD_STATE_DIR",
 	"FD_TIMEOUT", "FD_TOKEN", "FD_URL", "FD_WORKTREE",
-	"HOME", "XDG_STATE_HOME",
+	"HOME", "PATH", "USER", "XDG_STATE_HOME",
 }
 
 // ★ 이 시험의 핵심. 축을 푸는 것 자체보다 **푸는 순간 열리는 문**이 위험하다.
@@ -136,7 +142,8 @@ func TestUnpinnedEnvReachesEveryStateDirBranch(t *testing.T) {
 	}
 }
 
-// 새 환경 축이 생기면 알아챈다 — 위 knownEnvAxes 주석에 이유가 있다.
+// 하네스가 고정하는 축은 전부 알려진 축이어야 한다. 코드 쪽 대조는
+// TestEveryEnvKeyTheCodeReadsIsInventoried 가 한다 — 이 시험만으로는 새 축을 못 본다.
 func TestEnvAxisInventoryIsCurrent(t *testing.T) {
 	known := map[string]bool{}
 	for _, k := range knownEnvAxes {
