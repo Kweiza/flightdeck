@@ -40,7 +40,7 @@ import (
 // ★ 이 함수는 하드 스톱이 아니다 — 진짜로 멈추는 것은 `go test -timeout`(기본 10분)이다.
 // 여기서 하는 것은 **예산 초과를 그 시험의 실패로 남기는 것**이고, 그래서
 // t.Errorf 다(t.Fatalf 는 정리 단계에서 부를 수 없다).
-// 이 파일의 대기는 전부 상한이 있다: HTTP 는 클라이언트 타임아웃(FD_TIMEOUT, 기본 5초),
+// 이 파일의 대기는 전부 상한이 있다: HTTP 는 클라이언트 타임아웃(FD_TIMEOUT — 하네스는 harnessClientTimeout),
 // 나머지는 파일 조작이라 대기 구간이 없다.
 func withTimeBudget(t *testing.T, budget time.Duration) {
 	t.Helper()
@@ -641,5 +641,24 @@ func restoreQueueDir(t *testing.T, dir string, snap map[string][]byte) {
 		if err := os.WriteFile(filepath.Join(dir, name), b, 0o600); err != nil {
 			t.Fatalf("큐 항목 원문 복원 실패(%s): %v", name, err)
 		}
+	}
+}
+
+// 하네스의 제한 시간은 운영 기본값보다 길고 열화 예산보다 짧아야 한다.
+//
+// ★ 길어야 하는 이유: 붐비는 머신에서 요청 하나가 운영 기본값(5초)을 넘기면 시험이 조정
+// 결함과 무관하게 「미도달」로 빨개진다(2026-09-24 실측). ★ 짧아야 하는 이유: 이 파일의 대기
+// 상한은 그 제한 시간이다 — 예산보다 길면 느려진 요청 하나가 예산 초과로도 안 잡힌다.
+func TestHarnessClientTimeoutFitsTheBudgets(t *testing.T) {
+	h := newHarness(t)
+	got, err := time.ParseDuration(h.env["FD_TIMEOUT"])
+	if err != nil {
+		t.Fatalf("하네스의 FD_TIMEOUT 을 못 읽었다(%q): %v", h.env["FD_TIMEOUT"], err)
+	}
+	if got <= 5*time.Second {
+		t.Errorf("하네스 제한 시간 %s 가 운영 기본값(5초) 이하다 — 붐비는 머신에서 준비 단계가 미도달로 떨어진다", got)
+	}
+	if got >= degradeBudget {
+		t.Errorf("하네스 제한 시간 %s 가 열화 예산 %s 이상이다 — 느려진 요청이 예산으로 안 잡힌다", got, degradeBudget)
 	}
 }
