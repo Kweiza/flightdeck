@@ -69,6 +69,16 @@ func (e *MoveRefusedError) Error() string {
 		clip(e.ItemID, 64), clip(e.To, 64), e.Reason)
 }
 
+// itemKeyedTables 는 (project, item_id) 로 항목을 가리키는 표 — MoveItem 이 함께 옮기는 표다.
+//
+// 이름을 여기 한 자리에 모아 둔다 — 표가 늘면 이 목록도 늘려야 하고, 흩어 놓으면 늘리는
+// 사람이 전부를 못 찾는다. 빠뜨리면 TestMoveItemListCoversEveryTableKeyedToItem 이 스키마에서
+// 뽑은 목록과 대조해 빨개진다.
+//
+// ★ item_revision 은 증분 016 이 더했고 017 이 project 좌표만 바꿀 수 있게 열었다 — 그 전에는
+// 이 목록에 없어서 amend 된 항목의 이동이 FK 787 로 거절됐다(2026-09-24 실측).
+var itemKeyedTables = []string{"item_after", "claim", "job", "item_revision"}
+
 // MoveItem 은 항목과 **그 항목을 (project, item_id) 로 가리키는 모든 행**을 함께 옮긴다.
 //
 // ★ 항목 행만 옮기면 안 된다. item_after·claim 은 item(project, id) 에 복합 FK 를 걸고
@@ -90,9 +100,7 @@ func (t *Tx) MoveItem(project, itemID, toProject, sessionID string) error {
 	if err := affectedOne(res, NFItem, project, itemID); err != nil {
 		return err
 	}
-	// 딸린 표 넷. 이름을 여기 한 자리에 모아 둔다 — 표가 늘면 이 목록도 늘려야 하고,
-	// 흩어 놓으면 늘리는 사람이 전부를 못 찾는다.
-	for _, tbl := range []string{"item_after", "claim", "job"} {
+	for _, tbl := range itemKeyedTables {
 		if _, err := t.tx.ExecContext(t.ctx,
 			fmt.Sprintf(`UPDATE %s SET project = ? WHERE project = ? AND item_id = ?`, tbl),
 			toProject, project, itemID); err != nil {
@@ -191,9 +199,35 @@ func (s *Store) MoveItem(ctx context.Context, project, itemID, toProject, sessio
 			return derr
 		}
 		crossRefs = n
-		return nil
+		// ★ 판단 연결도 다시 쓴다. 이것이 없으면 옮긴 항목의 판단이 조회에서 사라진다 —
+		//   연결 행은 그대로인데 target_project 가 비어 있으면 판단의 프로젝트, 곧 옛
+		//   프로젝트로 해석되기 때문이다(2026-09-24 실측: 판단 7건이 show·pick 에서 사라졌다).
+		return t.RewriteJudgmentLinkProject(project, itemID, toProject)
 	})
 	return crossRefs, err
+}
+
+// RewriteJudgmentLinkProject 는 옮긴 항목을 가리키던 판단 연결에 **새 프로젝트를 박는다.**
+//
+// ★ 옛 프로젝트로 해석되던 연결만 고친다 — COALESCE(target_project, 판단의 프로젝트) 가
+//
+//	옛 프로젝트인 행이다. 다른 프로젝트를 명시한 연결은 같은 id 의 **남의 항목**을
+//	가리키므로 건드리지 않는다(RewriteDepProject 와 같은 규율).
+//
+// ★ 판단 자신은 안 옮긴다. 판단은 추가 전용이고 프로젝트를 넘지 못한다 — 넘는 것은 연결의
+//
+//	target_project 다(증분 009 의 관례). 조회는 그 칼럼으로 새 자리에서 판단을 찾는다.
+func (t *Tx) RewriteJudgmentLinkProject(fromProject, itemID, toProject string) error {
+	if _, err := t.tx.ExecContext(t.ctx,
+		`UPDATE judgment_link SET target_project = ?
+		  WHERE target_kind = 'item' AND target_id = ?
+		    AND COALESCE(target_project,
+		                 (SELECT j.project FROM judgment j WHERE j.id = judgment_link.judgment_id)) = ?`,
+		toProject, itemID, fromProject); err != nil {
+		return fmt.Errorf("판단 연결 이동 실패(project=%q id=%q to=%q): %w",
+			clip(fromProject, 64), clip(itemID, 64), clip(toProject, 64), err)
+	}
+	return nil
 }
 
 // projectExists 는 대상 프로젝트가 원장에 있는지다.
