@@ -299,7 +299,7 @@ func TestCodexAxesGradesTheSilence(t *testing.T) {
 // 파일을 고쳐도 안 바뀌기 때문이다.
 //
 // 아래 셋은 그 화면들이 **한계를 말하는지**를 문다. 해시 재현으로 고치지 않는 이유는
-// `5f8b556` 기각 ① 그대로다 — 규칙을 베끼면 codex 가 그것을 바꾸는 날 우리가 조용히 거짓이 된다.
+// `36c9a9c` 기각 ① 그대로다 — 규칙을 베끼면 codex 가 그것을 바꾸는 날 우리가 조용히 거짓이 된다.
 
 // TestTrustAxisDoesNotClaimTheHooksAreLive 는 신뢰 축이 **못 재는 것을 못 잰다고** 하는지 문다.
 func TestTrustAxisDoesNotClaimTheHooksAreLive(t *testing.T) {

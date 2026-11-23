@@ -616,7 +616,7 @@ func ProjectIDFromPath(p string) string { return judge.ProjectIDFromPath(p) }
 //
 // 그 결과가 원장의 유령 프로젝트다. 서버는 클라이언트 머신의 cwd 를 볼 수 없어 받은 이름을
 // 믿을 수밖에 없고, 미등록 이름이 오면 자동 등록한다. 실측된 재현 경로 둘: ⑴ git 저장소가
-// 아닌 디렉토리(proj-r 의 /tmp 경로가 그랬다 — `fatal: not a git repository`),
+// 아닌 디렉토리(한 프로젝트의 /tmp 경로가 그랬다 — `fatal: not a git repository`),
 // ⑵ 워크트리가 막 만들어지는 중이거나 지워지는 중일 때(그 창에서 rev-parse 가 실패한다).
 //
 // ★ **두 축이 왜 다르게 답하나.** 워크트리는 "이 프로세스가 어디서 도는가"라 cwd 가 이미

@@ -13,7 +13,7 @@ import (
 // ★ 이 시험이 잠그는 것은 "빈 값이 낫다"가 아니라 **지어낸 좌표가 서버로 나가지 않는다**이다.
 // 옛 동작은 `ProjectIDFromPath(cwd)` — 즉 **디렉토리 이름**을 프로젝트 id 로 냈고, 실패 사실은
 // Detail 에만 적혔다. 그러면 서버는 그것을 믿고 프로젝트를 자동 등록한다: 워크트리가 막
-// 만들어지는 중이거나 지워지는 중이거나, 아예 git 저장소가 아닌 디렉토리(proj-r 의
+// 만들어지는 중이거나 지워지는 중이거나, 아예 git 저장소가 아닌 디렉토리(한 프로젝트의
 // /tmp 경로가 실제로 그랬다)에서 fd 를 부르면 `wt` 같은 유령 프로젝트가 원장에 하나 는다.
 //
 // 서버 쪽 방어(a168c20)는 **3중키 세션이 이미 있을 때만** 듣는다 — 그 세션의 프로젝트로
@@ -122,7 +122,7 @@ func TestResolvedProjectAddsNoNoticeNoise(t *testing.T) {
 		}
 	}
 	root := t.TempDir()
-	main := filepath.Join(root, "Kweizaect")
+	main := filepath.Join(root, "myproject")
 	git(root, "init", "-q", main)
 	git(main, "commit", "-q", "--allow-empty", "-m", "init")
 
@@ -131,7 +131,7 @@ func TestResolvedProjectAddsNoNoticeNoise(t *testing.T) {
 		"FD_STATE_DIR": state, "HOME": state,
 	}), quietLogger(), main, strings.NewReader(""))
 
-	if app.proj.ID != "Kweizaect" {
+	if app.proj.ID != "myproject" {
 		t.Fatalf("전제가 깨졌다 — 좌표가 안 풀렸다: %q", app.proj.ID)
 	}
 	if strings.Contains(app.notice, "프로젝트 좌표") {
@@ -154,12 +154,12 @@ func TestResolvedProjectStillNamesTheMainRepo(t *testing.T) {
 		}
 	}
 	root := t.TempDir()
-	main := filepath.Join(root, "Kweizaect")
+	main := filepath.Join(root, "myproject")
 	git(root, "init", "-q", main)
 	git(main, "commit", "-q", "--allow-empty", "-m", "init")
 
 	c := resolveProject(func(string) (string, bool) { return "", false }, main)
-	if c.ID != "Kweizaect" {
+	if c.ID != "myproject" {
 		t.Fatalf("정상 경로가 깨졌다: %q", c.ID)
 	}
 }

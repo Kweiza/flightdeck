@@ -2142,7 +2142,7 @@ func (a *App) runAmend(ctx context.Context, args []string, out io.Writer) int {
 		// ★ nonBlankPositionals(:111) 로 거른다(재리뷰 I-3) — 안 그러면 `--path ""` 는
 		//   `[]` 가 아니라 `[""]` 를 그대로 보내고 store 가 빈 경로 한 칸을 저장한다.
 		//   서버는 paths:[] 를 이미 일급으로 다룬다(겹침 계산 자체를 안 돌린다,
-		//   커밋 1a51bba) — CLI 만 그 자리에 못 갔던 결함이었다. 이 필터가
+		//   커밋 f53fac9) — CLI 만 그 자리에 못 갔던 결함이었다. 이 필터가
 		//   "한 번이라도 주면 목록 전체를 바꾼다"와 "공백만 든 경로는 뺀다"를
 		//   동시에 지킨다 — `--path ""` 하나만 주면 목록이 정말 비워진다.
 		p := nonBlankPositionals(paths)

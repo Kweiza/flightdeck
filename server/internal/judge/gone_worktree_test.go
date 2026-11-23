@@ -102,8 +102,8 @@ func TestWorktreeNotGoneWhenItsTreeIsStillListed(t *testing.T) {
 }
 
 // 관례 자리여도 이 저장소의 목록 워크트리 안이 아니면 근거가 없다 — 다른 저장소이거나 이
-// 서버가 못 읽는 파일시스템의 경로다(실측 2026-09-17: `/Users/…/proj-c` 로 등록된 프로젝트에
-// `/home/u/proj-c…` 카드 228장이 **이 머신의 머신 id 로** 섞여 있다 — 머신 축으로는 못 가른다).
+// 서버가 못 읽는 파일시스템의 경로다(실측 2026-09-17: `/Users/…/app` 로 등록된 프로젝트에
+// 다른 머신 경로의 카드 228장이 **이 머신의 머신 id 로** 섞여 있다 — 머신 축으로는 못 가른다).
 func TestWorktreeNotGoneOutsideEveryListedTree(t *testing.T) {
 	f := goneFacts()
 	f.Worktree = "/home/other/proj-c/.claude/worktrees/feature-x"

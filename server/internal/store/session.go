@@ -453,7 +453,7 @@ func (s *Store) Rekey(ctx context.Context, id, ccSessionID string) (model.Sessio
 // 침묵하면 "겹침 없음"과 "이 축을 안 본다"가 구분되지 않는다.
 //
 // ★ **세션 수와 무관한 질의 수(4번)다(2026-11-23).** 앞 판은 세션마다 신호 · 발자국 · 선점을
-// 따로 물었다(1+3N). 보드는 창 밖 건수를 세려고 since=0 으로 이것을 부르는데, proj-m 은
+// 따로 물었다(1+3N). 보드는 창 밖 건수를 세려고 since=0 으로 이것을 부르는데, 큰 프로젝트는
 // 그 세션이 1239개라 요청 하나가 질의 3700여 번에 약 2초를 썼다. 지금은 세션 목록 하나와
 // 세 축을 같은 거름(liveSessionFilter)의 하위 질의로 한 번씩 묻는다.
 func (s *Store) ListLive(ctx context.Context, project string, since time.Time) ([]model.SessionView, error) {
