@@ -5,7 +5,7 @@
 //	fd serve                     조정 서버(REST 정본 · HTML · SSE · /healthz · /metrics)
 //	fd mcp                       stdio MCP — REST 위의 얇은 껍데기
 //	fd status|open|beat|…        클라이언트. **전부 REST 를 친다**
-//	fd hook <event>              훅 5종. 전부 fail-open(어떤 실패에도 종료코드 0)
+//	fd hook <event>              훅 8종. 전부 종료코드 0 이고 막는 것은 worker-card 하나(작업자 띄우기를 거절)
 //
 // 하나로 둔 이유: 배포 단위가 하나면 클라이언트·서버 버전 스큐를 /healthz 한 축으로 볼 수 있고,
 // 플러그인이 캐시할 산출물도 하나다.
@@ -140,7 +140,7 @@ func run(args []string, env func(string) (string, bool), stdin io.Reader, stdout
 
 	case "hook":
 		if len(args) < 2 {
-			log.Error("훅 이름이 없다", "error", "fd hook <session-start|user-prompt|post-tool|pre-compact|stop>")
+			log.Error("훅 이름이 없다", "error", "fd hook <"+strings.Join(HookNames, "|")+">")
 			return 0 // ★ fail-open. 인자가 틀려도 세션을 막지 않는다
 		}
 		return app.runHook(ctx, args[1], stdin, stdout)

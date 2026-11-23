@@ -41,6 +41,9 @@ type hooksFile struct {
 			Command string `json:"command"`
 			Async   bool   `json:"async"`
 			Timeout int    `json:"timeout"`
+			// StatusMessage 는 훅이 도는 동안 화면에 뜨는 한 줄이다. 표시 전용이라 동작을 바꾸지 않는다 —
+			// 작업자 훅 둘(TestWorkerHooksAreWiredAsDesigned)만 쓴다: 15초 · 120초를 기다리는 동안 무엇을 기다리는지 보이게.
+			StatusMessage string `json:"statusMessage"`
 		} `json:"hooks"`
 	} `json:"hooks"`
 }
@@ -79,6 +82,10 @@ func TestHooksJSONIsWiredAsDesigned(t *testing.T) {
 		"Stop": {"", false},
 		// ★ SessionEnd 는 **clear 만** 받는다. 아래 단정이 그 폭을 붙들고 있다.
 		"SessionEnd": {"clear", true},
+		// ★ 작업자 훅 둘은 async 면 안 된다 — worker-card 의 출력이 곧 거절 · 꼬리글이고,
+		//   worker-close 의 systemMessage 가 닫기 실패를 조정 세션에 보이는 길이다.
+		"PreToolUse":   {"Agent", false},
+		"SubagentStop": {"", false},
 	}
 	if len(hf.Hooks) != len(want) {
 		t.Fatalf("훅 이벤트가 %d개다 — %d개여야 한다: %v", len(hf.Hooks), len(want), keysOf(hf.Hooks))
@@ -140,9 +147,9 @@ func TestHooksJSONIsWiredAsDesigned(t *testing.T) {
 
 	// 훅 이름이 fd 가 아는 것과 **같아야** 한다. 여기가 어긋나면 fd 는 fail-open 이라
 	// 조용히 아무것도 안 하고 0 을 낸다 — 그것이 이 단정을 두는 이유다.
-	known := map[string]bool{
-		"session-start": true, "user-prompt": true, "post-tool": true, "pre-compact": true,
-		"stop": true, "session-end": true,
+	known := map[string]bool{}
+	for _, n := range HookNames {
+		known[n] = true
 	}
 	for ev, groups := range hf.Hooks {
 		cmd := groups[0].Hooks[0].Command

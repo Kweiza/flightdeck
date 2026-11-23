@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -14,12 +15,6 @@ import (
 // 템플릿의 명령이 나중에 한 글자라도 바뀌면 **이미 신뢰한 사용자 전원이 TUI 재승인**이다.
 // 그래서 `--harness codex` 와 고정 경로는 **처음부터** 들어 있어야 하고, 그 사실을 시험이
 // 문다. 나중에 고치면 되는 종류가 아니다.
-
-// fdHookNames 는 fd 진입점이 아는 훅 이름이다(hook.go 의 switch 와 같아야 한다).
-var fdHookNames = map[string]bool{
-	"session-start": true, "user-prompt": true, "post-tool": true, "pre-compact": true,
-	"stop": true, "session-end": true,
-}
 
 // TestCodexHooksTemplateIsWiredAsDesigned 는 embed 된 템플릿 자체를 문다.
 func TestCodexHooksTemplateIsWiredAsDesigned(t *testing.T) {
@@ -125,7 +120,7 @@ func TestCodexHooksTemplateIsWiredAsDesigned(t *testing.T) {
 				if len(rest) == 0 {
 					t.Fatalf("%s 의 명령에 하네스 선언 말고 아무것도 없다(%q)", ev, h.Command)
 				}
-				if name := rest[len(rest)-1]; !fdHookNames[name] {
+				if name := rest[len(rest)-1]; !slices.Contains(HookNames, name) {
 					t.Errorf("%s 가 fd 가 모르는 훅 이름 %q 를 부른다 — fd 는 fail-open 이라 "+
 						"조용히 아무것도 안 하고 0 을 낸다", ev, name)
 				}

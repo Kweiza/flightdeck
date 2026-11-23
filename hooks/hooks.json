@@ -57,6 +57,31 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/fd\" hook worker-card --harness claude",
+            "timeout": 15,
+            "statusMessage": "작업자 보드 카드 확인"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/fd\" hook worker-close --harness claude",
+            "timeout": 120,
+            "statusMessage": "끝난 작업자 보드 카드 닫기"
+          }
+        ]
+      }
+    ],
     "PreCompact": [
       {
         "hooks": [

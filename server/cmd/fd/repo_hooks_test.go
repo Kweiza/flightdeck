@@ -41,7 +41,8 @@ import (
 // **검사받지 않은 채 들어오는 길**이 없다.
 var repoHookEvents = map[string][]string{
 	"flightdeck": {
-		"PostToolUse", "PreCompact", "SessionEnd", "SessionStart", "Stop", "UserPromptSubmit",
+		"PostToolUse", "PreCompact", "PreToolUse", "SessionEnd", "SessionStart", "Stop", "SubagentStop",
+		"UserPromptSubmit",
 	},
 }
 

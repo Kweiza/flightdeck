@@ -162,6 +162,20 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 착륙하면 `fd pick <단위>` 뒤 `fd finish <단위> -outcome done -title ... -body -` 로 닫고 본문에 `커밋: <sha>` 줄을 넣는다.
 버릴 때는 `-outcome dropped -close-reason "<까닭>"`. MCP 로는 같은 일을 `add(labels)` · `label(add, rm)` · `pick` · `finish` 로 한다.
 
+### 작업자 카드 훅 (플러그인이 건다)
+
+조정 세션이 작업자(서브에이전트)를 띄우고 거둘 때는 위 손일을 플러그인 훅 둘이 한다(`.flightdeck/` 가 있는 저장소에서만).
+
+- 띄울 때(`PreToolUse` · `Agent`, `fd hook worker-card`): 지시(prompt)에 `fd:<항목 id>` 가 없으면 띄우지 않는다(카드 없는 짧은 일은 `fd:none`,
+  읽기 전용 도우미 Explore · Plan 등은 빼고). 있으면 그 항목에 `status:running` 을 달고, 지시 끝에 닫는 줄 규약을 붙인다
+  (지시에 `FD_FINISH` 가 이미 있으면 꼬리표만). 항목이 없어 꼬리표를 못 달면 띄우지 않는다.
+- 끝날 때(`SubagentStop`, `fd hook worker-close`): 작업자의 마지막 말에서 줄을 읽는다.
+  `FD_FINISH <id> [done|dropped]` 다음 줄부터 `FD_END` 까지가 finish 본문(안에 `FD_FOLLOWUPS [...]` 한 줄을 두면 후속, 문자열 목록도 받는다),
+  `FD_OWNER <id>` 는 `status:running` 을 떼고 `status:owner`, `FD_BLOCKED <id> <사유>` 는 `status:running` 을 떼고 blocked 판단.
+  결과는 조정 세션에 systemMessage 로, 그리고 Claude Code 설정 폴더(`CLAUDE_CONFIG_DIR`, 없으면 홈의 `.claude`)의 `hooks/fd-worker-close.log` 에 한 줄씩 남는다.
+- 사용자 설정에도 같은 `fd hook worker-card` · `fd hook worker-close` 를 걸어 두면(플러그인 판을 아직 안 읽은 세션을 위해) 호출마다 한 번만 일한다(같은 폴더의 `hooks/fd-worker-once/` 표식). 표식은 이 하위 명령끼리만 보므로 다른 스크립트를 함께 걸면 두 번 일한다.
+- 닫는 낱말(`FD_FINISH` 등)이 보이는데 규약 꼴이 아니면(줄 머리가 아님 · `FD_END` 빠짐) 아무것도 닫지 않았다고 알린다. 실패한 보고는 표식을 지워, 같은 보고를 다시 받으면 다시 해 본다.
+
 ## 소유자 동작이 fd 에 남기는 흔적
 
 보드의 쓰기는 POST 만, 같은 출처(Sec-Fetch-Site same-origin 또는 Origin 이 보드 호스트)와 JSON 만 받는다.

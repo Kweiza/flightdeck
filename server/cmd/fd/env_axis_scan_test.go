@@ -29,6 +29,7 @@ var notEnvAxes = map[string]string{
 	"GIT_DIR":        "gitreader 가 자식 git 의 환경에서 **걷어 내는** 키다(strippedGitEnv) — 읽지 않는다",
 	"GIT_WORK_TREE":  "gitreader 가 자식 git 의 환경에서 **걷어 내는** 키다(strippedGitEnv) — 읽지 않는다",
 	"GIT_INDEX_FILE": "gitreader 가 자식 git 의 환경에서 **걷어 내는** 키다(strippedGitEnv) — 읽지 않는다",
+	"FD_FINISH":      "작업자 지시 · 마지막 말 안의 닫는 줄 표식이다(hook_worker.go) — 환경 키가 아니다",
 }
 
 // 비시험 코드가 읽는 환경 키는 **전부** knownEnvAxes 에 있어야 한다. 그리고 그 반대도.

@@ -162,6 +162,20 @@ a worker that picks the item shows as running anyway. Handing to the owner: `fd 
 plus a `소유자:` line (and `선택:` if needed). After landing: `fd pick <unit>` then `fd finish <unit> --outcome done ...` with a `커밋: <sha>` line.
 Over MCP the same is `add(labels)` · `label(add, rm)` · `pick` · `finish`.
 
+### Worker card hooks (installed by the plugin)
+
+When a coordinating session launches and collects a worker (sub-agent), two plugin hooks do the manual steps above (only in a repository with `.flightdeck/`).
+
+- On launch (`PreToolUse` · `Agent`, `fd hook worker-card`): a prompt without `fd:<item id>` is refused (`fd:none` for a short job with no card;
+  read-only helpers such as Explore · Plan are skipped). Otherwise the item gets `status:running` and the closing-line convention is appended to the prompt
+  (only the label if the prompt already contains `FD_FINISH`). If the label cannot be added (no such item) the launch is refused.
+- On stop (`SubagentStop`, `fd hook worker-close`): reads the worker's last message.
+  `FD_FINISH <id> [done|dropped]` then lines up to `FD_END` are the finish body (an `FD_FOLLOWUPS [...]` line inside adds followups; a list of strings is accepted),
+  `FD_OWNER <id>` swaps `status:running` for `status:owner`, `FD_BLOCKED <id> <reason>` removes `status:running` and records a blocked judgment.
+  Results reach the coordinator as a systemMessage and one line in `hooks/fd-worker-close.log` under the Claude Code config folder (`CLAUDE_CONFIG_DIR`, else `.claude` in the home folder).
+- If user settings also register the same `fd hook worker-card` · `fd hook worker-close` (for sessions that have not loaded the plugin version yet), each call is handled once (markers in `hooks/fd-worker-once/` there). Only these subcommands read the markers, so registering a different script alongside does the work twice.
+- If a closing word (`FD_FINISH` etc.) appears but not in the convention's shape (not at line start, missing `FD_END`), it reports that nothing was closed. A failed report clears its marker so the same report is retried when it comes again.
+
 ## What owner actions leave in fd
 
 Writes are POST only, same-origin (Sec-Fetch-Site same-origin, or an Origin that is a board host) and JSON only.

@@ -251,6 +251,13 @@ func emitBlock(out io.Writer, reason string) {
 	fmt.Fprintln(out, string(buf))
 }
 
+// HookNames 는 `fd hook <이름>` 이 아는 이름 전부다. runHook 의 switch 와 이 목록이 한 쌍이고,
+// 안내 문구와 hooks.json 잠금 시험(plugin_test · codex_test)이 이 목록을 읽는다 — 이름 목록을 따로 두지 않는다.
+var HookNames = []string{
+	"session-start", "user-prompt", "post-tool", "pre-compact", "stop", "session-end",
+	"worker-card", "worker-close",
+}
+
 // runHook 은 훅 하나를 처리한다. **항상 0 을 돌려준다.**
 func (a *App) runHook(ctx context.Context, event string, stdin io.Reader, out io.Writer) int {
 	raw, rerr := io.ReadAll(io.LimitReader(stdin, 4<<20))
@@ -278,9 +285,13 @@ func (a *App) runHook(ctx context.Context, event string, stdin io.Reader, out io
 		a.hookStop(ctx, p, perr, out)
 	case "session-end":
 		a.hookSessionEnd(ctx, p)
+	case "worker-card":
+		a.hookWorkerCard(ctx, raw, out)
+	case "worker-close":
+		a.hookWorkerClose(ctx, raw, out)
 	default:
 		a.log.Error("모르는 훅 이름", "mode", clip(event, 40),
-			"error", "session-start|user-prompt|post-tool|pre-compact|stop|session-end 중 하나여야 한다")
+			"error", strings.Join(HookNames, "|")+" 중 하나여야 한다")
 	}
 	return 0 // ★ 이 함수의 반환값은 항상 0 이다. 훅이 세션을 막으면 안 된다
 }
@@ -540,12 +551,14 @@ func sameWorktree(x, y string) bool {
 // 그 지연은 매 도구 호출마다 사람이 기다리는 시간이다.
 //
 // ★ 그리고 그 훅 중에서도 **session-start 하나다.** 같은 hooks.json 에서 async 가 아닌 것,
-// 곧 사람이 그 시간을 통째로 기다리는 것은 셋이다 — user-prompt 5초 · stop 5초 ·
-// session-start 10초(2026-09-24 hooks.json 기준 — 앞의 둘은 한때 2초·3초였다).
-// 앞의 둘은 예산이 가장 작으면서 매 프롬프트·매 턴 끝마다 돈다.
+// 곧 사람이 그 시간을 통째로 기다리는 것은 다섯이다 — user-prompt 5초 · stop 5초 ·
+// session-start 10초(2026-09-24 hooks.json 기준 — 앞의 둘은 한때 2초·3초였다), 그리고
+// 작업자를 띄우고 거둘 때만 도는 worker-card 15초 · worker-close 120초.
+// user-prompt · stop 은 예산이 가장 작으면서 매 프롬프트·매 턴 끝마다 돈다.
+// 작업자 훅 둘은 자기 일(꼬리표 · finish)에 예산을 다 쓴다.
 // 나머지 셋(post-tool · pre-compact · session-end)은 async:true 라 예산 논거가 다르지만
 // post-tool 은 편집마다 돈다 — 횟수 쪽에서 걸린다. 그래서 "상한 없이 자라는 디렉토리를
-// 훑는다"를 감당하는 자리가 여섯 중 여기뿐이다. 여기가 먼저 눈에 띄어서가 아니다.
+// 훑는다"를 감당하는 자리가 여덟 중 여기뿐이다. 여기가 먼저 눈에 띄어서가 아니다.
 func (a *App) pruneWindows() {
 	if a.beaconDir == "" {
 		return
