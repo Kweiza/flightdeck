@@ -20,7 +20,7 @@ finish(
 )
 ```
 
-Call it without `body` and it tells you **right there** what to write.
+Call it without `body` and it tells you **right there** what to write. What the owner should see (preview · image · commit · an owner step · choices) goes in kanban convention lines (`미리보기:` · `그림:` · `커밋:` · `소유자:` · `선택:`, `board/README.md`).
 
 ## The four for `body`
 

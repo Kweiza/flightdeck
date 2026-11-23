@@ -16,6 +16,7 @@ The repository root is the plugin root (what `${CLAUDE_PLUGIN_ROOT}` points at).
 | `bin/fd` | Shell launcher. Builds `server/` on first use and caches it under `~/.cache/flightdeck/bin` |
 | `hooks/hooks.json` · `.mcp.json` | Claude Code hook wiring and the MCP server (`fd mcp`) |
 | `skills/` | The 4 skills |
+| `board/` | Owner kanban board (`board.py` · `index.html` · `install.sh`). Its tests `test_board.py` run under `go test ./cmd/fd` |
 | `server/` | One Go module — server, CLI, MCP and hooks are **one binary** |
 | `compose.yaml` | Server container (one-shot schema apply + server) |
 | `DESIGN.md` | Document of record for the design |

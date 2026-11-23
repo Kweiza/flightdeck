@@ -138,6 +138,13 @@ fd doctor                         # 이 머신과 서버의 상태를 실제로 
 
 파라미터 전체와 쓰는 규율은 [도구 레퍼런스](docs/reference.ko.md)에 있다.
 
+### 소유자 칸반 — `board/`
+
+사람이 큐를 칸반으로 보고 그 자리에서 답하는 웹 보드(파이썬 표준 라이브러리 한 파일, 호스트 프로세스).
+열은 꼬리표(`status:running` · `status:owner` · `status:owner-done` · `status:owner-ask`)로 갈리고, 카드는 본문의
+규약 줄(`미리보기:` · `그림:` · `커밋:` · `소유자:` · `선택:` …)로 그려진다. 세션은 그 규약을 MCP 안내문 한 줄로 받는다.
+설치 · 설정 · 규약 전문은 [board/README.ko.md](board/README.ko.md).
+
 ## codex
 
 ```bash

@@ -64,6 +64,7 @@ func TestInstructionsBudget(t *testing.T) {
 		"후속은 지금 못 하는 이유가 있는 것만 — 본문이 곧 패치면 이 세션에서 한다.",
 		"head·branch·sha·랜딩 이력은 서버가 git 에서 읽으므로 적지 마라.",
 		"겹침·선점·미확인 결과는 응답 꼬리에 온다.",
+		"칸반 규약 board/README: 꼬리표 status:running·owner·owner-done·owner-ask, 줄 미리보기:·그림:·커밋:·소유자:·선택:, 고를 일은 질문·배경·보기·추천.",
 	} {
 		if !strings.Contains(Instructions, want) {
 			t.Fatalf("instructions 에 설계 §6 의 줄이 없다: %q", want)

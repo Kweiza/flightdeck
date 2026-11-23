@@ -145,6 +145,13 @@ fd doctor                         # actually measure this machine and the server
 
 Every parameter and the habits that go with them are in the [Tool reference](docs/reference.md).
 
+### Owner kanban — `board/`
+
+A web board where a person sees the queue as a kanban and answers on the spot (one Python stdlib file, a host process).
+Columns come from labels (`status:running` · `status:owner` · `status:owner-done` · `status:owner-ask`); cards are drawn from
+convention lines in the body (`미리보기:` · `그림:` · `커밋:` · `소유자:` · `선택:` …). Sessions receive the convention as one line
+of the MCP instructions. Install, configuration and the full convention: [board/README.md](board/README.md).
+
 ## codex
 
 ```bash

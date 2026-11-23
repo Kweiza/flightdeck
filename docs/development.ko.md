@@ -16,6 +16,7 @@
 | `bin/fd` | 셸 런처. 첫 호출에 `server/` 를 빌드해 `~/.cache/flightdeck/bin` 에 캐시한다 |
 | `hooks/hooks.json` · `.mcp.json` | Claude Code 훅 배선과 MCP 서버(`fd mcp`) |
 | `skills/` | 스킬 4개 |
+| `board/` | 소유자 칸반 보드(`board.py` · `index.html` · `install.sh`). 시험 `test_board.py` 는 `go test ./cmd/fd` 가 돌린다 |
 | `server/` | Go 모듈 하나 — 서버 · CLI · MCP · 훅이 **한 바이너리**다 |
 | `compose.yaml` | 서버 컨테이너(스키마 적용 one-shot + 서버) |
 | `DESIGN.md` | 설계 정본 |
