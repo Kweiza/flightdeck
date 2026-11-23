@@ -26,11 +26,9 @@ var bareEnvKeys = map[string]bool{"HOME": true, "PATH": true, "USER": true, "TMP
 
 // notEnvAxes 는 환경 키 모양이지만 **이 코드가 환경에서 읽지 않는** 문자열이다. 사유가 값이다.
 var notEnvAxes = map[string]string{
-	"GIT_DIR":          "gitreader 가 자식 git 의 환경에서 **걷어 내는** 키다(strippedGitEnv) — 읽지 않는다",
-	"GIT_WORK_TREE":    "gitreader 가 자식 git 의 환경에서 **걷어 내는** 키다(strippedGitEnv) — 읽지 않는다",
-	"GIT_INDEX_FILE":   "gitreader 가 자식 git 의 환경에서 **걷어 내는** 키다(strippedGitEnv) — 읽지 않는다",
-	"GIT_AUTHOR_IDENT": "`git var` 의 인자다(identity_gate.go) — git 이 계산한 신원을 묻는 것이지 환경 변수가 아니다",
-	"FD_EXPECT_IDENT":  "저장소 커밋 훅(.githooks/_identity.sh) **본문에서 찾는 글자**다(identity_gate.go) — 환경에서 읽지 않는다",
+	"GIT_DIR":        "gitreader 가 자식 git 의 환경에서 **걷어 내는** 키다(strippedGitEnv) — 읽지 않는다",
+	"GIT_WORK_TREE":  "gitreader 가 자식 git 의 환경에서 **걷어 내는** 키다(strippedGitEnv) — 읽지 않는다",
+	"GIT_INDEX_FILE": "gitreader 가 자식 git 의 환경에서 **걷어 내는** 키다(strippedGitEnv) — 읽지 않는다",
 }
 
 // 비시험 코드가 읽는 환경 키는 **전부** knownEnvAxes 에 있어야 한다. 그리고 그 반대도.

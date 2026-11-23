@@ -20,8 +20,7 @@ The repository root is the plugin root (what `${CLAUDE_PLUGIN_ROOT}` points at).
 | `server/` | One Go module — server, CLI, MCP and hooks are **one binary** |
 | `compose.yaml` | Server container (one-shot schema apply + server) |
 | `DESIGN.md` | Document of record for the design |
-| `docs/*.md` · `docs/*.ko.md` | Topic docs (concepts · server · codex · several repositories · reference · field notes · development) |
-| `docs/superpowers/` | Per-feature designs (`specs/`) and implementation plans (`plans/`) |
+| `docs/*.md` · `docs/*.ko.md` | Topic docs (concepts · server · codex · several repositories · reference · development) |
 
 ## Verification gates
 
@@ -57,3 +56,17 @@ plugin → container).
 - The "N MCP tools" and "N skills" in the READMEs (Korean: 「MCP 도구 N개」, 「스킬 N개」) are checked
   against the real counts by a test (`server/cmd/fd/plugin_test.go`). Add a tool or skill and those
   numbers are the first thing to go wrong.
+
+## What stays out of this repository
+
+This repository is the product, not the record of building it. Keep these out of commits, docs, code
+comments, test values and commit messages:
+
+- Machine and person details: home-directory paths, account and host names, tailnet names, IP
+  addresses, session ids, names or e-mail addresses of people.
+- Other repositories' and projects' names, and numbers measured on them. A design note may keep a
+  measured number, but not where it was measured.
+- Development material: per-feature plans and specs, handoffs, measurement logs, review notes. Keep
+  them next to your checkout, outside git.
+
+Test values use neutral placeholders (`/home/u/proj`, `example.com`, `proj-a`).

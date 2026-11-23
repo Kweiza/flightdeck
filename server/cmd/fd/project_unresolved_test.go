@@ -122,7 +122,7 @@ func TestResolvedProjectAddsNoNoticeNoise(t *testing.T) {
 		}
 	}
 	root := t.TempDir()
-	main := filepath.Join(root, "myproject")
+	main := filepath.Join(root, "Kweizaect")
 	git(root, "init", "-q", main)
 	git(main, "commit", "-q", "--allow-empty", "-m", "init")
 
@@ -131,7 +131,7 @@ func TestResolvedProjectAddsNoNoticeNoise(t *testing.T) {
 		"FD_STATE_DIR": state, "HOME": state,
 	}), quietLogger(), main, strings.NewReader(""))
 
-	if app.proj.ID != "myproject" {
+	if app.proj.ID != "Kweizaect" {
 		t.Fatalf("전제가 깨졌다 — 좌표가 안 풀렸다: %q", app.proj.ID)
 	}
 	if strings.Contains(app.notice, "프로젝트 좌표") {
@@ -154,12 +154,12 @@ func TestResolvedProjectStillNamesTheMainRepo(t *testing.T) {
 		}
 	}
 	root := t.TempDir()
-	main := filepath.Join(root, "myproject")
+	main := filepath.Join(root, "Kweizaect")
 	git(root, "init", "-q", main)
 	git(main, "commit", "-q", "--allow-empty", "-m", "init")
 
 	c := resolveProject(func(string) (string, bool) { return "", false }, main)
-	if c.ID != "myproject" {
+	if c.ID != "Kweizaect" {
 		t.Fatalf("정상 경로가 깨졌다: %q", c.ID)
 	}
 }

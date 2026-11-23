@@ -29,7 +29,7 @@ func TestCLIAndMCPAgreeOnProjectInsideAWorktree(t *testing.T) {
 		}
 	}
 	root := t.TempDir()
-	main := filepath.Join(root, "myproject")
+	main := filepath.Join(root, "Kweizaect")
 	git(root, "init", "-q", main)
 	git(main, "commit", "-q", "--allow-empty", "-m", "init")
 	wt := filepath.Join(root, "detached-name")
@@ -51,7 +51,7 @@ func TestCLIAndMCPAgreeOnProjectInsideAWorktree(t *testing.T) {
 	}
 
 	cli := resolveProject(env, wt)
-	if cli.ID != "myproject" {
+	if cli.ID != "Kweizaect" {
 		t.Fatalf("CLI 가 주 저장소를 못 찾았다: %q", cli.ID)
 	}
 
@@ -102,7 +102,7 @@ func TestSubdirectoryOfAWorktreeIsTheSameSessionCoordinate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("임시 경로 해석 실패: %v", err)
 	}
-	main := filepath.Join(root, "myproject")
+	main := filepath.Join(root, "Kweizaect")
 	git(root, "init", "-q", main)
 	git(main, "commit", "-q", "--allow-empty", "-m", "init")
 	wt := filepath.Join(root, "detached-name")
@@ -146,7 +146,7 @@ func TestSubdirectoryOfAWorktreeIsTheSameSessionCoordinate(t *testing.T) {
 			atRoot.Worktree)
 	}
 	// 그리고 프로젝트는 둘 다 주 저장소다(기존 계약).
-	if atRoot.ID != "myproject" || atWT.ID != "myproject" {
+	if atRoot.ID != "Kweizaect" || atWT.ID != "Kweizaect" {
 		t.Fatalf("프로젝트가 갈렸다: %q vs %q", atRoot.ID, atWT.ID)
 	}
 }

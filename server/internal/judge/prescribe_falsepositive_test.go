@@ -79,7 +79,7 @@ func TestClosedCoverageSurvivesUncomparablePaths(t *testing.T) {
 		Now:       time.Now(),
 		SessionID: "card-A",
 		TurnPaths: []string{
-			"internal/service/pick.go",            // 선언 안 — 비교 가능
+			"internal/service/pick.go",        // 선언 안 — 비교 가능
 			"/home/u/other-repo/plugins/x.go", // 카드 워크트리 밖 — 비교 불가능
 		},
 		Closed: []ClaimView{{ItemID: "it-1", Paths: []string{"internal/service"}}},

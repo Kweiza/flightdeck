@@ -237,8 +237,7 @@ design of record, [DESIGN.md](DESIGN.md) (Korean).
 
 In the August 2026 ledger, **24 sessions on one machine signalled within the same 10-minute window**,
 and 22 of them were touching the same two repositories. In the first ten days, 601 overlap
-prescriptions went out and sessions queued for landing 157 times across the two repositories. The
-numbers and their limits are in [Field notes](docs/field-notes.md).
+prescriptions went out and sessions queued for landing 157 times across the two repositories.
 
 ## Development
 

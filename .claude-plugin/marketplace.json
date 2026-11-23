@@ -3,8 +3,7 @@
   "name": "flightdeck",
   "description": "flightdeck — parallel session coordination for Claude Code and codex",
   "owner": {
-    "name": "Kweiza",
-    "email": "5517346+Kweiza@users.noreply.github.com"
+    "name": "Kweiza"
   },
   "plugins": [
     {
