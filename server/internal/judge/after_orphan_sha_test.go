@@ -16,8 +16,8 @@ import (
 // 원장·git 으로 재현했다(2026-08-21). after-unmet-sha 로 막힌 열린 항목 셋이 전부 그 경로였고,
 // 세 dep_sha 의 내용이 **다른 sha 로 main 에 들어가 있었다**:
 //
-//	fd-lane-turn-remeasure-on-2026-08-26-or-50-landings        6ef65db → a419130 (0.19.0 릴리스)
-//	fd-leave-bundle-n2-observation-on-2026-08-19-or-10-leaves  e776805 → 7a18807
+//	fd-lane-turn-remeasure-on-2026-08-26-or-50-landings        6ef65db → e9473b7 (0.19.0 릴리스)
+//	fd-leave-bundle-n2-observation-on-2026-08-19-or-10-leaves  e776805 → d4b0ba3
 //	fd-leave-judgment-body-is-mostly-boilerplate               a6c68b4 → 6903562
 //
 // 세 커밋 다 `git cat-file -e` 는 통과하고 `git branch -a --contains` 는 **비어 있다.**

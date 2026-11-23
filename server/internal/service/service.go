@@ -87,7 +87,7 @@ const (
 	//     건드린다. 오판당한 세션은 신호를 계속 보내면서도 다음 SessionStart 까지 보드에서
 	//     사라진다. claim 자동만료를 실측 2회로 기각한 것과 같은 부류다"였다. 그 둘을 다시 쟀다:
 	//     ① **"다음 SessionStart 까지"는 훅 카드에 대해서는 사실이 아니었고, MCP 카드에 대해서는
-	//     사실이다.** UserPromptSubmit·PostToolUse 훅은 그때(c27e70f)도 지금도 매번
+	//     사실이다.** UserPromptSubmit·PostToolUse 훅은 그때(ea0e9c1)도 지금도 매번
 	//     `POST /api/v1/sessions`(= Service.OpenSession)를 신호보다 먼저 지난다(cmd/fd 의
 	//     beatFromHook) — 훅 카드는 다음 프롬프트나 편집에서 되살아난다. 그런데 MCP 카드는
 	//     ensureSession 이 프로세스당 한 번만 열고 도구마다 찍는 mcp 신호(Tx.Beat)는 state 를 안

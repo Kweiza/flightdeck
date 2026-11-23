@@ -15,7 +15,7 @@ import (
 //
 // 실측(2026-08-21, kweiza-cc-plugins): after-unmet-sha 로 막힌 **열린 항목 셋**이 전부 이 경로였고
 // 셋 다 티클러였다. 세 dep_sha 는 `git cat-file -e` 는 통과하고 `git branch -a --contains` 는
-// 비어 있었으며, 내용은 다른 sha 로 main 에 들어가 있었다(6ef65db→a419130 · e776805→7a18807 ·
+// 비어 있었으며, 내용은 다른 sha 로 main 에 들어가 있었다(6ef65db→e9473b7 · e776805→d4b0ba3 ·
 // a6c68b4→6903562).
 //
 // ★ 판정을 **rc=1 일 때만** 덧댄다. rc=0(조상이다)에는 물을 것이 없고, rc=128 은 이미 갈려 있다.

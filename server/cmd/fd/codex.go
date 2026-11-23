@@ -120,7 +120,7 @@ func codexHookCommands(raw string) (cmds []string, ok bool) {
 // 예산이 그대로인 훅은 계속 돌고 바뀐 훅만 죽어서, 화면상 "일부만 도는" 모양이 된다.
 // 그때도 이 함수는 true 다. **그러므로 이 값을 「훅이 지금 돈다」로 읽으면 안 된다.**
 //
-// ★ 해시 재현은 여전히 **안 한다**(`c5e4aa5` 기각 ①). 규칙을 베끼면 codex 가 그것을 바꾸는
+// ★ 해시 재현은 여전히 **안 한다**(`5f8b556` 기각 ①). 규칙을 베끼면 codex 가 그것을 바꾸는
 // 날 우리가 조용히 거짓이 된다 — 이 축이 통째로 싸우는 병과 같은 모양이다.
 // 대신 **못 재는 것을 못 잰다고 화면에 적는다**(아래 CodexAxes 의 신뢰 축).
 func codexTrusted(configRaw, hooksPath string) bool {

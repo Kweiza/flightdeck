@@ -147,7 +147,7 @@ func TestAmendCLIExplicitEmptyBodyActuallyClearsIt(t *testing.T) {
 // 슬라이스에 빈 문자열 하나를 그대로 쌓는다. `nonBlankPositionals` 로 거르지 않으면
 // 그 값이 그대로 서버에 실려 store 가 항목 paths 에 빈 칸 하나를 저장한다 — 서버는
 // `paths: []`(경로 없음)을 이미 일급으로 다루는데(겹침 계산을 아예 안 돈다, 커밋
-// 4b796b7) CLI 로는 그 상태에 못 가고 대신 쓰레기 값 하나가 남는 셈이다. 그리고
+// 1a51bba) CLI 로는 그 상태에 못 가고 대신 쓰레기 값 하나가 남는 셈이다. 그리고
 // `--path` 플래그 설명("한 번이라도 주면 목록 전체를 이것으로 바꾼다")을 읽은
 // 사람은 정확히 `--path ""` 를 쳐서 "경로 축을 비워라"를 표현하려 할 것이다.
 func TestAmendCLIEmptyPathClearsListInsteadOfStoringBlankEntry(t *testing.T) {

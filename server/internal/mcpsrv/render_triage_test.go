@@ -68,7 +68,7 @@ func TestRenderFinishTriageReachesEveryCreatedFollowup(t *testing.T) {
 // ★ 이 갈림이 위 개정의 절반이다 — 발화 조건은 넓히되 **실측 문장은 안 넓힌다.**
 // "이런 버스트가 후속 유입의 절반을 낳는다"는 창작 ≥3 에서만 참인 수다(finish 의 9.5%가
 // 유입의 51%). 1~2건에 그대로 실으면 응답이 거짓을 말하고, 이 저장소에는 관문 문구가
-// 거짓이어서 세션 행동을 실제로 오염시킨 실물이 있다(d878bab — 그 문구가 권한 note 우회를
+// 거짓이어서 세션 행동을 실제로 오염시킨 실물이 있다(3a8b76e — 그 문구가 권한 note 우회를
 // 쓴 세션이 있었고, 그렇게 만들어진 것은 중복 판단이었다).
 func TestRenderFinishBurstClaimStaysAtThree(t *testing.T) {
 	for _, n := range []int{1, 2} {

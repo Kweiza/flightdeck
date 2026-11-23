@@ -72,7 +72,7 @@ func TestAddResponseNamesTheProjectAndTheWayBack(t *testing.T) {
 // ★ 다만 그 "하나"는 아직 의도지 사실이 아니다 — 지금 개수를 실제로 세는 시험은 **넷**이다:
 // TestToolTableIsTen · TestInitializeAndToolsListRoundTrip ·
 // TestPickGainsItemIDsWithoutGrowingToolCount · TestPickGainsLeaveWithoutGrowingToolCount.
-// (이 줄은 적어도 한 회차 전부터 "셋"이라 거짓이었다 — `b905f6b` 에 이미 넷이 있었다.
+// (이 줄은 적어도 한 회차 전부터 "셋"이라 거짓이었다 — `a237d96` 에 이미 넷이 있었다.
 //
 //	위 ★ 가 이 파일의 규율로 적은 것이 정확히 이 실패다: 이름 하나가 빠진 인용은
 //	grep 하는 사람을 빈손으로 만든다.)
