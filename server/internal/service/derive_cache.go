@@ -1,0 +1,493 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/kweiza/flightdeck/internal/model"
+)
+
+// 세션 카드 파생의 비용을 카드 수에서 떼어 낸다.
+//
+// ★ **왜 이 파일이 있나(2026-11-23 실측).** proj-m 보드(창 안 카드 31장, 워크트리 18,
+// 브랜치 17)의 `GET /api/v1/dashboard.json` 이 26~31초였다. 요청 하나가 git 프로세스를 154번
+// **차례로** 띄웠다, 카드마다 merge-base · diff --numstat · rev-list · status · diff HEAD 다섯.
+// 벽시계 표본 208개 중 205개가 그 다섯 안이었다(status 38% · diff HEAD 21% · merge-base 17% ·
+// rev-list 12% · diff 11%). 호스트 부하가 높으면 git 한 번이 0.1~1.8초라 합이 카드 수에 정비례했고,
+// 보드(board.py, 10초 상한)는 502 를 냈다. 같은 브랜치·같은 워크트리를 쥔 카드가 여럿이면
+// 같은 git 을 그 수만큼 다시 돌렸고, 다음 요청도 처음부터 다시 돌렸다.
+//
+// 그래서 축을 성질대로 가른다.
+//
+//	① 커밋 쌍의 순수 결과(갈래 지점 · 변경 경로 · ahead), 입력이 sha 둘이면 답이 영원히 같다.
+//	   sha 쌍으로 기억하고 다시 안 묻는다. 무효화가 필요 없다(키가 곧 내용이다).
+//	② 워크트리의 미커밋 상태(status · diff HEAD), 파일이 바뀌면 답이 바뀌고, 그것을 싸게 알려 줄
+//	   신호가 없다(읽기 전용 바인드 마운트라 감시도 못 건다). 그래서 **관측 시각과 함께** 보관하고,
+//	   화면(Board)만 그 관측을 쓰면서 뒤에서 새로 읽는다. 판정 자리(pick · amend · finish 가 지나는
+//	   sessionCards)는 언제나 지금 읽는다, 그 읽기가 보관본도 새로 고친다.
+//	③ 같은 워크트리 · 같은 커밋 쌍은 요청 안에서도, 겹친 요청 사이에서도 한 번만 읽는다(도는
+//	   읽기에 올라탄다). 서로 다른 것은 함께 읽는다(서버 전체 git 동시 실행 수 상한 deriveParallel).
+//
+// ★ 보관본을 쓴 화면은 **그 관측 시각을 말한다**(derive.observed → Freshness.ObservedAt).
+// 지금 읽은 척하지 않는다, 설계 §6 의 「(파생: git@14:31, 12초 전)」이 그 시각을 그대로 낸다.
+
+// deriveParallel 은 서버 전체에서 카드 파생 git 이 동시에 몇 개까지 뜨는지다.
+//
+// ★ 요청마다가 아니라 **서버 전체**다. 요청마다 두면 보드 여러 장이 겹칠 때 프로세스 수가
+// 그 곱으로 는다. 8 은 컨테이너 CPU(12) 아래로 둔 값이다, git status 는 대개 디스크를 기다린다.
+const deriveParallel = 8
+
+// pureMemoLimit 은 커밋 쌍 기억의 상한이다. 넘으면 끝난 쌍을 통째로 비운다(다음 요청이 다시 채운다).
+// 살아 있는 브랜치 수의 몇 배면 충분하다, 브랜치가 앞으로 가면 옛 쌍은 다시 안 쓰인다.
+const pureMemoLimit = 4096
+
+// memoIdle 보다 오래 아무도 안 쓴 보관본(커밋 쌍 · 워크트리)은 버린다(evict). 사라진 워크트리와
+// 지나간 커밋 쌍이 서버 수명 내내 쌓이지 않게 하는 유일한 장치다.
+const memoIdle = time.Hour
+
+// snapshotStaleAfter 보다 오래된 관측을 쓴 화면은 신선도를 「낡음」으로 낸다. 보드가 몇 초마다
+// 부르는 동안 보관본은 ScreenRefreshAfter 와 git 한 번의 시간 안에 있으므로, 이것을 넘었다는 것은
+// 뒤의 새로 읽기가 못 따라오고 있다는 뜻이다.
+const snapshotStaleAfter = 30 * time.Second
+
+// 화면 보관본의 기본값(서버가 켠다, cmd/fd 의 serve). 시험과 다른 진입점은 New 의 기본(끔)을 쓴다.
+const (
+	// ScreenRefreshAfter 보다 오래된 보관본을 화면이 쓰면 뒤에서 새로 읽는다.
+	ScreenRefreshAfter = 5 * time.Second
+	// ScreenWait 는 화면이 보관본 없는 읽기(새 워크트리 · 새 커밋 쌍 · 기동 직후)를 기다리는 상한이다.
+	// 넘으면 그 카드를 「관측 중」으로 고백하고 읽기는 뒤에서 마저 끝나 다음 조회에 실린다, 그래서
+	// 화면 한 장의 시간이 처음 보는 워크트리 수에도 비례하지 않는다.
+	ScreenWait = 2 * time.Second
+	// ScreenMaxAge 보다 오래된 보관본은 화면도 안 쓰고 새로 읽는다(ScreenWait 까지 기다린다).
+	// 보드 · 훅 · 다른 세션이 몇 초마다 부르는 동안은 보관본이 늘 몇 초 안이라, 이 상한은 한참
+	// 아무도 안 본 뒤의 첫 요청만 가른다. 그 요청은 한 시간 넘은 관측을 내지 않는다.
+	ScreenMaxAge = time.Hour
+)
+
+// WithScreenSnapshots 는 화면(Board)이 워크트리 미커밋 보관본을 쓰게 한다.
+//
+// refreshAfter 보다 오래된 보관본은 쓰면서 뒤에서 새로 읽고, maxAge 보다 오래되면 안 쓴다.
+// 보관본 없는 읽기는 wait 까지만 기다린다. maxAge 가 0 이하면 끈다(기본), 화면도 판정 자리처럼
+// 언제나 지금 읽고 끝까지 기다린다.
+func WithScreenSnapshots(refreshAfter, maxAge, wait time.Duration) Option {
+	return func(s *Service) {
+		if maxAge <= 0 {
+			return
+		}
+		s.dc.refreshAfter, s.dc.maxAge, s.dc.wait = max(refreshAfter, 0), maxAge, max(wait, 0)
+	}
+}
+
+// readMode 는 파생을 누가 쓰는지다. 보관본을 써도 되는지가 그것으로 갈린다.
+type readMode int
+
+const (
+	// readNow 는 판정 자리다(pick · amend · finish 가 지나는 sessionCards). 워크트리는 언제나
+	// 지금 읽고 끝까지 기다린다, 요청이 끊기면 읽기도 멈춘다.
+	readNow readMode = iota
+	// readScreen 은 화면이다(Board). 보관본을 쓰고, 보관본 없는 읽기는 wait 까지만 기다린다.
+	readScreen
+)
+
+// deriveCache 는 Service 하나가 쥐는 파생 보관소다. 0값으로는 못 쓴다, newDeriveCache.
+type deriveCache struct {
+	sem chan struct{} // 서버 전체 git 동시 실행 상한
+
+	refreshAfter time.Duration
+	maxAge       time.Duration // 0 이면 화면 보관본을 안 쓴다
+	wait         time.Duration // 화면이 보관본 없는 읽기를 기다리는 상한(maxAge>0 일 때만 쓴다)
+
+	mu   sync.Mutex
+	pure map[pureKey]*pureEntry
+	wt   map[string]*wtEntry // 워크트리 경로(Clean) → 보관본
+
+	// bg 는 뒤에서 도는 읽기의 수다. 시험이 그것이 끝나기를 기다릴 때만 쓴다.
+	bg sync.WaitGroup
+}
+
+func newDeriveCache() *deriveCache {
+	return &deriveCache{
+		sem:  make(chan struct{}, deriveParallel),
+		pure: map[pureKey]*pureEntry{},
+		wt:   map[string]*wtEntry{},
+	}
+}
+
+func (c *deriveCache) screenSnapshots(mode readMode) bool { return mode == readScreen && c.maxAge > 0 }
+
+// acquire 는 git 실행 자리 하나를 잡는다. ctx 가 먼저 끝나면 false.
+func (c *deriveCache) acquire(ctx context.Context) bool {
+	select {
+	case c.sem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (c *deriveCache) release() { <-c.sem }
+
+// evict 는 memoIdle 넘게 아무도 안 쓴 보관본을 버린다. 도는 읽기는 안 건드린다.
+//
+// ★ 워크트리 목록으로 거르지 않는다. 카드는 등록된 워크트리의 하위 디렉토리를 쥘 수 있어
+// (예: <wt>/server) 목록에 없는 경로가 곧 사라진 워크트리가 아니고, 사라진 워크트리의 카드는
+// 파생 앞에서 닫혀 그 보관본을 다시 묻지 않는다. 쓰이지 않는 것은 시간으로 빠진다.
+func (c *deriveCache) evict(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, e := range c.pure {
+		if settled(e.done) && t.Sub(e.used) > memoIdle {
+			delete(c.pure, k)
+		}
+	}
+	for k, e := range c.wt {
+		if e.inflight == nil && t.Sub(e.used) > memoIdle {
+			delete(c.wt, k)
+		}
+	}
+}
+
+func settled(done chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
+// errStillReading 은 화면의 기다림 상한(ScreenWait) 안에 못 끝난 읽기다. 읽기는 뒤에서 이어진다.
+var errStillReading = errors.New("관측 중, 첫 읽기가 뒤에서 이어진다(다음 조회에 실린다)")
+
+// branchKey 는 카드의 브랜치 하나다(이름과 그 tip). 같은 키의 카드는 커밋 축을 함께 쓴다.
+type branchKey struct{ name, sha string }
+
+// readCardFacts 는 카드들이 쓸 커밋 축(브랜치마다)과 미커밋 축(워크트리마다)을 **함께** 읽는다.
+//
+// 판정 자리(readNow)와 보관본이 꺼진 화면은 다 끝날 때까지 기다리고 요청의 ctx 를 쓴다.
+// 보관본이 켜진 화면은 wait 까지만 기다린다. 그 안에 못 끝난 것은 errStillReading 으로
+// 고백하고, 읽기는 요청의 ctx 와 떨어져 끝까지 돌아 보관소에 들어간다(커밋 쌍은 기억과
+// 변경집합에, 워크트리는 보관본에), 다음 조회가 그것을 쓴다.
+func (s *Service) readCardFacts(ctx context.Context, g GitReader, proj model.Project, mainSHA string,
+	bks []branchKey, wts []string, mode readMode) (map[branchKey]branchFacts, map[string]wtSnap) {
+
+	readCtx, bounded := ctx, s.dc.screenSnapshots(mode)
+	if bounded {
+		readCtx = context.WithoutCancel(ctx)
+	}
+	type got struct {
+		i    int
+		wt   bool
+		f    branchFacts
+		snap wtSnap
+	}
+	total := len(bks) + len(wts)
+	ch := make(chan got, total) // 넉넉히, 늦게 끝난 읽기가 아무도 안 받는 채널에 막히지 않게
+	for i, bk := range bks {
+		s.dc.bg.Add(1)
+		go func() {
+			defer s.dc.bg.Done()
+			// 변경집합 보관은 읽은 그 자리에서 한다. 화면이 기다림을 넘겨도 뒤에서 끝난 쌍이
+			// change_set 에 들어가야 한다(조립 단계에서 하면 늦게 끝난 쌍은 영영 빠진다).
+			remember := func(f branchFacts) { s.rememberChangeSet(readCtx, proj.ID, f.fork, bk.sha, f.paths) }
+			ch <- got{i: i, f: s.dc.branchFactsOf(readCtx, g, proj.Path, proj.DefaultBranch, mainSHA, bk.name, bk.sha, s.now(), remember)}
+		}()
+	}
+	for i, wt := range wts {
+		s.dc.bg.Add(1)
+		go func() {
+			defer s.dc.bg.Done()
+			ch <- got{i: i, wt: true, snap: s.dc.worktreeState(readCtx, g, proj.Path, wt, mode, s.now)}
+		}()
+	}
+	facts := make(map[branchKey]branchFacts, len(bks))
+	states := make(map[string]wtSnap, len(wts))
+	for _, bk := range bks {
+		facts[bk] = branchFacts{forkErr: errStillReading, pathsErr: errStillReading, aheadErr: errStillReading}
+	}
+	for _, wt := range wts {
+		states[wt] = wtSnap{pathsErr: errStillReading, deltaErr: errStillReading}
+	}
+	put := func(r got) {
+		if r.wt {
+			states[wts[r.i]] = r.snap
+		} else {
+			facts[bks[r.i]] = r.f
+		}
+	}
+	var timeout <-chan time.Time
+	if bounded {
+		t := time.NewTimer(s.dc.wait)
+		defer t.Stop()
+		timeout = t.C
+	}
+	for n := 0; n < total; n++ {
+		select {
+		case r := <-ch:
+			put(r)
+		case <-timeout:
+			// 상한과 같은 순간에 끝난 것은 마저 싣는다(기다리지는 않는다).
+			for ; n < total; n++ {
+				select {
+				case r := <-ch:
+					put(r)
+					continue
+				default:
+				}
+				break
+			}
+			if n < total {
+				s.log.InfoContext(ctx, "화면 파생이 기다림 상한을 넘었다, 남은 읽기는 뒤에서 잇는다",
+					"project", proj.ID, "wait", s.dc.wait.String(), "left", fmt.Sprintf("%d/%d", total-n, total))
+			}
+			return facts, states
+		}
+	}
+	return facts, states
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ① 커밋 쌍의 순수 결과
+// ─────────────────────────────────────────────────────────────────────────────
+
+type pureKey struct{ repo, base, head string }
+
+// pureEntry 는 커밋 쌍 하나의 기억이다. done 이 닫히기 전에는 읽는 중이다(올라탈 수 있다).
+type pureEntry struct {
+	done chan struct{}
+	f    branchFacts // done 이 닫힌 뒤에만 읽는다
+	used time.Time   // mu 아래에서만 쓴다
+}
+
+// branchFacts 는 브랜치 하나의 커밋 축 셋이다. 축마다 실패가 따로 산다(호출부가 축마다 고백한다).
+type branchFacts struct {
+	fork     string
+	forkErr  error
+	paths    []string
+	delta    map[string]model.LineDelta
+	pathsErr error
+	ahead    int
+	aheadErr error
+}
+
+func (f branchFacts) ok() bool { return f.forkErr == nil && f.pathsErr == nil && f.aheadErr == nil }
+
+func failedFacts(err error) branchFacts {
+	return branchFacts{forkErr: err, pathsErr: err, aheadErr: err}
+}
+
+// branchFactsOf 는 기본 브랜치 tip(mainSHA)과 브랜치 tip(headSHA) 쌍의 커밋 축 셋을 낸다.
+//
+// ★ git 에는 **sha 를 넘긴다**(이름이 아니라). 이름을 넘기고 sha 로 기억하면, 워크트리 목록을
+// 읽은 뒤 브랜치가 움직인 순간 새 tip 의 답이 옛 tip 의 키로 들어간다. sha 를 넘기면 키와
+// 답이 언제나 같은 커밋이고, 카드의 BranchSHA 와 변경집합의 head 도 같은 커밋을 가리킨다.
+// sha 를 하나라도 모르면 이름으로 읽고 기억하지 않는다(그때는 키가 없다, 변경집합도 안 남긴다).
+//
+// 같은 쌍을 누가 읽는 중이면 그 읽기에 올라탄다(겹친 보드가 같은 git 을 다시 띄우지 않게).
+// 셋이 다 성공했을 때만 기억하고, 그때 한 번 remember 를 부른다. 실패는 일시적일 수 있어
+// 기억하지 않는다, 올라탔던 쪽은 다시 시도한다.
+func (c *deriveCache) branchFactsOf(ctx context.Context, g GitReader, repo, defBranch, mainSHA, branch, headSHA string,
+	t time.Time, remember func(branchFacts)) branchFacts {
+
+	if mainSHA == "" || headSHA == "" {
+		return c.readFacts(ctx, g, defBranch, branch)
+	}
+	key := pureKey{repo: filepath.Clean(repo), base: mainSHA, head: headSHA}
+	for {
+		c.mu.Lock()
+		if e := c.pure[key]; e != nil {
+			e.used = t
+			c.mu.Unlock()
+			select {
+			case <-e.done:
+			case <-ctx.Done():
+				return failedFacts(ctx.Err())
+			}
+			if e.f.ok() {
+				return e.f
+			}
+			continue // 앞선 읽기가 실패해 기억에서 빠졌다, 다시 시도한다
+		}
+		if len(c.pure) >= pureMemoLimit {
+			for k, e := range c.pure {
+				if settled(e.done) {
+					delete(c.pure, k)
+				}
+			}
+		}
+		e := &pureEntry{done: make(chan struct{}), used: t}
+		c.pure[key] = e
+		c.mu.Unlock()
+
+		f := c.readFacts(ctx, g, mainSHA, headSHA)
+		if f.ok() && remember != nil {
+			remember(f)
+		}
+		c.mu.Lock()
+		e.f = f
+		if !f.ok() && c.pure[key] == e {
+			delete(c.pure, key)
+		}
+		close(e.done)
+		c.mu.Unlock()
+		return f
+	}
+}
+
+// readFacts 는 커밋 축 셋을 지금 읽는다.
+func (c *deriveCache) readFacts(ctx context.Context, g GitReader, base, head string) branchFacts {
+	if !c.acquire(ctx) {
+		return failedFacts(ctx.Err())
+	}
+	defer c.release()
+	var f branchFacts
+	if f.fork, f.forkErr = g.MergeBase(ctx, base, head); f.forkErr == nil {
+		f.paths, f.delta, f.pathsErr = g.ChangedPaths(ctx, f.fork, head)
+	}
+	f.ahead, _, f.aheadErr = g.AheadBehind(ctx, head, base)
+	return f
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ② 워크트리의 미커밋 상태
+// ─────────────────────────────────────────────────────────────────────────────
+
+// wtSnap 은 워크트리 하나의 미커밋 관측 한 번이다. 두 축의 실패가 따로 산다.
+type wtSnap struct {
+	paths    []string
+	pathsErr error
+	delta    map[string]model.LineDelta
+	deltaErr error
+	at       time.Time // 읽기를 **시작한** 시각, 이 관측은 적어도 그때만큼 새롭다
+}
+
+func (sn wtSnap) ok() bool { return sn.pathsErr == nil && sn.deltaErr == nil }
+
+// wtEntry 는 워크트리 하나의 보관본이다. 필드는 mu 아래에서만 읽고 쓴다.
+type wtEntry struct {
+	snap     wtSnap
+	have     bool
+	inflight chan struct{} // 화면 쪽 읽기(첫 읽기 · 뒤의 새로 읽기)가 도는 중이면 닫히기를 기다릴 채널
+	used     time.Time
+}
+
+// readWorktree 는 워크트리 하나를 지금 읽는다. 자리(sem)는 호출자가 잡는다.
+func readWorktree(ctx context.Context, g GitReader, wt string, at time.Time) wtSnap {
+	sn := wtSnap{at: at}
+	sn.paths, sn.pathsErr = g.UncommittedPaths(ctx, wt)
+	sn.delta, sn.deltaErr = g.UncommittedDelta(ctx, wt)
+	return sn
+}
+
+// entry 는 워크트리의 보관본 자리를 낸다(없으면 만든다). mu 를 쥐고 부른다.
+func (c *deriveCache) entry(wt string, t time.Time) *wtEntry {
+	e := c.wt[wt]
+	if e == nil {
+		e = &wtEntry{}
+		c.wt[wt] = e
+	}
+	e.used = t
+	return e
+}
+
+// store 는 관측을 보관한다. mu 를 쥐고 부른다.
+//
+//   - 더 새 관측이 이미 있으면 안 덮는다(뒤늦게 끝난 읽기가 새 값을 지우지 않게).
+//   - 요청이 끊겨 난 실패는 안 넣는다, 그것은 워크트리의 사실이 아니다.
+//   - 뒤의 새로 읽기(keepGood)가 실패하면 성한 보관본을 안 덮는다. 부하로 git 한 번이 시간을
+//     넘긴 것이 화면의 경로를 지우면 안 된다. 성한 보관본은 늙어 가다 maxAge 에서 빠진다.
+func (e *wtEntry) store(ctx context.Context, sn wtSnap, keepGood bool) {
+	if ctx.Err() != nil {
+		return
+	}
+	if e.have && e.snap.at.After(sn.at) {
+		return
+	}
+	if keepGood && e.have && e.snap.ok() && !sn.ok() {
+		return
+	}
+	e.snap, e.have = sn, true
+}
+
+// worktreeState 는 워크트리 하나의 미커밋 관측을 낸다.
+//
+// 판정 자리(readNow)나 보관본이 꺼진 화면은 **언제나 지금 읽는다**, 도는 읽기에 올라타지도
+// 않는다(그 읽기는 이 요청보다 먼저 시작했을 수 있다). 화면은 maxAge 안의 보관본을 쓰고
+// refreshAfter 보다 오래됐으면 뒤에서 하나 새로 읽는다. 쓸 보관본이 없으면 도는 읽기에
+// 올라타거나, 없으면 자기가 읽는다(같은 워크트리의 첫 읽기는 겹친 보드 사이에서도 하나다).
+func (c *deriveCache) worktreeState(ctx context.Context, g GitReader, repo, wt string, mode readMode, now func() time.Time) wtSnap {
+	wt = filepath.Clean(wt)
+	if !c.screenSnapshots(mode) {
+		at := now()
+		if !c.acquire(ctx) {
+			return wtSnap{at: at, pathsErr: ctx.Err(), deltaErr: ctx.Err()}
+		}
+		sn := readWorktree(ctx, g, wt, at)
+		c.release()
+		if c.maxAge > 0 { // 화면이 보관본을 쓸 때만 넣는다(꺼져 있으면 아무도 안 꺼낸다)
+			c.mu.Lock()
+			c.entry(wt, now()).store(ctx, sn, false)
+			c.mu.Unlock()
+		}
+		return sn
+	}
+	for {
+		t := now()
+		c.mu.Lock()
+		e := c.entry(wt, t)
+		if e.have && t.Sub(e.snap.at) <= c.maxAge {
+			sn := e.snap
+			if t.Sub(sn.at) >= c.refreshAfter && e.inflight == nil {
+				e.inflight = make(chan struct{})
+				c.bg.Add(1)
+				go func() {
+					defer c.bg.Done()
+					c.readInto(context.Background(), g, wt, e, now, true)
+				}()
+			}
+			c.mu.Unlock()
+			return sn
+		}
+		if ch := e.inflight; ch != nil {
+			c.mu.Unlock()
+			select {
+			case <-ch:
+				continue // 그 읽기가 넣은 보관본을 다시 본다
+			case <-ctx.Done():
+				return wtSnap{at: t, pathsErr: ctx.Err(), deltaErr: ctx.Err()}
+			}
+		}
+		e.inflight = make(chan struct{})
+		c.mu.Unlock()
+		return c.readInto(ctx, g, wt, e, now, false)
+	}
+}
+
+// readInto 는 e.inflight 를 쥔 쪽이 워크트리를 읽어 보관하고 inflight 를 푼다.
+//
+// 뒤의 새로 읽기(background)는 요청의 ctx 를 안 쓴다. 응답이 나가면 그 ctx 는 끝나고, 그러면
+// 읽기가 매번 취소돼 보관본이 영영 안 새로워진다. 상한은 git 한 번의 시간 상한(gitreader)이 건다.
+func (c *deriveCache) readInto(ctx context.Context, g GitReader, wt string, e *wtEntry, now func() time.Time, background bool) wtSnap {
+	at := now()
+	sn := wtSnap{at: at, pathsErr: ctx.Err(), deltaErr: ctx.Err()}
+	if c.acquire(ctx) {
+		sn = readWorktree(ctx, g, wt, at)
+		c.release()
+	}
+	c.mu.Lock()
+	e.store(ctx, sn, background)
+	close(e.inflight)
+	e.inflight = nil
+	c.mu.Unlock()
+	return sn
+}
+
+// hasKey 는 맵에 키가 있는지다(값이 0값이어도).
+func hasKey[K comparable, V any](m map[K]V, k K) bool {
+	_, ok := m[k]
+	return ok
+}

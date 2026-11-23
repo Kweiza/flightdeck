@@ -264,67 +264,125 @@ func (t *Tx) ProjectRefCounts(id string) (map[string]int, error) {
 }
 
 func projectRefCounts(ctx context.Context, q dbtx, id string) (map[string]int, error) {
+	all, err := projectRefCountsBy(ctx, q, id)
+	if err != nil {
+		return nil, err
+	}
+	return refCountsOf(all, id), nil
+}
+
+// ProjectRefCountsAll 은 **모든 프로젝트**의 행 수를 표별로 한 번에 센다(프로젝트 → 표 → 수).
+// 등록된 프로젝트인데 행이 하나도 없으면 맵에 없다, RefCountsOf 로 꺼내면 0 으로 채워진다.
+//
+// ★ 프로젝트마다 ProjectRefCounts 를 부르면 표마다 프로젝트 수만큼 훑는다. event 는
+// project 색인이 없어서(46만 행, 2026-11-23) 그 곱이 GET /api/v1/projects 를 5초로 만들었다.
+// 여기서는 표마다 한 번 GROUP BY 로 센다, 프로젝트 수와 무관하다.
+func (s *Store) ProjectRefCountsAll(ctx context.Context) (map[string]map[string]int, error) {
+	return projectRefCountsBy(ctx, s.db, "")
+}
+
+// RefCountsOf 는 ProjectRefCountsAll 의 결과에서 프로젝트 하나의 수를 꺼낸다. 없는 표는 0 이다.
+func RefCountsOf(all map[string]map[string]int, id string) map[string]int {
+	return refCountsOf(all, id)
+}
+
+func refCountsOf(all map[string]map[string]int, id string) map[string]int {
 	out := make(map[string]int, len(projectRefTables)+2)
 	for _, tbl := range projectRefTables {
-		var n int
-		// ★ 표 이름은 위 projectRefTables 상수에서만 온다(외부 입력이 아니다) — 그래서
-		// 문자열 결합으로 SQL 을 짓는 것이 안전하다. tbl 이 사용자 입력이었다면 이 자리가
-		// SQL 인젝션 통로였을 것이다.
-		if err := q.QueryRowContext(ctx,
-			`SELECT count(*) FROM `+tbl+` WHERE project = ?`, id).Scan(&n); err != nil {
-			return nil, fmt.Errorf("행 수 조회 실패(table=%s, project=%q): %w", tbl, clip(id, 64), err)
-		}
-		out[tbl] = n
+		out[tbl] = 0
 	}
-	var ev int
-	if err := q.QueryRowContext(ctx,
-		`SELECT count(*) FROM event WHERE project = ?`, id).Scan(&ev); err != nil {
-		return nil, fmt.Errorf("이벤트 수 조회 실패(project=%q): %w", clip(id, 64), err)
+	out["event"], out["judgment_foreign"] = 0, 0
+	for k, n := range all[id] {
+		out[k] = n
 	}
-	out["event"] = ev // 세기만 한다 — 안 지운다
+	return out
+}
 
-	// ★ judgment.session_id 는 session(id) 를 CASCADE 없이 참조하고 judgment.project 와는
-	// **독립 컬럼**이다(schema.sql:230-231) — 그래서 다른 프로젝트의 판단이 이 프로젝트의
-	// 세션을 가리킬 수 있다. 실물 경로: service.NoteInput 은 Project 와 SessionID 를 각자
-	// 받고(finish.go) 서로 같은 프로젝트인지 검증하지 않는다 — 세션은 맞게 골랐는데
-	// --project 를 오타 내거나 다른 값으로 주면 이 모양의 행이 생긴다.
-	//
-	// 위 루프의 "judgment" 카운트(project = id)는 이 판단들을 못 잡는다 — project 컬럼이
-	// 다르기 때문이다. 그런데 이 판단은 삭제 금지 트리거(judgment_no_delete)가 걸려 있어
-	// RemoveProject 도 못 지운다 — 그 판단이 하나라도 남아 있으면 session 삭제(여섯 번째
-	// 단계)가 FK 위반으로 죽는다. 그래서 별도 질의로 센다: 이 축을 안 세면
-	// JudgeProjectRemoval 이 이 경로를 못 보고 통과시키고, 사람은 드라이버 원문 그대로의
-	// FK 오류("FOREIGN KEY constraint failed")만 받는다 — 무엇이 막았는지 아무도 모른다.
-	//
-	// ★ session(id) 를 CASCADE 없이 참조하는 표는 judgment 말고 **넷 더** 있다 —
-	// claim(schema.sql:196) · resource_hold(:318) · job(:337) · landing_queue
-	// (migrations/003:18). 넷 다 구조적으로 judgment 와 같은 취약점이 있다: ClaimItem·
-	// EnqueueLanding 등은 session_id 가 넘겨준 project 소속인지 검증하지 않는다(예:
-	// EnqueueLanding(project, sessionID, at) 은 project 와 sessionID 를 각자 받는다) —
-	// TestRemoveProjectTranslatesForeignLandingQueueFKViolation 이 그 경로로 실제 FK
-	// 위반을 재현한다. 그런데도 이 넷은 **미리 세지 않는다**. 이유가 judgment 와 다르다:
-	//   1. judgment 는 judgment_no_delete 트리거 때문에 **영원히** 못 지운다 — 세지 않으면
-	//      이 프로젝트는 그 판단이 남는 한 영구히 못 지워지는데, 그 사실 자체를 아무도
-	//      모른 채 "확인 없음" 문구만 반복해서 본다. claim·resource_hold·job·landing_queue
-	//      는 DELETE 대상이다(judgment_no_delete 같은 트리거가 없다) — 걸리면 RemoveProject
-	//      의 트랜잭션이 롤백될 뿐이고(아래 2차 방어가 사유를 낸다), 데이터 손실이 아니라
-	//      **삭제 실패**로 끝난다. 사람은 사유를 읽고 다시 시도하면 된다.
-	//   2. 넷의 project 값은 대개 **서비스 내부 로직**이 채운다(랜딩 큐 진입·선점·자원
-	//      점유는 세션이 이미 열려 있는 프로젝트 컨텍스트에서 서버가 조립한다) — judgment
-	//      처럼 사람이 명령줄마다 `--project` 를 손으로 치는 경로가 아니다. 실물로
-	//      어긋나려면 그 내부 로직 자체가 버그를 내야 하므로 발생 확률이 judgment(사람의
-	//      오타 하나) 보다 훨씬 낮다고 판단했다.
-	// 넷 다 셀 수도 있었지만(질의를 넷 더 늘리면 된다), 위 이유로 지금은 안 세는 쪽을
-	// 골랐다 — 세는 축을 늘릴수록 JudgeProjectRemoval 의 판정문이 늘어 사람이 읽는 표가
-	// 커지는데, 그 대가에 걸맞은 것은 "영원히 못 지운다"는 judgment 하나뿐이라고 봤다.
-	var foreignJudgment int
-	if err := q.QueryRowContext(ctx, `
-		SELECT count(*) FROM judgment
-		WHERE session_id IN (SELECT id FROM session WHERE project = ?)
-		  AND (project IS NULL OR project <> ?)`, id, id).Scan(&foreignJudgment); err != nil {
-		return nil, fmt.Errorf("교차 프로젝트 판단 수 조회 실패(project=%q): %w", clip(id, 64), err)
+// projectRefCountsBy 는 표마다 프로젝트별 행 수를 센다. only 가 비면 모든 프로젝트, 아니면 그 하나다.
+// ProjectRefCounts(한 프로젝트) 와 ProjectRefCountsAll(전부) 이 **같은 질의**를 쓴다, 두 벌이면
+// 한쪽만 고친 날 목록의 수와 삭제 판정의 수가 갈린다.
+//
+// "event" 는 지우지 않으므로 세기만 한다(projectRefTables 에 없다).
+//
+// ★ judgment.session_id 는 session(id) 를 CASCADE 없이 참조하고 judgment.project 와는
+// **독립 컬럼**이다(schema.sql:230-231), 그래서 다른 프로젝트의 판단이 이 프로젝트의
+// 세션을 가리킬 수 있다. 실물 경로: service.NoteInput 은 Project 와 SessionID 를 각자
+// 받고(finish.go) 서로 같은 프로젝트인지 검증하지 않는다, 세션은 맞게 골랐는데
+// --project 를 오타 내거나 다른 값으로 주면 이 모양의 행이 생긴다.
+//
+// 위 루프의 "judgment" 카운트(project = id)는 이 판단들을 못 잡는다, project 컬럼이
+// 다르기 때문이다. 그런데 이 판단은 삭제 금지 트리거(judgment_no_delete)가 걸려 있어
+// RemoveProject 도 못 지운다, 그 판단이 하나라도 남아 있으면 session 삭제(여섯 번째
+// 단계)가 FK 위반으로 죽는다. 그래서 별도 질의로 센다: 이 축을 안 세면
+// JudgeProjectRemoval 이 이 경로를 못 보고 통과시키고, 사람은 드라이버 원문 그대로의
+// FK 오류("FOREIGN KEY constraint failed")만 받는다, 무엇이 막았는지 아무도 모른다.
+//
+// ★ session(id) 를 CASCADE 없이 참조하는 표는 judgment 말고 **넷 더** 있다 -
+// claim(schema.sql:196) · resource_hold(:318) · job(:337) · landing_queue
+// (migrations/003:18). 넷 다 구조적으로 judgment 와 같은 취약점이 있다: ClaimItem·
+// EnqueueLanding 등은 session_id 가 넘겨준 project 소속인지 검증하지 않는다(예:
+// EnqueueLanding(project, sessionID, at) 은 project 와 sessionID 를 각자 받는다) -
+// TestRemoveProjectTranslatesForeignLandingQueueFKViolation 이 그 경로로 실제 FK
+// 위반을 재현한다. 그런데도 이 넷은 **미리 세지 않는다**. 이유가 judgment 와 다르다:
+//  1. judgment 는 judgment_no_delete 트리거 때문에 **영원히** 못 지운다, 세지 않으면
+//     이 프로젝트는 그 판단이 남는 한 영구히 못 지워지는데, 그 사실 자체를 아무도
+//     모른 채 "확인 없음" 문구만 반복해서 본다. claim·resource_hold·job·landing_queue
+//     는 DELETE 대상이다(judgment_no_delete 같은 트리거가 없다), 걸리면 RemoveProject
+//     의 트랜잭션이 롤백될 뿐이고(아래 2차 방어가 사유를 낸다), 데이터 손실이 아니라
+//     **삭제 실패**로 끝난다. 사람은 사유를 읽고 다시 시도하면 된다.
+//  2. 넷의 project 값은 대개 **서비스 내부 로직**이 채운다(랜딩 큐 진입·선점·자원
+//     점유는 세션이 이미 열려 있는 프로젝트 컨텍스트에서 서버가 조립한다), judgment
+//     처럼 사람이 명령줄마다 `--project` 를 손으로 치는 경로가 아니다. 실물로
+//     어긋나려면 그 내부 로직 자체가 버그를 내야 하므로 발생 확률이 judgment(사람의
+//     오타 하나) 보다 훨씬 낮다고 판단했다.
+//
+// 넷 다 셀 수도 있었지만(질의를 넷 더 늘리면 된다), 위 이유로 지금은 안 세는 쪽을
+// 골랐다, 세는 축을 늘릴수록 JudgeProjectRemoval 의 판정문이 늘어 사람이 읽는 표가
+// 커지는데, 그 대가에 걸맞은 것은 "영원히 못 지운다"는 judgment 하나뿐이라고 봤다.
+func projectRefCountsBy(ctx context.Context, q dbtx, only string) (map[string]map[string]int, error) {
+	out := map[string]map[string]int{}
+	where, args := "", []any(nil)
+	if only != "" {
+		where, args = " WHERE project = ?", []any{only}
 	}
-	out["judgment_foreign"] = foreignJudgment
+	add := func(key, query string, args []any) error {
+		rows, err := q.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var p sql.NullString
+			var n int
+			if err := rows.Scan(&p, &n); err != nil {
+				return err
+			}
+			if !p.Valid {
+				continue // project 가 빈 행은 어느 프로젝트에도 안 묶인다
+			}
+			if out[p.String] == nil {
+				out[p.String] = map[string]int{}
+			}
+			out[p.String][key] = n
+		}
+		return rows.Err()
+	}
+	// ★ 표 이름은 projectRefTables 상수와 "event" 에서만 온다(외부 입력이 아니다), 그래서
+	// 문자열 결합으로 SQL 을 짓는 것이 안전하다.
+	for _, tbl := range append(append([]string{}, projectRefTables...), "event") {
+		if err := add(tbl, `SELECT project, count(*) FROM `+tbl+where+` GROUP BY project`, args); err != nil {
+			return nil, fmt.Errorf("행 수 조회 실패(table=%s, project=%q): %w", tbl, clip(only, 64), err)
+		}
+	}
+	foreign := `
+		SELECT s.project, count(*) FROM judgment j JOIN session s ON s.id = j.session_id
+		WHERE (j.project IS NULL OR j.project <> s.project)`
+	if only != "" {
+		foreign += ` AND s.project = ?`
+	}
+	if err := add("judgment_foreign", foreign+` GROUP BY s.project`, args); err != nil {
+		return nil, fmt.Errorf("교차 프로젝트 판단 수 조회 실패(project=%q): %w", clip(only, 64), err)
+	}
 	return out, nil
 }
 

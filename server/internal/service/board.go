@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -55,6 +56,9 @@ type SessionCard struct {
 	AheadKnown  bool              `json:"ahead_known"`
 	DeriveError string            `json:"derive_error,omitempty"`
 	IsSelf      bool              `json:"is_self"`
+	// Observing 는 이 카드의 git 축 중 하나 이상이 아직 첫 읽기 중이라는 뜻이다(화면의 기다림
+	// 상한을 넘어 뒤에서 이어진다). 그동안 경로가 비어 있어도 「안 막는다」가 아니라 「모른다」다.
+	Observing bool `json:"observing,omitempty"`
 }
 
 // splitCardsOf 는 카드에서 갈림 탐지 입력을 뽑는다.
@@ -272,7 +276,7 @@ func (s *Service) Board(ctx context.Context, project string, opt BoardOptions) (
 	if window <= 0 {
 		window = s.window
 	}
-	cards, roots, closed, err := s.sessionCardsAndRoots(ctx, proj, s.cut(now, window), opt.Self, d)
+	cards, roots, closed, err := s.sessionCardsAndRoots(ctx, proj, s.cut(now, window), opt.Self, readScreen, d)
 	if err != nil {
 		return BoardView{}, err
 	}
@@ -513,9 +517,10 @@ func (s *Service) RecentNotes(ctx context.Context, project string, limit int) ([
 //
 // 셋째 반환값은 **이 호출이 닫은 카드**다 — 워크트리가 git 목록에서 사라진 카드는 파생 앞에서
 // 닫고 카드 목록에서 뺀다(gone_worktree.go 머리말이 자리와 근거를 적는다).
-func (s *Service) sessionCardsAndRoots(ctx context.Context, proj model.Project, cut time.Time, self string, d *derive) ([]SessionCard, []string, []GoneWorktreeClosure, error) {
-	// ★ 이 함수가 이 서버에서 가장 비싼 일이다 — `git worktree list` 한 번 + 살아 있는
-	//   세션마다 ChangedPaths·UncommittedPaths·UncommittedDelta. 그 비용을 세는 자리를 여기 둔다.
+func (s *Service) sessionCardsAndRoots(ctx context.Context, proj model.Project, cut time.Time, self string, mode readMode, d *derive) ([]SessionCard, []string, []GoneWorktreeClosure, error) {
+	// ★ 이 함수가 이 서버에서 가장 비싼 일이다, `git worktree list` 한 번 + 서로 다른 브랜치마다
+	//   MergeBase·ChangedPaths·AheadBehind, 서로 다른 워크트리마다 UncommittedPaths·UncommittedDelta
+	//   (보관본에 있으면 0, derive_cache.go). 그 비용을 세는 자리를 여기 둔다.
 	//   호출부에 두면 호출부가 늘 때마다 계측이 조용히 빠진다(실제로 그 모양으로
 	//   MCP 꼬리가 도구 호출마다 이 파생을 한 번씩 더 돌리고 있었고, 아무 화면에도 안 떴다).
 	start := time.Now()
@@ -535,6 +540,7 @@ func (s *Service) sessionCardsAndRoots(ctx context.Context, proj model.Project, 
 	var heads map[string]string
 	var roots []string
 	var wl worktreeList // ok=false 가 0값이다 — git 을 안 불렀으면 부재를 말할 근거도 없다
+	var mainSHA string  // 기본 브랜치 tip. 커밋 쌍 기억의 키 한쪽이다(못 읽으면 비고, 기억도 안 한다)
 	if strings.TrimSpace(proj.Path) == "" {
 		d.note("project-path", "프로젝트 경로가 비어 있다 — git 파생을 아예 시도하지 않았다")
 	} else {
@@ -552,9 +558,13 @@ func (s *Service) sessionCardsAndRoots(ctx context.Context, proj model.Project, 
 		} else {
 			d.ok()
 			s.rememberRef(ctx, proj.ID, r)
+			mainSHA = r.SHA
 		}
 	}
 
+	s.dc.evict(s.now())
+
+	// ── 1. 카드 뼈대, 사라진 워크트리의 카드를 닫고, 브랜치를 붙인다(git 호출 0) ──
 	cards := make([]SessionCard, 0, len(live))
 	var closed []GoneWorktreeClosure
 	for _, v := range live {
@@ -568,16 +578,56 @@ func (s *Service) sessionCardsAndRoots(ctx context.Context, proj model.Project, 
 			continue
 		}
 		card := SessionCard{View: v, IsSelf: v.Session.ID == self}
-		var fails []string
-
 		if g != nil {
 			wt := filepath.Clean(v.Session.Worktree)
 			if br, ok := wts[wt]; ok {
 				card.View.Branch, card.BranchKnown = br, true
 				card.View.BranchSHA = heads[wt]
 			}
+		}
+		cards = append(cards, card)
+	}
+
+	// ── 2. git 읽기, 같은 워크트리 · 같은 커밋 쌍은 한 번, 서로 다른 것은 함께(derive_cache.go) ──
+	branchOf := func(c SessionCard) bool {
+		return c.BranchKnown && c.View.Branch != "" && c.View.Branch != proj.DefaultBranch
+	}
+	facts := map[branchKey]branchFacts{}
+	states := map[string]wtSnap{}
+	if g != nil {
+		var bks []branchKey
+		var wtsToRead []string
+		for _, c := range cards {
+			if bk := (branchKey{c.View.Branch, c.View.BranchSHA}); branchOf(c) && !hasKey(facts, bk) {
+				facts[bk] = branchFacts{}
+				bks = append(bks, bk)
+			}
+			if wt := filepath.Clean(c.View.Session.Worktree); !hasKey(states, wt) {
+				states[wt] = wtSnap{}
+				wtsToRead = append(wtsToRead, wt)
+			}
+		}
+		facts, states = s.readCardFacts(ctx, g, proj, mainSHA, bks, wtsToRead, mode)
+	}
+
+	// ── 3. 조립, 카드 순서대로, 축마다 성공·실패를 센다(읽기가 함께 돌아도 기록 순서는 그대로다) ──
+	for i := range cards {
+		card := &cards[i]
+		var fails []string
+		// failed 는 축 하나의 실패를 센다. 아직 첫 읽기 중인 축은 축마다 말하지 않고 카드에
+		// 「관측 중」 한 번으로 모은다(못 읽은 것이 아니라 아직 안 끝난 것이다).
+		failed := func(axis string, err error, say string) {
+			d.fail(axis, err)
+			if errors.Is(err, errStillReading) {
+				card.Observing = true
+			} else {
+				fails = append(fails, say)
+			}
+		}
+
+		if g != nil {
 			// 변경집합 — 착수 직후 구간은 브랜치 diff 가 정의상 비어 있어 footprint 가 덮는다.
-			if card.BranchKnown && card.View.Branch != "" && card.View.Branch != proj.DefaultBranch {
+			if branchOf(*card) {
 				// ★ base 는 기본 브랜치의 tip 이 아니라 **갈래 지점**이다.
 				//
 				//   tip 을 넘기면 두 점 diff 가 되어 두 끝점을 비교한다 — main 만 바꾼 파일이
@@ -588,38 +638,36 @@ func (s *Service) sessionCardsAndRoots(ctx context.Context, proj model.Project, 
 				//
 				//   갈래 지점을 못 구하면 이 축을 **비운 채** 못 읽었다고 말한다. 두 점으로
 				//   되돌아가지 않는다 — 그것이 없애려는 바로 그 오탐이다. 발자국·미커밋이 덮는다.
-				if forkSHA, err := g.MergeBase(ctx, proj.DefaultBranch, card.View.Branch); err != nil {
-					d.fail("merge-base:"+clip(card.View.Branch, 120), err)
-					fails = append(fails, "갈래 지점을 못 읽었다")
-				} else if paths, delta, err := g.ChangedPaths(ctx, forkSHA, card.View.Branch); err != nil {
-					d.fail("changed-paths:"+clip(card.View.Branch, 120), err)
-					fails = append(fails, "변경 경로를 못 읽었다")
+				f := facts[branchKey{card.View.Branch, card.View.BranchSHA}]
+				if f.forkErr != nil {
+					failed("merge-base:"+clip(card.View.Branch, 120), f.forkErr, "갈래 지점을 못 읽었다")
+				} else if f.pathsErr != nil {
+					failed("changed-paths:"+clip(card.View.Branch, 120), f.pathsErr, "변경 경로를 못 읽었다")
 				} else {
 					d.ok()
-					card.View.Paths = UnionPaths(card.View.Paths, paths)
-					card.View.PathDelta = MergeDelta(card.View.PathDelta, delta)
-					// 보관되는 뜻이 정확해진다 — 갈래 기준 diff 는 forkSHA 로부터의 두 점 diff 와 같다.
-					s.rememberChangeSet(ctx, proj.ID, forkSHA, card.View.BranchSHA, paths)
+					card.View.Paths = UnionPaths(card.View.Paths, f.paths)
+					card.View.PathDelta = MergeDelta(card.View.PathDelta, f.delta)
+					// 변경집합(change_set)은 이 쌍을 처음 읽은 자리가 보관했다(readCardFacts), 갈래
+					// 기준 diff 는 forkSHA 로부터의 두 점 diff 와 같아 보관되는 뜻이 정확하다.
 				}
-				if ahead, _, err := g.AheadBehind(ctx, card.View.Branch, proj.DefaultBranch); err != nil {
-					d.fail("ahead-behind:"+clip(card.View.Branch, 120), err)
-					fails = append(fails, "ahead 를 못 읽었다")
+				if f.aheadErr != nil {
+					failed("ahead-behind:"+clip(card.View.Branch, 120), f.aheadErr, "ahead 를 못 읽었다")
 				} else {
 					d.ok()
-					card.View.AheadMain, card.AheadKnown = ahead, true
+					card.View.AheadMain, card.AheadKnown = f.ahead, true
 				}
 			}
+			sn := states[filepath.Clean(card.View.Session.Worktree)]
+			d.observed(sn.at)
 			// 미커밋 — 커밋 전 의도를 나르는 유일한 축이라 조용히 짧아지면 안 된다.
-			if unc, err := g.UncommittedPaths(ctx, v.Session.Worktree); err != nil {
-				d.fail("uncommitted:"+clip(v.Session.ID, 64), err)
-				fails = append(fails, "미커밋 경로를 못 읽었다")
+			if sn.pathsErr != nil {
+				failed("uncommitted:"+clip(card.View.Session.ID, 64), sn.pathsErr, "미커밋 경로를 못 읽었다")
 			} else {
 				d.ok()
-				card.View.Paths = UnionPaths(card.View.Paths, unc)
+				card.View.Paths = UnionPaths(card.View.Paths, sn.paths)
 			}
 			// 미커밋 규모 — **위 경로 축과 갈라 둔다.** 이것이 실패해도 위가 살아야 하고
 			// (커밋 전 의도를 나르는 유일한 축이다), 그것이 두 git 호출을 안 합친 이유다.
-			// 이 호출 하나가 이 축에서 새로 드는 비용의 전부다(세션당 4→5).
 			//
 			// ★ **두 축 이름의 접미가 같은 세션 id 인 것에 화면이 기댄다.** 워크트리가 지워지면
 			// 둘이 **함께** 실패하고(같은 `Session.Worktree` 를 본다) 원인도 하나인데, 화면이
@@ -631,12 +679,11 @@ func (s *Service) sessionCardsAndRoots(ctx context.Context, proj model.Project, 
 			// 뿐이다. 원장 밖에 남는 것은 아래 "보드 조회" 로그 줄의 skipped 수가 전부다).
 			// 이름 꼴을 바꾸면 접기가 조용히 안 걸린다(줄이 둘로 돌아갈 뿐이라
 			// 시험 없이는 안 보인다) — `TestDeadWorktreeFoldsIntoOneLineButKeepsTheAxisCount` 가 문다.
-			if ud, err := g.UncommittedDelta(ctx, v.Session.Worktree); err != nil {
-				d.fail("uncommitted-delta:"+clip(v.Session.ID, 64), err)
-				fails = append(fails, "미커밋 규모를 못 읽었다")
+			if sn.deltaErr != nil {
+				failed("uncommitted-delta:"+clip(card.View.Session.ID, 64), sn.deltaErr, "미커밋 규모를 못 읽었다")
 			} else {
 				d.ok()
-				card.View.PathDelta = MergeDelta(card.View.PathDelta, ud)
+				card.View.PathDelta = MergeDelta(card.View.PathDelta, sn.delta)
 			}
 		} else {
 			fails = append(fails, "git 파생을 시도하지 않았다(프로젝트 경로 없음)")
@@ -646,14 +693,16 @@ func (s *Service) sessionCardsAndRoots(ctx context.Context, proj model.Project, 
 		//   아무도 안 막고, **안 막는다는 사실이 화면에 있어야** 한다(설계 §5).
 		card.View.HasFootprint = len(card.View.Paths) > 0
 
-		if note, err := s.lastNote(ctx, v.Session.ID); err != nil {
+		if note, err := s.lastNote(ctx, card.View.Session.ID); err != nil {
 			return nil, nil, nil, err
 		} else if note != nil {
 			card.View.LastNote = note
 		}
 
+		if card.Observing {
+			fails = append(fails, errStillReading.Error())
+		}
 		card.DeriveError = strings.Join(fails, " · ")
-		cards = append(cards, card)
 	}
 	return cards, roots, closed, nil
 }
@@ -667,7 +716,7 @@ func (s *Service) sessionCards(ctx context.Context, proj model.Project, cut time
 	// ★ 닫은 카드 목록은 여기서 버린다 — 이 껍데기의 호출부(pick·note 수신자·amend)는 카드를
 	//   화면에 안 내므로 "사라진 카드"를 말할 자리가 없다. 닫기 자체는 원장 이벤트와 INFO 로그가
 	//   나른다(gone_worktree.go). 닫기를 보드에서만 돌리지 않는 이유도 거기 적었다.
-	cards, _, _, err := s.sessionCardsAndRoots(ctx, proj, cut, self, d)
+	cards, _, _, err := s.sessionCardsAndRoots(ctx, proj, cut, self, readNow, d)
 	return cards, err
 }
 

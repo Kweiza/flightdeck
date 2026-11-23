@@ -32,20 +32,22 @@ type ProjectSummary struct {
 
 // ListProjectSummaries 는 전 프로젝트의 요약이다.
 //
-// ★ 프로젝트 수는 사람이 등록한 만큼이라(store.ListProjects 의 그 주석) 프로젝트당
-// 질의 몇 개는 감당한다. 이 경로는 화면 머리가 아니라 CLI 와 REST 전용이다 —
+// ★ 행 수는 표마다 한 번에 센다(store.ProjectRefCountsAll), 프로젝트마다 세면 색인 없는
+// event 표를 프로젝트 수만큼 훑는다(2026-11-23 실측 5초). 마지막 세션 시각은 색인을 타는
+// 프로젝트당 질의 하나다. 이 경로는 화면 머리가 아니라 CLI 와 REST 전용이다 -
 // 매 렌더 도는 자리에 두면 프로젝트가 늘수록 화면 전체가 느려진다.
 func (s *Service) ListProjectSummaries(ctx context.Context) ([]ProjectSummary, error) {
 	projects, err := s.st.ListProjects(ctx)
 	if err != nil {
 		return nil, err
 	}
+	all, err := s.st.ProjectRefCountsAll(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]ProjectSummary, 0, len(projects))
 	for _, p := range projects {
-		counts, err := s.st.ProjectRefCounts(ctx, p.ID)
-		if err != nil {
-			return nil, err
-		}
+		counts := store.RefCountsOf(all, p.ID)
 		last, err := s.st.LastSessionAt(ctx, p.ID)
 		if err != nil {
 			return nil, err

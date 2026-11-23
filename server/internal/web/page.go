@@ -773,16 +773,23 @@ func sessionRow(now time.Time, c service.SessionCard) SessionRow {
 	} else {
 		r.BranchNote = "브랜치 못 읽음"
 	}
-	if c.AheadKnown {
+	switch {
+	case c.AheadKnown:
 		r.Ahead = fmt.Sprintf("+%d", v.AheadMain)
-	} else {
+	case c.Observing:
+		r.AheadNote = "ahead 관측 중"
+	default:
 		r.AheadNote = "ahead 못 읽음"
 	}
 	// ★ 발자국 없음을 빈칸으로 두지 않는다(설계 §5). 그 세션은 경로 축에서 아무도 안 막고,
 	//   **안 막는다는 사실이 화면에 있어야** 한다.
-	if !v.HasFootprint {
+	//   첫 읽기가 아직 안 끝났으면(Observing) 비어 있는 것은 「없음」이 아니라 「아직 모름」이다.
+	switch {
+	case !v.HasFootprint && c.Observing:
+		r.Footprint = "관측 중"
+	case !v.HasFootprint:
 		r.Footprint = "발자국 없음"
-	} else {
+	default:
 		r.Footprint = fmt.Sprintf("경로 %d건", len(v.Paths))
 		const cap = 12
 		if len(v.Paths) > cap {

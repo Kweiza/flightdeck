@@ -451,49 +451,122 @@ func (s *Store) Rekey(ctx context.Context, id, ccSessionID string) (model.Sessio
 // HasFootprint 를 함께 채우는 이유: 커밋도 편집도 안 하는 세션(조사·판정만)은
 // 경로 축에서 아무도 안 막는데, **안 막는다는 사실이 화면에 있어야** 한다.
 // 침묵하면 "겹침 없음"과 "이 축을 안 본다"가 구분되지 않는다.
+//
+// ★ **세션 수와 무관한 질의 수(4번)다(2026-11-23).** 앞 판은 세션마다 신호 · 발자국 · 선점을
+// 따로 물었다(1+3N). 보드는 창 밖 건수를 세려고 since=0 으로 이것을 부르는데, proj-m 은
+// 그 세션이 1239개라 요청 하나가 질의 3700여 번에 약 2초를 썼다. 지금은 세션 목록 하나와
+// 세 축을 같은 거름(liveSessionFilter)의 하위 질의로 한 번씩 묻는다.
 func (s *Store) ListLive(ctx context.Context, project string, since time.Time) ([]model.SessionView, error) {
 	cut := fmtTime(since)
-	rows, err := s.db.QueryContext(ctx, `
+	args := []any{project, cut, cut}
+	// 네 질의를 읽기 트랜잭션 하나에서 묻는다. 세 축의 하위 질의는 거름을 다시 평가하므로, 따로
+	// 물으면 그 사이 끝난 세션이 목록에는 있고 축에는 없을 수 있다. 한 트랜잭션은 한 스냅숏을 본다.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("살아 있는 세션 조회 트랜잭션 시작 실패(project=%q): %w", clip(project, 64), err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
 		SELECT `+sessionCols+` FROM session s
-		WHERE s.project = ? AND s.state <> 'done'
-		  AND (s.opened_at >= ?
-		       OR EXISTS (SELECT 1 FROM signal g WHERE g.session_id = s.id AND g.at >= ?))
-		ORDER BY s.opened_at DESC`, project, cut, cut)
+		WHERE `+liveSessionFilter+`
+		ORDER BY s.opened_at DESC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("살아 있는 세션 조회 실패(project=%q): %w", clip(project, 64), err)
 	}
 	defer rows.Close()
 
-	var sessions []model.Session
+	var out []model.SessionView
+	at := map[string]int{} // 세션 id → out 의 자리
 	for rows.Next() {
 		sess, err := scanSession(rows)
 		if err != nil {
 			return nil, fmt.Errorf("세션 행 해석 실패: %w", err)
 		}
-		sessions = append(sessions, sess)
+		at[sess.ID] = len(out)
+		// 신호가 없는 세션도 빈 맵이다(Signals 와 같은 모양, nil 과 「없음」을 안 가른다).
+		out = append(out, model.SessionView{Session: sess, Signals: map[model.SignalKind]time.Time{}})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("세션 목록 순회 실패: %w", err)
 	}
+	if len(out) == 0 {
+		return out, nil
+	}
 
-	out := make([]model.SessionView, 0, len(sessions))
-	for _, sess := range sessions {
-		v := model.SessionView{Session: sess}
-		if v.Signals, err = s.Signals(ctx, sess.ID); err != nil {
-			return nil, err
-		}
-		if v.Paths, err = s.FootprintPaths(ctx, sess.ID); err != nil {
-			return nil, err
-		}
-		v.HasFootprint = len(v.Paths) > 0
-		if v.Claims, err = s.ClaimedItems(ctx, sess.ID); err != nil {
-			return nil, err
-		}
-		// Branch·BranchSHA·AheadMain·LastNote 는 git 리더와 J 계층이 채우는 축이라
-		// 여기서 비워 둔다. 0값과 "안 봤다"를 뭉개지 않으려면 채우는 쪽이 하나여야 한다.
-		out = append(out, v)
+	ids := `SELECT s.id FROM session s WHERE ` + liveSessionFilter
+	if err := eachRow(ctx, tx, `SELECT session_id, kind, at FROM signal WHERE session_id IN (`+ids+`)`, args,
+		"신호", func(r *sql.Rows) error {
+			var id, kind, ts string
+			if err := r.Scan(&id, &kind, &ts); err != nil {
+				return err
+			}
+			t, err := parseTime(ts)
+			if err != nil {
+				return err
+			}
+			if i, ok := at[id]; ok {
+				out[i].Signals[model.SignalKind(kind)] = t
+			}
+			return nil
+		}); err != nil {
+		return nil, err
+	}
+	if err := eachRow(ctx, tx, `SELECT DISTINCT session_id, path FROM footprint WHERE session_id IN (`+ids+`) ORDER BY session_id, path`, args,
+		"발자국 경로", func(r *sql.Rows) error {
+			var id, p string
+			if err := r.Scan(&id, &p); err != nil {
+				return err
+			}
+			if i, ok := at[id]; ok {
+				out[i].Paths = append(out[i].Paths, p)
+			}
+			return nil
+		}); err != nil {
+		return nil, err
+	}
+	if err := eachRow(ctx, tx, `SELECT session_id, item_id FROM claim WHERE released_at IS NULL AND session_id IN (`+ids+`) ORDER BY session_id, item_id`, args,
+		"선점 목록", func(r *sql.Rows) error {
+			var id, item string
+			if err := r.Scan(&id, &item); err != nil {
+				return err
+			}
+			if i, ok := at[id]; ok {
+				out[i].Claims = append(out[i].Claims, item)
+			}
+			return nil
+		}); err != nil {
+		return nil, err
+	}
+	// Branch·BranchSHA·AheadMain·LastNote 는 git 리더와 J 계층이 채우는 축이라
+	// 여기서 비워 둔다. 0값과 "안 봤다"를 뭉개지 않으려면 채우는 쪽이 하나여야 한다.
+	for i := range out {
+		out[i].HasFootprint = len(out[i].Paths) > 0
 	}
 	return out, nil
+}
+
+// liveSessionFilter 는 ListLive 의 거름이다(인자: project, since, since). 세션 목록과 세 축의
+// 하위 질의가 **같은 문장**을 쓴다, 두 벌이면 한쪽만 고친 순간 축이 다른 세션 집합을 본다.
+const liveSessionFilter = `s.project = ? AND s.state <> 'done'
+		  AND (s.opened_at >= ?
+		       OR EXISTS (SELECT 1 FROM signal g WHERE g.session_id = s.id AND g.at >= ?))`
+
+// eachRow 는 질의 하나의 행마다 fn 을 부른다. what 은 오류 문구의 대상 이름이다.
+func eachRow(ctx context.Context, db dbtx, query string, args []any, what string, fn func(*sql.Rows) error) error {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("%s 조회 실패: %w", what, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := fn(rows); err != nil {
+			return fmt.Errorf("%s 행 해석 실패: %w", what, err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("%s 순회 실패: %w", what, err)
+	}
+	return nil
 }
 
 // ListSessions 는 프로젝트의 **모든** 세션을 상태와 무관하게 낸다.

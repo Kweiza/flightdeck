@@ -873,7 +873,11 @@ func boardCard(c service.SessionCard, now time.Time, pathLimit int, detail bool,
 			label, v.Session.HarnessLabel(), branch, state,
 			formatPaths(v.Paths, pathLimit), FormatSignals(v.Signals, now)),
 	}
-	if !v.HasFootprint {
+	switch {
+	case !v.HasFootprint && c.Observing:
+		// 첫 읽기가 아직 안 끝났다. 비어 있는 것은 「안 막는다」가 아니라 「아직 모른다」다.
+		lines[1] += " | 경로 축 관측 중(다음 조회에 실린다)"
+	case !v.HasFootprint:
 		// 안 막는다는 사실이 화면에 있어야 한다(설계 §5의 "그래도 안 보이는 것" ①).
 		lines[1] += " | 경로 축에서 아무도 안 막는다"
 	}

@@ -142,6 +142,9 @@ const (
 // *gitreader.Reader 가 이것을 만족한다. 인터페이스로 둔 이유는 시험이
 // **실패하는 리더**를 주입해 "파생이 죽어도 조정은 산다"를 단정할 수 있게 하기 위해서다
 // (실물 저장소 시험이 정본이고, 이 주입은 실물로 만들기 어려운 실패만 덮는다).
+//
+// ★ 구현은 **동시에 불려도 안전해야 한다.** 카드 파생은 서로 다른 워크트리 · 커밋 쌍을 함께
+// 읽는다(derive_cache.go). *gitreader.Reader 는 호출마다 git 프로세스를 따로 띄워 이것을 만족한다.
 type GitReader interface {
 	Refs(ctx context.Context) ([]model.RefState, error)
 	Ref(ctx context.Context, ref string) (model.RefState, error)
@@ -186,6 +189,9 @@ type Service struct {
 	derives      atomic.Uint64
 	deriveCards  atomic.Uint64
 	deriveMicros atomic.Uint64
+
+	// dc 는 카드 파생의 보관소다, 커밋 쌍의 순수 결과와 워크트리 미커밋 관측(derive_cache.go).
+	dc *deriveCache
 }
 
 // DeriveStats 는 세션 카드 파생의 누적 비용이다.
@@ -284,6 +290,7 @@ func New(st *store.Store, log *slog.Logger, opts ...Option) *Service {
 		git: func(repo string) GitReader {
 			return gitreader.New(repo, gitreader.WithLogger(log))
 		},
+		dc: newDeriveCache(),
 	}
 	for _, o := range opts {
 		o(s)
@@ -321,6 +328,16 @@ type Derived struct {
 type derive struct {
 	reads    int
 	failures []DerivedFailure
+	// oldest 는 이 파생이 쓴 **보관본** 중 가장 오래된 관측 시각이다(없으면 0값).
+	// 화면이 보관본을 쓰면 신선도의 관측 시각이 지금이 아니라 그 시각이 된다, 지금 읽은 척하지 않는다.
+	oldest time.Time
+}
+
+// observed 는 보관본 하나의 관측 시각을 센다.
+func (d *derive) observed(at time.Time) {
+	if !at.IsZero() && (d.oldest.IsZero() || at.Before(d.oldest)) {
+		d.oldest = at
+	}
 }
 
 // ok 는 성공한 git 읽기 1회를 센다.
@@ -341,7 +358,15 @@ func (d *derive) note(axis, detail string) {
 }
 
 func (d *derive) result(now time.Time) Derived {
-	return Derived{Freshness: FreshnessOf(now, d.reads, len(d.failures)), Failures: d.failures}
+	f := FreshnessOf(now, d.reads, len(d.failures))
+	if d.reads > 0 && !d.oldest.IsZero() && d.oldest.Before(f.ObservedAt) {
+		f.ObservedAt = d.oldest
+		// 뒤의 새로 읽기가 못 따라와 관측이 늙었으면 「최신」이라 하지 않는다.
+		if now.Sub(d.oldest) > snapshotStaleAfter {
+			f.Stale = true
+		}
+	}
+	return Derived{Freshness: f, Failures: d.failures}
 }
 
 // FreshnessOf 는 파생 시도 결과를 신선도로 옮긴다. 순수 함수다.

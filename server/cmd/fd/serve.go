@@ -238,7 +238,10 @@ func runServe(args []string, env func(string) (string, bool), log *slog.Logger) 
 		}
 	}()
 
-	svc := service.New(st, log)
+	// ★ 화면(보드)은 워크트리 미커밋 관측의 보관본을 쓰고 뒤에서 새로 읽는다, 요청마다 카드 수만큼
+	//   git 을 다시 돌면 보드가 카드 수에 비례해 느려진다(service/derive_cache.go 머리말의 실측).
+	//   판정 자리(pick · amend · finish)는 이 설정과 무관하게 언제나 지금 읽는다.
+	svc := service.New(st, log, service.WithScreenSnapshots(service.ScreenRefreshAfter, service.ScreenMaxAge, service.ScreenWait))
 	token := envOr(env, "FD_TOKEN", "")
 	webH := web.New(svc, web.WithLogger(log), web.WithLang(lang.FromEnv(env)))
 	// ★ watcher 를 buildHandler 보다 먼저 만든다 — api.Options.SelfUpdate 콜백이
