@@ -106,6 +106,31 @@ The board is **a host process, not inside the container** — the images and log
 | `BOARD_LINKS` | `~/.config/flightdeck-board/links.json` | top link row, a per-machine file outside the repository; shape in `links.example.json` (`project` limits an entry to that project). Missing means no links |
 | `FD_CONFIG` | `~/.flightdeck/config.json` | where the fd URL and token are read (the fd client config, re-read per request) |
 | `FD_URL` · `FD_TOKEN` | (config file) | take precedence over the file |
+| `BOARD_TAILNET` | (install.sh: suffix of the tailscale name) | tailnet suffix `/api/embed` may call (e.g. `<tailnet>.ts.net`) |
+| `BOARD_PREVIEW_PORTS` | (none) | localhost ports `/api/embed` may call (comma-separated) |
+| `BOARD_AUTH` | `~/.config/flightdeck-board/auth.json` | access secret · owner logins (see Access) |
+
+## Access
+
+The board holds the fd token and writes to fd on the owner's behalf, so it sorts callers in two (one place, `access_denied` in `board.py`).
+
+- **Requests over the tailnet** (Host is a tailnet name in `BOARD_HOSTS`): the `Tailscale-User-Login` header that `tailscale serve`
+  adds must be in `owner_logins` of the access file, otherwise 403. That header cannot be forged from outside only while the board
+  is bound to loopback behind serve, so the board refuses to start when `BOARD_ADDR` is not loopback (`check_bind`).
+- **`/api/*` · `/file` for every request**: the cookie `/` hands out (`fdboard`, HttpOnly · SameSite=Strict, a random secret made at install)
+  is required. It stops another site's page from driving the board through the owner's browser.
+- Access file `BOARD_AUTH` (default `~/.config/flightdeck-board/auth.json`, 0600): `{"secret": …, "owner_logins": […]}`. `install.sh`
+  creates it when missing (login from `BOARD_OWNER_LOGIN` or this machine's tailscale user) and never prints the values. Do not put them
+  in the repository, reports or cards. Without the file the board does not start.
+- **Remaining risk**: a process of the same user on the same Mac can fetch the cookie from `/` and imitate Host and headers. The board does
+  not defend that boundary (such a process can already read the token in `~/.flightdeck/config.json`).
+- The preview check `/api/embed` accepts same-origin requests only, HEADs only names under this machine's tailnet suffix (`BOARD_TAILNET`)
+  and `localhost` · `127.0.0.1` on `BOARD_PREVIEW_PORTS`, and does not follow redirects.
+
+Coordinators and scripts calling the board API fetch the cookie first:
+
+    curl -s -c /tmp/fdboard.jar -o /dev/null http://127.0.0.1:7430/
+    curl -s -b /tmp/fdboard.jar 'http://127.0.0.1:7430/api/inbox?project=<project id>'
 
 ## Tests
 
@@ -148,7 +173,8 @@ A claimed card stays in Running whatever its labels. Closed items do not change 
 
 ## Where the coordinator reads: `/api/inbox`
 
-    curl -s 'http://127.0.0.1:7430/api/inbox?project=<project id>'
+    curl -s -c /tmp/fdboard.jar -o /dev/null http://127.0.0.1:7430/
+    curl -s -b /tmp/fdboard.jar 'http://127.0.0.1:7430/api/inbox?project=<project id>'
 
 - `items`: open items labelled `status:owner-done` · `status:owner-ask` (`kind`, body, that item's `[fdboard]` notes in time order).
 - `recent_owner_notes`: the project's latest 30 `[fdboard]` notes (newest first, `item` = item id).

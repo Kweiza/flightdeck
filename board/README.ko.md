@@ -102,8 +102,33 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 | `BOARD_LINKS` | `~/.config/flightdeck-board/links.json` | 위 링크 줄(기계별 파일, 저장소 밖). 꼴은 `links.example.json`: `[{"name", "url", "project"?}]`, `project` 가 있으면 그 프로젝트에서만. 없으면 링크 줄이 빈다. 요청마다 다시 읽음 |
 | `FD_CONFIG` | `~/.flightdeck/config.json` | fd 주소 · 토큰을 읽는 파일(fd 클라이언트 설정과 같은 것, 요청마다 다시 읽음) |
 | `FD_URL` · `FD_TOKEN` | (설정 파일) | 있으면 설정 파일보다 먼저 |
+| `BOARD_TAILNET` | (install.sh: tailscale 이름의 접미사) | `/api/embed` 가 부를 tailnet 접미사(예: `<tailnet>.ts.net`) |
+| `BOARD_PREVIEW_PORTS` | (없음) | `/api/embed` 가 부를 이 맥(localhost)의 포트(쉼표 구분) |
+| `BOARD_AUTH` | `~/.config/flightdeck-board/auth.json` | 접근 비밀 · 소유자 로그인(아래 「접근」) |
 
 커밋 링크(`커밋:` 줄, 닫힌 항목의 랜딩 sha)는 그 프로젝트 저장소의 `origin`(fd `/api/v1/projects` 의 path)에서 GitHub 주소를 만든다.
+
+## 접근
+
+보드는 fd 토큰을 쥐고 소유자 대신 fd 에 쓴다. 그래서 누가 부르는지를 둘로 가른다(`board.py` 의 `access_denied` 한 곳).
+
+- **tailnet 으로 온 요청**(Host 가 `BOARD_HOSTS` 의 tailnet 이름): `tailscale serve` 가 붙이는 `Tailscale-User-Login` 이
+  접근 설정 파일의 `owner_logins` 에 있어야 한다. 없거나 다르면 403. 이 헤더를 바깥에서 위조할 수 없는 것은 보드가
+  루프백에만 묶여 serve 뒤에만 있을 때라, `BOARD_ADDR` 가 루프백이 아니면 보드는 뜨지 않는다(`check_bind`).
+- **모든 요청의 `/api/*` · `/file`**: `/` 가 내려 주는 쿠키(`fdboard`, HttpOnly · SameSite=Strict, 값은 설치 때 만든 무작위 비밀)가
+  있어야 한다. 다른 사이트의 페이지가 소유자 브라우저로 보드를 부르는 길을 막는다.
+- 접근 설정 파일 `BOARD_AUTH`(기본 `~/.config/flightdeck-board/auth.json`, 0600): `{"secret": …, "owner_logins": […]}`.
+  `install.sh` 가 없으면 만들고(로그인은 `BOARD_OWNER_LOGIN` 또는 이 기계 tailscale 사용자), 값을 화면 · 로그에 찍지 않는다.
+  저장소 · 보고 · 카드에 그 값을 쓰지 않는다. 파일이 없으면 보드는 뜨지 않는다.
+- **남는 위험**: 같은 맥의 같은 사용자 프로세스는 `/` 에서 쿠키를 받고 Host · 헤더도 흉내 낼 수 있다. 보드는 그 경계를 지키지 않는다
+  (그 프로세스는 이미 `~/.flightdeck/config.json` 의 토큰을 읽을 수 있다).
+- 미리보기 확인 `/api/embed` 는 같은 출처 요청만 받고, 이 기계 tailnet 접미사(`BOARD_TAILNET`) 아래 이름과 `BOARD_PREVIEW_PORTS` 의
+  `localhost` · `127.0.0.1` 만 HEAD 로 부르며, 리다이렉트는 따라가지 않는다.
+
+조정자 · 스크립트가 보드 API 를 부를 때는 쿠키를 먼저 받는다:
+
+    curl -s -c /tmp/fdboard.jar -o /dev/null http://127.0.0.1:7430/
+    curl -s -b /tmp/fdboard.jar 'http://127.0.0.1:7430/api/inbox?project=<프로젝트 id>'
 
 ## 시험
 
@@ -148,7 +173,8 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 
 ## 조정자가 읽는 곳: `/api/inbox`
 
-    curl -s 'http://127.0.0.1:7430/api/inbox?project=<프로젝트 id>'
+    curl -s -c /tmp/fdboard.jar -o /dev/null http://127.0.0.1:7430/
+    curl -s -b /tmp/fdboard.jar 'http://127.0.0.1:7430/api/inbox?project=<프로젝트 id>'
 
 - `items`: 열린 항목 중 `status:owner-done` · `status:owner-ask` 인 것(`kind`, 본문, 그 항목의 `[fdboard]` 노트 시간순).
 - `recent_owner_notes`: 그 프로젝트의 최근 `[fdboard]` 노트 30개(최신 먼저, `item` = 항목 id). 댓글만 남긴 카드도 여기서 보인다.

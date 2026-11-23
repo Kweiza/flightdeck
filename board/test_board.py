@@ -29,7 +29,8 @@ def load_board(**env):
 
 
 B = load_board(BOARD_FILE_ROOTS="/nonexistent-root", BOARD_LINKS="/nonexistent/links.json",
-               FD_CONFIG="/nonexistent/config.json", BOARD_PROJECT="", BOARD_HOSTS="board.example.ts.net:37430")
+               FD_CONFIG="/nonexistent/config.json", BOARD_PROJECT="", BOARD_HOSTS="board.example.ts.net:37430",
+               BOARD_AUTH="/nonexistent/auth.json", BOARD_TAILNET="", BOARD_PREVIEW_PORTS="", BOARD_ADDR="", BOARD_PORT="")
 
 DECISION = """맨 윗줄 요약
 ### 질문
@@ -181,6 +182,131 @@ class Config(unittest.TestCase):
         self.assertEqual(B.read_links("game"), (200, {"links": [], "file": "/nonexistent/links.json", "missing": True}))
         with self.assertRaises(ValueError):
             B.links_of({"name": "x"}, "game")
+
+
+OWNER = "owner@example.com"
+SECRET = "s" * 40
+AUTH = {"secret": SECRET, "owner_logins": [OWNER]}
+TS = "board.example.ts.net:37430"
+
+
+class Embed(unittest.TestCase):
+    def test_allowlist(self):
+        ok = lambda u: B.embed_allowed(u, "tail0.ts.net", {8000})[0]
+        self.assertTrue(ok("https://mac.tail0.ts.net:30818/"))
+        self.assertFalse(ok("https://mac.othertail.ts.net/"))  # 남의 tailnet
+        self.assertFalse(ok("https://mac.tail0.ts.net.evil.example/"))
+        self.assertFalse(ok("https://user@mac.tail0.ts.net/"))
+        self.assertFalse(ok("http://127.0.0.1:7420/"))  # fd 서버 같은 이 맥의 다른 포트
+        self.assertTrue(ok("http://localhost:8000/"))
+        self.assertFalse(ok("file:///etc/passwd"))
+        self.assertFalse(B.embed_allowed("https://mac.tail0.ts.net/", "", set())[0])  # tailnet 미설정이면 안 부름
+
+    def test_redirect_not_followed(self):
+        import http.server
+        import threading
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                hits.append(self.path)
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:%d/next" % self.server.server_port)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        keep = B.PREVIEW_PORTS
+        B.PREVIEW_PORTS = {srv.server_port}
+        try:
+            v = B.embed_check("http://127.0.0.1:%d/start" % srv.server_port)
+        finally:
+            B.PREVIEW_PORTS = keep
+            srv.shutdown()
+            srv.server_close()
+        self.assertFalse(v["ok"])
+        self.assertIn("리다이렉트", v["reason"])
+        self.assertEqual(hits, ["/start"])  # /next 로 안 갔다
+
+
+class Access(unittest.TestCase):
+    def deny(self, path, auth=AUTH, **h):
+        return B.access_denied({k.replace("_", "-"): v for k, v in h.items()}, path, auth)
+
+    def test_tailnet_needs_owner(self):
+        self.assertIn("신원", self.deny("/", Host=TS))
+        self.assertIn("소유자", self.deny("/", Host=TS, Tailscale_User_Login="other@example.com"))
+        self.assertEqual(self.deny("/", Host=TS, Tailscale_User_Login="Owner@Example.com"), "")
+        self.assertIn("쿠키", self.deny("/api/board", Host=TS, Tailscale_User_Login=OWNER))
+        self.assertEqual(self.deny("/api/board", Host=TS, Tailscale_User_Login=OWNER, Cookie="a=b; fdboard=" + SECRET), "")
+
+    def test_loopback_needs_cookie(self):
+        self.assertEqual(self.deny("/", Host="127.0.0.1:7430"), "")
+        self.assertIn("쿠키", self.deny("/file", Host="127.0.0.1:7430"))
+        self.assertIn("쿠키", self.deny("/api/inbox", Host="127.0.0.1:7430", Cookie="fdboard=wrong"))
+        self.assertEqual(self.deny("/api/inbox", Host="127.0.0.1:7430", Cookie="fdboard=" + SECRET), "")
+        self.assertIn("소유자", self.deny("/", Host="127.0.0.1:7430", Tailscale_User_Login="other@example.com"))
+
+    def test_no_auth_file(self):
+        self.assertIn("install.sh", B.access_denied({"Host": "127.0.0.1:7430"}, "/", {}))
+        self.assertIsNone(B.read_auth("/nonexistent/auth.json"))
+
+    def test_bind_loopback_only(self):
+        self.assertEqual(B.ADDR, "127.0.0.1")
+        B.check_bind("127.0.0.1")
+        B.check_bind("::1")
+        for bad in ("0.0.0.0", "100.64.0.1", "::"):
+            with self.assertRaises(SystemExit):
+                B.check_bind(bad)
+
+
+class Http(unittest.TestCase):
+    """실제 Handler 를 띄워 쿠키 · embed 같은 출처 검사를 본다(fd 는 안 부르는 경로만)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        cls.keep = B.AUTH, B.Handler.log_message
+        B.AUTH = AUTH
+        B.Handler.log_message = lambda *a: None
+        cls.srv = B.ThreadingHTTPServer(("127.0.0.1", 0), B.Handler)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        B.AUTH, B.Handler.log_message = cls.keep
+
+    def get(self, path, **h):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.srv.server_port, timeout=5)
+        c.request("GET", path, headers={"Host": "127.0.0.1:7430", **{k.replace("_", "-"): v for k, v in h.items()}})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r
+
+    def test_index_sets_strict_cookie(self):
+        r = self.get("/")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.getheader("Set-Cookie"), "fdboard=%s; HttpOnly; SameSite=Strict; Path=/" % SECRET)
+
+    def test_file_and_api_need_cookie(self):
+        self.assertEqual(self.get("/file?path=/x.png").status, 403)
+        self.assertEqual(self.get("/api/config").status, 403)
+        self.assertEqual(self.get("/api/config", Cookie="fdboard=" + SECRET).status, 200)
+        self.assertEqual(self.get("/", Host="evil.example:7430").status, 421)
+
+    def test_embed_same_origin(self):
+        ck = "fdboard=" + SECRET
+        self.assertEqual(self.get("/api/embed?url=https://x/", Cookie=ck).status, 403)
+        self.assertEqual(self.get("/api/embed?url=https://x/", Cookie=ck, Sec_Fetch_Site="cross-site").status, 403)
+        self.assertEqual(self.get("/api/embed?url=https://x/", Cookie=ck, Sec_Fetch_Site="same-origin").status, 200)
 
 
 if __name__ == "__main__":

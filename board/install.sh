@@ -8,7 +8,10 @@
 # 설정은 환경 변수로 받아 plist 에 적는다(README 「설정」). 안 주면 지금 돌고 있는 plist 의 값을 이어받고,
 # 그것도 없으면 기본값이다 — 다시 설치할 때 기계별 값을 잃지 않게.
 #   BOARD_PORT(7430) · BOARD_PROJECT · BOARD_FILE_ROOTS · BOARD_LINKS · BOARD_HOSTS · FD_CONFIG
+#   BOARD_TAILNET · BOARD_PREVIEW_PORTS · BOARD_AUTH(~/.config/flightdeck-board/auth.json)
 #   BOARD_TS_PORT(37430): BOARD_HOSTS 가 비면 tailscale 이름과 이 포트로 「<이름>:<포트>」를 만든다
+#   BOARD_OWNER_LOGIN: 접근 설정 파일이 새로 생길 때 넣을 소유자 tailnet 로그인(없으면 이 기계 tailscale 사용자).
+#     로그인 · 비밀은 저장소 밖 0600 파일에만 쓰고 화면에 찍지 않는다.
 #   BOARD_LABEL(com.<사용자>.flightdeck-board) · BOARD_PYTHON(/usr/bin/python3)
 #
 # tailscale serve 는 건드리지 않는다(공유 설정). 경로가 없으면 칠 명령만 알려 준다.
@@ -41,15 +44,20 @@ roots="${BOARD_FILE_ROOTS:-$(prev BOARD_FILE_ROOTS)}"
 links="${BOARD_LINKS:-$(prev BOARD_LINKS)}"
 fdcfg="${FD_CONFIG:-$(prev FD_CONFIG)}"
 hosts="${BOARD_HOSTS:-$(prev BOARD_HOSTS)}"
-if [ -z "$hosts" ] && command -v tailscale >/dev/null 2>&1; then
-  ts_name="$(tailscale status --json 2>/dev/null | "$py" -I -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null || true)"
-  [ -n "$ts_name" ] && hosts="$ts_name:${BOARD_TS_PORT:-37430}"
-fi
+tailnet="${BOARD_TAILNET:-$(prev BOARD_TAILNET)}"
+pports="${BOARD_PREVIEW_PORTS-$(prev BOARD_PREVIEW_PORTS)}"
+auth="${BOARD_AUTH:-$(prev BOARD_AUTH)}"; auth="${auth:-$HOME/.config/flightdeck-board/auth.json}"
+ts_json=""
+command -v tailscale >/dev/null 2>&1 && ts_json="$(tailscale status --json 2>/dev/null || true)"
+ts_name="$(printf '%s' "$ts_json" | "$py" -I -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null || true)"
+[ -z "$hosts" ] && [ -n "$ts_name" ] && hosts="$ts_name:${BOARD_TS_PORT:-37430}"
+[ -z "$tailnet" ] && [ -n "$ts_name" ] && tailnet="${ts_name#*.}"
 
 render() {
   LABEL="$label" PY="$py" BOARD="$here/board.py" LOG="$log" \
   E_BOARD_PORT="$port" E_BOARD_PROJECT="$project" E_BOARD_FILE_ROOTS="$roots" E_BOARD_LINKS="$links" \
-  E_BOARD_HOSTS="$hosts" E_FD_CONFIG="$fdcfg" \
+  E_BOARD_HOSTS="$hosts" E_FD_CONFIG="$fdcfg" E_BOARD_TAILNET="$tailnet" E_BOARD_PREVIEW_PORTS="$pports" \
+  E_BOARD_AUTH="$auth" \
   "$py" -I -c '
 import os, plistlib, sys
 env = {k[2:]: v for k, v in os.environ.items() if k.startswith("E_") and v}
@@ -68,6 +76,35 @@ if [ "$mode" = "--print" ]; then
 fi
 
 mkdir -p "$(dirname "$plist")" "$(dirname "$log")"
+
+# 접근 설정: 없으면 만든다(무작위 비밀 + 소유자 로그인), 있으면 비밀은 그대로 두고 로그인이 비었을 때만 채운다.
+( umask 077; mkdir -p "$(dirname "$auth")" )
+owners="$(TS_JSON="$ts_json" OWNER="${BOARD_OWNER_LOGIN:-}" AUTH="$auth" "$py" -I -c '
+import json, os, secrets
+path = os.environ["AUTH"]
+try:
+    a = json.load(open(path))
+except (OSError, ValueError):
+    a = {}
+if not isinstance(a.get("secret"), str) or len(a["secret"]) < 32:
+    a["secret"] = secrets.token_urlsafe(32)
+login = os.environ.get("OWNER", "").strip()
+if not login and os.environ.get("TS_JSON"):
+    try:
+        d = json.loads(os.environ["TS_JSON"])
+        login = d["User"][str(d["Self"]["UserID"])]["LoginName"]
+    except (ValueError, KeyError):
+        login = ""
+if not a.get("owner_logins") and login:
+    a["owner_logins"] = [login]
+fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(a, f)
+os.replace(path + ".tmp", path)
+print(len(a.get("owner_logins") or []))')"
+if [ "$owners" = "0" ] && [ -n "$hosts" ]; then
+  echo "주의: $auth 에 소유자 로그인이 없어 tailnet 요청은 모두 403. BOARD_OWNER_LOGIN=<로그인> 으로 다시 부르거나 파일의 owner_logins 에 넣는다" >&2
+fi
 tmp="$(mktemp "$plist.XXXXXX")"
 render >"$tmp"
 plutil -lint "$tmp" >/dev/null
@@ -87,7 +124,7 @@ if [ "$code" != "200" ]; then
   tail -5 "$log" >&2 || true
   exit 1
 fi
-echo "BOARD_READY http://127.0.0.1:$port label=$label board=$here/board.py hosts=${hosts:-(루프백만)}"
+echo "BOARD_READY http://127.0.0.1:$port label=$label board=$here/board.py hosts=${hosts:-(루프백만)} owners=$owners"
 if [ -n "$hosts" ] && command -v tailscale >/dev/null 2>&1; then
   ts_port="${hosts##*:}"
   if ! tailscale serve status 2>/dev/null | grep -q ":$ts_port"; then
