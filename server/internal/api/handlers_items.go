@@ -117,6 +117,53 @@ func (s *server) handleShowItem(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, r, http.StatusOK, res)
 }
 
+// handleListClosedItems 는 닫힌 항목을 최근에 닫힌 순으로 낸다(읽기 전용).
+//
+// ★ state 는 closed(기본, done·dropped 둘 다) · done · dropped 셋뿐이다. open 을 받지 않는
+// 이유: 열린 항목의 정본 목록은 dashboard.json 의 open_items 이고, 여기서도 내면 같은 이름의
+// 목록이 두 표면에서 갈린다. 모르는 값은 조용히 기본값으로 접지 않고 거절한다 — 오타가
+// "끝난 것이 없다"로 읽히면 안 된다.
+func (s *server) handleListClosedItems(w http.ResponseWriter, r *http.Request) {
+	project, ok := s.requireQuery(w, r, "project",
+		"항목 id 는 프로젝트마다 독립이라 어느 프로젝트의 목록인지 없이는 좌표가 없다.")
+	if !ok {
+		return
+	}
+	var state model.ItemState
+	switch raw := strings.TrimSpace(r.URL.Query().Get("state")); raw {
+	case "", "closed":
+	case string(model.ItemDone), string(model.ItemDropped):
+		state = model.ItemState(raw)
+	default:
+		s.writeError(w, r, badRequest("bad_state", "state 는 closed · done · dropped 중 하나다",
+			"열린 항목은 GET /api/v1/dashboard.json?project=… 의 open_items 가 낸다."))
+		return
+	}
+	limit, err := queryInt(r, "limit", 50)
+	if err != nil {
+		s.writeError(w, r, badRequest("bad_limit", "limit 이 정수가 아니다", "예: limit=50"))
+		return
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	items, err := s.st.ListClosed(r.Context(), project, state, limit)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if items == nil {
+		items = []model.Item{}
+	}
+	stateName := string(state)
+	if stateName == "" {
+		stateName = "closed"
+	}
+	s.writeJSON(w, r, http.StatusOK, map[string]any{
+		"project": project, "state": stateName, "limit": limit, "count": len(items), "items": items,
+	})
+}
+
 type addItemRequest struct {
 	Project   string       `json:"project"`
 	SessionID string       `json:"session_id"`

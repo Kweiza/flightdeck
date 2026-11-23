@@ -325,6 +325,8 @@ func (s *server) routes() *http.ServeMux {
 	// ★ `/items/next` 와 안 부딪힌다. Go 1.22 의 ServeMux 는 리터럴이 와일드카드를
 	//   이기므로 `GET /items/next` 가 늘 먼저 걸린다 — 등록 순서와 무관하다.
 	mux.HandleFunc("GET /api/v1/items/{id}", s.handleShowItem)
+	// 닫힌 항목 목록(읽기). 열린 항목은 dashboard.json 의 open_items 가 정본이라 여기 없다.
+	mux.HandleFunc("GET /api/v1/items", s.handleListClosedItems)
 	mux.HandleFunc("POST /api/v1/items", s.handleAddItem)
 	mux.HandleFunc("POST /api/v1/items/{id}/claim", s.handleClaimItem)
 	mux.HandleFunc("POST /api/v1/items/{id}/claim/release", s.handleReclaimClaim)

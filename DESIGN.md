@@ -963,6 +963,7 @@ POST   /sessions/{id}/signals       POST   /sessions/{id}/workspaces  ← 클라
 POST   /sessions/{id}/rekey         (훅 전용 — /clear·compact 로 갈린 대화의 새 cc 를 카드에 반영)
 GET    /items/next                  POST   /items
 GET    /items/{id}?project&session_id  (항목 하나를 **읽는다** — 지금 본문 + 개정 이력 + 걸린 판단. 닫힌 항목도 준다, 자르지 않는다. session_id 는 선택 — 워크스페이스 관문에만 쓴다)
+GET    /items?project&state&limit  (닫힌 항목을 최근에 닫힌 순으로 **읽는다** — state 는 closed·done·dropped, 열린 항목은 dashboard.json 의 open_items 가 정본이라 안 받는다)
 POST   /items/{id}/claim            POST   /items/{id}/finish
 POST   /items/{id}/claim/release    (사람의 선점 회수 — 대시보드 폼·CLI 와 같은 함수)
 POST   /claims/leave                (세션이 **자기** 선점을 놓는다 — `pick(leave:…)`. 항목 id 가 선택이라 경로에 없다)
