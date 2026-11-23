@@ -63,6 +63,7 @@ button:disabled { opacity: .55; cursor: default; }
 #msg-text { white-space: pre-line; }
 #links { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--card); }
 #links:empty { display: none; }
+#unread { padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--card); color: var(--danger); font-weight: 600; }
 #links .btn { font-size: 13px; padding: 3px 10px; }
 .layout { flex: 1 1 auto; display: flex; min-height: 0; }
 main {
@@ -203,6 +204,7 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
   <button id="theme" type="button" aria-label="밝기 바꾸기">밝기</button>
 </header>
 <nav id="links" aria-label="자주 쓰는 링크"></nav>
+<div id="unread" role="alert" hidden></div>
 <div class="layout">
   <main id="board">
     <section class="column col-waiting" data-col="waiting"><h2><span class="dot" style="background:var(--waiting)"></span>대기 <span class="n">0</span></h2><div class="cards"></div></section>
@@ -360,12 +362,27 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
     $(".more").hidden = state.cards.filter((c) => c.column === "done").length < state.done;
   }
 
+  // 보낸 알림은 도착이 아니다(README 「세션에 알림」): 조정 세션이 수신함을 N 분 넘게 안 읽은 소유자 동작이 있으면 경고.
+  function showUnread(u) {
+    const box = $("#unread");
+    let text = "";
+    if (u && u.late > 0) {
+      const at = Number(u.read_at), ok = Number.isFinite(at) && at > 0 && at < 1e11;
+      const read = ok ? `마지막으로 읽은 때 ${fmt(new Date(at * 1000).toISOString())}` : "아직 한 번도 안 읽음";
+      const ids = Array.isArray(u.late_items) ? u.late_items.map(String).join(", ") : "";
+      text = `조정 세션이 ${Number(u.minutes) || 15}분 넘게 수신함을 안 읽었어요: 소유자 동작 ${Number(u.late)}건${ids ? ` (${ids})` : ""}. ${read}. 세션이 멈췄거나 알림이 대화상자에 붙들렸을 수 있어요.`;
+    }
+    if (box.textContent === text) return;  // 같은 글이면 다시 쓰지 않는다(화면 읽기 프로그램이 되풀이해 읽지 않게)
+    box.textContent = text; box.hidden = !text;
+  }
+
   async function load(force) {
     if (!state.project) return;
     try {
       const b = await getJSON(`/api/board?project=${encodeURIComponent(state.project)}&done=${state.done}`);
       const sig = JSON.stringify(b.cards);
       setStatus(`새로 읽음 ${fmt(new Date().toISOString())}`);
+      try { showUnread(b.unread); } catch (e) { console.warn("unread", e); }  // 경고는 덤: 카드 그리기를 막지 않는다
       if (!force && (sig === state.sig || state.dragging)) return;  // 바뀐 것 없으면 화면을 건드리지 않는다
       state.cards = b.cards; state.sig = sig;
       fillLabels(); render();

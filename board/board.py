@@ -32,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import inbox_watch  # noqa: E402
 import session_inbox  # noqa: E402  (같은 폴더의 모듈, -I 는 스크립트 폴더를 path 에 넣지 않는다)
 
 
@@ -71,6 +72,10 @@ PREVIEW_PORTS = {int(p) for p in env("BOARD_PREVIEW_PORTS").split(",") if p.stri
 
 # 접근 비밀 · 소유자 로그인: 저장소 밖 파일(install.sh 가 0600 으로 만든다). 값은 응답 · 로그에 싣지 않는다.
 AUTH_FILE = os.path.expanduser(env("BOARD_AUTH", "~/.config/flightdeck-board/auth.json"))
+# 보낸 것은 도착이 아니다(README 「세션에 알림」): 소유자 동작과 수신함 읽기를 맞대어 오래 안 읽힌 것을 화면에 경고.
+WATCH_FILE = os.path.expanduser(env("BOARD_WATCH", "~/.config/flightdeck-board/inbox-watch.json"))
+UNREAD_MINUTES = max(1, int(env("BOARD_UNREAD_MINUTES", "15") or 15))
+WATCH = inbox_watch.Watch(WATCH_FILE, UNREAD_MINUTES)
 COOKIE = "fdboard"
 
 
@@ -95,7 +100,9 @@ STATUS_LABELS = (OWNER_TODO, OWNER_DONE, OWNER_ASK, RUNNING)
 # 보드가 남기는 판단 노트의 제목 머리. 검색 낱말이기도 하다(/api/inbox 가 이 낱말로 찾는다).
 NOTE_MARK = "[fdboard]"
 NOTE_KIND = "decision"
-CHOICE_PREFIX = "소유자 선택: "  # 선택 버튼이 남기는 노트 본문 머리(chosen_of 가 다시 읽는다)
+CHOICE_PREFIX = "소유자 선택: "
+MOVE_PREFIX = "소유자: 옮김 -> "  # 상태 옮기기가 남기는 노트 머리(제목 · 본문)
+COLUMN_NAMES = {"waiting": "대기", "owner": "소유자 차례", "running": "진행 중"}  # 선택 버튼이 남기는 노트 본문 머리(chosen_of 가 다시 읽는다)
 
 DIRECTIVE_RE = re.compile(r"^\s*(미리보기|그림|영상|파일|링크|커밋|소유자|선택)\s*:\s*(.+?)\s*$", re.M)
 SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
@@ -384,7 +391,9 @@ def embed_check(url):
 
 
 def is_owner_note(j):
-    return (j.get("Title") or "").startswith(NOTE_MARK)
+    """보드가 남긴 소유자 노트: 제목 머리 [fdboard] 이고 세션이 없다(보드는 세션 없이 쓴다). 세션이 [fdboard] 제목을
+    흉내 내 쓴 노트는 소유자 노트가 아니다(수신함이 받는 세션의 믿음의 기준이라서)."""
+    return (j.get("Title") or "").startswith(NOTE_MARK) and not j.get("SessionID")
 
 
 # 이 보드를 부르는 이름만(DNS 리바인딩 막기). X-Forwarded-Host 는 믿지 않는다. 이름은 판정의 근거가 아니다
@@ -735,7 +744,11 @@ def act_move(project, req, item):
     add = [l for l in add if l not in labels]
     if not add and not rm:
         return 200, {"item": item, "unchanged": True}
-    return set_labels(project, req["id"], add, rm)
+    code, body = set_labels(project, req["id"], add, rm)
+    if code != 200:
+        return code, body
+    # 수신함(/api/inbox)에 흔적이 남게: 초인종은 동작 이름만 싣고, 받는 세션은 수신함만 믿는다.
+    return owner_note(project, req["id"], MOVE_PREFIX + COLUMN_NAMES[to], MOVE_PREFIX + COLUMN_NAMES[to])
 
 
 def act_add(project, req):
@@ -750,33 +763,39 @@ def act_add(project, req):
 
 ACTIONS = {"/api/note": act_note, "/api/done": act_done, "/api/choose": act_choose, "/api/move": act_move}
 
-# 세션 알림(README 「세션에 알림」): 동작마다 받는 세션이 읽을 이름과 요약. 요약은 소유자가 이 요청에 직접 친 글만
-# 싣는다(댓글 · 새 카드). 카드 제목 · 보기 글은 작업자도 쓰는 글이라 싣지 않는다, 받는 세션이 fd 에서 읽는다.
-TOLD = {
-    "/api/note": ("댓글", lambda req: req.get("text")),
-    "/api/done": ("했어", lambda req: ""),
-    "/api/choose": ("선택", lambda req: ""),
-    "/api/move": ("상태 옮김(%s)", lambda req: ""),
-    "/api/add": ("새 카드", lambda req: "%s · %s" % (req.get("title"), req.get("body") or "")),
-}
+# 세션 알림(README 「세션에 알림」): 동작마다 초인종에 실을 동작 이름의 열쇠(session_inbox.ACTION_NAMES).
+# 소유자 글 · 카드 제목 · 요약은 싣지 않는다. 받는 세션이 /api/inbox 와 fd 에서 읽는다.
+TOLD = {"/api/note": "note", "/api/done": "done", "/api/choose": "choose", "/api/move": "move", "/api/add": "add"}
 
 
 def tell_sessions(project, path, req, body):
-    """동작이 저장된 뒤 그 프로젝트의 세션에 한 줄. 결과는 응답의 notify 칸에, 실패는 경고와 로그로.
-    여기서 무엇이 터져도 이미 저장된 동작의 응답은 그대로 나간다(다시 누르면 노트가 둘이 된다)."""
+    """소유자 동작이 저장된 뒤: 수신함 감시에 적고(inbox_watch), 그 프로젝트의 세션에 초인종 한 줄. 결과는 응답의
+    notify 칸에, 실패는 경고와 로그로. 둘은 따로 지킨다(감시가 터져도 초인종은 나간다). 여기서 무엇이 터져도 이미
+    저장된 동작의 응답은 그대로 나간다(다시 누르면 노트가 둘이 된다)."""
     if not isinstance(body, dict) or body.get("unchanged"):
         return body
-    action, summary = TOLD[path]
-    if "%s" in action:
-        action = action % (req.get("to") or "")
-    iid = req.get("id") or ((body.get("item") or {}).get("ID")) or ""
+    # 새 카드의 id 는 보드가 지었다: fd 응답의 것만 믿는다(요청 값은 싣지 않는다).
+    iid = ((body.get("item") or {}).get("ID") or "") if path == "/api/add" else (req.get("id") or "")
+    iid = iid if isinstance(iid, str) else ""
     try:
-        body["notify"] = session_inbox.notify(project, project_of(project)["path"], project_paths(), iid, action,
-                                              summary(req) or "")
+        WATCH.acted(project, iid, TOLD[path])
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write("BOARD_INBOX_WATCH_FAILED %s\n" % e.__class__.__name__)
+    try:
+        body["notify"] = session_inbox.notify(project, project_of(project)["path"], project_paths(), iid, TOLD[path])
     except Exception as e:  # noqa: BLE001  알림은 덤이다: 까닭을 남기고 동작 응답을 지킨다
         sys.stderr.write("BOARD_NOTIFY_FAILED %s\n" % e.__class__.__name__)
         body["notify"] = {"ok": False, "sent": 0, "failed": [], "warning": "알림 못 보냄: 보드 오류 %s" % e.__class__.__name__}
     return body
+
+
+def unread_or_empty(project):
+    """화면의 안 읽힘 경고. 덤이라 터지면 빈 값(보드 화면을 막지 않는다)."""
+    try:
+        return WATCH.unread(project)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write("BOARD_INBOX_WATCH_FAILED %s\n" % e.__class__.__name__)
+        return None
 
 
 def perform(path, project, req, tell):
@@ -924,7 +943,9 @@ class Handler(BaseHTTPRequestHandler):
             if code != 200:
                 return self.send(502, err("closed_list_failed",
                                           "닫힌 항목 목록(GET /api/v1/items)을 못 읽음: %s" % code, fd=closed))
-            return self.send(200, board_of(project, dash, closed, repo_url_of(project)))
+            out = board_of(project, dash, closed, repo_url_of(project))
+            out["unread"] = unread_or_empty(project)
+            return self.send(200, out)
         if path == "/api/item":
             iid = q.get("id", "")
             if not iid:
@@ -942,7 +963,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(403, err("cross_origin", "이 보드의 페이지에서 온 요청만: " + why))
             return self.send(200, embed_check(q.get("url", "")))
         if path == "/api/inbox":
-            return self.send(*inbox_of(project))
+            asked = WATCH.clock()  # 읽기 전에 잰다: 읽는 사이 저장된 동작은 이 응답에 없으니 읽힘이 아니다
+            code, body = inbox_of(project)
+            if code == 200 and self.local:  # 조정 세션은 로컬 포트로 읽는다: 그때까지의 소유자 동작은 읽힘
+                WATCH.read(project, at=asked)
+            return self.send(code, body)
         if path == "/file":
             return self.serve_file(q)
         return self.send(404, err("not_found", path))

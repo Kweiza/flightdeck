@@ -2,7 +2,9 @@
 
 Go 시험(server/cmd/fd/board_py_test.go)이 이것을 돌리고 「OK」 줄을 단언한다.
 """
+import atexit
 import importlib
+import shutil
 import os
 import sys
 import tempfile
@@ -28,7 +30,9 @@ def load_board(**env):
                 os.environ[k] = v
 
 
-B = load_board(BOARD_FILE_ROOTS="/nonexistent-root", BOARD_LINKS="/nonexistent/links.json",
+WATCH_DIR = tempfile.mkdtemp(prefix="fdbw")  # 수신함 감시 파일: 시험이 사람의 설정 폴더에 쓰지 않게
+atexit.register(shutil.rmtree, WATCH_DIR, True)
+B = load_board(BOARD_WATCH=os.path.join(WATCH_DIR, "inbox-watch.json"), BOARD_FILE_ROOTS="/nonexistent-root", BOARD_LINKS="/nonexistent/links.json",
                FD_CONFIG="/nonexistent/config.json", BOARD_PROJECT="", BOARD_HOSTS="board.example.ts.net:37430",
                BOARD_AUTH="/nonexistent/auth.json", BOARD_TAILNET="", BOARD_PREVIEW_PORTS="", BOARD_ADDR="", BOARD_PORT="", BOARD_LOCAL_PORT="")
 

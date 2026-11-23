@@ -170,6 +170,60 @@ func TestHooksJSONIsWiredAsDesigned(t *testing.T) {
 	}
 }
 
+// TestBoardSessionHookIsTheOnlySecondGroup 는 위 시험이 groups[0] 만 보는 빈자리를 메운다.
+//
+// SessionStart · UserPromptSubmit 의 **둘째 그룹**은 보드 세션 알림의 등록 훅(board/session_inbox.py)이다
+// (board/README 「세션에 알림」). 이 그룹은 fd 바이너리를 안 불러 위 단정에 안 걸리고, 그래서 틀려도 아무도
+// 몰랐다: 동기로 바뀌면 프롬프트마다 python 을 기다리고, `; exit 0` 이 빠지면 보드가 없는 기계에서 훅이
+// 실패로 찍히고, 다른 이벤트에 붙으면 등록이 엉뚱한 때 돈다. 그 꼴을 명령 문자열째로 잠근다.
+func TestBoardSessionHookIsTheOnlySecondGroup(t *testing.T) {
+	root := pluginRoot(t)
+	raw, err := os.ReadFile(filepath.Join(root, "hooks", "hooks.json"))
+	if err != nil {
+		t.Fatalf("hooks.json 을 못 읽었다: %v", err)
+	}
+	var hf hooksFile
+	if err := json.Unmarshal(raw, &hf); err != nil {
+		t.Fatalf("hooks.json 을 못 읽었다: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "board", "session_inbox.py")); err != nil {
+		t.Fatalf("훅이 부르는 board/session_inbox.py 가 없다: %v", err)
+	}
+	const boardHook = `[ -d "$HOME/.config/flightdeck-board" ] && command -v python3 >/dev/null 2>&1 && ` +
+		`python3 -I "${CLAUDE_PLUGIN_ROOT}/board/session_inbox.py" hook; exit 0`
+	carriesBoard := map[string]bool{"SessionStart": true, "UserPromptSubmit": true}
+	for ev, groups := range hf.Hooks {
+		carries := carriesBoard[ev]
+		if !carries {
+			if len(groups) != 1 {
+				t.Fatalf("%s 의 그룹이 %d개다: 둘째 그룹은 SessionStart · UserPromptSubmit 의 보드 등록 훅뿐이다", ev, len(groups))
+			}
+			continue
+		}
+		if len(groups) != 2 {
+			t.Fatalf("%s 의 그룹이 %d개다: fd 훅 하나와 보드 등록 훅 하나여야 한다", ev, len(groups))
+		}
+		g := groups[1]
+		if g.Matcher != groups[0].Matcher { // 첫 그룹의 matcher 값 자체는 TestHooksJSONIsWiredAsDesigned 가 잠근다
+			t.Fatalf("%s 둘째 그룹의 matcher 가 %q 다: 첫 그룹과 같은 %q 여야 한다", ev, g.Matcher, groups[0].Matcher)
+		}
+		if len(g.Hooks) != 1 {
+			t.Fatalf("%s 둘째 그룹에 훅이 %d개다", ev, len(g.Hooks))
+		}
+		h := g.Hooks[0]
+		if h.Type != "command" || h.Command != boardHook {
+			t.Fatalf("%s 둘째 그룹의 명령이 바뀌었다:\n  %q\n기대:\n  %q\n"+
+				"(보드 설정 폴더가 없으면 아무것도 안 하고, 언제나 0 으로 끝나야 한다)", ev, h.Command, boardHook)
+		}
+		if !h.Async {
+			t.Fatalf("%s 의 보드 등록 훅이 async 가 아니다: 프롬프트마다 python 을 기다리게 된다", ev)
+		}
+		if h.Timeout <= 0 || h.Timeout > 10 {
+			t.Fatalf("%s 의 보드 등록 훅 타임아웃이 %d 다: 1..10 초", ev, h.Timeout)
+		}
+	}
+}
+
 func keysOf[T any](m map[string]T) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
