@@ -545,7 +545,7 @@ func (s *Service) sessionCardsAndRoots(ctx context.Context, proj model.Project, 
 		d.note("project-path", "프로젝트 경로가 비어 있다 — git 파생을 아예 시도하지 않았다")
 	} else {
 		g = s.git(proj.Path)
-		wts, heads, wl = s.worktreeIndex(ctx, g, d)
+		wts, heads, wl = worktreeIndex(s.dc.worktreeList(ctx, g, proj.Path, mode, s.now), d)
 		roots = make([]string, 0, len(wts))
 		for wt := range wts {
 			roots = append(roots, wt)
@@ -553,12 +553,15 @@ func (s *Service) sessionCardsAndRoots(ctx context.Context, proj model.Project, 
 		sort.Strings(roots) // 파생 결과가 맵 순회 순서에 안 새게
 		// 기본 브랜치의 tip 은 신선도·ref_state 용으로만 읽는다. 변경집합의 base 로는 안 쓴다 —
 		// 그 자리는 갈래 지점이다(아래 MergeBase 참조).
-		if r, err := g.Ref(ctx, proj.DefaultBranch); err != nil {
-			d.fail("ref:"+proj.DefaultBranch, err)
+		// 화면이면 보관본일 수 있다. ref_state 보관은 git 에서 새로 읽었을 때만 한다.
+		rs := s.dc.refState(ctx, g, proj.Path, proj.DefaultBranch, mode, s.now,
+			func(ctx context.Context, r model.RefState) { s.rememberRef(ctx, proj.ID, r) })
+		if rs.err != nil {
+			d.fail("ref:"+proj.DefaultBranch, rs.err)
 		} else {
 			d.ok()
-			s.rememberRef(ctx, proj.ID, r)
-			mainSHA = r.SHA
+			d.observed(rs.at)
+			mainSHA = rs.ref.SHA
 		}
 	}
 
@@ -725,16 +728,18 @@ func (s *Service) sessionCards(ctx context.Context, proj model.Project, cut time
 // ★ 셋째 반환값이 왜 따로 있나. 색인 맵은 실패 시 빈 맵이라 "못 읽었다"와 "비었다"가 같다 —
 // 브랜치 표시에는 그래도 되지만(BranchKnown 이 가른다) 워크트리가 사라진 카드를 닫는 판정에는
 // 안 된다. 목록을 못 읽었으면 ok=false 로 나가고, 그 판정은 거기서 멈춘다(judge.WorktreeGone ①).
-func (s *Service) worktreeIndex(ctx context.Context, g GitReader, d *derive) (branches, heads map[string]string, list worktreeList) {
+//
+// 목록 한 번(ls)은 화면이면 보관본일 수 있다(derive_cache.go 의 worktreeList). 그 관측 시각을 센다.
+func worktreeIndex(ls listSnap, d *derive) (branches, heads map[string]string, list worktreeList) {
 	branches, heads = map[string]string{}, map[string]string{}
-	wts, err := g.Worktrees(ctx)
-	if err != nil {
-		d.fail("worktrees", err)
+	if ls.err != nil {
+		d.fail("worktrees", ls.err)
 		return branches, heads, worktreeList{}
 	}
 	d.ok()
+	d.observed(ls.at)
 	list.ok = true
-	for _, w := range wts {
+	for _, w := range ls.wts {
 		p := filepath.Clean(w.Path)
 		branches[p] = w.ShortBranch()
 		heads[p] = w.HEAD

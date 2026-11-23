@@ -246,8 +246,8 @@ func TestBoardDeriveCostDoesNotGrowWithCards(t *testing.T) {
 			}
 			got = gc.take()
 			warm = append(warm, got)
-			if want := map[string]int{"Worktrees": 1, "Ref": 1}; !equalCounts(got, want) {
-				t.Errorf("둘째 보드 git %v, 기대 %v, 카드마다 git 이 다시 돈다", got, want)
+			if want := map[string]int{}; !equalCounts(got, want) {
+				t.Errorf("둘째 보드 git %v, 기대 %v(목록 · tip 도 보관본), 카드마다 git 이 다시 돈다", got, want)
 			}
 			if a, b := cardPaths(first.Sessions), cardPaths(second.Sessions); fmt.Sprint(a) != fmt.Sprint(b) {
 				t.Errorf("둘째 보드의 경로가 첫 보드와 다르다:\n첫 %v\n둘 %v", a, b)
@@ -534,9 +534,16 @@ func TestSubdirCardSnapshotIsKept(t *testing.T) {
 }
 
 // 기억의 키가 sha 쌍이라는 것을 잠근다. 같은 브랜치 이름이 앞으로 가거나(새 커밋) 기본 브랜치가
-// 그 브랜치를 빨아들이면(랜딩) 둘째 보드가 새 답을 낸다.
+// 그 브랜치를 빨아들이면(랜딩) 화면은 목록 · tip 의 새로 읽기 다음 보드에서 새 답을 낸다
+// (옛 쌍의 기억을 새 tip 에 쓰지 않는다). 판정 자리는 그 자리에서 본다.
 func TestMemoFollowsBranchMoveAndLanding(t *testing.T) {
-	s, _, _ := newCountingSvc(t, WithScreenSnapshots(time.Hour, 2*time.Hour, time.Minute))
+	var mu sync.Mutex
+	t0 := time.Now().UTC()
+	now := t0
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	step := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+
+	s, _, _ := newCountingSvc(t, WithClock(clock), WithScreenSnapshots(5*time.Second, time.Hour, time.Minute))
 	repo, wt := newRepoWithWorktree(t, "feat")
 	waitBehind(t, s)
 	commit := func(name string) {
@@ -546,16 +553,43 @@ func TestMemoFollowsBranchMoveAndLanding(t *testing.T) {
 	}
 	commit("a.py")
 	sess := openSession(t, s, "p", repo, wt, "cc-1", "x")
-	if c := boardOf(t, s, sess.Session.ID).Sessions[0]; c.View.AheadMain != 1 {
+	// screen 은 refreshAfter 를 넘긴 뒤 한 장(뒤에서 새로 읽음) + 한 장(그 값을 씀)이다.
+	screen := func() SessionCard {
+		t.Helper()
+		step(10 * time.Second)
+		boardOf(t, s, sess.Session.ID)
+		s.dc.bg.Wait()
+		step(time.Second)
+		return boardOf(t, s, sess.Session.ID).Sessions[0]
+	}
+	decision := func() SessionCard {
+		t.Helper()
+		proj, err := s.st.GetProject(ctx(), "p")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cards, err := s.sessionCards(ctx(), proj, s.cut(clock(), 0), sess.Session.ID, &derive{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cards[0]
+	}
+	if c := screen(); c.View.AheadMain != 1 {
 		t.Fatalf("ahead=%d", c.View.AheadMain)
 	}
 	commit("b.py")
-	if c := boardOf(t, s, sess.Session.ID).Sessions[0]; !contains(c.View.Paths, "b.py") || c.View.AheadMain != 2 {
-		t.Fatalf("브랜치가 앞으로 간 것을 못 봤다: paths=%v ahead=%d", c.View.Paths, c.View.AheadMain)
+	if c := decision(); !contains(c.View.Paths, "b.py") || c.View.AheadMain != 2 {
+		t.Fatalf("판정 자리가 브랜치가 앞으로 간 것을 못 봤다: paths=%v ahead=%d", c.View.Paths, c.View.AheadMain)
+	}
+	if c := screen(); !contains(c.View.Paths, "b.py") || c.View.AheadMain != 2 {
+		t.Fatalf("화면이 브랜치가 앞으로 간 것을 못 봤다: paths=%v ahead=%d", c.View.Paths, c.View.AheadMain)
 	}
 	runGit(t, repo, "merge", "-q", "--ff-only", "feat")
-	if c := boardOf(t, s, sess.Session.ID).Sessions[0]; c.View.AheadMain != 0 || contains(c.View.Paths, "a.py") {
-		t.Fatalf("랜딩을 못 봤다: paths=%v ahead=%d", c.View.Paths, c.View.AheadMain)
+	if c := decision(); c.View.AheadMain != 0 || contains(c.View.Paths, "a.py") {
+		t.Fatalf("판정 자리가 랜딩을 못 봤다: paths=%v ahead=%d", c.View.Paths, c.View.AheadMain)
+	}
+	if c := screen(); c.View.AheadMain != 0 || contains(c.View.Paths, "a.py") {
+		t.Fatalf("화면이 랜딩을 못 봤다: paths=%v ahead=%d", c.View.Paths, c.View.AheadMain)
 	}
 }
 
@@ -640,5 +674,45 @@ func TestFailedRefreshKeepsGoodSnapshotAndAges(t *testing.T) {
 	set(51 * time.Second)
 	if v := board(); !v.Freshness.ObservedAt.Equal(t0.Add(50*time.Second)) || v.Freshness.Stale {
 		t.Fatalf("새로 읽은 뒤: observed=%v stale=%v", v.Freshness.ObservedAt, v.Freshness.Stale)
+	}
+}
+
+// 화면이 보관본 워크트리 목록을 써도 카드 닫기는 안전하다. 보관본보다 뒤에 생긴 워크트리의 카드는
+// (디렉토리가 있으니) 안 닫히고, 지워진 워크트리의 카드는 뒤의 새로 읽기 다음 보드에서 닫힌다.
+func TestStaleWorktreeListNeverClosesALiveCard(t *testing.T) {
+	var mu sync.Mutex
+	t0 := time.Now().UTC()
+	now := t0
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	set := func(d time.Duration) { mu.Lock(); now = t0.Add(d); mu.Unlock() }
+
+	s, _, _ := newCountingSvc(t, WithClock(clock), WithScreenSnapshots(5*time.Second, time.Hour, time.Minute))
+	repo, wt := newRepoWithWorktree(t, "feat")
+	waitBehind(t, s)
+	first := openSession(t, s, "p", repo, wt, "cc-1", "feat").Session.ID
+	board := func() BoardView {
+		t.Helper()
+		v, err := s.Board(ctx(), "p", BoardOptions{Self: first})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	board() // 목록 보관본(워크트리 feat 만)
+
+	wt2 := filepath.Join(filepath.Dir(repo), "wt-late")
+	runGit(t, repo, "worktree", "add", "-q", "-b", "late", wt2)
+	late := openSession(t, s, "p", repo, wt2, "cc-2", "late").Session.ID
+	set(time.Second) // refreshAfter 안: 보관본 목록에는 wt-late 가 없다
+	v := board()
+	if len(v.ClosedGoneWorktree) != 0 {
+		t.Fatalf("보관본 목록에 없다고 산 카드를 닫았다: %+v", v.ClosedGoneWorktree)
+	}
+	found := false
+	for _, c := range v.Sessions {
+		found = found || c.View.Session.ID == late
+	}
+	if !found {
+		t.Fatalf("뒤에 생긴 워크트리의 카드가 빠졌다")
 	}
 }

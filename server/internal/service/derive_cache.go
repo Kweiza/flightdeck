@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kweiza/flightdeck/internal/gitreader"
 	"github.com/kweiza/flightdeck/internal/model"
 )
 
@@ -26,7 +27,8 @@ import (
 //	① 커밋 쌍의 순수 결과(갈래 지점 · 변경 경로 · ahead), 입력이 sha 둘이면 답이 영원히 같다.
 //	   sha 쌍으로 기억하고 다시 안 묻는다. 무효화가 필요 없다(키가 곧 내용이다).
 //	② 워크트리의 미커밋 상태(status · diff HEAD), 파일이 바뀌면 답이 바뀌고, 그것을 싸게 알려 줄
-//	   신호가 없다(읽기 전용 바인드 마운트라 감시도 못 건다). 그래서 **관측 시각과 함께** 보관하고,
+//	   신호가 없다(읽기 전용 바인드 마운트라 감시도 못 건다). 워크트리 목록 · 기본 브랜치 tip 도
+//	   같은 성질이다. 그래서 **관측 시각과 함께** 보관하고,
 //	   화면(Board)만 그 관측을 쓰면서 뒤에서 새로 읽는다. 판정 자리(pick · amend · finish 가 지나는
 //	   sessionCards)는 언제나 지금 읽는다, 그 읽기가 보관본도 새로 고친다.
 //	③ 같은 워크트리 · 같은 커밋 쌍은 요청 안에서도, 겹친 요청 사이에서도 한 번만 읽는다(도는
@@ -101,9 +103,11 @@ type deriveCache struct {
 	maxAge       time.Duration // 0 이면 화면 보관본을 안 쓴다
 	wait         time.Duration // 화면이 보관본 없는 읽기를 기다리는 상한(maxAge>0 일 때만 쓴다)
 
-	mu   sync.Mutex
-	pure map[pureKey]*pureEntry
-	wt   map[string]*wtEntry // 워크트리 경로(Clean) → 보관본
+	mu    sync.Mutex
+	pure  map[pureKey]*pureEntry
+	wt    cells[wtSnap]   // 워크트리 경로(Clean) → 미커밋 관측
+	lists cells[listSnap] // 저장소 경로(Clean) → 워크트리 목록
+	refs  cells[refSnap]  // 저장소 경로 + ref → tip
 
 	// bg 는 뒤에서 도는 읽기의 수다. 시험이 그것이 끝나기를 기다릴 때만 쓴다.
 	bg sync.WaitGroup
@@ -111,9 +115,11 @@ type deriveCache struct {
 
 func newDeriveCache() *deriveCache {
 	return &deriveCache{
-		sem:  make(chan struct{}, deriveParallel),
-		pure: map[pureKey]*pureEntry{},
-		wt:   map[string]*wtEntry{},
+		sem:   make(chan struct{}, deriveParallel),
+		pure:  map[pureKey]*pureEntry{},
+		wt:    cells[wtSnap]{},
+		lists: cells[listSnap]{},
+		refs:  cells[refSnap]{},
 	}
 }
 
@@ -144,11 +150,9 @@ func (c *deriveCache) evict(t time.Time) {
 			delete(c.pure, k)
 		}
 	}
-	for k, e := range c.wt {
-		if e.inflight == nil && t.Sub(e.used) > memoIdle {
-			delete(c.wt, k)
-		}
-	}
+	c.wt.evict(t)
+	c.lists.evict(t)
+	c.refs.evict(t)
 }
 
 func settled(done chan struct{}) bool {
@@ -201,7 +205,7 @@ func (s *Service) readCardFacts(ctx context.Context, g GitReader, proj model.Pro
 		s.dc.bg.Add(1)
 		go func() {
 			defer s.dc.bg.Done()
-			ch <- got{i: i, wt: true, snap: s.dc.worktreeState(readCtx, g, proj.Path, wt, mode, s.now)}
+			ch <- got{i: i, wt: true, snap: s.dc.worktreeState(readCtx, g, wt, mode, s.now)}
 		}()
 	}
 	facts := make(map[branchKey]branchFacts, len(bks))
@@ -353,104 +357,102 @@ func (c *deriveCache) readFacts(ctx context.Context, g GitReader, base, head str
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ② 워크트리의 미커밋 상태
+// ② 관측 보관본: 워크트리 목록 · 기본 브랜치 tip · 워크트리 미커밋
 // ─────────────────────────────────────────────────────────────────────────────
 
-// wtSnap 은 워크트리 하나의 미커밋 관측 한 번이다. 두 축의 실패가 따로 산다.
-type wtSnap struct {
-	paths    []string
-	pathsErr error
-	delta    map[string]model.LineDelta
-	deltaErr error
-	at       time.Time // 읽기를 **시작한** 시각, 이 관측은 적어도 그때만큼 새롭다
+// snapshot 은 보관본 한 칸에 드는 관측 한 번이다.
+type snapshot interface {
+	observedAt() time.Time // 읽기를 **시작한** 시각, 이 관측은 적어도 그때만큼 새롭다
+	ok() bool              // 실패 없이 읽었나(실패한 새로 읽기가 성한 관측을 안 덮게)
 }
 
-func (sn wtSnap) ok() bool { return sn.pathsErr == nil && sn.deltaErr == nil }
-
-// wtEntry 는 워크트리 하나의 보관본이다. 필드는 mu 아래에서만 읽고 쓴다.
-type wtEntry struct {
-	snap     wtSnap
+// cell 은 키 하나의 보관본이다. 필드는 mu 아래에서만 읽고 쓴다.
+type cell[T snapshot] struct {
+	val      T
 	have     bool
 	inflight chan struct{} // 화면 쪽 읽기(첫 읽기 · 뒤의 새로 읽기)가 도는 중이면 닫히기를 기다릴 채널
 	used     time.Time
 }
 
-// readWorktree 는 워크트리 하나를 지금 읽는다. 자리(sem)는 호출자가 잡는다.
-func readWorktree(ctx context.Context, g GitReader, wt string, at time.Time) wtSnap {
-	sn := wtSnap{at: at}
-	sn.paths, sn.pathsErr = g.UncommittedPaths(ctx, wt)
-	sn.delta, sn.deltaErr = g.UncommittedDelta(ctx, wt)
-	return sn
-}
+// cells 는 한 종류의 보관본이다(키 → 칸).
+type cells[T snapshot] map[string]*cell[T]
 
-// entry 는 워크트리의 보관본 자리를 낸다(없으면 만든다). mu 를 쥐고 부른다.
-func (c *deriveCache) entry(wt string, t time.Time) *wtEntry {
-	e := c.wt[wt]
+// at 은 키의 칸을 낸다(없으면 만든다). mu 를 쥐고 부른다.
+func (m cells[T]) at(key string, t time.Time) *cell[T] {
+	e := m[key]
 	if e == nil {
-		e = &wtEntry{}
-		c.wt[wt] = e
+		e = &cell[T]{}
+		m[key] = e
 	}
 	e.used = t
 	return e
 }
 
+// evict 는 memoIdle 넘게 안 쓴 칸을 버린다(도는 읽기는 안 건드린다). mu 를 쥐고 부른다.
+func (m cells[T]) evict(t time.Time) {
+	for k, e := range m {
+		if e.inflight == nil && t.Sub(e.used) > memoIdle {
+			delete(m, k)
+		}
+	}
+}
+
 // store 는 관측을 보관한다. mu 를 쥐고 부른다.
 //
 //   - 더 새 관측이 이미 있으면 안 덮는다(뒤늦게 끝난 읽기가 새 값을 지우지 않게).
-//   - 요청이 끊겨 난 실패는 안 넣는다, 그것은 워크트리의 사실이 아니다.
+//   - 요청이 끊겨 난 실패는 안 넣는다, 그것은 저장소의 사실이 아니다.
 //   - 뒤의 새로 읽기(keepGood)가 실패하면 성한 보관본을 안 덮는다. 부하로 git 한 번이 시간을
-//     넘긴 것이 화면의 경로를 지우면 안 된다. 성한 보관본은 늙어 가다 maxAge 에서 빠진다.
-func (e *wtEntry) store(ctx context.Context, sn wtSnap, keepGood bool) {
+//     넘긴 것이 화면의 경로를 지우면 안 된다. 성한 보관본은 늙어 가다(낡음) maxAge 에서 빠진다.
+func (e *cell[T]) store(ctx context.Context, v T, keepGood bool) {
 	if ctx.Err() != nil {
 		return
 	}
-	if e.have && e.snap.at.After(sn.at) {
+	if e.have && e.val.observedAt().After(v.observedAt()) {
 		return
 	}
-	if keepGood && e.have && e.snap.ok() && !sn.ok() {
+	if keepGood && e.have && e.val.ok() && !v.ok() {
 		return
 	}
-	e.snap, e.have = sn, true
+	e.val, e.have = v, true
 }
 
-// worktreeState 는 워크트리 하나의 미커밋 관측을 낸다.
+// observe 는 키 하나의 관측을 낸다. read 는 지금 읽는다(git 자리 sem 은 read 가 잡는다).
 //
 // 판정 자리(readNow)나 보관본이 꺼진 화면은 **언제나 지금 읽는다**, 도는 읽기에 올라타지도
-// 않는다(그 읽기는 이 요청보다 먼저 시작했을 수 있다). 화면은 maxAge 안의 보관본을 쓰고
-// refreshAfter 보다 오래됐으면 뒤에서 하나 새로 읽는다. 쓸 보관본이 없으면 도는 읽기에
-// 올라타거나, 없으면 자기가 읽는다(같은 워크트리의 첫 읽기는 겹친 보드 사이에서도 하나다).
-func (c *deriveCache) worktreeState(ctx context.Context, g GitReader, repo, wt string, mode readMode, now func() time.Time) wtSnap {
-	wt = filepath.Clean(wt)
+// 않는다(그 읽기는 이 요청보다 먼저 시작했을 수 있다). 그 읽기도 보관본을 고친다.
+// 화면은 maxAge 안의 보관본을 쓰고 refreshAfter 보다 오래됐으면 뒤에서 하나 새로 읽는다.
+// 쓸 보관본이 없으면 도는 읽기에 올라타거나, 없으면 자기가 읽는다(같은 키의 첫 읽기는
+// 겹친 보드 사이에서도 하나다).
+func observe[T snapshot](c *deriveCache, m cells[T], key string, ctx context.Context, mode readMode,
+	now func() time.Time, read func(context.Context) T) T {
+
 	if !c.screenSnapshots(mode) {
-		at := now()
-		if !c.acquire(ctx) {
-			return wtSnap{at: at, pathsErr: ctx.Err(), deltaErr: ctx.Err()}
-		}
-		sn := readWorktree(ctx, g, wt, at)
-		c.release()
+		v := read(ctx)
 		if c.maxAge > 0 { // 화면이 보관본을 쓸 때만 넣는다(꺼져 있으면 아무도 안 꺼낸다)
 			c.mu.Lock()
-			c.entry(wt, now()).store(ctx, sn, false)
+			m.at(key, now()).store(ctx, v, false)
 			c.mu.Unlock()
 		}
-		return sn
+		return v
 	}
 	for {
 		t := now()
 		c.mu.Lock()
-		e := c.entry(wt, t)
-		if e.have && t.Sub(e.snap.at) <= c.maxAge {
-			sn := e.snap
-			if t.Sub(sn.at) >= c.refreshAfter && e.inflight == nil {
+		e := m.at(key, t)
+		if e.have && t.Sub(e.val.observedAt()) <= c.maxAge {
+			v := e.val
+			if t.Sub(v.observedAt()) >= c.refreshAfter && e.inflight == nil {
 				e.inflight = make(chan struct{})
 				c.bg.Add(1)
 				go func() {
 					defer c.bg.Done()
-					c.readInto(context.Background(), g, wt, e, now, true)
+					// 요청의 ctx 를 안 쓴다. 응답이 나가면 그 ctx 는 끝나고, 그러면 읽기가 매번
+					// 취소돼 보관본이 영영 안 새로워진다. 상한은 git 한 번의 시간 상한(gitreader)이 건다.
+					readInto(c, e, context.Background(), read, true)
 				}()
 			}
 			c.mu.Unlock()
-			return sn
+			return v
 		}
 		if ch := e.inflight; ch != nil {
 			c.mu.Unlock()
@@ -458,32 +460,112 @@ func (c *deriveCache) worktreeState(ctx context.Context, g GitReader, repo, wt s
 			case <-ch:
 				continue // 그 읽기가 넣은 보관본을 다시 본다
 			case <-ctx.Done():
-				return wtSnap{at: t, pathsErr: ctx.Err(), deltaErr: ctx.Err()}
+				return read(ctx) // 끊긴 ctx 로 읽으면 곧바로 그 실패가 난다
 			}
 		}
 		e.inflight = make(chan struct{})
 		c.mu.Unlock()
-		return c.readInto(ctx, g, wt, e, now, false)
+		return readInto(c, e, ctx, read, false)
 	}
 }
 
-// readInto 는 e.inflight 를 쥔 쪽이 워크트리를 읽어 보관하고 inflight 를 푼다.
-//
-// 뒤의 새로 읽기(background)는 요청의 ctx 를 안 쓴다. 응답이 나가면 그 ctx 는 끝나고, 그러면
-// 읽기가 매번 취소돼 보관본이 영영 안 새로워진다. 상한은 git 한 번의 시간 상한(gitreader)이 건다.
-func (c *deriveCache) readInto(ctx context.Context, g GitReader, wt string, e *wtEntry, now func() time.Time, background bool) wtSnap {
-	at := now()
-	sn := wtSnap{at: at, pathsErr: ctx.Err(), deltaErr: ctx.Err()}
-	if c.acquire(ctx) {
-		sn = readWorktree(ctx, g, wt, at)
-		c.release()
-	}
+// readInto 는 e.inflight 를 쥔 쪽이 읽어 보관하고 inflight 를 푼다.
+func readInto[T snapshot](c *deriveCache, e *cell[T], ctx context.Context, read func(context.Context) T, background bool) T {
+	v := read(ctx)
 	c.mu.Lock()
-	e.store(ctx, sn, background)
+	e.store(ctx, v, background)
 	close(e.inflight)
 	e.inflight = nil
 	c.mu.Unlock()
-	return sn
+	return v
+}
+
+// withSlot 은 git 실행 자리를 잡고 fn 을 부른다. 못 잡으면(ctx 끝남) failed 를 낸다.
+func withSlot[T any](c *deriveCache, ctx context.Context, failed func(error) T, fn func() T) T {
+	if !c.acquire(ctx) {
+		return failed(ctx.Err())
+	}
+	defer c.release()
+	return fn()
+}
+
+// wtSnap 은 워크트리 하나의 미커밋 관측 한 번이다. 두 축의 실패가 따로 산다.
+type wtSnap struct {
+	paths    []string
+	pathsErr error
+	delta    map[string]model.LineDelta
+	deltaErr error
+	at       time.Time
+}
+
+func (sn wtSnap) observedAt() time.Time { return sn.at }
+func (sn wtSnap) ok() bool              { return sn.pathsErr == nil && sn.deltaErr == nil }
+
+// worktreeState 는 워크트리 하나의 미커밋 관측을 낸다(observe 의 규칙대로).
+func (c *deriveCache) worktreeState(ctx context.Context, g GitReader, wt string, mode readMode, now func() time.Time) wtSnap {
+	wt = filepath.Clean(wt)
+	return observe(c, c.wt, wt, ctx, mode, now, func(ctx context.Context) wtSnap {
+		at := now()
+		return withSlot(c, ctx, func(err error) wtSnap { return wtSnap{at: at, pathsErr: err, deltaErr: err} }, func() wtSnap {
+			sn := wtSnap{at: at}
+			sn.paths, sn.pathsErr = g.UncommittedPaths(ctx, wt)
+			sn.delta, sn.deltaErr = g.UncommittedDelta(ctx, wt)
+			return sn
+		})
+	})
+}
+
+// listSnap 은 저장소 하나의 `git worktree list` 한 번이다.
+type listSnap struct {
+	wts []gitreader.Worktree
+	err error
+	at  time.Time
+}
+
+func (l listSnap) observedAt() time.Time { return l.at }
+func (l listSnap) ok() bool              { return l.err == nil }
+
+// worktreeList 는 저장소의 워크트리 목록을 낸다(observe 의 규칙대로).
+//
+// ★ 화면이 보관본 목록을 써도 사라진 워크트리의 카드 닫기는 안전하다. 닫기는 목록에 없다는 것에
+// 더해 그 디렉토리가 **지금** 없어야 한다(gone_worktree.go, lstat). 보관본보다 뒤에 생긴
+// 워크트리는 디렉토리가 있어 안 닫히고, 지워진 워크트리는 다음 새로 읽기 뒤에 닫힌다.
+func (c *deriveCache) worktreeList(ctx context.Context, g GitReader, repo string, mode readMode, now func() time.Time) listSnap {
+	return observe(c, c.lists, filepath.Clean(repo), ctx, mode, now, func(ctx context.Context) listSnap {
+		at := now()
+		return withSlot(c, ctx, func(err error) listSnap { return listSnap{err: err, at: at} }, func() listSnap {
+			wts, err := g.Worktrees(ctx)
+			return listSnap{wts: wts, err: err, at: at}
+		})
+	})
+}
+
+// refSnap 은 ref 하나의 tip 관측이다.
+type refSnap struct {
+	ref model.RefState
+	err error
+	at  time.Time
+}
+
+func (r refSnap) observedAt() time.Time { return r.at }
+func (r refSnap) ok() bool              { return r.err == nil }
+
+// refState 는 저장소 repo 의 ref 하나의 tip 을 낸다(observe 의 규칙대로). fresh 는 git 에서
+// 새로 읽은 성한 관측마다 한 번 불린다(ref_state 보관, 보관본에서 꺼낸 값은 이미 보관됐다).
+func (c *deriveCache) refState(ctx context.Context, g GitReader, repo, ref string, mode readMode, now func() time.Time,
+	fresh func(context.Context, model.RefState)) refSnap {
+
+	return observe(c, c.refs, filepath.Clean(repo)+"\x00"+ref, ctx, mode, now, func(ctx context.Context) refSnap {
+		at := now()
+		r := withSlot(c, ctx, func(err error) refSnap { return refSnap{err: err, at: at} }, func() refSnap {
+			r, err := g.Ref(ctx, ref)
+			return refSnap{ref: r, err: err, at: at}
+		})
+		if r.ok() {
+			fresh(ctx, r.ref)
+		}
+		return r
+	})
 }
 
 // hasKey 는 맵에 키가 있는지다(값이 0값이어도).
