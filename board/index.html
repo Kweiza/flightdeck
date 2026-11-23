@@ -204,9 +204,9 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
 <nav id="links" aria-label="자주 쓰는 링크"></nav>
 <div class="layout">
   <main id="board">
+    <section class="column col-waiting" data-col="waiting"><h2><span class="dot" style="background:var(--waiting)"></span>대기 <span class="n">0</span></h2><div class="cards"></div></section>
     <section class="column col-owner" data-col="owner"><h2><span class="dot" style="background:var(--owner)"></span>소유자 차례 <span class="n">0</span></h2><div class="cards"></div></section>
     <section class="column col-running" data-col="running"><h2><span class="dot" style="background:var(--running)"></span>진행 중 <span class="n">0</span></h2><div class="cards"></div></section>
-    <section class="column col-waiting" data-col="waiting"><h2><span class="dot" style="background:var(--waiting)"></span>대기 <span class="n">0</span></h2><div class="cards"></div></section>
     <section class="column col-done" data-col="done"><h2><span class="dot" style="background:var(--done)"></span>끝남 <span class="n">0</span></h2><div class="cards"></div><button class="more" type="button" hidden>더 보기</button></section>
   </main>
   <aside id="panel" hidden aria-label="카드 상세">
@@ -223,7 +223,7 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
 <script>
 (() => {
   const REFRESH_MS = 30000, DONE_STEP = 30;
-  const COLS = ["owner", "running", "waiting", "done"];
+  const COLS = ["waiting", "owner", "running", "done"];
   const COL_NAME = { owner: "소유자 차례", running: "진행 중", waiting: "대기", done: "끝남" };
   const MARK = "[fdboard]";
   const $ = (s, el = document) => el.querySelector(s);
