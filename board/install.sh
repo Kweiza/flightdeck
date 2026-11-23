@@ -127,7 +127,9 @@ fi
 echo "BOARD_READY http://127.0.0.1:$port label=$label board=$here/board.py hosts=${hosts:-(루프백만)} owners=$owners"
 if [ -n "$hosts" ] && command -v tailscale >/dev/null 2>&1; then
   ts_port="${hosts##*:}"
-  if ! tailscale serve status 2>/dev/null | grep -q ":$ts_port"; then
+  # pipefail 아래서 grep -q 가 먼저 끝나면 앞 명령이 SIGPIPE 로 져서 「없음」으로 읽힌다: 먼저 받아 둔다.
+  serve_status="$(tailscale serve status 2>/dev/null || true)"
+  if ! grep -q ":$ts_port " <<<"$serve_status"; then
     echo "tailnet 경로 없음: tailscale serve --bg --https=$ts_port http://127.0.0.1:$port 로 연다(다른 경로는 그대로 둔다)"
   fi
 fi
