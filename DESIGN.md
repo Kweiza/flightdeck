@@ -1101,8 +1101,8 @@ TLS 뒤에서만 `Secure`)를 굽고, `JudgeAuth` 는 **`/` · `/actions/*` · `
 | `PreCompact` | — | `async` `fd note --draft` — 압축으로 판단이 날아가는 것만 막는다 |
 | `Stop` | — | `fd hook stop` → 처방(발화 5조건, 전이 1회) 주입 + 라이프사이클 단계면 decision:block(대화 단위 판정 · 방벽은 stop_hook_active). **fail-open, 3초** |
 | `SessionEnd` | `clear` | `async` `fd hook session-end` → 떠나는 대화의 카드를 닫는다. **선점이 있으면 안 닫는다** |
-| `PreToolUse` | `Agent` | `fd hook worker-card` → 작업자 지시에 `fd:<id>`(또는 `fd:none`)가 없거나 꼬리표를 못 달면 **거절**(permissionDecision deny), 있으면 `status:running` + 닫는 줄 꼬리글(updatedInput). **유일하게 막는 훅**이다 |
-| `SubagentStop` | — | `fd hook worker-close` → 작업자 마지막 말의 `FD_FINISH`·`FD_OWNER`·`FD_BLOCKED` 로 finish · 꼬리표 · 막힘 판단, 결과는 systemMessage + 설정 폴더 로그. 줄 규약은 board/README 「작업자 카드 훅」 |
+| `PreToolUse` | `Agent` | `fd hook worker-card` → 작업자 지시에 `fd:<id>`(또는 `fd:none`)가 없거나 카드 기록 · 꼬리표를 못 달면 **거절**(permissionDecision deny), 있으면 `status:running` + 닫는 줄 꼬리글(updatedInput). **유일하게 막는 훅**이다 |
+| `SubagentStop` | — | `fd hook worker-close` → 작업자 마지막 말의 `FD_FINISH`·`FD_OWNER`·`FD_BLOCKED` 로 finish · 꼬리표 · 막힘 판단, 그 작업자를 띄운 호출에 이 세션이 기록한 카드만. 결과는 systemMessage + 설정 폴더 로그. 줄 규약은 board/README 「작업자 카드 훅」 |
 
 **`Stop` 의 "발화 5조건"은 `judge.Prescribe` 가 부르는 생성기 다섯이다** —
 `lane-turn` · `overlap` · `outside` · `unclaimed` · `silent`(`judge/prescribe.go` 의 상수 다섯).

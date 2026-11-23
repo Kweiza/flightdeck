@@ -168,12 +168,17 @@ When a coordinating session launches and collects a worker (sub-agent), two plug
 
 - On launch (`PreToolUse` · `Agent`, `fd hook worker-card`): a prompt without `fd:<item id>` is refused (`fd:none` for a short job with no card;
   read-only helpers such as Explore · Plan are skipped). Otherwise the item gets `status:running` and the closing-line convention is appended to the prompt
-  (only the label if the prompt already contains `FD_FINISH`). If the label cannot be added (no such item) the launch is refused.
+  (only the label if the prompt already contains `FD_FINISH`). If the label cannot be added (no such item) or the card record cannot be written, the launch is refused.
+  A worker launched by a worker passes with no label and no footer (still refused without a card marker), and its words close no card.
+  Cards handed over later with SendMessage are not recorded for that launch and are not closed on stop (the coordinator closes them by hand).
 - On stop (`SubagentStop`, `fd hook worker-close`): reads the worker's last message.
   `FD_FINISH <id> [done|dropped]` then lines up to `FD_END` are the finish body (an `FD_FOLLOWUPS [...]` line inside adds followups; a list of strings is accepted),
   `FD_OWNER <id>` swaps `status:running` for `status:owner`, `FD_BLOCKED <id> <reason>` removes `status:running` and records a blocked judgment.
+  It closes only cards **this session's launch hook labelled for the call that launched this worker (`toolUseId` in the `.meta.json` next to the worker transcript)**
+  (records in `hooks/fd-worker-cards/` under the config folder, one 0600 file per launch; closed cards drop out). If the meta cannot be read or has `parentAgentId` (a worker launched by a worker), nothing is closed. Ids must match `^[A-Za-z0-9][A-Za-z0-9._/-]*$`. Anything else is refused and reported.
   Results reach the coordinator as a systemMessage and one line in `hooks/fd-worker-close.log` under the Claude Code config folder (`CLAUDE_CONFIG_DIR`, else `.claude` in the home folder).
 - If user settings also register the same `fd hook worker-card` · `fd hook worker-close` (for sessions that have not loaded the plugin version yet), each call is handled once (markers in `hooks/fd-worker-once/` there). Only these subcommands read the markers, so registering a different script alongside does the work twice.
+  In a session that also runs the old version (0.45.0), the new version takes the old version's marker too and so holds it off; a call the old version took first is left alone and reported with "reopen the coordinating session". A failed report clears only the new version's marker, so an old version arriving late cannot redo it without the binding.
 - If a closing word (`FD_FINISH` etc.) appears but not in the convention's shape (not at line start, missing `FD_END`), it reports that nothing was closed. A failed report clears its marker so the same report is retried when it comes again.
 
 ## What owner actions leave in fd

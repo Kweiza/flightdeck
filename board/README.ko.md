@@ -168,12 +168,17 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 
 - 띄울 때(`PreToolUse` · `Agent`, `fd hook worker-card`): 지시(prompt)에 `fd:<항목 id>` 가 없으면 띄우지 않는다(카드 없는 짧은 일은 `fd:none`,
   읽기 전용 도우미 Explore · Plan 등은 빼고). 있으면 그 항목에 `status:running` 을 달고, 지시 끝에 닫는 줄 규약을 붙인다
-  (지시에 `FD_FINISH` 가 이미 있으면 꼬리표만). 항목이 없어 꼬리표를 못 달면 띄우지 않는다.
+  (지시에 `FD_FINISH` 가 이미 있으면 꼬리표만). 항목이 없어 꼬리표를 못 달거나 카드 기록을 못 적으면 띄우지 않는다.
+  작업자가 띄운 작업자는 꼬리표도 꼬리글도 없이 지나가고(카드 표시가 없으면 여전히 거절), 그 말로는 아무 카드도 닫지 않는다.
+  SendMessage 로 새로 맡긴 카드는 그 띄우기에 기록되지 않아 끝날 때 닫히지 않는다(조정 세션이 손으로 닫는다).
 - 끝날 때(`SubagentStop`, `fd hook worker-close`): 작업자의 마지막 말에서 줄을 읽는다.
   `FD_FINISH <id> [done|dropped]` 다음 줄부터 `FD_END` 까지가 finish 본문(안에 `FD_FOLLOWUPS [...]` 한 줄을 두면 후속, 문자열 목록도 받는다),
   `FD_OWNER <id>` 는 `status:running` 을 떼고 `status:owner`, `FD_BLOCKED <id> <사유>` 는 `status:running` 을 떼고 blocked 판단.
+  닫는 것은 **그 작업자를 띄운 호출(작업자 기록 옆 `.meta.json` 의 `toolUseId`)에 이 세션의 띄울 때 훅이 꼬리표를 단 카드**뿐이다
+  (설정 폴더의 `hooks/fd-worker-cards/` 기록, 띄우기마다 0600 파일, 닫은 카드는 빠진다). meta 를 못 읽거나 `parentAgentId` 가 있으면(작업자가 띄운 작업자) 아무것도 닫지 않는다. id 는 `^[A-Za-z0-9][A-Za-z0-9._/-]*$` 꼴만 받는다. 그 밖은 거절하고 결과 줄로 알린다.
   결과는 조정 세션에 systemMessage 로, 그리고 Claude Code 설정 폴더(`CLAUDE_CONFIG_DIR`, 없으면 홈의 `.claude`)의 `hooks/fd-worker-close.log` 에 한 줄씩 남는다.
 - 사용자 설정에도 같은 `fd hook worker-card` · `fd hook worker-close` 를 걸어 두면(플러그인 판을 아직 안 읽은 세션을 위해) 호출마다 한 번만 일한다(같은 폴더의 `hooks/fd-worker-once/` 표식). 표식은 이 하위 명령끼리만 보므로 다른 스크립트를 함께 걸면 두 번 일한다.
+  옛 판(0.45.0)이 함께 걸린 세션에서는 새 판이 옛 판의 표식도 잡아 옛 판을 막고, 옛 판이 먼저 맡은 호출에는 손대지 않고 「조정 세션을 다시 연다」고 알린다. 실패한 보고를 다시 받을 때 지우는 것은 새 판의 표식뿐이라, 늦게 온 옛 판이 그 보고를 묶음 없이 다시 하지 못한다.
 - 닫는 낱말(`FD_FINISH` 등)이 보이는데 규약 꼴이 아니면(줄 머리가 아님 · `FD_END` 빠짐) 아무것도 닫지 않았다고 알린다. 실패한 보고는 표식을 지워, 같은 보고를 다시 받으면 다시 해 본다.
 
 ## 소유자 동작이 fd 에 남기는 흔적
