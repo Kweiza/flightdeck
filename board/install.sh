@@ -6,8 +6,8 @@
 #   board/install.sh --uninstall
 #
 # 설정은 환경 변수로 받아 plist 에 적는다(README 「설정」). 안 주면 지금 돌고 있는 plist 의 값을 이어받고,
-# 그것도 없으면 기본값이다 — 다시 설치할 때 기계별 값을 잃지 않게.
-#   BOARD_PORT(7430) · BOARD_PROJECT · BOARD_FILE_ROOTS · BOARD_LINKS · BOARD_HOSTS · FD_CONFIG
+# 그것도 없으면 기본값이다. 다시 설치할 때 기계별 값을 잃지 않게.
+#   BOARD_PORT(7430, serve 가 가리킴) · BOARD_LOCAL_PORT(7431, 에이전트 · 로컬 확인용) · BOARD_PROJECT · BOARD_FILE_ROOTS · BOARD_LINKS · BOARD_HOSTS · FD_CONFIG
 #   BOARD_TAILNET · BOARD_PREVIEW_PORTS · BOARD_AUTH(~/.config/flightdeck-board/auth.json)
 #   BOARD_TS_PORT(37430): BOARD_HOSTS 가 비면 tailscale 이름과 이 포트로 「<이름>:<포트>」를 만든다
 #   BOARD_OWNER_LOGIN: 접근 설정 파일이 새로 생길 때 넣을 소유자 tailnet 로그인(없으면 이 기계 tailscale 사용자).
@@ -39,6 +39,7 @@ fi
 # 지금 plist 의 값(있으면) -> 안 준 변수의 기본.
 prev() { [ -f "$plist" ] && /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$plist" 2>/dev/null || true; }
 port="${BOARD_PORT:-$(prev BOARD_PORT)}"; port="${port:-7430}"
+lport="${BOARD_LOCAL_PORT:-$(prev BOARD_LOCAL_PORT)}"; lport="${lport:-7431}"
 project="${BOARD_PROJECT-$(prev BOARD_PROJECT)}"
 roots="${BOARD_FILE_ROOTS:-$(prev BOARD_FILE_ROOTS)}"
 links="${BOARD_LINKS:-$(prev BOARD_LINKS)}"
@@ -55,7 +56,7 @@ ts_name="$(printf '%s' "$ts_json" | "$py" -I -c 'import json,sys; print(json.loa
 
 render() {
   LABEL="$label" PY="$py" BOARD="$here/board.py" LOG="$log" \
-  E_BOARD_PORT="$port" E_BOARD_PROJECT="$project" E_BOARD_FILE_ROOTS="$roots" E_BOARD_LINKS="$links" \
+  E_BOARD_PORT="$port" E_BOARD_LOCAL_PORT="$lport" E_BOARD_PROJECT="$project" E_BOARD_FILE_ROOTS="$roots" E_BOARD_LINKS="$links" \
   E_BOARD_HOSTS="$hosts" E_FD_CONFIG="$fdcfg" E_BOARD_TAILNET="$tailnet" E_BOARD_PREVIEW_PORTS="$pports" \
   E_BOARD_AUTH="$auth" \
   "$py" -I -c '
@@ -115,16 +116,24 @@ for _ in $(seq 1 50); do launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 |
 launchctl bootstrap "gui/$(id -u)" "$plist"
 
 for _ in $(seq 1 50); do
-  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/healthz" || true)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$lport/healthz" || true)"
   [ "$code" = "200" ] && break
   sleep 0.2
 done
 if [ "$code" != "200" ]; then
-  echo "BOARD_INSTALL_FAILED: http://127.0.0.1:$port/healthz = $code (로그 $log, fd 서버가 떠 있는지 curl -s localhost:7420/healthz)" >&2
+  echo "BOARD_INSTALL_FAILED: http://127.0.0.1:$lport/healthz = $code (로그 $log, fd 서버가 떠 있는지 curl -s localhost:7420/healthz)" >&2
   tail -5 "$log" >&2 || true
   exit 1
 fi
-echo "BOARD_READY http://127.0.0.1:$port label=$label board=$here/board.py hosts=${hosts:-(루프백만)} owners=$owners"
+# 두 포트 모두 루프백에만 묶였는가(바깥에 열리면 신원 헤더를 누구나 위조한다).
+for p in "$port" "$lport"; do
+  listen="$(lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $9}' | sort -u || true)"
+  if [ -z "$listen" ] || grep -qv '^127\.0\.0\.1:\|^\[::1\]:' <<<"$listen"; then
+    echo "BOARD_INSTALL_FAILED: $p 포트가 루프백 밖에 묶였거나 안 열림: ${listen:-(없음)}" >&2
+    exit 1
+  fi
+done
+echo "BOARD_READY http://127.0.0.1:$port local=http://127.0.0.1:$lport label=$label board=$here/board.py hosts=${hosts:-(루프백만)} owners=$owners"
 if [ -n "$hosts" ] && command -v tailscale >/dev/null 2>&1; then
   ts_port="${hosts##*:}"
   # pipefail 아래서 grep -q 가 먼저 끝나면 앞 명령이 SIGPIPE 로 져서 「없음」으로 읽힌다: 먼저 받아 둔다.

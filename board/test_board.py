@@ -30,7 +30,7 @@ def load_board(**env):
 
 B = load_board(BOARD_FILE_ROOTS="/nonexistent-root", BOARD_LINKS="/nonexistent/links.json",
                FD_CONFIG="/nonexistent/config.json", BOARD_PROJECT="", BOARD_HOSTS="board.example.ts.net:37430",
-               BOARD_AUTH="/nonexistent/auth.json", BOARD_TAILNET="", BOARD_PREVIEW_PORTS="", BOARD_ADDR="", BOARD_PORT="")
+               BOARD_AUTH="/nonexistent/auth.json", BOARD_TAILNET="", BOARD_PREVIEW_PORTS="", BOARD_ADDR="", BOARD_PORT="", BOARD_LOCAL_PORT="")
 
 DECISION = """맨 윗줄 요약
 ### 질문
@@ -234,29 +234,34 @@ class Embed(unittest.TestCase):
 
 
 class Access(unittest.TestCase):
-    def deny(self, path, auth=AUTH, **h):
-        return B.access_denied({k.replace("_", "-"): v for k, v in h.items()}, path, auth)
+    def deny(self, path, method="GET", local=False, auth=AUTH, **h):
+        return B.access_denied({k.replace("_", "-"): v for k, v in h.items()}, path, method, local, auth)
 
-    def test_tailnet_needs_owner(self):
+    def test_public_port_always_needs_owner(self):
         self.assertIn("신원", self.deny("/", Host=TS))
+        self.assertIn("신원", self.deny("/", Host="127.0.0.1:7430"))  # Host 를 루프백으로 위조해도
+        self.assertIn("신원", self.deny("/api/board", Host="127.0.0.1:7430", Cookie="fdboard=" + SECRET))
         self.assertIn("소유자", self.deny("/", Host=TS, Tailscale_User_Login="other@example.com"))
         self.assertEqual(self.deny("/", Host=TS, Tailscale_User_Login="Owner@Example.com"), "")
         self.assertIn("쿠키", self.deny("/api/board", Host=TS, Tailscale_User_Login=OWNER))
+        self.assertIn("쿠키", self.deny("/file", Host=TS, Tailscale_User_Login=OWNER, Cookie="fdboard=wrong"))
         self.assertEqual(self.deny("/api/board", Host=TS, Tailscale_User_Login=OWNER, Cookie="a=b; fdboard=" + SECRET), "")
 
-    def test_loopback_needs_cookie(self):
-        self.assertEqual(self.deny("/", Host="127.0.0.1:7430"), "")
-        self.assertIn("쿠키", self.deny("/file", Host="127.0.0.1:7430"))
-        self.assertIn("쿠키", self.deny("/api/inbox", Host="127.0.0.1:7430", Cookie="fdboard=wrong"))
-        self.assertEqual(self.deny("/api/inbox", Host="127.0.0.1:7430", Cookie="fdboard=" + SECRET), "")
-        self.assertIn("소유자", self.deny("/", Host="127.0.0.1:7430", Tailscale_User_Login="other@example.com"))
+    def test_local_port_reads_free_writes_need_secret(self):
+        self.assertEqual(self.deny("/api/inbox", local=True), "")
+        self.assertEqual(self.deny("/file", "HEAD", local=True), "")
+        self.assertIn("X-Board-Secret", self.deny("/api/note", "POST", local=True))
+        self.assertIn("X-Board-Secret", self.deny("/api/note", "POST", local=True, X_Board_Secret="wrong"))
+        self.assertIn("X-Board-Secret", self.deny("/api/note", "POST", local=True, Cookie="fdboard=" + SECRET))
+        self.assertEqual(self.deny("/api/note", "POST", local=True, X_Board_Secret=SECRET), "")
 
     def test_no_auth_file(self):
-        self.assertIn("install.sh", B.access_denied({"Host": "127.0.0.1:7430"}, "/", {}))
+        self.assertIn("install.sh", B.access_denied({}, "/", "GET", True, {}))
         self.assertIsNone(B.read_auth("/nonexistent/auth.json"))
 
     def test_bind_loopback_only(self):
         self.assertEqual(B.ADDR, "127.0.0.1")
+        self.assertEqual((B.PORT, B.LOCAL_PORT), (7430, 7431))
         B.check_bind("127.0.0.1")
         B.check_bind("::1")
         for bad in ("0.0.0.0", "100.64.0.1", "::"):
@@ -265,7 +270,8 @@ class Access(unittest.TestCase):
 
 
 class Http(unittest.TestCase):
-    """실제 Handler 를 띄워 쿠키 · embed 같은 출처 검사를 본다(fd 는 안 부르는 경로만)."""
+    """실제 두 Handler(바깥 · 로컬)를 띄워 신원 · 쿠키 · 비밀 · embed 같은 출처를 본다. Host 는 설정 포트 이름으로
+    준다(판정은 Host 가 아니라 어느 서버로 왔는지로 갈린다는 것이 이 시험의 요점이다)."""
 
     @classmethod
     def setUpClass(cls):
@@ -273,40 +279,62 @@ class Http(unittest.TestCase):
         cls.keep = B.AUTH, B.Handler.log_message
         B.AUTH = AUTH
         B.Handler.log_message = lambda *a: None
-        cls.srv = B.ThreadingHTTPServer(("127.0.0.1", 0), B.Handler)
-        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.pub = B.ThreadingHTTPServer(("127.0.0.1", 0), B.Handler)
+        cls.loc = B.ThreadingHTTPServer(("127.0.0.1", 0), B.LocalHandler)
+        for srv in (cls.pub, cls.loc):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls):
-        cls.srv.shutdown()
-        cls.srv.server_close()
+        for srv in (cls.pub, cls.loc):
+            srv.shutdown()
+            srv.server_close()
         B.AUTH, B.Handler.log_message = cls.keep
 
-    def get(self, path, **h):
+    def call(self, srv, path, method="GET", body=None, **h):
         import http.client
-        c = http.client.HTTPConnection("127.0.0.1", self.srv.server_port, timeout=5)
-        c.request("GET", path, headers={"Host": "127.0.0.1:7430", **{k.replace("_", "-"): v for k, v in h.items()}})
+        host = "127.0.0.1:7431" if srv is self.loc else "127.0.0.1:7430"
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_port, timeout=5)
+        c.request(method, path, body=body, headers={"Host": host, **{k.replace("_", "-"): v for k, v in h.items()}})
         r = c.getresponse()
         r.read()
         c.close()
         return r
 
-    def test_index_sets_strict_cookie(self):
-        r = self.get("/")
+    def test_public_spoofed_loopback_host_gets_403_and_no_cookie(self):
+        r = self.call(self.pub, "/")
+        self.assertEqual(r.status, 403)
+        self.assertIsNone(r.getheader("Set-Cookie"))
+
+    def test_public_owner_gets_strict_cookie(self):
+        r = self.call(self.pub, "/", Tailscale_User_Login=OWNER)
         self.assertEqual(r.status, 200)
         self.assertEqual(r.getheader("Set-Cookie"), "fdboard=%s; HttpOnly; SameSite=Strict; Path=/" % SECRET)
 
-    def test_file_and_api_need_cookie(self):
-        self.assertEqual(self.get("/file?path=/x.png").status, 403)
-        self.assertEqual(self.get("/api/config").status, 403)
-        self.assertEqual(self.get("/api/config", Cookie="fdboard=" + SECRET).status, 200)
-        self.assertEqual(self.get("/", Host="evil.example:7430").status, 421)
+    def test_public_file_and_api_need_cookie(self):
+        me = {"Tailscale_User_Login": OWNER}
+        self.assertEqual(self.call(self.pub, "/file?path=/x.png", **me).status, 403)
+        self.assertEqual(self.call(self.pub, "/api/config", **me).status, 403)
+        self.assertEqual(self.call(self.pub, "/api/config", Cookie="fdboard=" + SECRET, **me).status, 200)
+        self.assertEqual(self.call(self.pub, "/", Host="evil.example:7430", **me).status, 421)
 
-    def test_embed_same_origin(self):
-        ck = "fdboard=" + SECRET
-        self.assertEqual(self.get("/api/embed?url=https://x/", Cookie=ck).status, 403)
-        self.assertEqual(self.get("/api/embed?url=https://x/", Cookie=ck, Sec_Fetch_Site="cross-site").status, 403)
-        self.assertEqual(self.get("/api/embed?url=https://x/", Cookie=ck, Sec_Fetch_Site="same-origin").status, 200)
+    def test_public_embed_same_origin(self):
+        me = {"Tailscale_User_Login": OWNER, "Cookie": "fdboard=" + SECRET}
+        self.assertEqual(self.call(self.pub, "/api/embed?url=https://x/", **me).status, 403)
+        self.assertEqual(self.call(self.pub, "/api/embed?url=https://x/", Sec_Fetch_Site="cross-site", **me).status, 403)
+        self.assertEqual(self.call(self.pub, "/api/embed?url=https://x/", Sec_Fetch_Site="same-origin", **me).status, 200)
+
+    def test_local_port(self):
+        r = self.call(self.loc, "/")
+        self.assertEqual(r.status, 200)
+        self.assertIsNone(r.getheader("Set-Cookie"))  # 로컬 포트는 비밀을 내주지 않는다
+        self.assertEqual(self.call(self.loc, "/api/config").status, 200)
+        self.assertEqual(self.call(self.loc, "/api/config", Host="127.0.0.1:7430").status, 421)
+        body = '{"project": "p", "id": "x", "text": "t"}'
+        js = {"Content_Type": "application/json"}
+        self.assertEqual(self.call(self.loc, "/api/note", "POST", body, **js).status, 403)
+        # 비밀이 맞으면 관문을 지나 fd 를 부른다(시험의 fd 설정이 없어 502).
+        self.assertEqual(self.call(self.loc, "/api/note", "POST", body, X_Board_Secret=SECRET, **js).status, 502)
 
 
 if __name__ == "__main__":

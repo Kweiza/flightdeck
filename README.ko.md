@@ -138,7 +138,7 @@ fd doctor                         # 이 머신과 서버의 상태를 실제로 
 
 파라미터 전체와 쓰는 규율은 [도구 레퍼런스](docs/reference.ko.md)에 있다.
 
-### 소유자 칸반 — `board/`
+### 소유자 칸반: `board/`
 
 사람이 큐를 칸반으로 보고 그 자리에서 답하는 웹 보드(파이썬 표준 라이브러리 한 파일, 호스트 프로세스).
 열은 꼬리표(`status:running` · `status:owner` · `status:owner-done` · `status:owner-ask`)로 갈리고, 카드는 본문의

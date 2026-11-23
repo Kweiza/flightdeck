@@ -145,7 +145,7 @@ fd doctor                         # actually measure this machine and the server
 
 Every parameter and the habits that go with them are in the [Tool reference](docs/reference.md).
 
-### Owner kanban — `board/`
+### Owner kanban: `board/`
 
 A web board where a person sees the queue as a kanban and answers on the spot (one Python stdlib file, a host process).
 Columns come from labels (`status:running` · `status:owner` · `status:owner-done` · `status:owner-ask`); cards are drawn from

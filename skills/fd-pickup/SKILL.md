@@ -47,7 +47,7 @@ is missing entirely (steal refused · offline · old fd) do not invent a number.
 
 The judgment section **is no substitute for the body** — the body is "what", the judgments are **"why it was done that way"**:
 what was considered and why it was not done, which evidence turned out false, where something was **left unfixed on purpose**.
-Skip them and you redo the investigation, or **read a deliberately left seam as a defect and go fix it.** The owner's `[fdboard]` notes from the kanban board (choice · comment · done) and the `status:owner-done` · `status:owner-ask` labels arrive here too — they are the owner's answer.
+Skip them and you redo the investigation, or **read a deliberately left seam as a defect and go fix it.** The owner's `[fdboard]` notes from the kanban board (choice · comment · done) and the `status:owner-done` · `status:owner-ask` labels arrive here too; they are the owner's answer.
 
 ## 5. Coordinate when an overlap comes back
 

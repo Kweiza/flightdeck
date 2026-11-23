@@ -10,7 +10,7 @@ import (
 // 보드는 이 저장소의 REST 소비자인데 파이썬이라 Go 컴파일러가 안 본다. 실제로 두 번 깨졌다:
 // 세션 view 의 Claims 가 {ItemID} 객체에서 id 문자열로 바뀌자 보드가 AttributeError 로 502 를 냈고,
 // 선점된 항목이 dashboard.json 의 open_items 에서 빠지자 진행 중 열이 비었다. 여기 적힌 키를
-// 바꾸거나 지우면 이 시험이 빨개진다 — 그때 board.py 의 같은 이름을 함께 고쳐라.
+// 바꾸거나 지우면 이 시험이 빨개진다. 그때 board.py 의 같은 이름을 함께 고쳐라.
 func TestBoardReadsTheseFields(t *testing.T) {
 	e := newEnv(t, nil)
 	sess := e.openSession("cc-board")
@@ -68,7 +68,7 @@ func TestBoardReadsTheseFields(t *testing.T) {
 		openIDs = append(openIDs, it["ID"].(string))
 	}
 	if len(openIDs) == 0 {
-		t.Fatalf("open_items 가 비었다 — bd-open 이 있어야 한다")
+		t.Fatalf("open_items 가 비었다: bd-open 이 있어야 한다")
 	}
 	claimed := map[string]bool{}
 	for _, x := range list("sessions", dash["sessions"]) {
@@ -83,7 +83,7 @@ func TestBoardReadsTheseFields(t *testing.T) {
 					claimed[id] = true
 				}
 			default:
-				t.Fatalf("Claims 원소가 문자열도 {ItemID} 도 아니다: %#v — board.py claimed_ids 를 함께 고쳐라", c)
+				t.Fatalf("Claims 원소가 문자열도 {ItemID} 도 아니다: %#v, board.py claimed_ids 를 함께 고쳐라", c)
 			}
 		}
 	}
@@ -107,7 +107,7 @@ func TestBoardReadsTheseFields(t *testing.T) {
 	item := obj("item", detail["item"])
 	has("item", item, "ID", "Title", "Body", "Labels", "State", "CreatedAt")
 	if labels := list("item.Labels", item["Labels"]); len(labels) != 1 || labels[0] != "status:owner-done" {
-		t.Fatalf("꼬리표가 %v 다 — status:owner-done 하나여야 한다", labels)
+		t.Fatalf("꼬리표가 %v 다: status:owner-done 하나여야 한다", labels)
 	}
 	js := list("judgments", detail["judgments"])
 	if len(js) == 0 {
@@ -126,7 +126,7 @@ func TestBoardReadsTheseFields(t *testing.T) {
 	closed := e.okBody(t, e.do(http.MethodGet, "/api/v1/items?project="+testProject+"&state=closed&limit=30", nil), "닫힌 목록")
 	cl := list("items", closed["items"])
 	if len(cl) != 1 {
-		t.Fatalf("닫힌 목록이 %d건이다 — bd-closed 하나여야 한다", len(cl))
+		t.Fatalf("닫힌 목록이 %d건이다: bd-closed 하나여야 한다", len(cl))
 	}
 	has("닫힌 items[]", obj("items[]", cl[0]), "ID", "Title", "Body", "Labels", "State", "ClosedAt")
 

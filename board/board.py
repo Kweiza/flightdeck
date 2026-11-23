@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -40,7 +41,8 @@ def env(name, default=""):
 CONFIG = os.path.expanduser(env("FD_CONFIG", "~/.flightdeck/config.json"))
 LINKS = os.path.expanduser(env("BOARD_LINKS", "~/.config/flightdeck-board/links.json"))
 ADDR = env("BOARD_ADDR", "127.0.0.1")
-PORT = int(env("BOARD_PORT", "7430"))
+PORT = int(env("BOARD_PORT", "7430"))  # tailscale serve 가 가리키는 곳: 모든 요청이 소유자 신원을 지녀야 한다
+LOCAL_PORT = int(env("BOARD_LOCAL_PORT", "7431"))  # 에이전트 · 로컬 확인용, serve 가 가리키지 않는다(127.0.0.1 고정)
 DEFAULT_PROJECT = env("BOARD_PROJECT")  # 비면 화면이 프로젝트 목록의 첫째를 고른다
 TIMEOUT = 10
 MAX_POST = 64 * 1024
@@ -383,51 +385,59 @@ def is_owner_note(j):
     return (j.get("Title") or "").startswith(NOTE_MARK)
 
 
-# 이 보드를 부르는 이름만(DNS 리바인딩 막기). X-Forwarded-Host 는 믿지 않는다.
+# 이 보드를 부르는 이름만(DNS 리바인딩 막기). X-Forwarded-Host 는 믿지 않는다. 이름은 판정의 근거가 아니다
+# (위조할 수 있다): 신원은 어느 포트로 왔는지(PORT · LOCAL_PORT)와 access_denied 가 가른다.
 # 루프백 밖의 이름(tailnet 이름:포트 등)은 BOARD_HOSTS 로 준다(install.sh 가 tailscale 에서 읽어 적는다).
-LOOPBACK_HOSTS = {"127.0.0.1:%d" % PORT, "localhost:%d" % PORT}
-BOARD_HOSTS = LOOPBACK_HOSTS | {
+BOARD_HOSTS = {"127.0.0.1:%d" % PORT, "localhost:%d" % PORT} | {
     h.strip().lower() for h in env("BOARD_HOSTS").split(",") if h.strip()}
+LOCAL_HOSTS = {"127.0.0.1:%d" % LOCAL_PORT, "localhost:%d" % LOCAL_PORT}
+SECRET_HEADER = "X-Board-Secret"  # 로컬 포트의 쓰기가 지녀야 하는 설치 비밀
 
 
-def host_ok(headers):
-    return (headers.get("Host") or "").strip().lower() in BOARD_HOSTS
+def host_ok(headers, hosts=None):
+    return (headers.get("Host") or "").strip().lower() in (BOARD_HOSTS if hosts is None else hosts)
 
 
-def same_origin(headers):
+def same_origin(headers, hosts=None):
     """쓰기는 이 보드 자신의 페이지에서 온 것만. (통과, 까닭)."""
     sfs = (headers.get("Sec-Fetch-Site") or "").strip()
     origin = (headers.get("Origin") or "").strip()
     if sfs and sfs != "same-origin":
         return False, "Sec-Fetch-Site=%s" % sfs
     if origin:
-        host = urllib.parse.urlparse(origin).netloc
-        if host not in BOARD_HOSTS:
-            return False, "Origin %s 이 이 보드(%s)가 아님" % (host, ", ".join(sorted(BOARD_HOSTS)))
+        hosts = BOARD_HOSTS if hosts is None else hosts
+        host = urllib.parse.urlparse(origin).netloc.lower()
+        if host not in hosts:
+            return False, "Origin %s 이 이 보드(%s)가 아님" % (host, ", ".join(sorted(hosts)))
     if not sfs and not origin:
         return False, "Origin 도 Sec-Fetch-Site 도 없음"
     return True, "같은 출처"
 
 
-def access_denied(headers, path, auth=None):
-    """'' 이면 통과, 아니면 거절 까닭. host_ok 를 지난 요청에만 부른다.
+def access_denied(headers, path, method="GET", local=False, auth=None):
+    """'' 이면 통과, 아니면 거절 까닭. host_ok 를 지난 요청에만 부른다. Host 이름은 보지 않는다(위조할 수 있다).
 
-    - tailnet 이름(BOARD_HOSTS 의 루프백 아닌 것)으로 온 요청은 tailscale serve 를 지난 것이고, serve 가 붙이는
-      Tailscale-User-Login 이 소유자 로그인 목록에 있어야 한다(바깥에서 이 헤더를 위조할 수 없는 것은 보드가
-      127.0.0.1 에만 묶여 serve 뒤에만 있을 때다: check_bind).
-    - 루프백 이름으로 온 요청은 헤더가 없다. 그래도 헤더가 있으면 같은 판정을 한다.
-    - / 밖(/api/* · /file)은 / 가 내려 준 쿠키(설치 때 만든 비밀)를 요구한다.
-    같은 사용자의 로컬 프로세스는 이 모두를 흉내 낼 수 있다(README 「접근」)."""
+    - 바깥 포트(PORT, tailscale serve 가 가리킴): 모든 요청이 serve 가 붙이는 Tailscale-User-Login 을 지니고 그것이
+      소유자 로그인 목록에 있어야 한다. 헤더 없음(태그 기기 · Host 위조 포함)은 거절. / 밖(/api/* · /file)은 / 가
+      신원 검사 뒤에만 내려 주는 쿠키(설치 때 만든 비밀)를 더 요구한다(다른 사이트가 소유자 브라우저로 부르는 길).
+    - 로컬 포트(LOCAL_PORT, 127.0.0.1 고정, serve 가 안 가리킴): 신원 헤더 없이 읽기를 받고, 쓰기는 설치 비밀
+      (X-Board-Secret)을 요구한다.
+    바깥에서 이 헤더를 위조할 수 없는 것은 두 포트가 루프백에만 묶였을 때다(check_bind).
+    같은 사용자의 로컬 프로세스는 비밀 파일을 읽고 헤더를 흉내 낼 수 있다(README 「접근」)."""
     auth = AUTH if auth is None else auth
     if not auth:
         return "접근 설정(%s)이 없음: board/install.sh 를 다시 돌린다" % AUTH_FILE
-    host = (headers.get("Host") or "").strip().lower()
+    if local:
+        if method in ("GET", "HEAD"):
+            return ""
+        given = (headers.get(SECRET_HEADER) or "").strip()
+        return "" if given and hmac.compare_digest(given.encode(), auth["secret"].encode()) else \
+            "로컬 포트의 쓰기는 %s(설치 비밀)가 있어야 함" % SECRET_HEADER
     login = (headers.get("Tailscale-User-Login") or "").strip().lower()
-    if host not in LOOPBACK_HOSTS or login:
-        if not login:
-            return "tailnet 신원(Tailscale-User-Login)이 없음"
-        if login not in auth["owner_logins"]:
-            return "소유자 로그인이 아님"
+    if not login:
+        return "tailnet 신원(Tailscale-User-Login)이 없음: tailscale serve 로만 부른다(로컬 확인은 %d 포트)" % LOCAL_PORT
+    if login not in auth["owner_logins"]:
+        return "소유자 로그인이 아님"
     if path in ("/", "/index.html", "/healthz"):
         return ""
     return "" if cookie_ok(headers.get("Cookie"), auth["secret"]) else "보드 쿠키가 없음: / 를 먼저 연다"
@@ -747,7 +757,10 @@ def inbox_of(project):
 # ---- HTTP ----------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "fd-board/2"
+    """바깥 포트(PORT). 로컬 포트는 LocalHandler."""
+    server_version = "fd-board/3"
+    local = False
+    hosts = BOARD_HOSTS
 
     def log_message(self, fmt, *args):  # 경로만, 머리(토큰 없음)는 안 적는다
         sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
@@ -775,11 +788,11 @@ class Handler(BaseHTTPRequestHandler):
         return u.path, {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
 
     def gate(self, path):
-        """Host · 신원 · 쿠키. 통과면 False, 거절 응답을 보냈으면 True."""
-        if not host_ok(self.headers):
+        """Host · 신원 · 쿠키 · 비밀. 통과면 False, 거절 응답을 보냈으면 True."""
+        if not host_ok(self.headers, self.hosts):
             self.send(421, err("host", "이 보드의 이름으로만 부름"))
             return True
-        why = access_denied(self.headers, path)
+        why = access_denied(self.headers, path, self.command, self.local)
         if why:
             self.send(403, err("access", why))
             return True
@@ -799,8 +812,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path in ("/", "/index.html"):
             with open(os.path.join(HERE, "index.html"), "rb") as f:
-                cookie = "%s=%s; HttpOnly; SameSite=Strict; Path=/" % (COOKIE, AUTH["secret"])
-                return self.send(200, f.read(), "text/html; charset=utf-8", extra={"Set-Cookie": cookie})
+                page = f.read()
+            if self.local:  # 로컬 포트는 비밀을 내주지 않는다(쓰기는 X-Board-Secret 으로)
+                return self.send(200, page, "text/html; charset=utf-8")
+            cookie = "%s=%s; HttpOnly; SameSite=Strict; Path=/" % (COOKIE, AUTH["secret"])  # 신원 검사(gate) 뒤에만
+            return self.send(200, page, "text/html; charset=utf-8", extra={"Set-Cookie": cookie})
         if path == "/healthz":
             code, body = fd_get("/healthz")
             return self.send(200 if code == 200 else 502, {"ok": code == 200, "fd": body.get("ok", False)})
@@ -840,7 +856,7 @@ class Handler(BaseHTTPRequestHandler):
                 body["card"] = card
             return self.send(code, body)
         if path == "/api/embed":
-            ok, why = same_origin(self.headers)
+            ok, why = same_origin(self.headers, self.hosts)
             if not ok:
                 return self.send(403, err("cross_origin", "이 보드의 페이지에서 온 요청만: " + why))
             return self.send(200, embed_check(q.get("url", "")))
@@ -900,7 +916,7 @@ class Handler(BaseHTTPRequestHandler):
         path, q = self.query()
         if self.gate(path):
             return
-        ok, why = same_origin(self.headers)
+        ok, why = (True, "") if self.local else same_origin(self.headers, self.hosts)  # 로컬은 gate 가 비밀을 봤다
         if not ok:
             return self.send(403, err("cross_origin", "이 보드의 페이지에서 온 쓰기만 받음: " + why))
         if not (self.headers.get("Content-Type") or "").startswith("application/json"):
@@ -934,15 +950,27 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(*act(project, req, item))
 
 
+class LocalHandler(Handler):
+    """로컬 포트(LOCAL_PORT): 에이전트 · 로컬 확인용. 신원 헤더 없이 읽기, 쓰기는 설치 비밀."""
+    local = True
+    hosts = LOCAL_HOSTS
+
+
 def main():
     check_bind(ADDR)
     if not AUTH:
         raise SystemExit("BOARD_AUTH_MISSING: %s 이 없거나 깨짐(secret 32자 이상). board/install.sh 가 만든다" % AUTH_FILE)
+    if LOCAL_PORT == PORT:
+        raise SystemExit("BOARD_PORT_CLASH: BOARD_LOCAL_PORT 와 BOARD_PORT 가 같음(%d)" % PORT)
     srv = ThreadingHTTPServer((ADDR, PORT), Handler)
+    local = ThreadingHTTPServer(("127.0.0.1", LOCAL_PORT), LocalHandler)
+    threading.Thread(target=local.serve_forever, daemon=True).start()
     # 소유자 로그인 · 비밀은 적지 않는다(수만).
-    sys.stderr.write("BOARD_READY http://%s:%d project=%s hosts=%s roots=%s links=%s tailnet=%s preview_ports=%s owners=%d\n" % (
-        ADDR, PORT, DEFAULT_PROJECT or "(첫째)", ",".join(sorted(BOARD_HOSTS)), ":".join(FILE_ROOTS), LINKS,
-        TAILNET or "(없음)", ",".join(map(str, sorted(PREVIEW_PORTS))) or "(없음)", len(AUTH["owner_logins"])))
+    sys.stderr.write("BOARD_READY http://%s:%d local=http://127.0.0.1:%d project=%s hosts=%s roots=%s links=%s "
+                     "tailnet=%s preview_ports=%s owners=%d\n" % (
+                         ADDR, PORT, LOCAL_PORT, DEFAULT_PROJECT or "(첫째)", ",".join(sorted(BOARD_HOSTS)),
+                         ":".join(FILE_ROOTS), LINKS, TAILNET or "(없음)",
+                         ",".join(map(str, sorted(PREVIEW_PORTS))) or "(없음)", len(AUTH["owner_logins"])))
     srv.serve_forever()
 
 

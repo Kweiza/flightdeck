@@ -5,7 +5,7 @@
 flightdeck 큐를 칸반으로 보는 사람(소유자)의 작업 데스크톱. 원본은 fd 하나이고 보드는 상태를 갖지 않는다.
 소유자가 보드에서 한 일은 fd 의 꼬리표와 판단 노트로만 남는다. 세션(Claude Code · Codex)은 이 규약을
 MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)과 `fd-pickup` · `fd-handoff` 스킬로 받는다.
-**이 파일이 규약의 정본이다** — 다른 곳에 옮겨 적지 말고 이 파일을 가리킨다.
+**이 파일이 규약의 정본이다**, 다른 곳에 옮겨 적지 말고 이 파일을 가리킨다.
 
 [← README](../README.ko.md)
 
@@ -69,10 +69,11 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 
 `board.py` 하나(파이썬 3 표준 라이브러리만)가 정적 페이지(`index.html`)를 주고, fd REST API 를 대신 부르고
 (토큰은 이 프로세스만 안다), 로컬 파일을 `GET /file?path=` 로 준다(영상은 Range 206, `tail=N` 은 끝 N 줄).
-보드는 **컨테이너 안이 아니라 호스트 프로세스**다 — 작업자가 카드에 다는 그림 · 로그가 호스트 디스크에 있다.
+보드는 **컨테이너 안이 아니라 호스트 프로세스**다, 작업자가 카드에 다는 그림 · 로그가 호스트 디스크에 있다.
 
-- 주소: `http://127.0.0.1:7430/`(`?project=<id>` 프로젝트, `?item=<id>` 그 카드 상세를 열고 시작). 다른 기기에서 보려면
-  tailnet 등으로 노출한다(예: `tailscale serve --bg --https=37430 http://127.0.0.1:7430`) — 보드는 그 설정을 건드리지 않는다.
+- 소유자 주소: 7430 을 `tailscale serve` 로 낸 tailnet 주소(예: `tailscale serve --bg --https=37430 http://127.0.0.1:7430`, 보드는
+  그 설정을 건드리지 않는다). `?project=<id>` 프로젝트, `?item=<id>` 그 카드 상세를 열고 시작. 7430 을 직접 열면 신원이 없어 403.
+- 이 맥의 확인 · 에이전트: `http://127.0.0.1:7431/`(읽기 전용 화면, 쓰기는 설치 비밀 헤더, 아래 「접근」).
 - 상세는 데스크톱에서 옆 판, 폰(900px 이하)에서 전체 화면. 30초마다 새로 읽되 바뀐 것이 없으면 화면을 건드리지 않고,
   열린 상세 판은 소유자 동작 뒤에만 다시 그린다.
 - 프로젝트 고르기: 위 칸. 처음 값은 `?project=` → 이 브라우저가 마지막에 본 것 → `BOARD_PROJECT` → 목록의 첫째.
@@ -84,7 +85,7 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
     board/install.sh --uninstall
 
 - 라벨 `com.<사용자>.flightdeck-board`, KeepAlive, 로그 `~/Library/Logs/flightdeck-board.log`.
-  plist 는 `install.sh` 가 있는 체크아웃의 `board.py` 를 가리킨다 — 옮긴 뒤에는 새 자리에서 다시 부른다.
+  plist 는 `install.sh` 가 있는 체크아웃의 `board.py` 를 가리킨다, 옮긴 뒤에는 새 자리에서 다시 부른다.
 - 다시 부르면 지금 plist 의 설정 값을 이어받는다(안 준 변수만). 값을 바꾸려면 변수를 주고 다시 부른다.
 - 코드만 고친 뒤: `launchctl kickstart -k gui/$(id -u)/com.$(id -un).flightdeck-board`.
 - macOS 밖에서는 `python3 -I board/board.py` 를 그 OS 의 서비스로 띄운다(설정은 아래 환경 변수).
@@ -95,7 +96,8 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 
 | 변수 | 기본 | 뜻 |
 | --- | --- | --- |
-| `BOARD_PORT` · `BOARD_ADDR` | `7430` · `127.0.0.1` | 듣는 자리 |
+| `BOARD_PORT` · `BOARD_ADDR` | `7430` · `127.0.0.1` | tailscale serve 가 가리키는 자리(루프백만) |
+| `BOARD_LOCAL_PORT` | `7431` | 에이전트 · 로컬 확인용(127.0.0.1 고정, 아래 「접근」) |
 | `BOARD_PROJECT` | (없음) | 처음 보일 프로젝트. 없으면 목록의 첫째 |
 | `BOARD_HOSTS` | (없음) | 루프백 밖에서 부를 이름 `이름:포트`(쉼표 구분). `install.sh` 는 비면 tailscale 이름과 `BOARD_TS_PORT`(37430)로 채운다 |
 | `BOARD_FILE_ROOTS` | `~/Developments:/private/tmp/claude-<uid>` | `/file` 허용 뿌리(콜론 구분) |
@@ -110,25 +112,27 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 
 ## 접근
 
-보드는 fd 토큰을 쥐고 소유자 대신 fd 에 쓴다. 그래서 누가 부르는지를 둘로 가른다(`board.py` 의 `access_denied` 한 곳).
+보드는 fd 토큰을 쥐고 소유자 대신 fd 에 쓴다. 그래서 **어느 포트로 왔는지**로 부르는 이를 가른다. Host 이름은 위조할 수 있어
+판정에 쓰지 않는다(`board.py` 의 `access_denied` 한 곳).
 
-- **tailnet 으로 온 요청**(Host 가 `BOARD_HOSTS` 의 tailnet 이름): `tailscale serve` 가 붙이는 `Tailscale-User-Login` 이
-  접근 설정 파일의 `owner_logins` 에 있어야 한다. 없거나 다르면 403. 이 헤더를 바깥에서 위조할 수 없는 것은 보드가
-  루프백에만 묶여 serve 뒤에만 있을 때라, `BOARD_ADDR` 가 루프백이 아니면 보드는 뜨지 않는다(`check_bind`).
-- **모든 요청의 `/api/*` · `/file`**: `/` 가 내려 주는 쿠키(`fdboard`, HttpOnly · SameSite=Strict, 값은 설치 때 만든 무작위 비밀)가
-  있어야 한다. 다른 사이트의 페이지가 소유자 브라우저로 보드를 부르는 길을 막는다.
+| 포트 | 누가 | 요구 |
+| --- | --- | --- |
+| `BOARD_PORT`(7430) | `tailscale serve` 가 가리키는 곳, 소유자 브라우저 | **모든 요청**에 serve 가 붙이는 `Tailscale-User-Login` 이 `owner_logins` 에 있어야 함(헤더 없음 · 태그 기기 · Host 위조 = 403). 그 검사를 지난 `/` 만 쿠키(`fdboard`, HttpOnly · SameSite=Strict, 값은 설치 비밀)를 내려 주고, `/api/*` · `/file` 은 그 쿠키도 요구 |
+| `BOARD_LOCAL_PORT`(7431) | 에이전트 · 이 맥의 확인, serve 가 안 가리킴 | 읽기는 신원 없이, 쓰기(POST)는 `X-Board-Secret: <설치 비밀>` 헤더. 쿠키는 내주지 않음 |
+
+- 두 포트 모두 루프백에만 묶는다. `BOARD_ADDR` 가 루프백이 아니면 보드가 뜨지 않고(`check_bind`), `install.sh` 는 두 포트가
+  127.0.0.1 에서만 듣는지 `lsof` 로 단언한다. `Tailscale-User-Login` 을 바깥에서 위조할 수 없는 것은 그때뿐이다.
 - 접근 설정 파일 `BOARD_AUTH`(기본 `~/.config/flightdeck-board/auth.json`, 0600): `{"secret": …, "owner_logins": […]}`.
   `install.sh` 가 없으면 만들고(로그인은 `BOARD_OWNER_LOGIN` 또는 이 기계 tailscale 사용자), 값을 화면 · 로그에 찍지 않는다.
   저장소 · 보고 · 카드에 그 값을 쓰지 않는다. 파일이 없으면 보드는 뜨지 않는다.
-- **남는 위험**: 같은 맥의 같은 사용자 프로세스는 `/` 에서 쿠키를 받고 Host · 헤더도 흉내 낼 수 있다. 보드는 그 경계를 지키지 않는다
-  (그 프로세스는 이미 `~/.flightdeck/config.json` 의 토큰을 읽을 수 있다).
+- **남는 위험**: 같은 맥의 같은 사용자 프로세스는 7431 로 읽고, 설정 파일의 비밀로 쓰고, 7430 에 신원 헤더를 흉내 낼 수 있다.
+  보드는 그 경계를 지키지 않는다(그 프로세스는 이미 `~/.flightdeck/config.json` 의 토큰을 읽을 수 있다).
 - 미리보기 확인 `/api/embed` 는 같은 출처 요청만 받고, 이 기계 tailnet 접미사(`BOARD_TAILNET`) 아래 이름과 `BOARD_PREVIEW_PORTS` 의
   `localhost` · `127.0.0.1` 만 HEAD 로 부르며, 리다이렉트는 따라가지 않는다.
 
-조정자 · 스크립트가 보드 API 를 부를 때는 쿠키를 먼저 받는다:
+조정자 · 스크립트는 로컬 포트로 읽는다:
 
-    curl -s -c /tmp/fdboard.jar -o /dev/null http://127.0.0.1:7430/
-    curl -s -b /tmp/fdboard.jar 'http://127.0.0.1:7430/api/inbox?project=<프로젝트 id>'
+    curl -s 'http://127.0.0.1:7431/api/inbox?project=<프로젝트 id>'
 
 ## 시험
 
@@ -136,7 +140,7 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 
 `go test ./cmd/fd` 의 `TestBoardPythonSuite` 가 같은 것을 돌린다. 보드가 읽는 서버 응답 꼴(dashboard.json 의
 `open_items` · `sessions[].view.Claims`, `items/{id}` 의 `item` · `judgments`, 닫힌 목록, projects)은
-`go test ./internal/api` 의 `TestBoardReadsTheseFields` 가 잠근다 — 서버 쪽 이름을 바꾸면 거기서 빨개진다.
+`go test ./internal/api` 의 `TestBoardReadsTheseFields` 가 잠근다, 서버 쪽 이름을 바꾸면 거기서 빨개진다.
 
 ## 열과 상태를 바꾸는 법
 
@@ -173,8 +177,7 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 
 ## 조정자가 읽는 곳: `/api/inbox`
 
-    curl -s -c /tmp/fdboard.jar -o /dev/null http://127.0.0.1:7430/
-    curl -s -b /tmp/fdboard.jar 'http://127.0.0.1:7430/api/inbox?project=<프로젝트 id>'
+    curl -s 'http://127.0.0.1:7431/api/inbox?project=<프로젝트 id>'
 
 - `items`: 열린 항목 중 `status:owner-done` · `status:owner-ask` 인 것(`kind`, 본문, 그 항목의 `[fdboard]` 노트 시간순).
 - `recent_owner_notes`: 그 프로젝트의 최근 `[fdboard]` 노트 30개(최신 먼저, `item` = 항목 id). 댓글만 남긴 카드도 여기서 보인다.

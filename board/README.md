@@ -6,7 +6,7 @@ A work desktop for the person (the owner) who watches the flightdeck queue as a 
 truth and the board holds no state: whatever the owner does on the board is left only as fd labels and judgment notes.
 Sessions (Claude Code · Codex) receive this convention as one line of the MCP instructions (`Instructions` in
 `server/internal/mcpsrv/protocol.go`) and through the `fd-pickup` · `fd-handoff` skills.
-**The Korean file [README.ko.md](README.ko.md) is canonical** — point to it, do not copy it elsewhere.
+**The Korean file [README.ko.md](README.ko.md) is canonical**, point to it, do not copy it elsewhere.
 The line prefixes stay Korean (`미리보기:` …) because the board parses them literally.
 
 [← README](../README.md)
@@ -77,10 +77,11 @@ list card the first line of the question and a "추천: name" chip.
 
 One `board.py` (Python 3 standard library only) serves a static page (`index.html`), proxies the fd REST API
 (only this process knows the token), and serves local files at `GET /file?path=` (Range 206 for video, `tail=N` for the last N lines).
-The board is **a host process, not inside the container** — the images and logs workers attach live on the host disk.
+The board is **a host process, not inside the container**, the images and logs workers attach live on the host disk.
 
-- Address: `http://127.0.0.1:7430/` (`?project=<id>`, `?item=<id>` opens that card). To reach it from other devices expose it,
-  e.g. `tailscale serve --bg --https=37430 http://127.0.0.1:7430` — the board never touches that configuration.
+- Owner address: the tailnet address that `tailscale serve` gives 7430 (e.g. `tailscale serve --bg --https=37430 http://127.0.0.1:7430`;
+  the board never touches that configuration). `?project=<id>`, `?item=<id>` opens that card. Opening 7430 directly has no identity: 403.
+- Checks and agents on this Mac: `http://127.0.0.1:7431/` (read-only page; writes need the install secret header, see Access).
 - Initial project: `?project=` → the last one this browser saw → `BOARD_PROJECT` → the first in the list.
 
 ## Install (macOS launchd)
@@ -90,7 +91,7 @@ The board is **a host process, not inside the container** — the images and log
     board/install.sh --uninstall
 
 - Label `com.<user>.flightdeck-board`, KeepAlive, log `~/Library/Logs/flightdeck-board.log`. The plist points at the
-  `board.py` of the checkout that ran `install.sh` — after moving, run it again from the new place.
+  `board.py` of the checkout that ran `install.sh`, after moving, run it again from the new place.
 - Re-running inherits the current plist's values for variables you do not pass.
 - After a code-only change: `launchctl kickstart -k gui/$(id -u)/com.$(id -un).flightdeck-board`.
 - Outside macOS, run `python3 -I board/board.py` as that OS's service with the variables below.
@@ -99,7 +100,8 @@ The board is **a host process, not inside the container** — the images and log
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `BOARD_PORT` · `BOARD_ADDR` | `7430` · `127.0.0.1` | where it listens |
+| `BOARD_PORT` · `BOARD_ADDR` | `7430` · `127.0.0.1` | what tailscale serve points at (loopback only) |
+| `BOARD_LOCAL_PORT` | `7431` | for agents and local checks (127.0.0.1, see Access) |
 | `BOARD_PROJECT` | (none) | first project shown; otherwise the first in the list |
 | `BOARD_HOSTS` | (none) | `name:port` names allowed beyond loopback (comma-separated). `install.sh` fills it from the tailscale name and `BOARD_TS_PORT` (37430) |
 | `BOARD_FILE_ROOTS` | `~/Developments:/private/tmp/claude-<uid>` | `/file` roots (colon-separated) |
@@ -112,32 +114,34 @@ The board is **a host process, not inside the container** — the images and log
 
 ## Access
 
-The board holds the fd token and writes to fd on the owner's behalf, so it sorts callers in two (one place, `access_denied` in `board.py`).
+The board holds the fd token and writes to fd for the owner, so callers are sorted by **which port they came in on**. The Host name
+can be forged and is not used for the decision (one place, `access_denied` in `board.py`).
 
-- **Requests over the tailnet** (Host is a tailnet name in `BOARD_HOSTS`): the `Tailscale-User-Login` header that `tailscale serve`
-  adds must be in `owner_logins` of the access file, otherwise 403. That header cannot be forged from outside only while the board
-  is bound to loopback behind serve, so the board refuses to start when `BOARD_ADDR` is not loopback (`check_bind`).
-- **`/api/*` · `/file` for every request**: the cookie `/` hands out (`fdboard`, HttpOnly · SameSite=Strict, a random secret made at install)
-  is required. It stops another site's page from driving the board through the owner's browser.
+| Port | Who | Requires |
+| --- | --- | --- |
+| `BOARD_PORT` (7430) | what `tailscale serve` points at, the owner's browser | **every request** carries the `Tailscale-User-Login` header serve adds, and it is in `owner_logins` (no header · tagged device · forged Host = 403). Only `/` after that check sets the cookie (`fdboard`, HttpOnly · SameSite=Strict, the install secret); `/api/*` · `/file` also require the cookie |
+| `BOARD_LOCAL_PORT` (7431) | agents and checks on this Mac; serve does not point here | reads without identity; writes (POST) need the `X-Board-Secret: <install secret>` header. No cookie is handed out |
+
+- Both ports bind to loopback only. The board refuses to start when `BOARD_ADDR` is not loopback (`check_bind`), and `install.sh`
+  asserts with `lsof` that both listen on 127.0.0.1 only. Only then can `Tailscale-User-Login` not be forged from outside.
 - Access file `BOARD_AUTH` (default `~/.config/flightdeck-board/auth.json`, 0600): `{"secret": …, "owner_logins": […]}`. `install.sh`
   creates it when missing (login from `BOARD_OWNER_LOGIN` or this machine's tailscale user) and never prints the values. Do not put them
   in the repository, reports or cards. Without the file the board does not start.
-- **Remaining risk**: a process of the same user on the same Mac can fetch the cookie from `/` and imitate Host and headers. The board does
-  not defend that boundary (such a process can already read the token in `~/.flightdeck/config.json`).
+- **Remaining risk**: a process of the same user on this Mac can read through 7431, write with the secret from the file, and imitate
+  the identity header on 7430. The board does not defend that boundary (such a process can already read the token in `~/.flightdeck/config.json`).
 - The preview check `/api/embed` accepts same-origin requests only, HEADs only names under this machine's tailnet suffix (`BOARD_TAILNET`)
   and `localhost` · `127.0.0.1` on `BOARD_PREVIEW_PORTS`, and does not follow redirects.
 
-Coordinators and scripts calling the board API fetch the cookie first:
+Coordinators and scripts read through the local port:
 
-    curl -s -c /tmp/fdboard.jar -o /dev/null http://127.0.0.1:7430/
-    curl -s -b /tmp/fdboard.jar 'http://127.0.0.1:7430/api/inbox?project=<project id>'
+    curl -s 'http://127.0.0.1:7431/api/inbox?project=<project id>'
 
 ## Tests
 
     python3 -I -B -m unittest discover -s board -p 'test_*.py'
 
 `TestBoardPythonSuite` in `go test ./cmd/fd` runs the same. `TestBoardReadsTheseFields` in `go test ./internal/api`
-locks the server response fields the board reads — rename one on the server and it turns red there.
+locks the server response fields the board reads, rename one on the server and it turns red there.
 
 ## Columns and how to move a card
 
@@ -173,8 +177,7 @@ A claimed card stays in Running whatever its labels. Closed items do not change 
 
 ## Where the coordinator reads: `/api/inbox`
 
-    curl -s -c /tmp/fdboard.jar -o /dev/null http://127.0.0.1:7430/
-    curl -s -b /tmp/fdboard.jar 'http://127.0.0.1:7430/api/inbox?project=<project id>'
+    curl -s 'http://127.0.0.1:7431/api/inbox?project=<project id>'
 
 - `items`: open items labelled `status:owner-done` · `status:owner-ask` (`kind`, body, that item's `[fdboard]` notes in time order).
 - `recent_owner_notes`: the project's latest 30 `[fdboard]` notes (newest first, `item` = item id).

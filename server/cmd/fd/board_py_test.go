@@ -13,12 +13,12 @@ import (
 // 여기서 돌려 **같은 관문**에 물린다. 보드가 읽는 서버 응답 꼴은 api 패키지의
 // TestBoardReadsTheseFields 가 따로 잠근다.
 //
-// ★ 종료코드가 아니라 unittest 의 마지막 「OK」 줄과 돈 시험 수를 단언한다 — 발견이 0건이면
+// ★ 종료코드가 아니라 unittest 의 마지막 「OK」 줄과 돈 시험 수를 단언한다. 발견이 0건이면
 // unittest 도 「OK」로 끝나므로 수가 0 이 아닌지를 함께 본다.
 func TestBoardPythonSuite(t *testing.T) {
 	py, err := exec.LookPath("python3")
 	if err != nil {
-		t.Skip("python3 가 없다 — 보드 시험을 못 돌린다(보드는 python3 로만 돈다)")
+		t.Skip("python3 가 없다, 보드 시험을 못 돌린다(보드는 python3 로만 돈다)")
 	}
 	root := pluginRoot(t)
 	cmd := exec.Command(py, "-I", "-B", "-m", "unittest", "discover", "-s", filepath.Join(root, "board"), "-p", "test_*.py")
