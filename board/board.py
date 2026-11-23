@@ -31,6 +31,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import session_inbox  # noqa: E402  (같은 폴더의 모듈, -I 는 스크립트 폴더를 path 에 넣지 않는다)
 
 
 def env(name, default=""):
@@ -619,17 +621,35 @@ def set_labels(project, iid, add, rm):
     return fd_post(item_path(iid) + "/label", {"project": project, "add": add, "rm": rm})
 
 
-_repo_cache = {}  # project -> (읽은 때, github 주소)
+_project_cache = {}  # project -> (읽은 때, {"path", "repo"})
+_projects_list = [0, []]  # [읽은 때, fd 의 프로젝트 목록]
 
 
-def repo_url_of(project):
-    hit = _repo_cache.get(project)
+def projects_list():
+    """fd /api/v1/projects 의 목록(10분 기억, 200 일 때만 기억해 fd 가 잠깐 안 닿아도 10분씩 비지 않게)."""
+    if _projects_list[1] and time.time() - _projects_list[0] < 600:
+        return _projects_list[1]
+    code, body = fd_get("/api/v1/projects")
+    if code != 200:
+        return _projects_list[1]
+    _projects_list[:] = [time.time(), [p for p in body.get("projects") or [] if isinstance(p, dict)]]
+    return _projects_list[1]
+
+
+def project_paths():
+    """이 맥에 있는 fd 프로젝트 폴더 전부(세션이 어느 프로젝트의 것인지 가장 깊은 폴더로 가를 때 쓴다)."""
+    return [p["path"] for p in projects_list() if isinstance(p.get("path"), str) and os.path.isdir(p["path"])]
+
+
+def project_of(project):
+    """fd 프로젝트의 저장소 폴더와 GitHub 주소(10분 기억). 커밋 링크와 세션 알림이 같은 것을 읽는다."""
+    hit = _project_cache.get(project)
     if hit and time.time() - hit[0] < 600:
         return hit[1]
-    url = ""
-    code, body = fd_get("/api/v1/projects")
-    if code == 200:
-        path = next((p.get("path") for p in body.get("projects", []) if p.get("id") == project), "")
+    path, url = "", ""
+    found_list = projects_list()
+    if found_list:
+        path = next((p.get("path") for p in found_list if p.get("id") == project), "") or ""
         if path and os.path.isdir(path):
             try:
                 out = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"],
@@ -637,8 +657,14 @@ def repo_url_of(project):
                 url = github_url(out.stdout)
             except (OSError, subprocess.SubprocessError):
                 url = ""
-    _repo_cache[project] = (time.time(), url)
-    return url
+    found = {"path": path if path and os.path.isdir(path) else "", "repo": url}
+    if found_list:  # fd 가 안 닿았던 빈 답은 기억하지 않는다
+        _project_cache[project] = (time.time(), found)
+    return found
+
+
+def repo_url_of(project):
+    return project_of(project)["repo"]
 
 
 def links_of(raw, project):
@@ -723,6 +749,61 @@ def act_add(project, req):
 
 
 ACTIONS = {"/api/note": act_note, "/api/done": act_done, "/api/choose": act_choose, "/api/move": act_move}
+
+# 세션 알림(README 「세션에 알림」): 동작마다 받는 세션이 읽을 이름과 요약. 요약은 소유자가 이 요청에 직접 친 글만
+# 싣는다(댓글 · 새 카드). 카드 제목 · 보기 글은 작업자도 쓰는 글이라 싣지 않는다, 받는 세션이 fd 에서 읽는다.
+TOLD = {
+    "/api/note": ("댓글", lambda req: req.get("text")),
+    "/api/done": ("했어", lambda req: ""),
+    "/api/choose": ("선택", lambda req: ""),
+    "/api/move": ("상태 옮김(%s)", lambda req: ""),
+    "/api/add": ("새 카드", lambda req: "%s · %s" % (req.get("title"), req.get("body") or "")),
+}
+
+
+def tell_sessions(project, path, req, body):
+    """동작이 저장된 뒤 그 프로젝트의 세션에 한 줄. 결과는 응답의 notify 칸에, 실패는 경고와 로그로.
+    여기서 무엇이 터져도 이미 저장된 동작의 응답은 그대로 나간다(다시 누르면 노트가 둘이 된다)."""
+    if not isinstance(body, dict) or body.get("unchanged"):
+        return body
+    action, summary = TOLD[path]
+    if "%s" in action:
+        action = action % (req.get("to") or "")
+    iid = req.get("id") or ((body.get("item") or {}).get("ID")) or ""
+    try:
+        body["notify"] = session_inbox.notify(project, project_of(project)["path"], project_paths(), iid, action,
+                                              summary(req) or "")
+    except Exception as e:  # noqa: BLE001  알림은 덤이다: 까닭을 남기고 동작 응답을 지킨다
+        sys.stderr.write("BOARD_NOTIFY_FAILED %s\n" % e.__class__.__name__)
+        body["notify"] = {"ok": False, "sent": 0, "failed": [], "warning": "알림 못 보냄: 보드 오류 %s" % e.__class__.__name__}
+    return body
+
+
+def perform(path, project, req, tell):
+    """POST 동작 하나 -> (코드, 응답). tell 이면(소유자 포트) 저장에 성공한 동작을 세션에 알린다(tell_sessions).
+    로컬 포트의 쓰기는 에이전트 · 이 맥의 확인이라 「소유자가 했다」고 알리지 않는다."""
+    item = None
+    if path == "/api/add":
+        code, body = act_add(project, req)
+    else:
+        act = ACTIONS.get(path)
+        if not act:
+            return 404, err("not_found", path)
+        if not req.get("id"):
+            return 400, err("missing_id", "id 가 없음")
+        if act is act_note:
+            code, body = act(project, req)
+        else:
+            code, detail = fd_get(item_path(req["id"]), project=project)
+            if code != 200:
+                return code, detail
+            item = detail.get("item") or {}
+            if item.get("State") in ("done", "dropped"):
+                return 409, err("closed", "닫힌 항목은 꼬리표를 바꾸지 않음(댓글은 됨)")
+            code, body = act(project, req, item)
+    if tell and code in (200, 201):
+        body = tell_sessions(project, path, req, body)
+    return code, body
 
 
 def inbox_of(project):
@@ -932,22 +1013,7 @@ class Handler(BaseHTTPRequestHandler):
         project = req.get("project") or DEFAULT_PROJECT
         if not project:
             return self.send(400, err("missing_project", "project 가 없음"))
-        if path == "/api/add":
-            return self.send(*act_add(project, req))
-        act = ACTIONS.get(path)
-        if not act:
-            return self.send(404, err("not_found", path))
-        if not req.get("id"):
-            return self.send(400, err("missing_id", "id 가 없음"))
-        if act is act_note:
-            return self.send(*act(project, req))
-        code, detail = fd_get(item_path(req["id"]), project=project)
-        if code != 200:
-            return self.send(code, detail)
-        item = detail.get("item") or {}
-        if item.get("State") in ("done", "dropped"):
-            return self.send(409, err("closed", "닫힌 항목은 꼬리표를 바꾸지 않음(댓글은 됨)"))
-        return self.send(*act(project, req, item))
+        return self.send(*perform(path, project, req, tell=not self.local))
 
 
 class LocalHandler(Handler):

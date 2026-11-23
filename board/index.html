@@ -60,6 +60,7 @@ button:disabled { opacity: .55; cursor: default; }
 .small { padding: 2px 8px; font-size: 12px; }
 #status { color: var(--muted); font-size: 12px; white-space: nowrap; }
 #status.err { color: var(--danger); }
+#msg-text { white-space: pre-line; }
 #links { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--card); }
 #links:empty { display: none; }
 #links .btn { font-size: 13px; padding: 3px 10px; }
@@ -268,6 +269,13 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
     return body;
   }
   function setStatus(text, err) { const s = $("#status"); s.textContent = text; s.classList.toggle("err", !!err); }
+  // 동작 뒤 세션 알림 결과(응답의 notify, README 「세션에 알림」). 못 보냈으면 확인 팝업: 동작은 저장됐고 세션이 다음에 inbox 로 읽는다.
+  function toldStatus(r, okText, also) {
+    const w = r && r.notify && r.notify.warning;
+    if (okText) setStatus(okText);
+    const lines = [also, w && `${okText || "저장함"}. ${w}. 조정 세션이 다음에 카드를 읽을 때 봅니다.`].filter(Boolean);
+    if (lines.length) popup(lines.join("\n\n"), w ? "세션 알림" : "알림");
+  }
   function popup(text, title = "알림") { $("#msg-title").textContent = title; $("#msg-text").textContent = text; $("#msg").showModal(); }
   $("#msg-ok").onclick = () => $("#msg").close();
 
@@ -381,11 +389,11 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
   async function moveTo(id, to) {
     if (to === "done") return popup("끝남으로는 옮기지 않아요. 닫기는 조정자가 커밋과 함께 합니다. 끝났다면 「했어」나 댓글을 남겨 주세요.");
     try {
-      await post("/api/move", { id, to });
+      const r = await post("/api/move", { id, to });
       const c = state.cards.find((x) => x.id === id);
-      if (c && c.claimed && to !== "running") popup("어느 세션이 이 카드를 선점 중이라 꼬리표를 바꿔도 진행 중에 남습니다.");
       await load(true);
       if (state.open === id) openDetail(id);
+      toldStatus(r, "옮김", c && c.claimed && to !== "running" ? "어느 세션이 이 카드를 선점 중이라 꼬리표를 바꿔도 진행 중에 남습니다." : "");
     } catch (e) { popup(`옮기지 못함: ${e.message}`); }
   }
 
@@ -427,7 +435,7 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
   function section(title, ...kids) { const s = el("div", "section"); s.append(el("h4", null, title), ...kids); return s; }
 
   async function act(path, data, okText) {
-    try { await post(path, data); await load(true); await openDetail(state.open); if (okText) setStatus(okText); }
+    try { const r = await post(path, data); await load(true); await openDetail(state.open); toldStatus(r, okText); }
     catch (e) { popup(`하지 못함: ${e.message}`); }
   }
 
@@ -638,6 +646,7 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
       const r = await post("/api/add", { title, body: $("#new-body").value });
       $("#newdlg").close(); await load(true);
       if (r.item && r.item.ID) openDetail(r.item.ID);
+      toldStatus(r, "새 카드 만듦");
     } catch (err) { popup(`만들지 못함: ${err.message}`); }
     $("#new-ok").disabled = false;
   });
