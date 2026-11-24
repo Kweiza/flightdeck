@@ -225,7 +225,7 @@ func (s *Service) readCardFacts(ctx context.Context, g GitReader, proj model.Pro
 			defer s.dc.bg.Done()
 			// 변경집합 보관은 읽은 그 자리에서 한다. 화면이 기다림을 넘겨도 뒤에서 끝난 쌍이
 			// change_set 에 들어가야 한다(조립 단계에서 하면 늦게 끝난 쌍은 영영 빠진다).
-			remember := func(f branchFacts) { s.rememberChangeSet(readCtx, proj.ID, f.fork, bk.sha, f.paths) }
+			remember := func(f branchFacts) error { return s.rememberChangeSet(readCtx, proj.ID, f.fork, bk.sha, f.paths) }
 			ch <- got{i: i, f: s.dc.branchFactsOf(readCtx, g, mode, proj.Path, proj.DefaultBranch, mainSHA, bk.name, bk.sha, s.now(), remember)}
 		}()
 	}
@@ -322,15 +322,20 @@ func failedFacts(err error) branchFacts {
 // sha 를 하나라도 모르면 이름으로 읽고 기억하지 않는다(그때는 키가 없다, 변경집합도 안 남긴다).
 //
 // 같은 쌍을 누가 읽는 중이면 그 읽기에 올라탄다(겹친 보드가 같은 git 을 다시 띄우지 않게).
-// 셋이 다 성공했을 때만 기억하고, 그때 한 번 remember 를 부른다. 실패는 일시적일 수 있어
-// 기억하지 않는다, 올라탔던 쪽은 다시 시도한다.
+// 셋이 다 성공했을 때 한 번 remember 를 부르고, remember 까지 성공했을 때만 기억한다. 실패는
+// 일시적일 수 있어 기억하지 않는다, 올라탔던 쪽은 다시 시도한다.
+//
+// ★ 기억은 「이 쌍의 답을 안다」에 더해 「이 쌍의 change_set 을 남겼다」는 약속이다. 기억이 있으면
+// 아무도 remember 를 다시 안 부르니, 저장이 실패한 쌍(요청이 git 을 다 읽은 뒤 끊겼거나 DB 가
+// 거절했다)을 기억하면 memoIdle 동안 그 쌍의 change_set 이 빈다. 그래서 저장이 실패하면 읽은
+// 답은 이번 호출과 올라탄 쪽에 내되 기억에서는 빼, 다음 읽기가 다시 읽고 다시 저장한다.
 //
 // ★ 판정 자리(readNow)는 **화면이 연 도는 읽기에 올라타지 않는다**. 그 읽기는 화면 자리
 // (deriveParallel)가 비기를 기다리는 중일 수 있고, 올라타면 판정이 다시 화면 줄 뒤에 선다.
 // 판정은 자기 자리로 따로 읽는다(쌍의 답은 같으니 결과는 같다). 기억과 remember 는 칸을 쥔 읽기가
 // 한다, 판정의 따로 읽기는 둘 다 안 한다. 판정이 연 칸에는 판정도 올라탄다(같은 판정 자리다).
 func (c *deriveCache) branchFactsOf(ctx context.Context, g GitReader, mode readMode, repo, defBranch, mainSHA, branch, headSHA string,
-	t time.Time, remember func(branchFacts)) branchFacts {
+	t time.Time, remember func(branchFacts) error) branchFacts {
 
 	if mainSHA == "" || headSHA == "" {
 		return c.readFacts(ctx, g, mode, defBranch, branch)
@@ -366,12 +371,13 @@ func (c *deriveCache) branchFactsOf(ctx context.Context, g GitReader, mode readM
 		c.mu.Unlock()
 
 		f := c.readFacts(ctx, g, mode, mainSHA, headSHA)
-		if f.ok() && remember != nil {
-			remember(f)
+		keep := f.ok()
+		if keep && remember != nil {
+			keep = remember(f) == nil
 		}
 		c.mu.Lock()
 		e.f = f
-		if !f.ok() && c.pure[key] == e {
+		if !keep && c.pure[key] == e {
 			delete(c.pure, key)
 		}
 		close(e.done)

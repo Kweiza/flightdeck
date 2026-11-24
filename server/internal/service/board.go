@@ -752,9 +752,10 @@ func (s *Service) rememberRef(ctx context.Context, project string, r model.RefSt
 
 // rememberChangeSet 은 변경집합을 불변으로 보관한다(브랜치가 지워져도 남는다).
 // sha 를 모르면 보관하지 않는다 — 키가 빈 행은 나중에 무엇의 변경인지 말하지 못한다.
-func (s *Service) rememberChangeSet(ctx context.Context, project, baseSHA, headSHA string, paths []string) {
+// 실패를 돌려준다: 커밋 쌍의 기억(branchFactsOf)은 저장이 성공했을 때만 남는다.
+func (s *Service) rememberChangeSet(ctx context.Context, project, baseSHA, headSHA string, paths []string) error {
 	if baseSHA == "" || headSHA == "" {
-		return
+		return nil
 	}
 	err := s.st.UpsertChangeSet(ctx, model.ChangeSet{
 		Project: project, BaseSHA: baseSHA, HeadSHA: headSHA, Paths: paths,
@@ -763,6 +764,7 @@ func (s *Service) rememberChangeSet(ctx context.Context, project, baseSHA, headS
 		s.log.WarnContext(ctx, "변경집합 보관 실패",
 			"project", project, "error", err.Error())
 	}
+	return err
 }
 
 // liveFor 는 겹침 판정에 쓸 살아 있는 세션 목록이다.

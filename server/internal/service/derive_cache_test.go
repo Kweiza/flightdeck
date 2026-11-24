@@ -791,3 +791,72 @@ func TestJudgeReadsDoNotQueueBehindScreen(t *testing.T) {
 		t.Fatalf("화면 자리가 풀린 뒤 화면 쪽 읽기가 못 끝났다: %+v", f)
 	}
 }
+
+// cancelAfterAhead 는 커밋 쌍의 마지막 git 읽기(AheadBehind)가 **성공한 뒤** 요청을 끊는다.
+// git 은 다 읽었는데 변경집합 저장(remember)만 끊긴 ctx 를 받는 순간을 만든다.
+type cancelAfterAhead struct {
+	GitReader
+	cancel *atomicCancel
+}
+
+func (c cancelAfterAhead) AheadBehind(ctx context.Context, ref, base string) (int, int, error) {
+	a, b, err := c.GitReader.AheadBehind(ctx, ref, base)
+	c.cancel.fire()
+	return a, b, err
+}
+
+type atomicCancel struct {
+	mu sync.Mutex
+	f  context.CancelFunc
+}
+
+func (a *atomicCancel) arm(f context.CancelFunc) { a.mu.Lock(); a.f = f; a.mu.Unlock() }
+func (a *atomicCancel) fire() {
+	a.mu.Lock()
+	f := a.f
+	a.f = nil
+	a.mu.Unlock()
+	if f != nil {
+		f()
+	}
+}
+
+// 판정 자리가 칸을 쥐고 git 을 다 읽은 뒤 요청이 끊기면 change_set 저장이 실패한다. 그 쌍을
+// 성공으로 기억하면 memoIdle 동안 아무도 다시 저장하지 않아 change_set 이 빈다. 저장이
+// 실패한 쌍은 기억하지 않는다, 다음 읽기가 다시 읽고 다시 저장한다.
+func TestFailedChangeSetSaveIsNotRemembered(t *testing.T) {
+	var cut atomicCancel
+	s, _, gc := newCountingSvc(t)
+	s.git = func(repo string) GitReader { return cancelAfterAhead{GitReader: gc.factory(repo), cancel: &cut} }
+	repo, wt := newRepoWithWorktree(t, "feat")
+	waitBehind(t, s)
+	forkSHA := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+	writeFile(t, wt, "branch/only.py", "print(1)\n")
+	runGit(t, wt, "add", "-A")
+	runGit(t, wt, "commit", "-q", "-m", "b")
+	headSHA := strings.TrimSpace(runGit(t, wt, "rev-parse", "HEAD"))
+	sess := openSession(t, s, "p", repo, wt, "cc-1", "feat").Session
+	proj, err := s.st.GetProject(ctx(), "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, cancel := context.WithCancel(ctx())
+	defer cancel()
+	cut.arm(cancel)
+	_, _ = s.sessionCards(c, proj, s.cut(s.now(), 0), sess.ID, &derive{}) // 끊긴 요청, 답은 안 본다
+	if c.Err() == nil {
+		t.Fatal("시험이 요청을 못 끊었다(AheadBehind 가 안 불렸다)")
+	}
+	if _, err := s.st.GetChangeSet(ctx(), "p", forkSHA, headSHA); err == nil {
+		t.Fatal("끊긴 요청이 change_set 을 저장했다(시험이 저장 실패를 못 만들었다)")
+	}
+
+	d := &derive{}
+	if _, err := s.sessionCards(ctx(), proj, s.cut(s.now(), 0), sess.ID, d); err != nil || len(d.failures) != 0 {
+		t.Fatalf("다음 판정이 실패했다: err=%v failures=%+v", err, d.failures)
+	}
+	if _, err := s.st.GetChangeSet(ctx(), "p", forkSHA, headSHA); err != nil {
+		t.Fatalf("저장이 실패한 쌍을 성공으로 기억해 다음 판정이 change_set 을 다시 안 썼다: %v", err)
+	}
+}
