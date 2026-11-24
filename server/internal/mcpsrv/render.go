@@ -428,7 +428,8 @@ func RenderBoard(v service.BoardView, opt BoardRenderOptions) string {
 	// ★ **워크스페이스 배너는 옵션과 무관하게 언제나 나간다.** 루트 세션이 19개 레포를
 	//   관장한다는 사실이 화면에 없으면, 그 세션은 자기가 자기 레포 하나만 보고 있다고
 	//   읽는다 — 그 오독이 이 항목 전체가 없애려는 것이다.
-	//   워크스페이스가 아니면 이 줄 자체가 없다(없는 축에 「해당 없음」을 안 붙인다).
+	//   워크스페이스가 아니면 이 줄 자체가 없다(없는 축에 「해당 없음」을 안 붙인다) —
+	//   명부를 못 읽은 사실(v.Roster)만은 예외로 낸다(workspaceBanner 의 머리말).
 	if b := workspaceBanner(v); b != "" {
 		head = append(head, b)
 	}
@@ -796,7 +797,24 @@ func renderMembers(v service.BoardView) []string {
 //
 // ★ 요약을 **안 낸** 상태에서도 낸다. 이 줄의 일은 "여기 더 있다"를 말하는 것이고,
 // 그 다음 화면(workspace:true)으로 가는 손잡이를 함께 준다.
+//
+// ★ **명부의 건강(v.Roster)을 같은 배너에 붙인다.** 명부를 통째로 못 읽으면 이 배너는 옛
+// 캐시로 떠서 정상처럼 보이고, 첫 명부부터 못 읽었으면 배너 자체가 없다 — 두 경우 다
+// 그 줄이 유일한 표시라, 워크스페이스가 아니어도 건강 줄은 낸다. 문장은 doctor 와 같다
+// (RosterHealth.Line).
 func workspaceBanner(v service.BoardView) string {
+	s := workspaceRosterBanner(v)
+	if v.Roster == nil {
+		return s
+	}
+	if s == "" {
+		return "워크스페이스 명부: " + v.Roster.Line()
+	}
+	return s + "\n  ! " + v.Roster.Line()
+}
+
+// workspaceRosterBanner 는 캐시된 명부의 한 줄이다(워크스페이스가 아니면 빈 문자열).
+func workspaceRosterBanner(v service.BoardView) string {
 	r := v.Workspace
 	if !r.Active() {
 		return ""

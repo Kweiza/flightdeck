@@ -121,6 +121,7 @@ func (r Roster) AttributePath(rel string) (project, memberRel string, ok bool) {
 //	멤버 → 루트            → 멤버 경로를 앞에 붙인다
 //	루트 → 멤버            → 그 멤버의 접두를 벗긴다. 접두가 아니면 **겹칠 수 없다**
 //	멤버 A → 멤버 B        → **언제나 겹칠 수 없다**(다른 레포의 다른 파일이다)
+//	루트 밖 멤버 ↔ 루트     → **겹칠 수 없다**(루트 세션의 발자국은 루트 트리 안에만 있다)
 //
 // ★ 마지막 둘에서 ok=false 를 내는 것이 판정이다. 억지로 문자열을 맞추면 서로 무관한
 // 두 레포의 `server/foo.go` 가 겹침으로 뜨고, 그 오탐이 쌓이면 이 축 전체가 무시된다.
@@ -133,6 +134,11 @@ func (r Roster) PathAsSeenFrom(srcProject, dstProject, rel string) (string, bool
 		return rel, true
 	}
 	if !r.Active() || !r.Knows(srcProject) || !r.Knows(dstProject) {
+		return "", false
+	}
+	// ★ 루트 밖 멤버(`../x`)는 루트 좌표로 닿지 않는다 — 루트 세션의 발자국은 루트 트리 안
+	//   상대 경로만 남는다(service.RelPathWithin). 그 사이는 «겹칠 수 없음»으로 낸다.
+	if OutsideRoot(r.Members[srcProject]) || OutsideRoot(r.Members[dstProject]) {
 		return "", false
 	}
 	switch {

@@ -112,26 +112,6 @@ func TestParseWorkspaceRefusesWhatItCannotRead(t *testing.T) {
 			"탭",
 		},
 		{
-			"절대경로",
-			"workspace:\n  members:\n    - path: /Users/u/cp\n",
-			"절대경로",
-		},
-		{
-			"루트 밖",
-			"workspace:\n  members:\n    - path: ../sibling\n",
-			"루트 밖",
-		},
-		{
-			"루트 자신",
-			"workspace:\n  members:\n    - path: .\n",
-			"루트 밖이거나 루트 자신",
-		},
-		{
-			"path 없음",
-			"workspace:\n  members:\n    - project: only-a-name\n",
-			"path 가 없다",
-		},
-		{
 			"시퀀스가 아닌 줄",
 			"workspace:\n  members:\n    path: a\n",
 			"시퀀스가 아닌 줄",
@@ -146,6 +126,95 @@ func TestParseWorkspaceRefusesWhatItCannotRead(t *testing.T) {
 		if !strings.Contains(err.Error(), c.wantSub) {
 			t.Errorf("%s: 사유에 %q 가 없다 — 실제: %v", c.name, c.wantSub, err)
 		}
+	}
+}
+
+// 멤버 한 줄의 결함은 **그 줄만** 뺀다. 명부 전체를 거절하면 캐시가 마지막으로 받아들인
+// 명부에 얼어붙고, 그 뒤에 올린 멤버들이 아무 표시 없이 빠진다(실배치에서 몇 주를 그렇게 갔다).
+//
+// ★ 뺀 줄은 **사유와 함께** 남는다(Rejected). 0건으로 접지 않는다는 이 파서의 규율은 그대로다 —
+// 거절하는 단위가 파일에서 줄로 좁아졌을 뿐이다.
+func TestParseWorkspaceRejectsOnlyTheFaultyMember(t *testing.T) {
+	cases := []struct {
+		name    string
+		bad     string
+		wantSub string
+	}{
+		{"절대경로", "    - path: /Users/u/cp\n", "절대경로"},
+		{"루트 자신", "    - path: .\n", "루트 자신"},
+		{"루트의 부모 자신", "    - path: ../\n", "루트 자신이거나 부모 마디뿐"},
+		{"부모 마디뿐", "    - path: ../..\n", "루트 자신이거나 부모 마디뿐"},
+		{"path 없음", "    - project: only-a-name\n", "path 가 없다"},
+		{"id 를 못 짓는다", "    - path: \"...\"\n", "프로젝트 id 가 비었다"},
+	}
+	for _, c := range cases {
+		src := "workspace:\n  members:\n    - path: good-a\n" + c.bad + "    - path: good-b\n"
+		ws, err := ParseWorkspace(src)
+		if err != nil {
+			t.Errorf("%s: 한 줄 결함이 명부 전체를 거절했다: %v", c.name, err)
+			continue
+		}
+		if len(ws.Members) != 2 || ws.Members[0].Path != "good-a" || ws.Members[1].Path != "good-b" {
+			t.Errorf("%s: 성한 줄이 안 남았다: %+v", c.name, ws.Members)
+		}
+		if len(ws.Rejected) != 1 {
+			t.Errorf("%s: 뺀 줄이 %d건 — 1건이어야 한다: %+v", c.name, len(ws.Rejected), ws.Rejected)
+			continue
+		}
+		if !strings.Contains(ws.Rejected[0].Reason, c.wantSub) {
+			t.Errorf("%s: 사유에 %q 가 없다 — 실제: %q", c.name, c.wantSub, ws.Rejected[0].Reason)
+		}
+	}
+}
+
+// 루트 밖 멤버(`../x`)는 **받는다.** 멤버 저장소를 워크스페이스 폴더 밖으로 옮긴 배치가
+// 실재하고, 그 멤버도 루트 경로와 합쳐 읽히는 자리다(service.MemberRepoPath).
+// id 는 여전히 마지막 마디다 — 그 레포에서 띄운 세션이 스스로 등록하는 이름과 같아야 한다.
+func TestParseWorkspaceAcceptsMembersOutsideTheRoot(t *testing.T) {
+	ws, err := ParseWorkspace("workspace:\n  members:\n    - path: ../sibling\n    - path: ../../far/away\n")
+	if err != nil {
+		t.Fatalf("오류: %v", err)
+	}
+	if len(ws.Rejected) != 0 {
+		t.Fatalf("루트 밖 멤버를 뺐다: %+v", ws.Rejected)
+	}
+	if len(ws.Members) != 2 {
+		t.Fatalf("멤버=%+v", ws.Members)
+	}
+	if got := MemberProjectID(ws.Members[0]); got != "sibling" {
+		t.Errorf("id=%q — sibling 이어야 한다", got)
+	}
+	if got := MemberProjectID(ws.Members[1]); got != "away" {
+		t.Errorf("id=%q — away 여야 한다", got)
+	}
+}
+
+// 채택은 id 축의 결함(루트 자신 · 겹침)도 **그 줄만** 뺀다. 겹치면 먼저 적힌 줄이 이긴다 —
+// 뒤 줄을 이기게 하면 명부 끝에 한 줄을 더한 것이 이미 쓰던 멤버의 경로를 조용히 바꾼다.
+func TestAdoptRosterDropsSelfAndDuplicateIDs(t *testing.T) {
+	ws := Workspace{Declared: true, Members: []WorkspaceMember{
+		{Path: "a"},
+		{Path: "nested/root"},           // 마지막 마디가 루트 id 와 같다
+		{Project: "a", Path: "other/a"}, // id 가 앞 줄과 겹친다
+		{Project: "b", Path: "../b"},
+	}, Rejected: []RejectedMember{{Path: "/abs", Reason: "파서가 뺀 줄"}}}
+
+	got, rejected := AdoptRoster("root", ws)
+	if len(got) != 2 || got[0] != (WorkspaceMember{Project: "a", Path: "a"}) ||
+		got[1] != (WorkspaceMember{Project: "b", Path: "../b"}) {
+		t.Fatalf("채택=%+v — a·b 둘이어야 한다(id 가 채워져서)", got)
+	}
+	if len(rejected) != 3 {
+		t.Fatalf("뺀 줄=%+v — 파서가 뺀 1 + 루트 자신 1 + 겹침 1", rejected)
+	}
+	if rejected[0].Path != "/abs" {
+		t.Errorf("파서가 뺀 줄이 먼저 와야 한다: %+v", rejected)
+	}
+	if !strings.Contains(rejected[1].Reason, "루트 자신과 같은") || rejected[1].Path != "nested/root" {
+		t.Errorf("루트 자신 사유: %+v", rejected[1])
+	}
+	if !strings.Contains(rejected[2].Reason, "두 번") || rejected[2].Path != "other/a" {
+		t.Errorf("겹침 사유: %+v", rejected[2])
 	}
 }
 

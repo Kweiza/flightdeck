@@ -93,7 +93,8 @@ func rosterOf(root string, members []model.WorkspaceMember) judge.Roster {
 // ★ 멤버 프로젝트가 원장에 **자기 path 를 갖고 있어도 그것을 안 쓴다.** 그 값은 그
 // 레포에서 세션이 열렸을 때 그 머신의 cwd 로 등록된 것이라, 서버가 컨테이너면 마운트
 // 지점과 다를 수 있다. 명부의 상대 경로는 루트를 기준으로 하므로 **서버가 루트를 볼 수
-// 있으면 멤버도 본다** — 그 함의가 doctor 의 판정 근거다.
+// 있으면 멤버도 본다** — 그 함의가 doctor 의 판정 근거다. 루트 밖 멤버(`../x`)는 예외다:
+// 그 자리는 루트 아래가 아니라서 컨테이너면 따로 마운트돼야 하고, doctor 가 그것을 말한다.
 func (s *Service) MemberRepoPath(ctx context.Context, r judge.Roster, member string) (string, error) {
 	if !r.Knows(member) {
 		return "", fmt.Errorf("프로젝트 %q 는 이 워크스페이스의 것이 아니다", clip(member, 64))
@@ -113,6 +114,56 @@ func (s *Service) MemberRepoPath(ctx context.Context, r judge.Roster, member str
 // 명부 갱신 — 커밋된 파일이 정본이다
 // ─────────────────────────────────────────────────────────────────────────────
 
+// rosterRead 는 커밋된 명부를 **한 번 읽은 결과**다. 캐시를 안 건드린다.
+//
+// ★ 읽기와 쓰기를 가른 이유: 명부를 읽는 자리가 셋이다 — 세션 열기(캐시를 맞춘다)·보드
+// 배너·doctor(캐시와 파일이 갈린 사실을 말한다). 셋이 각자 파일을 뜯으면 «무엇을 뺐나»의
+// 판정이 세 벌이 되고, 한 벌만 고치면 화면이 캐시와 다른 것을 말한다. 판정은 여기 하나다.
+type rosterRead struct {
+	ref string
+	// absent 가 비지 않으면 워크스페이스가 아니다(파일이 그 커밋에 없거나 블록이 없다) — 사유.
+	absent string
+	// failure 가 비지 않으면 명부를 **통째로** 못 읽었다(파일 읽기 실패·꼴을 못 읽음) — 사유.
+	failure  string
+	members  []model.WorkspaceMember
+	rejected []judge.RejectedMember
+}
+
+// rosterRef 는 명부를 읽는 ref 다 — 기본 브랜치, 모르면 main. 읽는 자리와 sha 를 재는 자리
+// (보드·doctor)가 같은 ref 를 봐야 «캐시 sha ≠ 기본 브랜치 sha» 가 한 축이 된다.
+func rosterRef(proj model.Project) string {
+	if ref := strings.TrimSpace(proj.DefaultBranch); ref != "" {
+		return ref
+	}
+	return "main"
+}
+
+// readRoster 는 기본 브랜치의 커밋된 명부를 읽어 채택할 멤버와 뺀 줄을 가른다.
+func (s *Service) readRoster(ctx context.Context, proj model.Project, g GitReader) rosterRead {
+	ref := rosterRef(proj)
+	rr := rosterRead{ref: ref}
+	raw, err := g.FileAt(ctx, ref, WorkspaceConfigFile)
+	if err != nil {
+		if errors.Is(err, gitreader.ErrFileNotInRef) {
+			rr.absent = WorkspaceConfigFile + " 가 " + ref + " 에 없다 — 워크스페이스가 아니다"
+		} else {
+			rr.failure = "명부를 못 읽었다: " + clip(err.Error(), 200)
+		}
+		return rr
+	}
+	ws, perr := judge.ParseWorkspace(string(raw))
+	if perr != nil {
+		rr.failure = WorkspaceConfigFile + " 의 workspace 블록을 못 읽었다: " + clip(perr.Error(), 200)
+		return rr
+	}
+	if !ws.Declared {
+		rr.absent = WorkspaceConfigFile + " 에 workspace 블록이 없다 — 워크스페이스가 아니다"
+		return rr
+	}
+	rr.members, rr.rejected = judge.AdoptRoster(proj.ID, ws)
+	return rr
+}
+
 // refreshWorkspace 는 루트 레포의 명부를 읽어 캐시를 맞춘다.
 //
 // **언제 도나**: 기본 브랜치의 sha 가 마지막으로 읽은 것과 다를 때만. 같으면 파일도
@@ -123,8 +174,16 @@ func (s *Service) MemberRepoPath(ctx context.Context, r judge.Roster, member str
 //   - 파일이 그 커밋에 없으면 **아무것도 안 바꾼다.** 단일 레포 프로젝트 전건이 이
 //     갈래로 오고, 여기서 캐시를 비우면 «파일이 잠깐 안 읽힌 것»이 «명부를 지운 것»이 된다.
 //   - `workspace:` 블록이 없어도 같다(judge.Workspace.Declared 가 그 축이다).
-//   - 파싱이 실패하면 **캐시를 안 건드리고 사유를 낸다.** 반쯤 읽은 명부로 덮으면
-//     자원 배타가 조용히 좁아진다.
+//   - 꼴을 통째로 못 읽으면 **캐시를 안 건드리고 사유를 낸다.** 줄 경계부터 못 믿는 파일로
+//     덮으면 자원 배타가 조용히 좁아진다. 그 낡음은 보드 배너와 doctor 가 말한다(RosterHealth).
+//
+// **멤버 한 줄의 결함은 그 줄만 뺀다**(judge.RejectedMember 의 사유). 예전에는 한 줄이
+// 명부 전체를 거절해, 마지막으로 받아들인 명부가 몇 주 동안 남고 새 멤버가 조용히 빠졌다.
+//
+// ★ 뺀 줄이 있으면 **sha 를 안 적는다**(파싱 실패와 같은 규율). 적으면 다음 세션이 「이미
+// 읽었다」로 접어 그 사실이 한 번 뜨고 영영 조용해진다. 값은 결함이 고쳐질 때까지 세션
+// 열기마다 파일 한 번이고, 캐시가 이미 같으면 다시 안 쓴다. 그리고 바로 그 어긋남(캐시 sha
+// ≠ 기본 브랜치 sha)이 보드가 «말할 것이 있나»를 git 없이 가르는 축이 된다.
 //
 // 반환은 (바꿨나, 사유)다. 사유는 언제나 채운다 — 안 바꾼 이유가 화면에 있어야
 // 「등록했는데 안 붙는다」를 사람이 스스로 짚는다.
@@ -134,65 +193,135 @@ func (s *Service) refreshWorkspace(ctx context.Context, proj model.Project, g Gi
 	if proj.ID == "" || strings.TrimSpace(proj.Path) == "" {
 		return false, "프로젝트 경로를 몰라 명부를 안 읽었다"
 	}
-	ref := strings.TrimSpace(proj.DefaultBranch)
-	if ref == "" {
-		ref = "main"
-	}
 	// ★ sha 를 모르면(브랜치를 못 읽었다) **읽는다.** 모르는 것을 "안 바뀌었다"로 접으면
 	//   명부가 영영 안 갱신되는 조용한 상태가 생긴다. 비용은 갱신 한 번이다.
 	if headSHA != "" && headSHA == proj.ConfigFromSHA {
 		return false, "명부는 " + stampSHA(headSHA) + " 에서 읽은 그대로다(파일을 다시 안 읽었다)"
 	}
 
-	raw, err := g.FileAt(ctx, ref, WorkspaceConfigFile)
-	if err != nil {
-		if errors.Is(err, gitreader.ErrFileNotInRef) {
-			// 정상 상태다. sha 는 기록한다 — 그래야 다음 세션이 같은 커밋에서 또 안 읽는다.
-			s.stampWorkspaceSHA(ctx, proj.ID, headSHA)
-			return false, WorkspaceConfigFile + " 가 " + ref + " 에 없다 — 워크스페이스가 아니다"
-		}
-		return false, "명부를 못 읽었다: " + clip(err.Error(), 200)
-	}
-	ws, perr := judge.ParseWorkspace(string(raw))
-	if perr != nil {
+	rr := s.readRoster(ctx, proj, g)
+	switch {
+	case rr.absent != "":
+		// 정상 상태다. sha 는 기록한다 — 그래야 다음 세션이 같은 커밋에서 또 안 읽는다.
+		s.stampWorkspaceSHA(ctx, proj.ID, headSHA)
+		return false, rr.absent
+	case rr.failure != "":
 		// ★ sha 를 **안 적는다.** 적으면 다음 세션이 "이미 읽었다"고 판정해 이 오류가
 		//   한 번 뜨고 영영 조용해진다. 파일이 고쳐질 때까지 매번 말하는 것이 맞다.
-		return false, WorkspaceConfigFile + " 의 workspace 블록을 못 읽었다: " + clip(perr.Error(), 200)
-	}
-	if !ws.Declared {
-		s.stampWorkspaceSHA(ctx, proj.ID, headSHA)
-		return false, WorkspaceConfigFile + " 에 workspace 블록이 없다 — 워크스페이스가 아니다"
+		return false, rr.failure
 	}
 
-	members := make([]model.WorkspaceMember, 0, len(ws.Members))
-	seen := make(map[string]bool, len(ws.Members))
-	for _, m := range ws.Members {
-		id := judge.MemberProjectID(m)
-		// ★ 루트 자신을 멤버로 등재하면 자원 정규화가 자기 참조가 되고, 발자국 귀속이
-		//   루트 경로를 다시 루트로 접는다. 경로 검증(memberPathOK)이 `.` 는 막지만
-		//   **이름이 겹치는 경우**는 못 막는다 — 다른 경로인데 basename 이 같을 수 있다.
-		if id == proj.ID {
-			return false, fmt.Sprintf("멤버 %q 가 루트 자신과 같은 프로젝트 id 다 — 명부를 안 바꿨다", clip(id, 64))
-		}
-		if seen[id] {
-			return false, fmt.Sprintf("멤버 프로젝트 id %q 가 두 번 나온다 — 명부를 안 바꿨다", clip(id, 64))
-		}
-		seen[id] = true
-		members = append(members, model.WorkspaceMember{Project: id, Path: m.Path})
+	stamp := headSHA
+	if len(rr.rejected) > 0 {
+		stamp = "" // 위 머리말의 ★ — 뺀 줄이 있으면 다음 세션도 다시 읽고 다시 말한다
 	}
+	same := false
+	if cur, err := s.st.WorkspaceMembers(ctx, proj.ID); err == nil {
+		same = sameMembers(cur, rr.members)
+	}
+	if !same || stamp != "" {
+		err := s.st.Tx(ctx, func(t *store.Tx) error {
+			if !same {
+				if err := t.ReplaceWorkspaceMembers(proj.ID, rr.members, s.now()); err != nil {
+					return err
+				}
+			}
+			if stamp == "" {
+				return nil
+			}
+			return t.SetWorkspaceSHA(proj.ID, stamp)
+		})
+		if err != nil {
+			return false, "명부 저장 실패: " + clip(err.Error(), 200)
+		}
+	}
+	if !same {
+		s.log.InfoContext(ctx, "워크스페이스 명부를 맞췄다",
+			"project", proj.ID, "members", len(rr.members), "rejected", len(rr.rejected),
+			"ref", rr.ref, "sha", stampSHA(headSHA))
+	}
+	detail = fmt.Sprintf("명부를 %s 의 %s 에서 읽었다 — 멤버 %d건", rr.ref, stampSHA(headSHA), len(rr.members))
+	if len(rr.rejected) > 0 {
+		detail += " · " + rejectedLine(rr.rejected)
+	}
+	return !same, detail
+}
 
-	err = s.st.Tx(ctx, func(t *store.Tx) error {
-		if err := t.ReplaceWorkspaceMembers(proj.ID, members, s.now()); err != nil {
-			return err
-		}
-		return t.SetWorkspaceSHA(proj.ID, headSHA)
-	})
-	if err != nil {
-		return false, "명부 저장 실패: " + clip(err.Error(), 200)
+// sameMembers 는 캐시와 새 명부가 같은 집합인가다. 캐시는 정렬돼 나오므로 집합으로 견준다.
+func sameMembers(cur, next []model.WorkspaceMember) bool {
+	if len(cur) != len(next) {
+		return false
 	}
-	s.log.InfoContext(ctx, "워크스페이스 명부를 맞췄다",
-		"project", proj.ID, "members", len(members), "ref", ref, "sha", stampSHA(headSHA))
-	return true, fmt.Sprintf("명부를 %s 의 %s 에서 읽었다 — 멤버 %d건", ref, stampSHA(headSHA), len(members))
+	want := make(map[model.WorkspaceMember]bool, len(next))
+	for _, m := range next {
+		want[m] = true
+	}
+	for _, m := range cur {
+		if !want[m] {
+			return false
+		}
+	}
+	return true
+}
+
+// RosterHealth 는 **커밋된 명부와 캐시가 갈린 사실**이다. 깨끗하면 이 값이 없다(nil).
+//
+// ★ 왜 따로 두나. 명부를 통째로 못 읽으면 캐시가 옛 명부 그대로 남는데, 배너는 그 옛
+// 명부로 계속 떠서 정상처럼 보였다 — 실배치에서 몇 주를 그렇게 갔고, doctor 도 캐시만
+// 읽어 못 봤다. 화면 두 자리(보드 배너·doctor)가 **같은 값의 같은 줄**(Line)을 낸다.
+type RosterHealth struct {
+	CacheSHA string `json:"cache_sha,omitempty"` // 캐시가 마지막으로 깨끗하게 읽은 커밋(project.config_from_sha)
+	HeadSHA  string `json:"head_sha,omitempty"`  // 지금 기본 브랜치의 tip
+	// Failure 가 비지 않으면 명부를 통째로 못 읽어 **캐시가 기본 브랜치보다 낡았다.**
+	Failure string `json:"failure,omitempty"`
+	// Rejected 는 받은 명부에서 뺀 줄이다(캐시에는 나머지가 들어가 있다).
+	Rejected []judge.RejectedMember `json:"rejected,omitempty"`
+}
+
+// Line 은 이 사실의 한 줄이다. 보드 배너와 doctor 가 이 줄을 그대로 쓴다.
+func (h RosterHealth) Line() string {
+	var parts []string
+	if h.Failure != "" {
+		parts = append(parts, fmt.Sprintf("명부 캐시가 기본 브랜치보다 낡았다(캐시 %s · 기본 브랜치 %s) — %s",
+			stampSHA(h.CacheSHA), stampSHA(h.HeadSHA), h.Failure))
+	}
+	if len(h.Rejected) > 0 {
+		parts = append(parts, rejectedLine(h.Rejected))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// rejectedLine 은 뺀 줄 목록의 표기다. 세션 열기의 사유와 RosterHealth.Line 이 함께 쓴다.
+func rejectedLine(rejected []judge.RejectedMember) string {
+	items := make([]string, 0, len(rejected))
+	for _, r := range rejected {
+		what := r.Path
+		if strings.TrimSpace(what) == "" {
+			what = "project=" + r.Project
+		}
+		items = append(items, fmt.Sprintf("%s(%s)", clip(what, 80), clip(r.Reason, 160)))
+	}
+	return fmt.Sprintf("명부에서 뺀 줄 %d건: %s", len(rejected), strings.Join(items, " · "))
+}
+
+// rosterHealth 는 이 프로젝트의 명부가 캐시와 갈렸나를 잰다. **캐시를 안 건드린다.**
+//
+// ★ **평시 비용은 0 이다.** 캐시 sha 가 기본 브랜치 sha 와 같으면 파일을 안 읽는다 —
+// refreshWorkspace 가 깨끗하게 읽었을 때만 sha 를 적으므로, 같다는 것이 곧 «말할 것이
+// 없다»다. 갈렸을 때만 파일 한 번을 읽는다(결함이 있는 동안, 또는 커밋 뒤 첫 세션 전).
+// headSHA 를 모르면 재지 않는다 — 모르는 것을 «낡았다»로 지어내지 않는다.
+//
+// 워크스페이스가 아니거나(absent) 캐시가 그저 한 커밋 뒤인 것뿐이면(다음 세션 열기가
+// 따라잡는다) nil 이다.
+func (s *Service) rosterHealth(ctx context.Context, proj model.Project, g GitReader, headSHA string) *RosterHealth {
+	if headSHA == "" || headSHA == proj.ConfigFromSHA || strings.TrimSpace(proj.Path) == "" {
+		return nil
+	}
+	rr := s.readRoster(ctx, proj, g)
+	if rr.absent != "" || (rr.failure == "" && len(rr.rejected) == 0) {
+		return nil
+	}
+	return &RosterHealth{CacheSHA: proj.ConfigFromSHA, HeadSHA: headSHA, Failure: rr.failure, Rejected: rr.rejected}
 }
 
 // stampWorkspaceSHA 는 "이 커밋은 봤다"만 적는다. 실패해도 진행한다 —
@@ -552,9 +681,15 @@ func (s *Service) workspaceAxes(ctx context.Context, projects []model.Project) [
 			// ① 실재하는 저장소인가
 			if r, err := s.gitIn(ax.Path, readSession).Ref(ctx, "HEAD"); err != nil {
 				notes = append(notes, "HEAD 를 못 읽었다: "+clip(err.Error(), 200))
+				if judge.OutsideRoot(m.Path) {
+					notes = append(notes, "루트 밖 멤버다 — 서버가 컨테이너면 그 자리도 마운트돼야 한다")
+				}
 			} else {
 				ax.Readable = true
 				notes = append(notes, "HEAD="+shortSHA(r.SHA))
+				if judge.OutsideRoot(m.Path) {
+					notes = append(notes, "루트 밖 멤버다 — 루트 세션의 발자국과는 겹침을 못 잰다")
+				}
 			}
 
 			// ② 원장에 있나

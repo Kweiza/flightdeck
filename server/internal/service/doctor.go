@@ -104,6 +104,17 @@ type DoctorReport struct {
 	// Workspaces 는 명부가 선언한 멤버들이다. 워크스페이스가 없으면 비어 있고,
 	// 그 부재는 결함이 아니라 「단일 레포 프로젝트뿐이다」라는 답이다.
 	Workspaces []WorkspaceAxis `json:"workspaces,omitempty"`
+	// Rosters 는 **커밋한 명부가 캐시와 갈린** 루트다(뺀 줄 · 낡은 캐시). 깨끗하면 비어 있다.
+	// Workspaces 가 캐시의 멤버를 재는 축이라, 캐시에 못 들어온 것은 이 축만 말한다.
+	Rosters []RosterAxis `json:"rosters,omitempty"`
+}
+
+// RosterAxis 는 루트 하나의 명부 건강이다. Detail 은 보드 배너와 **같은 줄**이다
+// (RosterHealth.Line) — 두 화면이 같은 사실을 다른 문장으로 말하지 않게.
+type RosterAxis struct {
+	Root   string       `json:"root"`
+	Health RosterHealth `json:"health"`
+	Detail string       `json:"detail"`
 }
 
 // platformAxes 는 §13 이 기대는 플랫폼 축의 목록이다.
@@ -193,6 +204,13 @@ func (s *Service) Doctor(ctx context.Context) DoctorReport {
 			axis.Worktrees = len(wts)
 		}
 		rep.Projects = append(rep.Projects, axis)
+		// ★ 캐시가 아니라 **커밋된 명부**를 캐시와 맞대 본다. 캐시만 읽으면 명부를 통째로 못
+		//   읽어 얼어붙은 캐시가 정상으로 보인다(RosterHealth 의 사유). 읽기만 한다.
+		if r, err := g.Ref(ctx, rosterRef(p)); err == nil {
+			if h := s.rosterHealth(ctx, p, g, r.SHA); h != nil {
+				rep.Rosters = append(rep.Rosters, RosterAxis{Root: p.ID, Health: *h, Detail: h.Line()})
+			}
+		}
 	}
 	rep.Workspaces = s.workspaceAxes(ctx, projects)
 

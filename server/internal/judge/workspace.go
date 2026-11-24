@@ -27,9 +27,25 @@ import (
 // 하나 빠뜨려도 컴파일을 통과한다. 이름을 여기 남기는 것은 이 패키지의 함수 시그니처가
 // 읽히게 하기 위해서다(정의를 옮긴 사실은 이 주석이 못박는다).
 //
-// Path 는 **루트 상대** 경로다. 절대경로는 memberPathOK 가 거절한다 — 정본이 커밋된
+// Path 는 **루트 상대** 경로다. 절대경로는 memberPathOK 가 뺀다 — 정본이 커밋된
 // 파일이라 그 값은 이 머신 밖에서도 읽히고, 절대경로는 남의 머신에서 뜻이 없다.
+// 루트 밖(`../x`)은 받는다(memberPathOK 의 사유).
 type WorkspaceMember = model.WorkspaceMember
+
+// RejectedMember 는 명부에서 **뺀 줄** 하나와 그 사유다.
+//
+// ★ 왜 줄 단위인가. 한 줄의 결함으로 명부 전체를 거절하면 캐시가 마지막으로 받아들인
+// 명부에 얼어붙는다 — 그 뒤에 올린 멤버들이 아무 표시 없이 빠지고, 배너는 옛 명부로
+// 계속 떠서 정상처럼 보인다(실배치에서 몇 주를 그렇게 갔다). 그래서 못 받는 줄만 빼고,
+// 뺀 사실은 이 값으로 화면까지 나른다. **조용히 버리지 않는다는 규율은 그대로다** —
+// 거절하는 단위가 파일에서 줄로 좁아졌을 뿐이다.
+//
+// Path·Project 는 파일에 적힌 그대로다(비어 있을 수 있다 — 그것이 사유일 때).
+type RejectedMember struct {
+	Path    string `json:"path,omitempty"`
+	Project string `json:"project,omitempty"`
+	Reason  string `json:"reason"`
+}
 
 // Workspace 는 루트 레포가 선언한 멤버 명부다.
 //
@@ -37,9 +53,13 @@ type WorkspaceMember = model.WorkspaceMember
 // 아예 없었다는 뜻이고, 그때는 **아무것도 바뀌지 않아야 한다**(fd-ws-registration 의
 // 수용 조건 — 단일 레포 프로젝트 전건이 지금과 같이 돈다). 블록은 있는데 멤버가 0건인
 // 것은 다른 사실이다: 사람이 명부를 비운 것이고, 그러면 캐시에 남은 옛 멤버를 걷어야 한다.
+//
+// Rejected 는 읽었지만 못 받은 멤버 줄이다(RejectedMember 의 사유). Members 와 함께 온다 —
+// 한 줄의 결함이 성한 줄을 끌고 가지 않는다.
 type Workspace struct {
 	Declared bool
 	Members  []WorkspaceMember
+	Rejected []RejectedMember
 }
 
 // MemberProjectID 는 멤버 하나의 프로젝트 id 다. 순수 함수다.
@@ -98,7 +118,9 @@ func ProjectIDFromPath(p string) string {
 // 이 도구의 입력 표면이 된다 — 앵커·별칭·태그·병합 키까지. 읽는 것을 좁히면 표면도 좁다.
 //
 // ★ **그래서 읽는 꼴을 못박고, 못 읽는 꼴은 거절한다.** 조용히 0건으로 접지 않는다 —
-// 그것이 이 저장소가 반복해서 당한 실패다("관문의 무출력은 통과가 아니다"). 읽는 꼴:
+// 그것이 이 저장소가 반복해서 당한 실패다("관문의 무출력은 통과가 아니다").
+// 거절의 단위는 둘이다: 파일의 **꼴**을 못 읽으면 오류(줄 경계부터 못 믿는다), 꼴은 읽었는데
+// **멤버 한 줄의 값**이 못 쓰는 것이면 그 줄만 Rejected 로 뺀다(RejectedMember 의 사유). 읽는 꼴:
 //
 //	workspace:
 //	  members:
@@ -106,12 +128,13 @@ func ProjectIDFromPath(p string) string {
 //	      path: platform-search-api
 //	    - path: platform-docs
 //
-// 거절하는 꼴과 사유:
+// 오류로 거절하는 꼴과 사유:
 //   - 플로우 스타일(`workspace: {members: [...]}`) — 읽는 척하고 0건을 내면 사람은
 //     "등록했는데 안 붙는다"만 본다. 못 읽는다고 **말한다**.
 //   - 탭 들여쓰기 — YAML 규격이 금지하고, 여기서 관대하면 진짜 YAML 도구와 이 파서가
 //     같은 파일을 다르게 읽는다.
-//   - 절대경로·`..` 를 넘는 경로 — 아래 memberPathOK 의 사유.
+//
+// 줄만 빼는 값: path 없음·절대경로·루트 자신(memberPathOK 의 사유), id 를 못 짓는 경로.
 //
 // ★ 다른 최상위 키는 **건너뛴다.** 이 파일에는 이미 labels·verify·secrets·recipes 가
 // 살고(설계 §8), 그것들은 이 함수의 관심 밖이다. 모르는 키를 만나 죽으면 명부 하나가
@@ -181,12 +204,16 @@ func ParseWorkspace(src string) (Workspace, error) {
 		}
 		m := *cur
 		cur = nil
+		reason := ""
 		if err := memberPathOK(m.Path); err != nil {
-			return err
-		}
-		if MemberProjectID(m) == "" {
-			return fmt.Errorf("멤버의 프로젝트 id 가 비었다(path=%q) — path 의 마지막 마디가 "+
+			reason = err.Error()
+		} else if MemberProjectID(m) == "" {
+			reason = fmt.Sprintf("멤버의 프로젝트 id 가 비었다(path=%q) — path 의 마지막 마디가 "+
 				"경계 문자뿐이면 id 를 지을 수 없다. project 를 명시해라", clipWS(m.Path, 60))
+		}
+		if reason != "" {
+			ws.Rejected = append(ws.Rejected, RejectedMember{Path: m.Path, Project: m.Project, Reason: reason})
+			return nil
 		}
 		ws.Members = append(ws.Members, m)
 		return nil
@@ -241,10 +268,20 @@ func ParseWorkspace(src string) (Workspace, error) {
 // 읽힌다. `/Users/u/...` 는 그 어느 곳에서도 안 맞고, 안 맞는 경로는 「멤버가
 // 실재하지 않는다」로만 나타나 사람이 원인을 못 짚는다.
 //
-// ★ 왜 `..` 를 막나. 루트 밖을 가리키는 멤버는 «루트가 관장한다»는 이 배치의 전제를
-// 깨고, 발자국 귀속(fd-ws-footprint-attribution)이 루트 트리 밖 경로를 멤버 상대로
-// 접으려다 엉뚱한 자리를 가리킨다. 루트 자신(`.`)도 막는다 — 자기를 멤버로 두면
-// 자원 정규화가 자기 참조가 된다.
+// ★ 루트 자신(`.`)과 부모 마디뿐인 경로(`..`·`../..`)는 막는다. 자기를 멤버로 두면 자원
+// 정규화가 자기 참조가 되고, 부모 마디뿐인 경로는 루트를 품은 폴더라 마지막 마디로 id 를
+// 지으면 그 이름이 멤버 레포가 아니라 그 폴더의 것이 된다.
+//
+// ★ **루트 밖(`../x`)은 받는다**(2026-11-24). 예전에는 막았다 — «루트가 관장한다»는 전제를
+// 깨고 발자국 귀속이 루트 트리 밖 경로를 멤버 상대로 접으려다 엉뚱한 자리를 가리킨다는
+// 사유였다. 그 거절이 명부 전체를 얼렸고(RejectedMember), 그 줄은 사람이 멤버 저장소를
+// 워크스페이스 폴더 밖으로 옮기며 **일부러** 쓴 것이었다. 지키던 것은 이렇게 남는다:
+//   - 경로 귀속(Roster.AttributePath)은 루트 상대 `..` 를 원래 귀속하지 않고, 형제 겹침의
+//     좌표 옮김(Roster.PathAsSeenFrom)은 루트 밖 멤버와 루트 사이를 «겹칠 수 없음»으로 낸다 —
+//     루트 세션의 발자국은 루트 트리 안 경로만 남기 때문이다(service.RelPathWithin).
+//     잃는 것은 그 둘 사이의 겹침 경고이고, 엉뚱한 귀속은 안 생긴다.
+//   - id 는 여전히 마지막 마디다(MemberProjectID) — 그 레포에서 띄운 세션이 등록하는 이름과 같다.
+//   - 실재하는 저장소인지 · 서버가 그 자리를 읽는지(컨테이너면 마운트 안인지)는 doctor 가 잰다.
 func memberPathOK(p string) error {
 	p = strings.TrimSpace(p)
 	if p == "" {
@@ -254,10 +291,53 @@ func memberPathOK(p string) error {
 		return fmt.Errorf("멤버 path 가 절대경로다(%q) — 커밋되는 값이라 루트 상대여야 한다", clipWS(p, 80))
 	}
 	c := path.Clean(strings.ReplaceAll(p, "\\", "/"))
-	if c == "." || c == ".." || strings.HasPrefix(c, "../") {
-		return fmt.Errorf("멤버 path 가 루트 밖이거나 루트 자신이다(%q)", clipWS(p, 80))
+	for c == ".." || strings.HasPrefix(c, "../") {
+		c = strings.TrimPrefix(strings.TrimPrefix(c, ".."), "/")
+	}
+	if c == "" || c == "." {
+		return fmt.Errorf("멤버 path 가 루트 자신이거나 부모 마디뿐이다(%q) — 멤버 레포 폴더를 가리켜라", clipWS(p, 80))
 	}
 	return nil
+}
+
+// OutsideRoot 는 루트 상대 멤버 경로가 루트 트리 밖(`../…`)인가다. 순수 함수다.
+//
+// 그런 멤버는 루트 경로와 합쳐 읽히지만(service.MemberRepoPath) 루트 세션의 발자국 좌표
+// (루트 트리 안 상대 경로)로는 닿지 않는다 — 좌표 옮김과 doctor 의 마운트 안내가 이것을 본다.
+func OutsideRoot(memberPath string) bool {
+	c := path.Clean(strings.ReplaceAll(strings.TrimSpace(memberPath), "\\", "/"))
+	return c == ".." || strings.HasPrefix(c, "../")
+}
+
+// AdoptRoster 는 파싱한 명부에서 **채택할 멤버**와 **뺀 줄**을 가른다. 순수 함수다.
+//
+// 파서가 본 것은 한 줄씩의 값이고, 여기서 보는 것은 줄 **사이**의 관계(id 축)다:
+//   - 루트 자신과 같은 id — 자원 정규화가 자기 참조가 되고 발자국 귀속이 루트 경로를 다시
+//     루트로 접는다. 경로 검증이 `.` 는 막지만 basename 이 겹치는 다른 경로는 못 막는다.
+//   - 두 번 나온 id — **먼저 적힌 줄이 이긴다.** 뒤 줄을 이기게 하면 명부 끝에 한 줄을 더한
+//     것이 이미 쓰던 멤버의 경로를 조용히 바꾼다.
+//
+// 채택한 멤버는 Project 가 채워져 나온다(빈 값은 store 가 거절한다). 뺀 줄은 파서가 뺀 것
+// 다음에 이 함수가 뺀 것이 파일 순서대로 온다.
+func AdoptRoster(root string, ws Workspace) ([]WorkspaceMember, []RejectedMember) {
+	members := make([]WorkspaceMember, 0, len(ws.Members))
+	rejected := append([]RejectedMember(nil), ws.Rejected...)
+	seen := make(map[string]bool, len(ws.Members))
+	for _, m := range ws.Members {
+		id := MemberProjectID(m)
+		switch {
+		case id == root:
+			rejected = append(rejected, RejectedMember{Path: m.Path, Project: m.Project,
+				Reason: fmt.Sprintf("멤버 %q 가 루트 자신과 같은 프로젝트 id 다", clipWS(id, 64))})
+		case seen[id]:
+			rejected = append(rejected, RejectedMember{Path: m.Path, Project: m.Project,
+				Reason: fmt.Sprintf("멤버 프로젝트 id %q 가 두 번 나온다 — 먼저 적힌 줄을 쓴다", clipWS(id, 64))})
+		default:
+			seen[id] = true
+			members = append(members, WorkspaceMember{Project: id, Path: m.Path})
+		}
+	}
+	return members, rejected
 }
 
 // yamlLine 은 들여쓰기를 뗀 한 줄이다.

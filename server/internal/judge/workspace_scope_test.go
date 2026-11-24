@@ -204,6 +204,19 @@ func TestRosterPathAsSeenFrom(t *testing.T) {
 				c.name, c.src, c.dst, c.rel, got, ok, c.want, c.ok)
 		}
 	}
+	// ★ 루트 밖 멤버(`../x`)와 루트 사이는 **겹칠 수 없다.** 루트 세션의 발자국은 루트 트리
+	//   안 상대 경로만 남으므로 `../x/…` 좌표는 루트 쪽에 원리적으로 없다 — 옮겨 실으면
+	//   보드가 매번 훑고 언제나 0쌍을 낸다(siblingLive 의 «경로가 안 남은 세션» 규율).
+	out := Roster{Root: "cp-root", Members: map[string]string{"far": "../far", "near": "near"}}
+	if got, ok := out.PathAsSeenFrom("far", "cp-root", "x.go"); ok {
+		t.Errorf("루트 밖 멤버 → 루트를 옮겼다: %q", got)
+	}
+	if got, ok := out.PathAsSeenFrom("cp-root", "far", "../far/x.go"); ok {
+		t.Errorf("루트 → 루트 밖 멤버를 옮겼다: %q", got)
+	}
+	if got, ok := out.PathAsSeenFrom("near", "cp-root", "x.go"); !ok || got != "near/x.go" {
+		t.Errorf("루트 안 멤버가 같이 막혔다: %q %v", got, ok)
+	}
 	// 워크스페이스가 아니면 같은 프로젝트만 통과한다.
 	var none Roster
 	if _, ok := none.PathAsSeenFrom("a", "b", "x.go"); ok {

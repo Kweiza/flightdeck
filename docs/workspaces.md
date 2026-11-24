@@ -43,9 +43,24 @@ fd status                    # does the banner show the member count?
 fd status --workspace        # one line per member (sessions · claims · queue · resources)
 ```
 
-No banner means the roster was not read, and **the session response says why** (no file · no block ·
-parse failure). If a member path is not readable by the server (outside the container's `FD_REPOS`
-mount), that member's branch stays `?(못 읽음)` ("? (unreadable)").
+No banner means there is no roster (no file · no block). When the roster has a problem, **the banner
+carries that line too**:
+
+- **A member line with an unusable value is dropped on its own** — no path · absolute path · the root
+  itself (`.`) · parent segments only (`..`) · the root's id · an id that repeats an earlier line (the
+  earlier line wins). The other members stand, and the banner adds `명부에서 뺀 줄 N건: path(reason)`
+  ("N lines dropped from the roster").
+- **When the file's shape cannot be read** (flow style · tab indentation) the roster is not changed at
+  all. The cache stays as last read, and the banner adds `명부 캐시가 기본 브랜치보다 낡았다(…) — reason`
+  ("the roster cache is older than the default branch", with both shas).
+
+Both lines are re-read and repeated at every session open until the file is fixed.
+
+A member may live outside the root (`path: ../other-repo`). The path is joined to the root path and
+the id is still its last segment. But a session started at the root only leaves footprints inside the
+root tree, so **no overlap warning fires between root sessions and that member's sessions.** If a member
+path is not readable by the server (outside the container's `FD_REPOS` mount — a member outside the root
+needs its own mount), that member's branch stays `?(못 읽음)` ("? (unreadable)").
 
 > **After changing the roster, compare the banner's member count with the file.** When parsing fails
 > the server **keeps the last roster it read** — so the banner still shows, and only the newly added
