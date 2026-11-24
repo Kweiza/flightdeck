@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/kweiza/flightdeck/internal/gitreader"
+	"github.com/kweiza/flightdeck/internal/judge"
 	"github.com/kweiza/flightdeck/internal/model"
 )
 
@@ -34,7 +35,7 @@ import (
 //	③ 같은 워크트리 · 같은 커밋 쌍은 요청 안에서도, 겹친 요청 사이에서도 한 번만 읽는다(도는
 //	   읽기에 올라탄다). 판정 자리만은 화면이 연 도는 읽기에 올라타지 않는다(branchFactsOf).
 //	   서로 다른 것은 함께 읽는다(서버 전체 git 동시 실행 수 상한, 화면은 deriveParallel ·
-//	   판정 자리는 judgeParallel, 둘은 따로 줄 선다).
+//	   판정 자리는 judgeParallel, 둘은 따로 줄 선다). 카드 파생 밖의 git 도 자리에 선다(gitIn).
 //
 // ★ 보관본을 쓴 화면은 **그 관측 시각을 말한다**(derive.observed → Freshness.ObservedAt).
 // 지금 읽은 척하지 않는다, 설계 §6 의 「(파생: git@14:31, 12초 전)」이 그 시각을 그대로 낸다.
@@ -57,9 +58,20 @@ const deriveParallel = 8
 // 한 번) 늘 지금 읽어야 하므로 화면에 밀리면 안 된다.
 // 크기는 화면과 같은 8 이다. 판정 읽기는 드물어 둘이 함께 꽉 차는 때가 짧고, 판정은 워크트리
 // 수만큼 읽어 자리를 줄이면 그만큼 느려진다(같은 측정에서 4 자리는 p50 1.52~1.55초). 둘이 겹친
-// 순간 카드 파생 git 의 상한은 16 이다. 카드 파생 밖의 git(pick 의 Ancestry, finish 의
-// worktreeFacts, session · workspace 의 Ref 등)은 어느 자리에도 서지 않는다, 이 상한 밖이다.
+// 순간 카드 파생 git 의 상한은 16 이다. 카드 파생 밖이라도 판정이 기대는 git(pick 의 선행 sha
+// 조상 판정, finish 의 선행 후보: 워크트리 목록 · 조상 판정)은 이 자리에 선다(gitIn).
 const judgeParallel = 8
+
+// sessionParallel 은 세션 열기 · 진단의 git 자리다(카드 파생도 판정도 아닌 지금 읽기).
+//
+// ★ 왜 자리가 있나. 세션 열기는 훅마다 온다(UserPromptSubmit · Edit/Write 뒤 비동기 PostToolUse ·
+// Stop · PreCompact · SessionStart, cmd/fd 의 beatFromHook). 요청 하나는 git 을 차례로 둘~넷
+// (Refs · worktree list, 못 찾으면 HEAD, 명부 sha 가 바뀌면 FileAt) 띄우므로 동시 git 수 = 겹친 훅
+// 요청 수다. 세션 여럿에 작업자 · 비동기 훅이 겹치면 수십이고, 상한이 없으면 그만큼 프로세스가 뜬다.
+// ★ 왜 따로 서나. 판정 자리에 세우면 잦은 훅이 드문 판정을 밀고(judgeParallel 이 갈라 놓은 그 모양),
+// 화면 자리에 세우면 화면 읽기를 몰아칠 때 훅(UserPromptSubmit 는 5초 상한)이 그 뒤에 선다.
+// 크기는 다른 둘과 같은 8 이다. 셋이 다 찬 순간 이 서버가 띄우는 git 의 상한은 24 다.
+const sessionParallel = 8
 
 // pureMemoLimit 은 커밋 쌍 기억의 상한이다. 넘으면 끝난 쌍을 통째로 비운다(다음 요청이 다시 채운다).
 // 살아 있는 브랜치 수의 몇 배면 충분하다, 브랜치가 앞으로 가면 옛 쌍은 다시 안 쓰인다.
@@ -111,12 +123,15 @@ const (
 	readNow readMode = iota
 	// readScreen 은 화면이다(Board). 보관본을 쓰고, 보관본 없는 읽기는 wait 까지만 기다린다.
 	readScreen
+	// readSession 은 세션 열기 · 진단이다(카드 파생 밖, 판정 밖). 언제나 지금 읽는다.
+	readSession
 )
 
 // deriveCache 는 Service 하나가 쥐는 파생 보관소다. 0값으로는 못 쓴다, newDeriveCache.
 type deriveCache struct {
-	screenSem chan struct{} // 화면 git 동시 실행 상한(서버 전체, deriveParallel)
-	judgeSem  chan struct{} // 판정 자리 git 동시 실행 상한(서버 전체, judgeParallel)
+	screenSem  chan struct{} // 화면 git 동시 실행 상한(서버 전체, deriveParallel)
+	judgeSem   chan struct{} // 판정 자리 git 동시 실행 상한(서버 전체, judgeParallel)
+	sessionSem chan struct{} // 세션 열기 · 진단 git 동시 실행 상한(서버 전체, sessionParallel)
 
 	refreshAfter time.Duration
 	maxAge       time.Duration // 0 이면 화면 보관본을 안 쓴다
@@ -134,23 +149,28 @@ type deriveCache struct {
 
 func newDeriveCache() *deriveCache {
 	return &deriveCache{
-		screenSem: make(chan struct{}, deriveParallel),
-		judgeSem:  make(chan struct{}, judgeParallel),
-		pure:      map[pureKey]*pureEntry{},
-		wt:        cells[wtSnap]{},
-		lists:     cells[listSnap]{},
-		refs:      cells[refSnap]{},
+		screenSem:  make(chan struct{}, deriveParallel),
+		judgeSem:   make(chan struct{}, judgeParallel),
+		sessionSem: make(chan struct{}, sessionParallel),
+		pure:       map[pureKey]*pureEntry{},
+		wt:         cells[wtSnap]{},
+		lists:      cells[listSnap]{},
+		refs:       cells[refSnap]{},
 	}
 }
 
 func (c *deriveCache) screenSnapshots(mode readMode) bool { return mode == readScreen && c.maxAge > 0 }
 
-// slots 는 mode 가 줄 서는 git 실행 자리다. 판정 자리는 화면 자리와 따로 선다(judgeParallel).
+// slots 는 mode 가 줄 서는 git 실행 자리다. 셋은 서로 따로 선다.
 func (c *deriveCache) slots(mode readMode) chan struct{} {
-	if mode == readNow {
+	switch mode {
+	case readNow:
 		return c.judgeSem
+	case readSession:
+		return c.sessionSem
+	default:
+		return c.screenSem
 	}
-	return c.screenSem
 }
 
 // acquire 는 mode 의 git 실행 자리 하나를 잡는다. ctx 가 먼저 끝나면 false.
@@ -532,6 +552,98 @@ func withSlot[T any](c *deriveCache, ctx context.Context, mode readMode, failed 
 	}
 	defer c.release(mode)
 	return fn()
+}
+
+// gitIn 은 카드 파생 **밖**에서 쓸 리더를 낸다. 메서드 하나가 부를 때마다 mode 의 git 자리 하나를
+// 잡는다(Ancestry 는 git 을 둘까지 차례로 띄우지만 동시에는 하나다). 자리를 못 잡으면(ctx 끝남)
+// 그 ctx 오류를 낸다, 호출부는 다른 git 실패처럼 사유로 싣는다.
+//
+// ★ 카드 파생(readCardFacts 와 그 아래, sessionCards 의 g)에 넘기지 마라. 그쪽은 읽기 묶음마다 자기가
+// 자리를 잡는다, 겹쳐 잡으면 자리가 찬 순간 서로를 기다린다. 그래서 s.git 은 그대로 두고 이것을 따로 둔다.
+func (s *Service) gitIn(repo string, mode readMode) GitReader {
+	return slotGit{g: s.git(repo), c: s.dc, mode: mode}
+}
+
+type slotGit struct {
+	g    GitReader
+	c    *deriveCache
+	mode readMode
+}
+
+// do 는 자리 하나를 쥐고 fn 을 부른다(withSlot). 못 잡으면 ctx 오류다.
+func (r slotGit) do(ctx context.Context, fn func()) error {
+	return withSlot(r.c, ctx, r.mode, func(err error) error { return err }, func() error { fn(); return nil })
+}
+
+func (r slotGit) Refs(ctx context.Context) (out []model.RefState, err error) {
+	if e := r.do(ctx, func() { out, err = r.g.Refs(ctx) }); e != nil {
+		return nil, e
+	}
+	return out, err
+}
+
+func (r slotGit) Ref(ctx context.Context, ref string) (out model.RefState, err error) {
+	if e := r.do(ctx, func() { out, err = r.g.Ref(ctx, ref) }); e != nil {
+		return model.RefState{}, e
+	}
+	return out, err
+}
+
+func (r slotGit) Worktrees(ctx context.Context) (out []gitreader.Worktree, err error) {
+	if e := r.do(ctx, func() { out, err = r.g.Worktrees(ctx) }); e != nil {
+		return nil, e
+	}
+	return out, err
+}
+
+func (r slotGit) ChangedPaths(ctx context.Context, base, head string) (paths []string, delta map[string]model.LineDelta, err error) {
+	if e := r.do(ctx, func() { paths, delta, err = r.g.ChangedPaths(ctx, base, head) }); e != nil {
+		return nil, nil, e
+	}
+	return paths, delta, err
+}
+
+func (r slotGit) MergeBase(ctx context.Context, a, b string) (out string, err error) {
+	if e := r.do(ctx, func() { out, err = r.g.MergeBase(ctx, a, b) }); e != nil {
+		return "", e
+	}
+	return out, err
+}
+
+func (r slotGit) UncommittedPaths(ctx context.Context, worktree string) (out []string, err error) {
+	if e := r.do(ctx, func() { out, err = r.g.UncommittedPaths(ctx, worktree) }); e != nil {
+		return nil, e
+	}
+	return out, err
+}
+
+func (r slotGit) UncommittedDelta(ctx context.Context, worktree string) (out map[string]model.LineDelta, err error) {
+	if e := r.do(ctx, func() { out, err = r.g.UncommittedDelta(ctx, worktree) }); e != nil {
+		return nil, e
+	}
+	return out, err
+}
+
+func (r slotGit) AheadBehind(ctx context.Context, ref, base string) (ahead, behind int, err error) {
+	if e := r.do(ctx, func() { ahead, behind, err = r.g.AheadBehind(ctx, ref, base) }); e != nil {
+		return 0, 0, e
+	}
+	return ahead, behind, err
+}
+
+// Ancestry 는 자리를 못 잡으면 judge.AncestryUnknown(「조회하지 않았다」)과 ctx 오류를 낸다.
+func (r slotGit) Ancestry(ctx context.Context, sha, tip string) (out judge.AncestryResult, err error) {
+	if e := r.do(ctx, func() { out, err = r.g.Ancestry(ctx, sha, tip) }); e != nil {
+		return judge.AncestryUnknown, e
+	}
+	return out, err
+}
+
+func (r slotGit) FileAt(ctx context.Context, ref, path string) (out []byte, err error) {
+	if e := r.do(ctx, func() { out, err = r.g.FileAt(ctx, ref, path) }); e != nil {
+		return nil, e
+	}
+	return out, err
 }
 
 // wtSnap 은 워크트리 하나의 미커밋 관측 한 번이다. 두 축의 실패가 따로 산다.

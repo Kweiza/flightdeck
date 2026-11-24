@@ -1294,7 +1294,7 @@ func (s *Service) afterFacts(ctx context.Context, proj model.Project, cands []ju
 	}
 	var g GitReader
 	if strings.TrimSpace(proj.Path) != "" {
-		g = s.git(proj.Path)
+		g = s.gitIn(proj.Path, readNow) // 판정이 기대는 조상 판정이다, 판정 자리에 선다
 	}
 	for _, c := range cands {
 		for _, a := range c.Item.After {

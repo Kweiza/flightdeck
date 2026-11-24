@@ -180,7 +180,7 @@ func (s *Service) Doctor(ctx context.Context) DoctorReport {
 			rep.Projects = append(rep.Projects, axis)
 			continue
 		}
-		g := s.git(p.Path)
+		g := s.gitIn(p.Path, readSession) // 진단은 세션 자리에 선다(sessionParallel)
 		if r, err := g.Ref(ctx, "HEAD"); err != nil {
 			axis.Detail = "HEAD 를 못 읽었다: " + clip(err.Error(), 400)
 		} else {

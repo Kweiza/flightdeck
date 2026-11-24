@@ -550,7 +550,7 @@ func (s *Service) workspaceAxes(ctx context.Context, projects []model.Project) [
 			var notes []string
 
 			// ① 실재하는 저장소인가
-			if r, err := s.git(ax.Path).Ref(ctx, "HEAD"); err != nil {
+			if r, err := s.gitIn(ax.Path, readSession).Ref(ctx, "HEAD"); err != nil {
 				notes = append(notes, "HEAD 를 못 읽었다: "+clip(err.Error(), 200))
 			} else {
 				ax.Readable = true

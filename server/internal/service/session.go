@@ -190,7 +190,8 @@ func (s *Service) OpenSession(ctx context.Context, in OpenSessionInput) (Session
 	branch, head := "", ""
 	var refs []model.RefState
 	if repo != "" {
-		g := s.git(repo)
+		// 훅마다 오는 읽기라 세션 자리에 선다(sessionParallel, gitIn).
+		g := s.gitIn(repo, readSession)
 		if rs, err := g.Refs(ctx); err != nil {
 			d.fail("refs", err)
 		} else {
@@ -381,7 +382,7 @@ func (s *Service) OpenSession(ctx context.Context, in OpenSessionInput) (Session
 	// ★ **오류를 올리지 않고 사유를 싣는다.** 명부를 못 읽은 것은 배너가 말할 사실이지
 	//   세션을 막을 사실이 아니다. 그 판정이 뒤집히면 `.flightdeck.yaml` 오타 하나가
 	//   그 레포의 전 세션을 못 열게 만든다.
-	_, wsDetail := s.refreshWorkspace(ctx, proj, s.git(proj.Path), refSHA(refs, proj.DefaultBranch))
+	_, wsDetail := s.refreshWorkspace(ctx, proj, s.gitIn(proj.Path, readSession), refSHA(refs, proj.DefaultBranch))
 	roster, rerr := s.Roster(ctx, proj.ID)
 	if rerr != nil {
 		s.log.WarnContext(ctx, "워크스페이스 명부 조회 실패 — 없는 것으로 진행한다",

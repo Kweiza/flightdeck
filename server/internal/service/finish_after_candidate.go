@@ -72,8 +72,10 @@ func (s *Service) afterCandidate(ctx context.Context, project, sessionID string,
 	}
 
 	// ★ 별도 derive 로 받아 **사유만** 옮긴다. 위 「git reads」 절이 이유다.
+	// 판정(finish)이 기대는 읽기라 판정 자리에 선다(gitIn).
+	g := s.gitIn(proj.Path, readNow)
 	gd := &derive{}
-	branch, head := s.worktreeFacts(ctx, s.git(proj.Path), sess.Worktree, gd)
+	branch, head := s.worktreeFacts(ctx, g, sess.Worktree, gd)
 	for _, f := range gd.failures {
 		d.note(afterCandidateAxis, f.Axis+": "+f.Detail)
 	}
@@ -89,7 +91,7 @@ func (s *Service) afterCandidate(ctx context.Context, project, sessionID string,
 		return ""
 	}
 
-	anc, err := s.git(proj.Path).Ancestry(ctx, head, proj.DefaultBranch)
+	anc, err := g.Ancestry(ctx, head, proj.DefaultBranch)
 	if err != nil {
 		d.fail(afterCandidateAxis, err)
 		return ""
