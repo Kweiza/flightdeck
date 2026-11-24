@@ -124,6 +124,21 @@ func Handler(svc *service.Service) http.Handler { return New(svc) }
 
 // New 는 옵션을 받는 생성자다.
 func New(svc *service.Service, opts ...Option) http.Handler {
+	h := newHandler(svc, opts)
+	h.mux = http.NewServeMux()
+	h.mux.HandleFunc("GET /{$}", h.dashboard)
+	h.mux.HandleFunc("POST /actions/reclaim", h.reclaim)
+	h.mux.HandleFunc("POST /actions/drop", h.drop)
+	h.mux.HandleFunc("POST /actions/lane-release", h.laneRelease)
+	h.mux.HandleFunc("POST /actions/project-view", h.projectView)
+	h.mux.HandleFunc("/", h.notFound)
+	return h
+}
+
+// newHandler 는 기본값에 옵션을 입힌 설정 한 벌이다. 대시보드(New)와 로그인 화면
+// (LoginScreen)이 **같은 옵션을 같은 자리에서** 읽는다 — 언어·로거를 화면마다 따로 받으면
+// 한쪽만 영어가 되는 표류가 생긴다(로그인 화면이 FD_LANG 을 못 받던 것이 그 모양이었다).
+func newHandler(svc *service.Service, opts []Option) *handler {
 	h := &handler{
 		svc: svc,
 		// ★ service.name 을 여기서 덧칠하지 않는다 — 그 필드는 프로세스 진입점 하나가 건다.
@@ -137,13 +152,6 @@ func New(svc *service.Service, opts ...Option) http.Handler {
 	for _, o := range opts {
 		o(h)
 	}
-	h.mux = http.NewServeMux()
-	h.mux.HandleFunc("GET /{$}", h.dashboard)
-	h.mux.HandleFunc("POST /actions/reclaim", h.reclaim)
-	h.mux.HandleFunc("POST /actions/drop", h.drop)
-	h.mux.HandleFunc("POST /actions/lane-release", h.laneRelease)
-	h.mux.HandleFunc("POST /actions/project-view", h.projectView)
-	h.mux.HandleFunc("/", h.notFound)
 	return h
 }
 
@@ -186,16 +194,35 @@ func (h *handler) dashboard(w http.ResponseWriter, r *http.Request) {
 		"claimed_cards", len(page.Live.Sessions))
 }
 
-// render 는 버퍼에 다 찍은 뒤에만 내보낸다.
-//
-// ★ 스트림에 직접 찍으면 템플릿이 중간에 실패했을 때 **반쪽 HTML 이 200 으로 나간다**.
-// 그러면 화면은 그럴듯한데 아래쪽 패널만 통째로 없고, 그 상태가 "막힘 0건"으로 읽힌다.
+// render 는 대시보드 한 장을 낸다.
 func (h *handler) render(r *http.Request, w http.ResponseWriter, page Page, status int) {
+	h.writePage(r, w, tpl, page, status, "GET /", dashboardScreen)
+}
+
+// screen 은 writePage 가 로그·오류 문장에 쓰는 화면 이름이다. 목적격 조사는 받침에 따라
+// 갈리므로 이름과 함께 적는다 — 조사를 덧붙여 만들면 「로그인 화면를」이 나온다.
+type screen struct{ name, object string }
+
+var (
+	dashboardScreen = screen{"대시보드", "대시보드를"}
+	loginScreen     = screen{"로그인 화면", "로그인 화면을"}
+)
+
+// writePage 는 HTML 화면 하나를 **버퍼에 다 찍은 뒤에만** 내보낸다. 대시보드와 로그인 화면이
+// 이 한 길을 탄다 — 언어 경계(h.lang.HTML)·캐시 금지·전송 실패 기록이 화면마다 갈리지 않는다.
+//
+// ★ 스트림에 직접 찍으면 템플릿이 중간에 실패했을 때 **반쪽 HTML 이 그 상태코드로 나간다**.
+// 그러면 화면은 그럴듯한데 아래쪽 패널만 통째로 없고, 그 상태가 "막힘 0건"으로 읽힌다
+// (로그인 화면이면 폼 없는 401 이 된다).
+//
+// ★ no-store: 대시보드는 낡은 판을 보이면 안 되고, 로그인 화면은 캐시되면 로그아웃한 뒤
+// 뒤로 가기로 폼이 되살아나 그 폼의 next 가 낡는다.
+func (h *handler) writePage(r *http.Request, w http.ResponseWriter, t *template.Template, data any, status int, route string, what screen) {
 	var buf bytes.Buffer
-	if err := tpl.Execute(&buf, page); err != nil {
-		h.log.ErrorContext(r.Context(), "대시보드 렌더 실패",
-			"route", "GET /", "error", err.Error())
-		http.Error(w, "대시보드를 렌더하지 못했다. 서버 로그의 원인 전문을 보라.",
+	if err := t.Execute(&buf, data); err != nil {
+		h.log.ErrorContext(r.Context(), what.name+" 렌더 실패",
+			"route", route, "error", err.Error())
+		http.Error(w, what.object+" 렌더하지 못했다. 서버 로그의 원인 전문을 보라.",
 			http.StatusInternalServerError)
 		return
 	}
@@ -205,7 +232,7 @@ func (h *handler) render(r *http.Request, w http.ResponseWriter, page Page, stat
 	if _, err := w.Write(h.lang.HTML(buf.Bytes())); err != nil {
 		// 클라이언트가 끊은 경우가 대부분이라 WARN 이다. 다만 삼키지 않는다 —
 		// 삼키면 "안 보낸 것"과 "보냈는데 끊긴 것"이 구분되지 않는다.
-		h.log.WarnContext(r.Context(), "대시보드 응답 전송 중단",
-			"route", "GET /", "error", err.Error())
+		h.log.WarnContext(r.Context(), what.name+" 응답 전송 중단",
+			"route", route, "error", err.Error())
 	}
 }

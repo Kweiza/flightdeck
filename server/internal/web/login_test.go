@@ -9,7 +9,7 @@ import (
 
 func TestLoginScreenRendersForm(t *testing.T) {
 	rec := httptest.NewRecorder()
-	LoginScreen(rec, httptest.NewRequest("GET", "/", nil),
+	LoginScreen()(rec, httptest.NewRequest("GET", "/", nil),
 		LoginView{Error: "토큰이 일치하지 않는다", Next: "/?project=Kweiza", Action: "./login"})
 
 	if rec.Code != http.StatusUnauthorized {
@@ -40,7 +40,7 @@ func TestLoginScreenRendersForm(t *testing.T) {
 // TestLoginScreenEscapes 는 사유와 next 가 HTML 로 새지 않는지 본다.
 func TestLoginScreenEscapes(t *testing.T) {
 	rec := httptest.NewRecorder()
-	LoginScreen(rec, httptest.NewRequest("GET", "/", nil),
+	LoginScreen()(rec, httptest.NewRequest("GET", "/", nil),
 		LoginView{Error: `<script>alert(1)</script>`, Next: `/"><script>x</script>`})
 
 	body := rec.Body.String()
@@ -55,7 +55,7 @@ func TestLoginScreenEscapes(t *testing.T) {
 // TestLoginScreenFirstVisitHasNoError 는 첫 방문에 빈 오류 자리가 안 뜨는지 본다.
 func TestLoginScreenFirstVisitHasNoError(t *testing.T) {
 	rec := httptest.NewRecorder()
-	LoginScreen(rec, httptest.NewRequest("GET", "/", nil), LoginView{Next: "/", Action: "login"})
+	LoginScreen()(rec, httptest.NewRequest("GET", "/", nil), LoginView{Next: "/", Action: "login"})
 	if strings.Contains(rec.Body.String(), `class="err"`) {
 		t.Fatal("사유가 없는데 오류 자리가 떴다")
 	}
@@ -71,7 +71,7 @@ func TestLoginScreenFirstVisitHasNoError(t *testing.T) {
 func TestLoginScreenUsesGivenAction(t *testing.T) {
 	for _, action := range []string{"./login", "../login", "../../../login"} {
 		rec := httptest.NewRecorder()
-		LoginScreen(rec, httptest.NewRequest("GET", "/", nil), LoginView{Next: "/", Action: action})
+		LoginScreen()(rec, httptest.NewRequest("GET", "/", nil), LoginView{Next: "/", Action: action})
 		if want := `action="` + action + `"`; !strings.Contains(rec.Body.String(), want) {
 			t.Errorf("폼에 %q 가 없다 — 템플릿이 준 값을 안 쓴다", want)
 		}

@@ -11,8 +11,9 @@ import (
 	"github.com/kweiza/flightdeck/internal/web"
 )
 
-// FD_LANG=en 의 **1차 범위 표면**이 한글 0자인가. 범위는 처음 만나는 표면이다 — 보드,
-// add·next·pick·note·finish·show, land 세 갈래, pick(leave), 꼬리, 대시보드 한 장.
+// FD_LANG=en 의 표면이 한글 0자인가. 범위는 처음 만나는 표면이다 — 보드,
+// add·next·pick·note·finish·show, land 세 갈래, pick(leave), 꼬리, doctor, 대시보드 한 장,
+// 토큰 로그인 화면(첫 방문과 거절 사유).
 //
 // ★ 번역은 출력 경계의 표(internal/lang/catalog.go)가 한다. 문장을 만드는 자리가 바뀌면
 // 표가 조용히 빗나가 그 문장만 한국어로 돌아온다 — 그 회귀를 잡는 것이 이 시험이다.
@@ -56,6 +57,7 @@ func TestEnglishSurfacesHaveNoHangul(t *testing.T) {
 	en("cc-c", "pick", "api-error-codes")
 	add("pick(leave)", en("cc-c", "pick", "--leave", "Waiting on the API owners."))
 	add("status(끝)", en("cc-a", "status"))
+	add("doctor", en("cc-a", "doctor"))
 
 	var left []string
 	for _, o := range outs {
@@ -73,6 +75,21 @@ func TestEnglishSurfacesHaveNoHangul(t *testing.T) {
 			left = append(left, "dashboard: "+line)
 		}
 	}
+	// 토큰 로그인 화면. 대시보드와 같은 언어 옵션(web.WithLang)을 받는다 — 운영 배선은 serve.go 의
+	// serveAPIOptions 가 대시보드와 같은 옵션 한 벌을 넘긴다(TestServeAPIOptionsLoginScreenFollowsLang).
+	// 사유는 api 가 거절할 때 싣는 문장 전부다(api/login.go · api/auth.go).
+	var loginBodies []string
+	for _, why := range append([]string{""}, loginReasonsForLangTest...) {
+		lrec := httptest.NewRecorder()
+		web.LoginScreen(web.WithLang(lang.English))(lrec, httptest.NewRequest("GET", "/", nil),
+			web.LoginView{Error: why, Next: "/", Action: "./login"})
+		loginBodies = append(loginBodies, lrec.Body.String())
+		for _, line := range visibleLines(lrec.Body.String()) {
+			if lang.HasHangul(line) {
+				left = append(left, "login: "+line)
+			}
+		}
+	}
 	if len(left) > 0 {
 		t.Fatalf("FD_LANG=en 인데 한글이 남은 줄 %d개 — 표(internal/lang/catalog.go)에 넣어라:\n  %s\n\n전체 출력:\n%s",
 			len(left), strings.Join(left, "\n  "), strings.Join(outs, "\n"))
@@ -87,6 +104,27 @@ func TestEnglishSurfacesHaveNoHangul(t *testing.T) {
 	if body := rec.Body.String(); !strings.Contains(body, `<html lang="en">`) || !strings.Contains(body, "Now — claimed work") {
 		t.Errorf("대시보드가 영어로 안 나왔다(상태 %d)", rec.Code)
 	}
+	if !strings.Contains(all, "■ this machine") {
+		t.Errorf("doctor 가 영어로 안 나왔다:\n%s", all)
+	}
+	if b := loginBodies[0]; !strings.Contains(b, `<html lang="en">`) || !strings.Contains(b, "Sign in") {
+		t.Errorf("로그인 화면이 영어로 안 나왔다:\n%s", b)
+	}
+}
+
+// loginReasonsForLangTest 는 로그인 화면에 사유로 실릴 수 있는 문장이다 — 거절하는 갈래만
+// (api/login.go 의 loginRefused 호출 셋, api/auth.go 에서 OK=false 인 사유). 통과 사유는
+// 폼에 안 뜬다.
+var loginReasonsForLangTest = []string{
+	"폼을 읽을 수 없다",
+	"토큰을 적어라",
+	"토큰이 일치하지 않는다",
+	"Authorization 헤더가 'Bearer <token>' 형식이 아니다",
+	"Authorization 인증 방식이 Bearer 가 아니다",
+	"화면 쿠키의 토큰이 일치하지 않는다 — 토큰이 바뀌었으면 다시 로그인해라",
+	"루프백이지만 이 서버는 루프백에도 토큰을 요구한다",
+	"쿠키가 있지만 이 경로는 화면이 아니다 — /api/v1 은 Authorization 헤더만 받는다",
+	"Authorization 헤더가 없다",
 }
 
 var (

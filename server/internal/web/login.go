@@ -1,7 +1,6 @@
 package web
 
 import (
-	"bytes"
 	"net/http"
 )
 
@@ -25,23 +24,17 @@ type LoginView struct {
 	Action string
 }
 
-// LoginScreen 은 토큰 폼을 401 로 낸다.
+// LoginScreen 은 토큰 폼을 401 로 내는 렌더러를 만든다. 옵션은 대시보드(New)의 것과 같다 —
+// 배선(cmd/fd/serve.go)이 **같은 한 벌**을 둘에 넘겨 언어(WithLang)·로거가 화면마다 안 갈린다.
 //
 // ★ 상태코드가 401 인 이유는 api/middleware.go 의 그 갈래에 적혀 있다 — 리다이렉트로
 // 덮으면 인증 실패가 /metrics 의 unauthorized 축에서 사라진다.
 //
-// ★ 버퍼에 다 찍은 뒤에만 내보낸다. render() 와 같은 규율이다 — 스트림에 직접 찍으면
-// 템플릿이 중간에 실패했을 때 반쪽 HTML 이 401 로 나가고, 폼 없는 로그인 화면이 된다.
-func LoginScreen(w http.ResponseWriter, r *http.Request, v LoginView) {
-	var buf bytes.Buffer
-	if err := loginTpl.Execute(&buf, v); err != nil {
-		http.Error(w, "로그인 화면을 렌더하지 못했다. 서버 로그의 원인 전문을 보라.",
-			http.StatusInternalServerError)
-		return
+// ★ 버퍼·캐시 금지·언어 경계는 대시보드와 같은 길(writePage)이다. 이 화면만의 번역 길을
+// 따로 두지 않는다 — 사유(Error)도 렌더된 문서의 텍스트 노드라 같은 표로 옮겨진다.
+func LoginScreen(opts ...Option) func(http.ResponseWriter, *http.Request, LoginView) {
+	h := newHandler(nil, opts)
+	return func(w http.ResponseWriter, r *http.Request, v LoginView) {
+		h.writePage(r, w, loginTpl, v, http.StatusUnauthorized, r.Method+" "+r.URL.Path, loginScreen)
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// ★ 캐시하면 로그아웃한 뒤 뒤로 가기로 폼이 되살아나고, 그 폼의 next 가 낡는다.
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusUnauthorized)
-	_, _ = buf.WriteTo(w)
 }

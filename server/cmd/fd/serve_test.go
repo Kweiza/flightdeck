@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/kweiza/flightdeck/internal/api"
+	"github.com/kweiza/flightdeck/internal/lang"
+	"github.com/kweiza/flightdeck/internal/web"
 )
 
 // drainProbe 는 api.Handler 를 만족하는 시험용 표면이다.
@@ -356,7 +358,7 @@ func TestSelfUpdateStatusOfLosesNoFieldAcrossTheLine(t *testing.T) {
 // 접히므로 서버는 멀쩡히 뜨고 REST 도 다 돌고, 오직 브라우저에서만 폼 대신 JSON 이 뜬다.
 // serve.go 가 조립을 순수 함수로 뽑아둔 근거가 정확히 이것이다.
 func TestServeAPIOptionsWiresLoginScreen(t *testing.T) {
-	opt := serveAPIOptions("tok", 60, slog.Default(), false, nil, nil, false)
+	opt := serveAPIOptions("tok", 60, slog.Default(), false, nil, nil, false, nil)
 	if opt.LoginScreen == nil {
 		t.Fatal("LoginScreen 이 nil 이다 — 브라우저가 폼 대신 JSON 401 을 본다")
 	}
@@ -392,5 +394,26 @@ func TestServeAPIOptionsWiresLoginScreen(t *testing.T) {
 	if !strings.Contains(body, `action="../login"`) {
 		t.Fatal(`폼 action 이 안 실렸다 — 어댑터가 Action 을 잘못 옮겼다. ` +
 			`빈 값이면 폼이 문서 URL 자신으로 제출돼 무한 폼이 된다`)
+	}
+}
+
+// TestServeAPIOptionsLoginScreenFollowsLang 은 로그인 화면이 **화면 옵션 한 벌**을 받는지 본다.
+//
+// ★ 이 배선이 빠지면 FD_LANG=en 에서 대시보드는 영어인데 토큰 폼만 한국어로 뜬다. 서버는 멀쩡히
+// 돌고 표면 시험(web.LoginScreen 을 직접 부른다)도 초록이라, 이 조립 자리에서만 잡힌다.
+func TestServeAPIOptionsLoginScreenFollowsLang(t *testing.T) {
+	for _, tc := range []struct {
+		opts []web.Option
+		want string
+	}{
+		{[]web.Option{web.WithLang(lang.English)}, `<html lang="en">`},
+		{nil, `<html lang="ko">`},
+	} {
+		opt := serveAPIOptions("tok", 60, slog.Default(), false, nil, nil, false, tc.opts)
+		rec := httptest.NewRecorder()
+		opt.LoginScreen(rec, httptest.NewRequest("GET", "/", nil), api.LoginView{Next: "/", Action: "./login"})
+		if body := rec.Body.String(); !strings.Contains(body, tc.want) {
+			t.Errorf("옵션 %d개: 로그인 화면에 %s 가 없다:\n%s", len(tc.opts), tc.want, body)
+		}
 	}
 }

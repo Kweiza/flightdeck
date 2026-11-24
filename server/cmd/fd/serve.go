@@ -102,7 +102,7 @@ func portOf(addr string) string {
 // **실패 모양**이다: 토큰이 끊기면 인증이 통째로 열려 시끄럽게 드러나고, self_update 가
 // 끊기면 화면이 아무 말도 안 하는 **침묵**이라 이 축만 한 칸 더 뺐다.
 func serveAPIOptions(token string, ratePerMinute int, log *slog.Logger, inContainer bool,
-	watcher *selfWatcher, ledgerJob *ledgerBackupJob, requireTokenOnLoopback bool) api.Options {
+	watcher *selfWatcher, ledgerJob *ledgerBackupJob, requireTokenOnLoopback bool, screenOpts []web.Option) api.Options {
 	opt := api.Options{
 		Token:         token,
 		RatePerMinute: ratePerMinute,
@@ -127,8 +127,13 @@ func serveAPIOptions(token string, ratePerMinute int, log *slog.Logger, inContai
 	// ★ nil 로 두면 실패가 **조용하다**: 서버는 뜨고 REST 도 다 도는데 브라우저에서만
 	// 폼 대신 JSON 401 이 뜬다. 그 모양은 운영에서 사람이 봐야 발견되고, 정확히 그런
 	// 침묵이 이 함수를 순수 함수로 뽑게 만든 사고였다(위 ★ 참고).
+	//
+	// ★ screenOpts 는 대시보드(web.New)가 받는 **바로 그 한 벌**이다(runServe). 로그인 화면만
+	// 따로 언어를 고르면 FD_LANG=en 에서 대시보드는 영어인데 폼은 한국어로 뜬다 — 이 자리가
+	// 그 길을 탔던 것이 fd-lang-en-login-and-doctor 다.
+	login := web.LoginScreen(screenOpts...)
 	opt.LoginScreen = func(w http.ResponseWriter, r *http.Request, v api.LoginView) {
-		web.LoginScreen(w, r, web.LoginView{Error: v.Error, Next: v.Next, Action: v.Action})
+		login(w, r, web.LoginView{Error: v.Error, Next: v.Next, Action: v.Action})
 	}
 	return opt
 }
@@ -243,7 +248,9 @@ func runServe(args []string, env func(string) (string, bool), log *slog.Logger) 
 	//   판정 자리(pick · amend · finish)는 이 설정과 무관하게 언제나 지금 읽는다.
 	svc := service.New(st, log, service.WithScreenSnapshots(service.ScreenRefreshAfter, service.ScreenMaxAge, service.ScreenWait))
 	token := envOr(env, "FD_TOKEN", "")
-	webH := web.New(svc, web.WithLogger(log), web.WithLang(lang.FromEnv(env)))
+	// 화면 옵션 한 벌 — 대시보드와 로그인 화면이 함께 쓴다(serveAPIOptions 의 screenOpts).
+	screenOpts := []web.Option{web.WithLogger(log), web.WithLang(lang.FromEnv(env))}
+	webH := web.New(svc, screenOpts...)
 	// ★ watcher 를 buildHandler 보다 먼저 만든다 — api.Options.SelfUpdate 콜백이
 	// 감시기의 Status() 를 물어야 하므로, 조립 시점에 감시기가 이미 있어야 한다.
 	watcher := newServeWatcher(log, env, home, path)
@@ -251,7 +258,7 @@ func runServe(args []string, env func(string) (string, bool), log *slog.Logger) 
 	// ★ 잡을 핸들러보다 먼저 만든다 — api.Options.LedgerBackup 콜백이 이 잡의 State() 를
 	//   물으므로 조립 시점에 이미 있어야 한다(감시기와 같은 이유).
 	ledgerJob := newLedgerBackupJob(log, st, LedgerOutDir(env, home, inContainer), ledgerBackupInterval)
-	handler := buildHandler(svc, webH, serveAPIOptions(token, *rate, log, inContainer, watcher, ledgerJob, *requireTokenOnLoopback))
+	handler := buildHandler(svc, webH, serveAPIOptions(token, *rate, log, inContainer, watcher, ledgerJob, *requireTokenOnLoopback, screenOpts))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

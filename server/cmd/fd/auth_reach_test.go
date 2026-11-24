@@ -68,11 +68,11 @@ func TestHealthzResponseReadsLoopbackConfigured(t *testing.T) {
 // "배선과 광고가 어긋났는데 전 스위트가 초록이었다"였다. 조립이 serve 본문
 // 안에만 있으면 축 하나가 빠져도 아무 시험이 안 잡는다 — 그래서 순수 함수로 뽑는다.
 func TestServeAPIOptionsCarriesTheContainerVerdict(t *testing.T) {
-	in := serveAPIOptions("tok", 60, quietLogger(), true, nil, nil, false)
+	in := serveAPIOptions("tok", 60, quietLogger(), true, nil, nil, false, nil)
 	if !in.InContainer {
 		t.Fatal("컨테이너 판정이 api 옵션까지 안 간다 — /healthz 와 401 처방이 '왜 면제가 안 닿는가'를 말할 근거를 잃는다")
 	}
-	out := serveAPIOptions("tok", 60, quietLogger(), false, nil, nil, false)
+	out := serveAPIOptions("tok", 60, quietLogger(), false, nil, nil, false, nil)
 	if out.InContainer {
 		t.Fatal("컨테이너가 아닌데 컨테이너라고 넘긴다 — 사유가 틀리면 안 말하느니만 못하다")
 	}
@@ -88,10 +88,10 @@ func TestServeAPIOptionsCarriesTheContainerVerdict(t *testing.T) {
 // 켰는데 아무 일도 안 일어나고, 그 사실이 증상으로 안 드러난다 — 면제는 원래 눈에 안
 // 보이고, 안 걸리는 것과 안 열린 것이 화면에서 같기 때문이다.
 func TestServeAPIOptionsCarriesLoopbackSwitch(t *testing.T) {
-	if serveAPIOptions("tok", 60, quietLogger(), false, nil, nil, false).RequireTokenOnLoopback {
+	if serveAPIOptions("tok", 60, quietLogger(), false, nil, nil, false, nil).RequireTokenOnLoopback {
 		t.Error("기본값이 참이다 — 로컬 루프백으로 토큰 없이 붙던 세션이 전부 깨진다")
 	}
-	if !serveAPIOptions("tok", 60, quietLogger(), false, nil, nil, true).RequireTokenOnLoopback {
+	if !serveAPIOptions("tok", 60, quietLogger(), false, nil, nil, true, nil).RequireTokenOnLoopback {
 		t.Error("스위치를 켰는데 옵션에 안 실렸다 — 플래그가 조용히 죽는다")
 	}
 }
