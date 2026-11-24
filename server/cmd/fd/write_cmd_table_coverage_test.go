@@ -499,7 +499,7 @@ type cliDoException struct {
 }
 
 // knownCliDoWrites 는 지금 정당화된 a.cli.do 호출 셋이다(키 = 감싸는 함수 이름).
-// 넷째가 생기면 아래 TestCliDoWriteCallsAreKnownAndJustified 가 그 자리에서 빨개진다 —
+// 다섯째가 생기면 아래 TestCliDoWriteCallsAreKnownAndJustified 가 그 자리에서 빨개진다 —
 // judgeOfflineGhostExceptions 와 같은 어법으로 reason 을 필수 필드로 둔다.
 var knownCliDoWrites = map[string]cliDoException{
 	"openSession": {"세션 열기는 고정 키를 쓰지 않는다 — 응답에 지금 상태(신규 여부·선점 " +
@@ -514,6 +514,10 @@ var knownCliDoWrites = map[string]cliDoException{
 	"CloseSession": {"Rekey 와 같은 이유(정책표가 모르는 명령을 거절한다)에 하나가 더 있다 — " +
 		"닫기는 **지금의 사실**이지 나중에 재생할 사실이 아니다(app.go 의 CloseSession 주석). " +
 		"오프라인 큐에 쌓아 두면 그 사이 되살아나 일하고 있는 세션을 나중에 다시 죽인다."},
+	"tellInbox": {"받는 곳(보드 초인종의 배달 주소)도 닫기와 같은 **지금의 사실**이다(inbox.go 의 " +
+		"tellInbox 주석). 소켓은 세션이 끝나면 죽고 다른 세션에 다시 쓰이므로, 오프라인 큐에 쌓아 " +
+		"뒀다가 재생하면 끝난 세션의 소켓을 되살린다. 다음 프롬프트가 지금 값을 다시 적는다. " +
+		"그리고 정책표(JudgeOffline)는 이 명령을 몰라 거절한다."},
 }
 
 // TestCliDoWriteCallsAreKnownAndJustified 는 I-4 를 잰다: a.cli.do 로 직접 나가는 서버

@@ -617,6 +617,11 @@ def fd_post(path, body):
     return fd_call("POST", path, body)
 
 
+def drop_inbox(session_id, sock):
+    """연결이 안 되는 소켓의 받는 곳을 fd 원장에서 지운다(소켓이 같을 때만, README 「세션에 알림」)."""
+    return fd_call("DELETE", "/api/v1/sessions/" + urllib.parse.quote(session_id, safe="") + "/inbox", {"socket": sock})
+
+
 def item_path(iid):
     return "/api/v1/items/" + urllib.parse.quote(iid, safe="")
 
@@ -645,13 +650,8 @@ def projects_list():
     return _projects_list[1]
 
 
-def project_paths():
-    """이 맥에 있는 fd 프로젝트 폴더 전부(세션이 어느 프로젝트의 것인지 가장 깊은 폴더로 가를 때 쓴다)."""
-    return [p["path"] for p in projects_list() if isinstance(p.get("path"), str) and os.path.isdir(p["path"])]
-
-
 def project_of(project):
-    """fd 프로젝트의 저장소 폴더와 GitHub 주소(10분 기억). 커밋 링크와 세션 알림이 같은 것을 읽는다."""
+    """fd 프로젝트의 저장소 폴더와 GitHub 주소(10분 기억). 커밋 링크가 읽는다."""
     hit = _project_cache.get(project)
     if hit and time.time() - hit[0] < 600:
         return hit[1]
@@ -782,7 +782,7 @@ def tell_sessions(project, path, req, body):
     except Exception as e:  # noqa: BLE001
         sys.stderr.write("BOARD_INBOX_WATCH_FAILED %s\n" % e.__class__.__name__)
     try:
-        body["notify"] = session_inbox.notify(project, project_of(project)["path"], project_paths(), iid, TOLD[path])
+        body["notify"] = session_inbox.notify(project, iid, TOLD[path], fd_get, drop_inbox)
     except Exception as e:  # noqa: BLE001  알림은 덤이다: 까닭을 남기고 동작 응답을 지킨다
         sys.stderr.write("BOARD_NOTIFY_FAILED %s\n" % e.__class__.__name__)
         body["notify"] = {"ok": False, "sent": 0, "failed": [], "warning": "알림 못 보냄: 보드 오류 %s" % e.__class__.__name__}

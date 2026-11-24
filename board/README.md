@@ -111,7 +111,7 @@ The board is **a host process, not inside the container**, the images and logs w
 | `BOARD_TAILNET` | (install.sh: suffix of the tailscale name) | tailnet suffix `/api/embed` may call (e.g. `<tailnet>.ts.net`) |
 | `BOARD_PREVIEW_PORTS` | (none) | localhost ports `/api/embed` may call (comma-separated) |
 | `BOARD_AUTH` | `~/.config/flightdeck-board/auth.json` | access secret · owner logins (see Access) |
-| `BOARD_SESSIONS` | `~/.config/flightdeck-board/sessions` | session registry (see Telling sessions). The hook and the board must see the same value |
+| `BOARD_SESSIONS` | `~/.config/flightdeck-board/sessions` | old session registry (see "While moving over" under Telling sessions). Hooks no longer write it; the board only reads files left by old sessions |
 | `BOARD_WATCH` | `~/.config/flightdeck-board/inbox-watch.json` | file pairing owner actions with inbox reads (0600, see Telling sessions) |
 | `BOARD_UNREAD_MINUTES` | `15` | the page warns when an owner action has gone unread by the coordinator for longer than this |
 
@@ -212,10 +212,11 @@ After handling, tidy the labels: close with `finish` when confirmed; `--rm statu
 ## Telling sessions
 
 After an owner action on the board (comment, done, choice, move, new card) is saved, the board posts one **doorbell** line into the inbox of every live,
-**human-opened** Claude Code session **on this Mac** whose folder is inside that card's project (worktrees inside it included; with nested
-projects such as `~/a` and `~/a/repos/b` a session belongs to the deepest one), using Claude Code's
-[cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging). The code lives in `session_inbox.py` (send, registry)
-and `inbox_watch.py` (unread warning).
+**human-opened** Claude Code session **on this Mac** among that card project's fd sessions (its worktrees included). Which project a session
+belongs to is what the fd ledger already decided (git-common-dir); the board does not judge it again by folder (nested repositories such as
+`~/a` and `~/a/repos/b` are each their own project). It uses Claude Code's
+[cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging). Registration is the fd hook (`server/cmd/fd/inbox.go`),
+sending is `session_inbox.py`, the unread warning is `inbox_watch.py`.
 
 The receiving session sees exactly these two lines (the first is the preview line):
 
@@ -226,13 +227,27 @@ The receiving session sees exactly these two lines (the first is the preview lin
   pass `^[a-z0-9][a-z0-9._/-]{0,79}$` (no trailing newline, no `..`).
   Card ids are chosen by workers, so hyphen-joined words can still appear; the receiving session never builds commands from them. No owner text, card title, option text or summary. An id that fails the check is left out and only
   "보드에 변경 있음" goes. Why: as Send explains, this line enters bypass sessions without a dialog, and any text it carried would become text that drives the session.
-- **Registry**: plugin hooks (SessionStart, UserPromptSubmit, async) run `session_inbox.py hook`, which writes `BOARD_SESSIONS/<session_id>.json`
-  (dir 0700, file 0600) with the session id, `CLAUDE_CODE_MESSAGING_SOCKET`, cwd and permission mode. Machines without the board's config folder
-  and `-p` / SDK workers (`CLAUDE_CODE_SESSION_ATTENDED=0`) are not registered. `CLAUDE_CODE_MESSAGING_TOKEN` is neither stored nor used
-  (optional on macOS and Linux, and useless when presented by a non-child process), so Windows is not supported yet.
-  Sessions already running register on their first prompt after they reload the plugin (restart).
-- **Send**: the line carries the registered `session_id`, so a session that reused the socket path drops it. Registry entries whose socket refuses
-  are removed. The envelope's `from-mode` names the receiving session's permission class (bypass or prompting). Claude Code lets a message into a
+- **Registration**: the fd hooks (SessionStart, UserPromptSubmit) write the card's address into the fd ledger while opening the session
+  (`PUT /api/v1/sessions/{id}/inbox`, table `session_inbox`: socket `CLAUDE_CODE_MESSAGING_SOCKET`, permission mode, time). Machines without the
+  board's config folder (`~/.config/flightdeck-board`) and `-p` / SDK workers (`CLAUDE_CODE_SESSION_ATTENDED=0`) write nothing. One socket on one
+  machine keeps one session (older rows with the same socket are removed on write). `CLAUDE_CODE_MESSAGING_TOKEN` is neither read nor sent by the
+  hook and has no column (optional on macOS and Linux, and useless when presented by a non-child process), so Windows is not supported yet. The mode
+  is rewritten from the payload's `permission_mode` on every prompt and guessed from the command line, then settings files, at session start. If the
+  server is unreachable nothing is queued; the next prompt writes it again.
+- **Reading**: the board reads `GET /api/v1/inbox?project=<card project>&machine=<this Mac's fd machine-id>` (the machine-id lives where the fd client
+  keeps it, `FD_STATE_DIR/machine-id` or `~/.flightdeck/machine-id`). Socket paths from another machine mean nothing here and may belong to someone
+  else's session, hence the machine filter. Closed (done) cards are left out.
+- **While moving over (old registry files)**: sessions already running on a 0.45.x plugin write their address only to `BOARD_SESSIONS/<session_id>.json`.
+  The board sends those files' ids as `legacy` in the same GET and sends only to the ones the ledger answers are open cards of this project on this
+  machine (no folder judgement). A session or socket that has a ledger address wins over a file. Files whose socket is dead, and files of
+  sessions or sockets that moved to the ledger, are removed. Those
+  sessions move to the ledger when they reload the plugin (restart); once all have, this path and `BOARD_SESSIONS` go away.
+- **Rollout order**: the board runs this checkout's `board.py` under launchd, so a code change takes effect only after a restart. Roll out the
+  server (container, migration 018), then restart the board (`launchctl kickstart -k gui/$(id -u)/<BOARD_LABEL>`), then the plugin. A new board
+  meeting an old server warns "알림 못 보냄: fd 서버가 받는 곳 경로를 모름"; an old board does not see sessions on the new plugin (the unread
+  warning counts that gap).
+- **Send**: the line carries the card's current `session_id` (after any rekey), so a session that reused the socket path drops it. Addresses whose
+  socket refuses are removed (`DELETE /api/v1/sessions/{id}/inbox`, only if the socket still matches; for old registrations, the file). The envelope's `from-mode` names the receiving session's permission class (bypass or prompting). Claude Code lets a message into a
   bypass session without a dialog only when it claims bypass, and into any other session when it does not claim bypass, so the board skips the
   approval dialog of bypass sessions (undocumented behaviour: if Claude Code changes it, notices get held in a dialog, which is the safe way to break).
   The mode is refreshed on every prompt, so the first notice right after a shift+tab mode change can be held in a dialog (approve or ignore it).

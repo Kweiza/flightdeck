@@ -136,4 +136,55 @@ func TestBoardReadsTheseFields(t *testing.T) {
 		t.Fatal("projects 가 비었다")
 	}
 	has("projects[]", obj("projects[]", ps[0]), "id", "path", "items")
+
+	// 세션 알림(board/session_inbox.py): 훅이 적은 받는 곳을 그 프로젝트 · 그 기계로 읽고, 죽은 소켓을 지운다.
+	e.okBody(t, e.write(http.MethodPut, "/api/v1/sessions/"+sess+"/inbox", map[string]any{
+		"socket": "/tmp/fd-test/inbox.sock", "mode": "bypassPermissions",
+	}), "받는 곳 적기")
+	ib := e.okBody(t, e.do(http.MethodGet, "/api/v1/inbox?project="+testProject+"&machine=m1&legacy=cc-board,cc-none", nil), "inbox")
+	has("inbox", ib, "inbox", "legacy")
+	rows := list("inbox.inbox", ib["inbox"])
+	if len(rows) != 1 {
+		t.Fatalf("inbox 가 %d건이다: 적은 하나여야 한다", len(rows))
+	}
+	row := obj("inbox[]", rows[0])
+	has("inbox[]", row, "session_id", "cc_session_id", "socket", "mode")
+	if row["cc_session_id"] != "cc-board" || row["socket"] != "/tmp/fd-test/inbox.sock" || row["mode"] != "bypassPermissions" {
+		t.Fatalf("inbox[] 값이 어긋났다: %v", row)
+	}
+	if lg := list("inbox.legacy", ib["legacy"]); len(lg) != 1 || lg[0] != "cc-board" {
+		t.Fatalf("legacy 가 %v 다: 물은 것 중 이 프로젝트 · 기계의 cc-board 하나여야 한다", lg)
+	}
+	other := e.okBody(t, e.do(http.MethodGet, "/api/v1/inbox?project="+testProject+"&machine=m-other", nil), "다른 기계 inbox")
+	if n := len(list("다른 기계 inbox", other["inbox"])); n != 0 {
+		t.Fatalf("다른 기계로 물었는데 받는 곳이 %d건 나왔다", n)
+	}
+	gone := e.okBody(t, e.write(http.MethodDelete, "/api/v1/sessions/"+sess+"/inbox", map[string]any{
+		"socket": "/tmp/fd-test/inbox.sock",
+	}), "받는 곳 지우기")
+	if gone["dropped"] != float64(1) {
+		t.Fatalf("지운 행이 %v 다: 1 이어야 한다", gone["dropped"])
+	}
+}
+
+// 받는 곳의 꼴이 어긋나면 거절한다(상대 경로 · 제어 문자 · 낱말이 아닌 모드), 기계를 안 밝힌 읽기도 거절한다.
+func TestInboxRefusesMalformed(t *testing.T) {
+	e := newEnv(t, nil)
+	sess := e.openSession("cc-inbox-bad")
+	for _, body := range []map[string]any{
+		{"socket": "rel/inbox.sock", "mode": "default"},
+		{"socket": "/tmp/a\nb.sock", "mode": "default"},
+		{"socket": "/tmp/a.sock", "mode": "bypass Permissions"},
+		{"socket": "", "mode": ""},
+	} {
+		if w := e.write(http.MethodPut, "/api/v1/sessions/"+sess+"/inbox", body); w.Code < 400 || w.Code >= 500 {
+			t.Errorf("꼴이 어긋난 받는 곳 %v 가 %d 로 들어갔다: %s", body, w.Code, w.Body.String())
+		}
+	}
+	if w := e.do(http.MethodGet, "/api/v1/inbox?project="+testProject, nil); w.Code != http.StatusBadRequest {
+		t.Errorf("machine 없는 읽기가 %d 다: 400 이어야 한다", w.Code)
+	}
+	if w := e.write(http.MethodPut, "/api/v1/sessions/nope/inbox", map[string]any{"socket": "/tmp/a.sock"}); w.Code != http.StatusNotFound {
+		t.Errorf("없는 세션에 받는 곳 적기가 %d 다: 404 여야 한다", w.Code)
+	}
 }

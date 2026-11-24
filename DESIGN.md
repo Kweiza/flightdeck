@@ -231,7 +231,7 @@ GHE push 도 이 구현 어디에도 없고, 그 셋을 어떻게 쪼갤지는 �
 
 ---
 
-## 3. 데이터 모델 — SQLite 파일 하나, 테이블 27개, 계층 셋
+## 3. 데이터 모델 — SQLite 파일 하나, 테이블 28개, 계층 셋
 
 계층이 곧 쓰기 권한이다.
 
@@ -243,11 +243,11 @@ GHE push 도 이 구현 어디에도 없고, 그 셋을 어떻게 쪼갤지는 �
 
 정본은 `server/internal/store/schema.sql`. 아래는 그 요지와 **각 제약이 막는 사고**다.
 
-**★ 27 은 세는 축을 밝혀 둔다 — 안 밝히면 다음 사람이 다른 축을 세고 어긋났다고 판단한다.**
+**★ 28 은 세는 축을 밝혀 둔다 — 안 밝히면 다음 사람이 다른 축을 세고 어긋났다고 판단한다.**
 사람이 선언한 것 = `schema.sql` 의 `CREATE TABLE` 21 + `CREATE VIRTUAL TABLE` 1(`judgment_fts`) +
-증분 5(`idempotency` 002 · `landing_queue` 003 · `landing_queue_resource` 008 ·
-`project_member` 014 · `item_revision` 016) = 27
-반면 살아 있는 DB 에서 `sqlite_master` 를 그대로 세면 **31** 이 나온다. 축이 **둘** 어긋난다:
+증분 6(`idempotency` 002 · `landing_queue` 003 · `landing_queue_resource` 008 ·
+`project_member` 014 · `item_revision` 016 · `session_inbox` 018) = 28
+반면 살아 있는 DB 에서 `sqlite_master` 를 그대로 세면 **32** 가 나온다. 축이 **둘** 어긋난다:
 
 - **⊖ 증분 011 이 `item_dependents` 를 DROP 한다.** 선언은 `schema.sql` 에 그대로 남아 있지만
   (정의를 두 자리에 두지 않는다는 규율 — `BaseSchemaVersion` 주석) **어떤 DB 에도 그 표는
@@ -256,9 +256,9 @@ GHE push 도 이 구현 어디에도 없고, 그 셋을 어떻게 쪼갤지는 �
   (`judgment_fts_config`·`_data`·`_docsize`·`_idx`), 거기에 `AUTOINCREMENT` 가 있는 표마다
   공유하는 `sqlite_sequence` 하나.
 
-합치면 27 − 1 + 4 + 1 = 31. 다섯은 SQLite 엔진이 만드는 부산물이고 `item_dependents` 는
-은퇴한 선언이라 **둘 다 이 절이 말하는 데이터 모델이 아니다** — 그래서 이 절은 27 을 쓴다.
-산식의 검산은 `store/schema_table_count_test.go` 가 **이름 목록 27개로** 잠근다(수만 맞추는
+합치면 28 − 1 + 4 + 1 = 32. 다섯은 SQLite 엔진이 만드는 부산물이고 `item_dependents` 는
+은퇴한 선언이라 **둘 다 이 절이 말하는 데이터 모델이 아니다** — 그래서 이 절은 28 을 쓴다.
+산식의 검산은 `store/schema_table_count_test.go` 가 **이름 목록 28개로** 잠근다(수만 맞추는
 시험이 아니다 — 하나를 지우고 하나를 더하면 거기서 빨개진다).
 
 **실측(2026-09-16, 운영 원장 `mode=ro` 사본):** 판 15 에서 `sqlite_master` 30개
@@ -279,6 +279,11 @@ GHE push 도 이 구현 어디에도 없고, 그 셋을 어떻게 쪼갤지는 �
   스스로 빠진다 — 이관이 필요 없는 이유다.
   `ended` 컬럼이 없다 — 채울 수 없는 컬럼은 반드시 거짓으로 채워진다. `pid` 도 없다.
 - `session_workspace` — 한 세션이 코드 레포와 문서 레포를 함께 만지는 실무를 담는다. 단수 `project` 필드로는 못 담는다.
+- `session_inbox`: 사람이 연 세션의 **받는 곳**(Claude Code cross-session messaging 소켓 · 권한 모드, 증분 018). 보드가 소유자 동작을
+  초인종 한 줄로 알릴 배달 주소다(`board/README.md` 「세션에 알림」). 훅이 적고(`PUT /sessions/{id}/inbox`) 보드가 프로젝트 · 기계로 읽는다.
+  **`session` 칼럼이 아니다.** 소켓은 프로세스 id 로 지어져 재시작마다 바뀌는 일시 경로라 좌표도 속성도 아니고, 칼럼으로 두면 판단 원장
+  백업(`ledgerTables`)에 이 기계의 일시 경로가 실려 나간다. 한 기계 · 한 소켓에 한 행(같은 소켓의 옛 행은 쓰기 때 지운다). **토큰 칸이 없다.**
+  `pid`·`ended` 를 안 두는 위 `session` 의 규율과 부딪히지 않는다: 살아 있는지는 여기 적지 않고, 보드가 소켓에 붙어 보고 안다.
 - `signal` — 생존 "사실"이지 판정이 아니다. `kind ∈ {prompt, tool, mcp, commit, push}`.
   **PK 가 `(session_id, kind)` 라 종류별 한 행이고 갱신된다 — 횟수·간격·이력이라는 값이 없다.**
   그것들의 재료는 `event` 표뿐이다(§10). 이 문장이 여기 있는 이유는 §4 아래에 있다.
@@ -1001,6 +1006,9 @@ GET    /sessions?machine&worktree&cc   (조회 전용 — 3중키. 없으면 404
 GET    /sessions?id=<카드>             (카드 id 로 지목 — 좌표 해석이 없는 유일한 축. 선점을 함께 낸다)
 POST   /sessions/{id}/signals       POST   /sessions/{id}/workspaces  ← 클라이언트 0건(아래)
 POST   /sessions/{id}/rekey         (훅 전용 — /clear·compact 로 갈린 대화의 새 cc 를 카드에 반영)
+PUT    /sessions/{id}/inbox         (훅 전용: 사람이 연 세션의 받는 곳(소켓 · 권한 모드), 보드 초인종의 배달 주소. 토큰은 칸이 없다)
+DELETE /sessions/{id}/inbox         (보드 전용: 연결이 안 되는 소켓의 받는 곳을 지운다, 소켓이 같을 때만)
+GET    /inbox?project&machine&legacy  (보드 전용: 그 프로젝트 · 그 기계의 받는 곳. legacy 는 옮겨 가는 동안 옛 등록 파일의 cc 를 묻는다)
 GET    /items/next                  POST   /items
 GET    /items/{id}?project&session_id  (항목 하나를 **읽는다** — 지금 본문 + 개정 이력 + 걸린 판단. 닫힌 항목도 준다, 자르지 않는다. session_id 는 선택 — 워크스페이스 관문에만 쓴다)
 GET    /items?project&state&limit  (닫힌 항목을 최근에 닫힌 순으로 **읽는다** — state 는 closed·done·dropped, 열린 항목은 dashboard.json 의 open_items 가 정본이라 안 받는다)
@@ -1101,8 +1109,8 @@ TLS 뒤에서만 `Secure`)를 굽고, `JudgeAuth` 는 **`/` · `/actions/*` · `
 
 | 이벤트 | matcher | 하는 일 |
 |---|---|---|
-| `SessionStart` | `startup\|resume\|clear\|compact\|fork` | `fd session open` → `additionalContext` 에 보드 요약 + 내 선점 + 미확인 결과 + **서버 상태 배너** |
-| `UserPromptSubmit` | — | `fd beat --kind prompt` (2초 타임아웃) + 미확인 알림 주입 |
+| `SessionStart` | `startup\|resume\|clear\|compact\|fork` | `fd session open` → `additionalContext` 에 보드 요약 + 내 선점 + 미확인 결과 + **서버 상태 배너**. 사람이 연 세션이면 `PUT /sessions/{id}/inbox`(받는 곳, 보드 설정 폴더가 있을 때만, §3 `session_inbox`) |
+| `UserPromptSubmit` | — | `fd beat --kind prompt` (2초 타임아웃) + 미확인 알림 주입 + 받는 곳의 권한 모드 고쳐 적기(위와 같은 조건) |
 | `PostToolUse` | `Edit\|Write\|NotebookEdit` | `async` `fd beat --kind tool --path <file>` — **미커밋 발자국의 유일한 원천** |
 | `PreCompact` | — | `async` `fd note --draft` — 압축으로 판단이 날아가는 것만 막는다 |
 | `Stop` | — | `fd hook stop` → 처방(발화 5조건, 전이 1회) 주입 + 라이프사이클 단계면 decision:block(대화 단위 판정 · 방벽은 stop_hook_active). **fail-open, 3초** |

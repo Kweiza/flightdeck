@@ -96,6 +96,7 @@ func TestDeclaredTablesMatchDesign(t *testing.T) {
 		"resource_hold",
 		"schema_version", // CREATE TABLE IF NOT EXISTS — 순진한 패턴이 놓치는 그 한 줄
 		"session",
+		"session_inbox", // 증분 018, 세션이 받는 곳(board/README 「세션에 알림」)
 		"session_workspace",
 		"signal",
 		"snapshot",

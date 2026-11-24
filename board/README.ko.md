@@ -107,7 +107,7 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 | `BOARD_TAILNET` | (install.sh: tailscale 이름의 접미사) | `/api/embed` 가 부를 tailnet 접미사(예: `<tailnet>.ts.net`) |
 | `BOARD_PREVIEW_PORTS` | (없음) | `/api/embed` 가 부를 이 맥(localhost)의 포트(쉼표 구분) |
 | `BOARD_AUTH` | `~/.config/flightdeck-board/auth.json` | 접근 비밀 · 소유자 로그인(아래 「접근」) |
-| `BOARD_SESSIONS` | `~/.config/flightdeck-board/sessions` | 세션 등록 폴더(아래 「세션에 알림」). 훅과 보드가 같은 값을 봐야 한다 |
+| `BOARD_SESSIONS` | `~/.config/flightdeck-board/sessions` | 옛 세션 등록 폴더(아래 「세션에 알림」의 「옮겨 가는 동안」). 지금 훅은 여기 쓰지 않고, 보드는 옛 세션의 파일만 읽는다 |
 | `BOARD_WATCH` | `~/.config/flightdeck-board/inbox-watch.json` | 소유자 동작과 수신함 읽기를 맞대는 보관 파일(0600, 아래 「세션에 알림」) |
 | `BOARD_UNREAD_MINUTES` | `15` | 조정 세션이 이 분 넘게 수신함을 안 읽은 소유자 동작이 있으면 보드 화면이 경고 |
 
@@ -211,10 +211,11 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 
 ## 세션에 알림
 
-소유자가 보드에서 동작(댓글 · 했어 · 선택 · 상태 옮기기 · 새 카드)을 하면, 저장된 뒤 보드가 **이 맥에서** 그 카드 프로젝트의 폴더(그 안의 워크트리 포함) 안에서
-**사람이 연** 살아 있는 Claude Code 세션마다 inbox 에 **초인종** 한 줄을 넣는다. 프로젝트 폴더가 겹치면(`~/a` 와 `~/a/repos/b`) 세션은 가장 깊은 프로젝트의 것으로 친다.
+소유자가 보드에서 동작(댓글 · 했어 · 선택 · 상태 옮기기 · 새 카드)을 하면, 저장된 뒤 보드가 **이 맥에서** 그 카드 프로젝트의 fd 세션(그 저장소의 워크트리 포함)
+중 **사람이 연** 살아 있는 Claude Code 세션마다 inbox 에 **초인종** 한 줄을 넣는다. 세션이 어느 프로젝트인지는 fd 원장이 정한 것(git-common-dir)을 그대로 쓴다,
+보드가 폴더로 다시 판정하지 않는다(`~/a` 와 `~/a/repos/b` 처럼 겹친 저장소도 각자 자기 프로젝트다).
 조정 세션이 따로 감시하거나 소유자가 「보드 봐」라고 시키지 않아도 된다. 쓰는 것은 Claude Code 의 [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging) 이고
-코드는 `session_inbox.py`(전송 · 등록)와 `inbox_watch.py`(안 읽힘 경고) 두 곳이다.
+코드는 등록이 fd 훅(`server/cmd/fd/inbox.go`), 전송이 `session_inbox.py`, 안 읽힘 경고가 `inbox_watch.py` 다.
 
 받는 세션이 보는 글은 이 두 줄뿐이다(첫 줄이 미리보기 한 줄):
 
@@ -225,11 +226,22 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
   카드 id 는 작업자가 고르는 글자라 하이픈으로 이은 낱말은 실릴 수 있다. 그래서 받는 세션은 그 글로 명령을 짓지 않는다.
   소유자 글 · 카드 제목 · 보기 글 · 요약은 싣지 않는다. 꼴이 어긋난 id 는 빼고 「보드에 변경 있음」만 간다(둘 다 어긋나면 그 한 마디만).
   까닭: 아래 「전송」처럼 이 줄은 권한 확인을 건너뛰는 세션에 대화상자 없이 들어간다. 그 안에 누가 쓴 글이든 실리면 세션을 부리는 글이 된다.
-- **등록**: 플러그인 훅(SessionStart · UserPromptSubmit, async)이 `session_inbox.py hook` 을 불러 `BOARD_SESSIONS/<session_id>.json`(폴더 0700, 파일 0600)에
-  세션 id · `CLAUDE_CODE_MESSAGING_SOCKET` · cwd · 권한 모드를 적는다. 보드 설정 폴더가 없는 기계, `-p` · SDK 작업자(`CLAUDE_CODE_SESSION_ATTENDED=0`)는 적지 않는다.
-  `CLAUDE_CODE_MESSAGING_TOKEN` 은 적지도 쓰지도 않는다(macOS · Linux 에서는 없어도 되고, 자식이 아닌 보드가 내밀어도 쓸모가 없다). 그래서 Windows 는 아직 안 된다.
-  이미 떠 있던 세션은 플러그인을 다시 읽은 뒤(재시작) 첫 프롬프트에 등록된다.
-- **전송**: 메시지에 등록한 `session_id` 를 실어 소켓 경로가 다른 세션에 다시 쓰였으면 그 세션이 버린다. 연결이 안 되는 소켓(끝난 세션)의 등록은 지운다.
+- **등록**: fd 훅(SessionStart · UserPromptSubmit)이 세션을 연 김에 그 카드의 받는 곳을 fd 원장에 적는다(`PUT /api/v1/sessions/{id}/inbox`,
+  표 `session_inbox`: 소켓 `CLAUDE_CODE_MESSAGING_SOCKET` · 권한 모드 · 적은 때). 보드 설정 폴더(`~/.config/flightdeck-board`)가 없는 기계,
+  `-p` · SDK 작업자(`CLAUDE_CODE_SESSION_ATTENDED=0`)는 적지 않는다. 한 기계 · 한 소켓에는 한 세션만 남는다(같은 소켓의 옛 행은 적을 때 지운다).
+  `CLAUDE_CODE_MESSAGING_TOKEN` 은 훅이 읽지도 보내지도 않고 원장에 칸도 없다(macOS · Linux 에서는 없어도 되고, 자식이 아닌 보드가 내밀어도 쓸모가 없다).
+  그래서 Windows 는 아직 안 된다. 권한 모드는 프롬프트마다 페이로드의 `permission_mode` 로 고쳐 적고, 세션 시작 때는 명령줄 다음 설정 파일로 짐작한다.
+  서버가 닿지 않으면 적지 못하고(줄 세워 두지 않는다), 다음 프롬프트가 다시 적는다.
+- **읽기**: 보드는 `GET /api/v1/inbox?project=<카드 프로젝트>&machine=<이 맥의 fd machine-id>` 로 받는 곳을 읽는다(machine-id 는 fd 클라이언트와 같은 자리,
+  `FD_STATE_DIR/machine-id` 또는 `~/.flightdeck/machine-id`). 다른 기계의 소켓 경로는 이 맥에서 뜻이 없고 남의 세션 것일 수 있어 기계로 가른다. 닫힌 카드(done)는 빠진다.
+- **옮겨 가는 동안(옛 등록 파일)**: 0.45.x 플러그인으로 이미 떠 있는 세션은 받는 곳을 `BOARD_SESSIONS/<session_id>.json` 에만 적는다. 보드는 그 파일들의 cc 를
+  같은 GET 의 `legacy` 로 묻고, 원장이 「이 프로젝트 · 이 기계의 닫히지 않은 카드」라고 답한 것에만 보낸다(폴더 판정 없음). 원장에 받는 곳이 있는 세션 · 소켓은 파일보다 이긴다.
+  죽은 소켓의 파일과 원장으로 옮겨 간 세션 · 소켓의 파일은 지운다. 그 세션들이 플러그인을 다시 읽으면(재시작) 원장으로 옮겨 가고, 다 옮겨 가면 이 길과 `BOARD_SESSIONS` 를 뺀다.
+- **올리는 순서**: 보드는 이 체크아웃의 `board.py` 를 launchd 로 띄우므로 코드가 바뀌어도 다시 띄울 때까지 옛 코드다. 서버(컨테이너, 증분 018) →
+  보드 다시 띄우기(`launchctl kickstart -k gui/$(id -u)/<BOARD_LABEL>`) → 플러그인 순으로 올린다. 새 보드가 옛 서버를 만나면 「알림 못 보냄: fd 서버가 받는 곳 경로를 모름」,
+  옛 보드가 새 플러그인 세션을 만나면 그 세션은 안 보인다(안 읽힘 경고가 그 틈을 센다).
+- **전송**: 메시지에 그 카드의 지금 `session_id`(rekey 뒤 값)를 실어 소켓 경로가 다른 세션에 다시 쓰였으면 그 세션이 버린다. 연결이 안 되는 소켓(끝난 세션)의 받는 곳은
+  지운다(원장은 `DELETE /api/v1/sessions/{id}/inbox`, 소켓이 같을 때만. 옛 등록은 그 파일).
   봉투의 `from-mode` 는 받는 세션의 권한 갈래(bypass · prompting)로 적는다. Claude Code 는 권한 확인을 건너뛰는(bypass) 세션에는 bypass 라고 밝힌 메시지만,
   그 밖의 세션에는 bypass 라고 밝히지 않은 메시지를 대화상자 없이 넘긴다. 곧 보드는 bypass 세션의 승인 대화상자를 건너뛴다(문서에 없는 동작이라
   Claude Code 가 바꾸면 대화상자에 붙들리는 쪽, 곧 안전한 쪽으로 깨진다). 권한 모드는 프롬프트마다 고쳐 적으므로 shift+tab 으로 바꾼 직후 첫 알림은

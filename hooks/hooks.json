@@ -10,17 +10,6 @@
             "timeout": 10
           }
         ]
-      },
-      {
-        "matcher": "startup|resume|clear|compact|fork",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "[ -d \"$HOME/.config/flightdeck-board\" ] && command -v python3 >/dev/null 2>&1 && python3 -I \"${CLAUDE_PLUGIN_ROOT}/board/session_inbox.py\" hook; exit 0",
-            "async": true,
-            "timeout": 5
-          }
-        ]
       }
     ],
     "UserPromptSubmit": [
@@ -29,16 +18,6 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/fd\" hook user-prompt --harness claude",
-            "timeout": 5
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "[ -d \"$HOME/.config/flightdeck-board\" ] && command -v python3 >/dev/null 2>&1 && python3 -I \"${CLAUDE_PLUGIN_ROOT}/board/session_inbox.py\" hook; exit 0",
-            "async": true,
             "timeout": 5
           }
         ]

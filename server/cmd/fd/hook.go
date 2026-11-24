@@ -36,6 +36,9 @@ type HookPayload struct {
 	ToolInput      map[string]any `json:"tool_input"`
 	Trigger        string         `json:"trigger"`
 	CustomInstr    string         `json:"custom_instructions"`
+	// PermissionMode 는 그 세션의 지금 권한 모드다. UserPromptSubmit 이 싣고 SessionStart 는 안 싣는다
+	// (inbox.go 의 inboxMode, 보드 초인종의 봉투 갈래를 고르는 데만 쓴다).
+	PermissionMode string `json:"permission_mode"`
 	// Reason 은 SessionEnd 가 **끝나는 이유**로 주는 값이다. 시작하는 것의 이름이 아니다.
 	// ★ clear 와 resume 말고는 아무도 안 쏜다 — 설치본 2.1.221·2.1.222 를 뜯어 확인했다
 	// (executeSessionEndHooks 호출부가 그 둘뿐이고, logout·prompt_input_exit·other·
@@ -455,6 +458,11 @@ func (a *App) hookSessionStart(ctx context.Context, p HookPayload, out io.Writer
 		}
 	}
 
+	// 받는 곳(보드 초인종의 배달 주소)을 그 카드에 적는다. 캐시로 연 카드는 서버가 안 닿으니 건너뛴다(inbox.go).
+	if err == nil && !stale {
+		a.tellInbox(ctx, in.SessionID, p)
+	}
+
 	// 비콘에 이번 cc 와 그 카드를 적어 둔다. 다음 전환에서 이 값이 rekey 의 대상이 된다.
 	if haveBeacon && in.SessionID != "" {
 		if _, werr := window.SaveIdentity(a.beaconDir, beaconKey, cc, in.SessionID, a.now()); werr != nil {
@@ -598,6 +606,9 @@ func (a *App) hookUserPrompt(ctx context.Context, p HookPayload, out io.Writer) 
 	if sess == "" {
 		return
 	}
+	// 권한 모드는 프롬프트마다 고쳐 적는다(shift+tab 으로 바꾼 것, 이미 떠 있던 세션의 첫 등록도 여기서).
+	// ★ 미확인 조회 **뒤에** 둔다: 같은 예산을 쓰므로 서버가 느리면 이 훅의 본래 일(미확인 주입)이 먼저다.
+	defer a.tellInbox(ctx, sess, p)
 	notes, err := a.recentNotes(ctx)
 	if err != nil {
 		a.log.Warn("프롬프트 훅에서 미확인 조회 실패", "error", err.Error())

@@ -488,3 +488,17 @@ type Freshness struct {
 	ObservedAt time.Time
 	Stale      bool
 }
+
+// SessionInbox 는 세션이 받는 곳이다(Claude Code cross-session messaging 의 유닉스 소켓과 권한 모드).
+//
+// 보드가 소유자 동작을 초인종 한 줄로 알릴 때만 읽는다(board/README 「세션에 알림」). 좌표도 속성도
+// 아닌 배달 주소라 Session 에 넣지 않는다(migrations/018 머리말). 토큰 칸은 일부러 없다.
+// CCSessionID 는 session 의 지금 값이다: 보드는 이 값을 메시지에 실어, 소켓이 다른 세션에 다시 쓰였으면
+// 받는 쪽이 버리게 한다.
+type SessionInbox struct {
+	SessionID   string    `json:"session_id"`
+	CCSessionID string    `json:"cc_session_id"`
+	Socket      string    `json:"socket"`
+	Mode        string    `json:"mode"`
+	SeenAt      time.Time `json:"seen_at"`
+}

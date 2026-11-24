@@ -134,6 +134,9 @@ func undoNonIdempotentMigrations(t *testing.T, exec func(string) (sql.Result, er
 		`ALTER TABLE item_after DROP COLUMN dep_project`,
 		// 016 · item_revision(표 + 트리거 둘). DROP TABLE 이 트리거도 함께 지운다.
 		`DROP TABLE IF EXISTS item_revision`,
+		// 018 · session_inbox(표 + 인덱스). 014 와 같은 순서로 인덱스를 먼저 걷는다.
+		`DROP INDEX IF EXISTS session_inbox_socket`,
+		`DROP TABLE IF EXISTS session_inbox`,
 		// 011 · item_dependents 를 **되살린다**(schema.sql 의 v1 정의 그대로).
 		`CREATE TABLE IF NOT EXISTS item_dependents (
   project TEXT NOT NULL,

@@ -317,6 +317,10 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/v1/sessions/{id}/rekey", s.handleRekey)
 	// 처방은 턴마다 돈다. **세션 카드 파생을 안 도는 표면이다** — /notices 와 같은 이유(설계 §6).
 	mux.HandleFunc("POST /api/v1/sessions/{id}/prescriptions", s.handlePrescriptions)
+	// 받는 곳: 보드 초인종의 배달 주소(board/README 「세션에 알림」). 훅이 적고 보드가 읽는다.
+	mux.HandleFunc("PUT /api/v1/sessions/{id}/inbox", s.handlePutInbox)
+	mux.HandleFunc("DELETE /api/v1/sessions/{id}/inbox", s.handleDropInbox)
+	mux.HandleFunc("GET /api/v1/inbox", s.handleInbox)
 
 	// 큐 — Q 계층.
 	mux.HandleFunc("GET /api/v1/items/next", s.handleNextItem)

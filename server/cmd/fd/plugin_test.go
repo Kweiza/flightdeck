@@ -177,13 +177,14 @@ func TestHooksJSONIsWiredAsDesigned(t *testing.T) {
 	}
 }
 
-// TestBoardSessionHookIsTheOnlySecondGroup 는 위 시험이 groups[0] 만 보는 빈자리를 메운다.
+// TestEveryHookEventHasOneGroup 는 위 시험이 groups[0] 만 보는 빈자리를 메운다.
 //
-// SessionStart · UserPromptSubmit 의 **둘째 그룹**은 보드 세션 알림의 등록 훅(board/session_inbox.py)이다
-// (board/README 「세션에 알림」). 이 그룹은 fd 바이너리를 안 불러 위 단정에 안 걸리고, 그래서 틀려도 아무도
-// 몰랐다: 동기로 바뀌면 프롬프트마다 python 을 기다리고, `; exit 0` 이 빠지면 보드가 없는 기계에서 훅이
-// 실패로 찍히고, 다른 이벤트에 붙으면 등록이 엉뚱한 때 돈다. 그 꼴을 명령 문자열째로 잠근다.
-func TestBoardSessionHookIsTheOnlySecondGroup(t *testing.T) {
+// 보드 세션 알림의 등록은 한때 SessionStart · UserPromptSubmit 의 **둘째 그룹**(python3 board/session_inbox.py
+// hook)이 보드 폴더에 따로 적었다. 이제 fd 훅이 세션을 연 김에 받는 곳을 원장에 적는다(inbox.go,
+// board/README 「세션에 알림」). 둘째 그룹이 되살아나면 세션 장부가 다시 둘이 되고, fd 바이너리를 안 부르는
+// 그룹은 위 단정에 안 걸려 아무도 모른다. 그래서 모든 이벤트가 그룹 하나 · 훅 하나이고, 어느 명령도
+// 보드 등록 스크립트를 부르지 않는다는 것을 잠근다.
+func TestEveryHookEventHasOneGroup(t *testing.T) {
 	root := pluginRoot(t)
 	raw, err := os.ReadFile(filepath.Join(root, "hooks", "hooks.json"))
 	if err != nil {
@@ -193,41 +194,13 @@ func TestBoardSessionHookIsTheOnlySecondGroup(t *testing.T) {
 	if err := json.Unmarshal(raw, &hf); err != nil {
 		t.Fatalf("hooks.json 을 못 읽었다: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "board", "session_inbox.py")); err != nil {
-		t.Fatalf("훅이 부르는 board/session_inbox.py 가 없다: %v", err)
-	}
-	const boardHook = `[ -d "$HOME/.config/flightdeck-board" ] && command -v python3 >/dev/null 2>&1 && ` +
-		`python3 -I "${CLAUDE_PLUGIN_ROOT}/board/session_inbox.py" hook; exit 0`
-	carriesBoard := map[string]bool{"SessionStart": true, "UserPromptSubmit": true}
 	for ev, groups := range hf.Hooks {
-		carries := carriesBoard[ev]
-		if !carries {
-			if len(groups) != 1 {
-				t.Fatalf("%s 의 그룹이 %d개다: 둘째 그룹은 SessionStart · UserPromptSubmit 의 보드 등록 훅뿐이다", ev, len(groups))
-			}
-			continue
+		if len(groups) != 1 || len(groups[0].Hooks) != 1 {
+			t.Fatalf("%s 의 그룹 · 훅이 하나가 아니다(그룹 %d개): 보드 등록은 fd 훅이 한다", ev, len(groups))
 		}
-		if len(groups) != 2 {
-			t.Fatalf("%s 의 그룹이 %d개다: fd 훅 하나와 보드 등록 훅 하나여야 한다", ev, len(groups))
-		}
-		g := groups[1]
-		if g.Matcher != groups[0].Matcher { // 첫 그룹의 matcher 값 자체는 TestHooksJSONIsWiredAsDesigned 가 잠근다
-			t.Fatalf("%s 둘째 그룹의 matcher 가 %q 다: 첫 그룹과 같은 %q 여야 한다", ev, g.Matcher, groups[0].Matcher)
-		}
-		if len(g.Hooks) != 1 {
-			t.Fatalf("%s 둘째 그룹에 훅이 %d개다", ev, len(g.Hooks))
-		}
-		h := g.Hooks[0]
-		if h.Type != "command" || h.Command != boardHook {
-			t.Fatalf("%s 둘째 그룹의 명령이 바뀌었다:\n  %q\n기대:\n  %q\n"+
-				"(보드 설정 폴더가 없으면 아무것도 안 하고, 언제나 0 으로 끝나야 한다)", ev, h.Command, boardHook)
-		}
-		if !h.Async {
-			t.Fatalf("%s 의 보드 등록 훅이 async 가 아니다: 프롬프트마다 python 을 기다리게 된다", ev)
-		}
-		if h.Timeout <= 0 || h.Timeout > 10 {
-			t.Fatalf("%s 의 보드 등록 훅 타임아웃이 %d 다: 1..10 초", ev, h.Timeout)
-		}
+	}
+	if strings.Contains(string(raw), "session_inbox.py") {
+		t.Fatal("hooks.json 이 board/session_inbox.py 를 부른다: 받는 곳은 fd 훅이 원장에 적는다(inbox.go)")
 	}
 }
 
