@@ -17,6 +17,7 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 읽는 곳은 `board.py` 의 `directives_of()` 한 곳이다.
 
     미리보기: https://...            웹 미리보기 URL -> 카드에 열기 버튼, 상세에서는 iframe(막히면 새 탭 버튼)
+    미리보기: ?run=a&gate=2          주소 뒤에 붙일 것만(? · / · # 로 시작) -> 그 프로젝트 「미리보기」 링크 주소에 붙여 전체 URL 로
     그림: /절대/경로.png             로컬 이미지 -> 카드에 썸네일, 누르면 크게
     영상: /절대/경로.mp4|webm|mov    로컬 영상 -> 상세에서 <video controls>, 카드에 표시
     파일: /절대/경로.md|txt|json|log 로컬 글 파일 -> 상세에서 내용 보기(md 는 렌더, 긴 로그는 끝 200줄)
@@ -101,7 +102,7 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 | `BOARD_PROJECT` | (없음) | 처음 보일 프로젝트. 없으면 목록의 첫째 |
 | `BOARD_HOSTS` | (없음) | 루프백 밖에서 부를 이름 `이름:포트`(쉼표 구분). `install.sh` 는 비면 tailscale 이름과 `BOARD_TS_PORT`(37430)로 채운다 |
 | `BOARD_FILE_ROOTS` | `~/Developments:/private/tmp/claude-<uid>` | `/file` 허용 뿌리(콜론 구분) |
-| `BOARD_LINKS` | `~/.config/flightdeck-board/links.json` | 위 링크 줄(기계별 파일, 저장소 밖). 꼴은 `links.example.json`: `[{"name", "url", "project"?}]`, `project` 가 있으면 그 프로젝트에서만. 없으면 링크 줄이 빈다. 요청마다 다시 읽음 |
+| `BOARD_LINKS` | `~/.config/flightdeck-board/links.json` | 위 링크 줄(기계별 파일, 저장소 밖). 꼴은 `links.example.json`: `[{"name", "url", "project"?}]`, `project` 가 있으면 그 프로젝트에서만. 없으면 링크 줄이 빈다. 이름에 「미리보기」가 든 링크(그 프로젝트 것이 먼저)가 상대 미리보기 줄의 기본 주소다. 요청마다 다시 읽음 |
 | `FD_CONFIG` | `~/.flightdeck/config.json` | fd 주소 · 토큰을 읽는 파일(fd 클라이언트 설정과 같은 것, 요청마다 다시 읽음) |
 | `FD_URL` · `FD_TOKEN` | (설정 파일) | 있으면 설정 파일보다 먼저 |
 | `BOARD_TAILNET` | (install.sh: tailscale 이름의 접미사) | `/api/embed` 가 부를 tailnet 접미사(예: `<tailnet>.ts.net`) |

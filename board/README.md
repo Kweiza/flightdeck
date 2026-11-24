@@ -19,6 +19,7 @@ Workers and coordinators write these lines in an fd item body. A line anywhere i
 prefix, and one kind may appear several times. They are read in one place, `directives_of()` in `board.py`.
 
     미리보기: https://...             web preview URL -> open button on the card, iframe in the detail (new-tab button if blocked)
+    미리보기: ?run=a&gate=2           only what goes after the address (starts with ? / #) -> joined to the project's 미리보기 link into a full URL
     그림: /absolute/path.png          local image -> thumbnail on the card, click to enlarge
     영상: /absolute/path.mp4|webm|mov local video -> <video controls> in the detail, marker on the card
     파일: /absolute/path.md|txt|json|log  local text file -> shown in the detail (md rendered, long logs last 200 lines)
@@ -105,7 +106,7 @@ The board is **a host process, not inside the container**, the images and logs w
 | `BOARD_PROJECT` | (none) | first project shown; otherwise the first in the list |
 | `BOARD_HOSTS` | (none) | `name:port` names allowed beyond loopback (comma-separated). `install.sh` fills it from the tailscale name and `BOARD_TS_PORT` (37430) |
 | `BOARD_FILE_ROOTS` | `~/Developments:/private/tmp/claude-<uid>` | `/file` roots (colon-separated) |
-| `BOARD_LINKS` | `~/.config/flightdeck-board/links.json` | top link row, a per-machine file outside the repository; shape in `links.example.json` (`project` limits an entry to that project). Missing means no links |
+| `BOARD_LINKS` | `~/.config/flightdeck-board/links.json` | top link row, a per-machine file outside the repository; shape in `links.example.json` (`project` limits an entry to that project). Missing means no links. A link whose name contains 미리보기 (the project's own first) is the base for relative preview lines |
 | `FD_CONFIG` | `~/.flightdeck/config.json` | where the fd URL and token are read (the fd client config, re-read per request) |
 | `FD_URL` · `FD_TOKEN` | (config file) | take precedence over the file |
 | `BOARD_TAILNET` | (install.sh: suffix of the tailscale name) | tailnet suffix `/api/embed` may call (e.g. `<tailnet>.ts.net`) |

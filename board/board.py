@@ -138,13 +138,26 @@ def github_url(remote):
     return "https://github.com/" + m.group(1) if m else ""
 
 
-def directives_of(body, repo_url=""):
-    """본문의 규약 줄을 모은다. 한 종류 여러 줄 가능, 모르는 접두어는 본문 그대로."""
-    d = {"previews": [], "images": [], "videos": [], "files": [], "links": [], "commits": [],
+def preview_url_of(val, base):
+    """미리보기 줄 값 -> 전체 URL, 못 만들면 ''. 주소 뒤 쿼리 · 경로 · 조각(? / #)만 적었으면 기본 주소에 붙인다."""
+    if val.startswith(("https://", "http://")):
+        return val
+    if val.startswith(("?", "/", "#")) and base.startswith(("https://", "http://")):
+        return urllib.parse.urljoin(base, val)
+    return ""
+
+
+def directives_of(body, bases=None):
+    """본문의 규약 줄을 모은다. 한 종류 여러 줄 가능, 모르는 접두어는 본문 그대로.
+    bases: {"repo": GitHub 주소(커밋 링크), "preview": 그 프로젝트 미리보기 주소(상대 미리보기 줄)}."""
+    bases = bases or {}
+    repo_url = bases.get("repo") or ""
+    d = {"previews": [], "preview_missing": [], "images": [], "videos": [], "files": [], "links": [], "commits": [],
          "owner": [], "choices": []}
     for key, val in DIRECTIVE_RE.findall(body or ""):
-        if key == "미리보기" and val.startswith(("https://", "http://")):
-            d["previews"].append(val)
+        if key == "미리보기":
+            url = preview_url_of(val, bases.get("preview") or "")
+            d["previews" if url else "preview_missing"].append(url or val)
         elif key == "그림":
             d["images"].append(val)
         elif key == "영상":
@@ -254,9 +267,10 @@ def summary_of(body):
     return ""
 
 
-def card_of(item, claimed, repo_url=""):
+def card_of(item, claimed, bases=None):
     body = item.get("Body") or ""
-    d = directives_of(body, repo_url)
+    d = directives_of(body, bases)
+    repo_url = (bases or {}).get("repo") or ""
     decision = decision_of(body, d["choices"])
     labels = item.get("Labels") or []
     if not d["commits"] and item.get("LandedRef"):
@@ -304,14 +318,14 @@ def add_claimed_items(dash, project):
             items.append(body["item"])
 
 
-def board_of(project, dash, closed, repo_url=""):
+def board_of(project, dash, closed, bases=None):
     claimed = claimed_ids(dash)
-    cards = [card_of(i, claimed, repo_url) for i in dash.get("open_items") or []]
-    cards += [card_of(i, claimed, repo_url) for i in closed.get("items") or []]
+    cards = [card_of(i, claimed, bases) for i in dash.get("open_items") or []]
+    cards += [card_of(i, claimed, bases) for i in closed.get("items") or []]
     counts = {k: 0 for k in ("owner", "running", "waiting", "done")}
     for c in cards:
         counts[c["column"]] += 1
-    return {"project": project, "at": dash.get("at"), "counts": counts, "repo": repo_url, "cards": cards}
+    return {"project": project, "at": dash.get("at"), "counts": counts, "repo": (bases or {}).get("repo") or "", "cards": cards}
 
 
 def move_labels(target):
@@ -672,10 +686,6 @@ def project_of(project):
     return found
 
 
-def repo_url_of(project):
-    return project_of(project)["repo"]
-
-
 def links_of(raw, project):
     """links 파일 -> 그 프로젝트의 위 링크 줄. 항목에 "project" 가 없으면 모든 프로젝트에, 있으면 그 프로젝트에만."""
     if not isinstance(raw, list):
@@ -684,11 +694,40 @@ def links_of(raw, project):
             if isinstance(l, dict) and l.get("url") and l.get("project") in (None, "", project)]
 
 
+PREVIEW_LINK_WORD = "미리보기"  # 이름에 이 낱말이 든 위 링크가 그 프로젝트의 미리보기 주소다
+
+
+def preview_base_of(raw, project):
+    """links 파일 -> 상대 미리보기 줄을 붙일 기본 주소. 그 프로젝트 것이 모든 프로젝트 것보다 먼저, 없으면 ''."""
+    if not isinstance(raw, list):
+        return ""
+    found = [l for l in raw if isinstance(l, dict) and PREVIEW_LINK_WORD in (l.get("name") or "")
+             and str(l.get("url") or "").startswith(("https://", "http://"))]
+    for scope in (project, None):
+        hit = next((l["url"] for l in found if (l.get("project") or None) == scope), "")
+        if hit:
+            return hit
+    return ""
+
+
+def load_links():
+    with open(LINKS) as f:
+        return json.load(f)
+
+
+def bases_of(project):
+    """카드 링크를 만들 프로젝트 주소들. links 파일이 없거나 깨졌으면 미리보기 기본 주소만 빈다(위 링크 줄이 까닭을 낸다)."""
+    try:
+        preview = preview_base_of(load_links(), project)
+    except (OSError, ValueError):
+        preview = ""
+    return {"repo": project_of(project)["repo"], "preview": preview}
+
+
 def read_links(project):
     """(코드, 응답). 파일이 없으면 빈 줄(기계별 설정이라 없어도 된다), 깨졌으면 500 으로 까닭을 낸다."""
     try:
-        with open(LINKS) as f:
-            return 200, {"links": links_of(json.load(f), project), "file": LINKS}
+        return 200, {"links": links_of(load_links(), project), "file": LINKS}
     except FileNotFoundError:
         return 200, {"links": [], "file": LINKS, "missing": True}
     except (OSError, ValueError, KeyError) as e:
@@ -943,7 +982,7 @@ class Handler(BaseHTTPRequestHandler):
             if code != 200:
                 return self.send(502, err("closed_list_failed",
                                           "닫힌 항목 목록(GET /api/v1/items)을 못 읽음: %s" % code, fd=closed))
-            out = board_of(project, dash, closed, repo_url_of(project))
+            out = board_of(project, dash, closed, bases_of(project))
             out["unread"] = unread_or_empty(project)
             return self.send(200, out)
         if path == "/api/item":
@@ -952,7 +991,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(400, err("missing_id", "id 가 없음"))
             code, body = fd_get(item_path(iid), project=project)
             if code == 200 and body.get("item"):
-                card = card_of(body["item"], set(), repo_url_of(project))
+                card = card_of(body["item"], set(), bases_of(project))
                 if card["decision"]:
                     card["decision"]["chosen"] = chosen_of(body.get("judgments"), body["item"].get("Labels"))
                 body["card"] = card

@@ -59,8 +59,9 @@ class Directives(unittest.TestCase):
     def test_lines(self):
         d = B.directives_of("미리보기: https://p.ts.net:1/\n그림: /a.png\n영상: /b.mp4\n파일: /c.md\n"
                             "링크: 콘솔 | https://play.google.com/\n커밋: abc1234 def5678\n"
-                            "소유자: 누를 것 · 탭 · 버튼\n선택: A | B\n미리보기: 상대주소", "https://github.com/o/r")
+                            "소유자: 누를 것 · 탭 · 버튼\n선택: A | B\n미리보기: 상대주소", {"repo": "https://github.com/o/r"})
         self.assertEqual(d["previews"], ["https://p.ts.net:1/"])
+        self.assertEqual(d["preview_missing"], ["상대주소"])
         self.assertEqual(d["images"], ["/a.png"])
         self.assertEqual(d["videos"], ["/b.mp4"])
         self.assertEqual(d["files"], ["/c.md"])
@@ -69,6 +70,25 @@ class Directives(unittest.TestCase):
                          ["https://github.com/o/r/commit/abc1234", "https://github.com/o/r/commit/def5678"])
         self.assertEqual(d["owner"], ["누를 것 · 탭 · 버튼"])
         self.assertEqual(d["choices"], ["A", "B"])
+
+    def test_relative_preview(self):
+        """주소 뒤 쿼리 · 경로만 적은 미리보기는 그 프로젝트 미리보기 주소에 붙여 전체 URL 이 된다."""
+        body = "미리보기: ?run=s21&gate=22\n미리보기: /play/?x=1\n미리보기: #t"
+        d = B.directives_of(body, {"preview": "https://p.ts.net:9/game/"})
+        self.assertEqual(d["previews"], ["https://p.ts.net:9/game/?run=s21&gate=22", "https://p.ts.net:9/play/?x=1",
+                                         "https://p.ts.net:9/game/#t"])
+        self.assertEqual(d["preview_missing"], [])
+        d = B.directives_of(body)  # 기본 주소가 없으면 버리지 않고 까닭 자리로
+        self.assertEqual(d["previews"], [])
+        self.assertEqual(d["preview_missing"], ["?run=s21&gate=22", "/play/?x=1", "#t"])
+
+    def test_preview_base(self):
+        raw = [{"name": "모두 미리보기", "url": "https://all/"}, {"name": "게임 미리보기", "url": "https://g/", "project": "game"},
+               {"name": "콘솔", "url": "https://c/", "project": "game"}, {"name": "남 미리보기", "url": "https://o/", "project": "other"}]
+        self.assertEqual(B.preview_base_of(raw, "game"), "https://g/")  # 프로젝트 것이 모두 것보다 먼저
+        self.assertEqual(B.preview_base_of(raw, "x"), "https://all/")
+        self.assertEqual(B.preview_base_of(raw[2:3], "game"), "")
+        self.assertEqual(B.preview_base_of({"bad": 1}, "game"), "")
 
     def test_github_url(self):
         for remote in ("git@github.com:team/game-x.git", "https://github.com/team/game-x", "ssh://git@github.com/team/game-x.git"):

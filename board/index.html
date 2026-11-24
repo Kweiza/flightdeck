@@ -560,6 +560,8 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
       }).catch((e) => wrap.replaceChildren(el("div", "empty", `확인 못 함: ${e.message}`)));
       out.push(section(`미리보기 ${u}`, row, wrap));
     });
+    (c.preview_missing || []).forEach((v) => out.push(section(`미리보기 ${v}`,
+      el("div", "empty", "전체 주소를 못 만듦: 쿼리 · 경로만 적은 미리보기는 links.json 에 이 프로젝트의 「미리보기」 링크가 있어야 붙입니다."))));
     if ((c.images || []).length) {
       const g = el("div", "gallery");
       c.images.forEach((p) => { const i = el("img"); i.src = fileURL(p); i.alt = p; i.title = p; i.loading = "lazy"; i.onclick = () => lightbox(p); g.append(i); });
