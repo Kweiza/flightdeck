@@ -716,3 +716,78 @@ func TestStaleWorktreeListNeverClosesALiveCard(t *testing.T) {
 		t.Fatalf("뒤에 생긴 워크트리의 카드가 빠졌다")
 	}
 }
+
+// 판정 자리는 화면 git 자리가 다 찼어도 기다리지 않는다(judgeParallel). 화면 자리를 모두 쥐고,
+// 그동안 화면 쪽 커밋 쌍 읽기 하나가 기억 칸을 잡은 채 화면 자리를 기다리게 둔다. 판정
+// (sessionCards)은 그 도는 읽기에 올라타지도, 화면 줄 뒤에 서지도 않고 지금 읽어 답을 채운다.
+// 한 줄로 서던 앞 판은 여기서 ctx(10초)가 끝날 때까지 붙잡혔다(세션 판단 조회까지 deadline 으로 실패).
+func TestJudgeReadsDoNotQueueBehindScreen(t *testing.T) {
+	s, _, gc := newCountingSvc(t, WithScreenSnapshots(time.Hour, 2*time.Hour, 50*time.Millisecond))
+	repo, wt := newRepoWithWorktree(t, "feat")
+	waitBehind(t, s)
+	writeFile(t, wt, "branch/only.py", "print(1)\n")
+	runGit(t, wt, "add", "-A")
+	runGit(t, wt, "commit", "-q", "-m", "b")
+	writeFile(t, wt, "a.txt", "a\n")
+	sess := openSession(t, s, "p", repo, wt, "cc-1", "feat").Session
+	proj, err := s.st.GetProject(ctx(), "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainSHA := strings.TrimSpace(runGit(t, repo, "rev-parse", proj.DefaultBranch))
+	headSHA := strings.TrimSpace(runGit(t, wt, "rev-parse", "HEAD"))
+	gc.take()
+
+	for i := 0; i < cap(s.dc.screenSem); i++ {
+		s.dc.screenSem <- struct{}{}
+	}
+	var once sync.Once
+	free := func() {
+		once.Do(func() {
+			for i := 0; i < cap(s.dc.screenSem); i++ {
+				<-s.dc.screenSem
+			}
+		})
+	}
+	t.Cleanup(free) // waitBehind(bg.Wait) 보다 먼저 돈다(정리는 거꾸로)
+
+	// 화면 쪽 커밋 쌍 읽기: 기억 칸을 잡고 화면 자리를 기다린다.
+	screenDone := make(chan branchFacts, 1)
+	go func() {
+		screenDone <- s.dc.branchFactsOf(context.Background(), s.git(proj.Path), readScreen, proj.Path,
+			proj.DefaultBranch, mainSHA, "feat", headSHA, s.now(), nil)
+	}()
+	key := pureKey{repo: filepath.Clean(proj.Path), base: mainSHA, head: headSHA}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		s.dc.mu.Lock()
+		e := s.dc.pure[key]
+		s.dc.mu.Unlock()
+		if e != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("화면 쪽 읽기가 기억 칸을 안 잡았다")
+		}
+	}
+
+	c, cancel := context.WithTimeout(ctx(), 10*time.Second)
+	defer cancel()
+	d := &derive{}
+	cards, err := s.sessionCards(c, proj, s.cut(s.now(), 0), sess.ID, d)
+	if err != nil || len(d.failures) != 0 || len(cards) != 1 {
+		t.Fatalf("판정 자리가 화면 줄 뒤에 섰다: err=%v failures=%+v cards=%d", err, d.failures, len(cards))
+	}
+	if p := cards[0].View.Paths; !contains(p, "a.txt") || !contains(p, "branch/only.py") || !cards[0].AheadKnown {
+		t.Fatalf("판정 자리 파생이 비었다: paths=%v ahead_known=%v", p, cards[0].AheadKnown)
+	}
+	select {
+	case <-screenDone:
+		t.Fatal("화면 쪽 읽기가 화면 자리 없이 끝났다(시험이 화면 줄을 못 막았다)")
+	default:
+	}
+
+	free()
+	if f := <-screenDone; !f.ok() || !contains(f.paths, "branch/only.py") {
+		t.Fatalf("화면 자리가 풀린 뒤 화면 쪽 읽기가 못 끝났다: %+v", f)
+	}
+}

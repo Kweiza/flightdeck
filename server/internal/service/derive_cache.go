@@ -32,16 +32,34 @@ import (
 //	   화면(Board)만 그 관측을 쓰면서 뒤에서 새로 읽는다. 판정 자리(pick · amend · finish 가 지나는
 //	   sessionCards)는 언제나 지금 읽는다, 그 읽기가 보관본도 새로 고친다.
 //	③ 같은 워크트리 · 같은 커밋 쌍은 요청 안에서도, 겹친 요청 사이에서도 한 번만 읽는다(도는
-//	   읽기에 올라탄다). 서로 다른 것은 함께 읽는다(서버 전체 git 동시 실행 수 상한 deriveParallel).
+//	   읽기에 올라탄다). 판정 자리만은 화면이 연 도는 읽기에 올라타지 않는다(branchFactsOf).
+//	   서로 다른 것은 함께 읽는다(서버 전체 git 동시 실행 수 상한, 화면은 deriveParallel ·
+//	   판정 자리는 judgeParallel, 둘은 따로 줄 선다).
 //
 // ★ 보관본을 쓴 화면은 **그 관측 시각을 말한다**(derive.observed → Freshness.ObservedAt).
 // 지금 읽은 척하지 않는다, 설계 §6 의 「(파생: git@14:31, 12초 전)」이 그 시각을 그대로 낸다.
 
-// deriveParallel 은 서버 전체에서 카드 파생 git 이 동시에 몇 개까지 뜨는지다.
+// deriveParallel 은 서버 전체에서 **화면(Board)** 카드 파생 git 이 동시에 몇 개까지 뜨는지다.
+// 뒤의 새로 읽기도 이 자리를 쓴다.
 //
 // ★ 요청마다가 아니라 **서버 전체**다. 요청마다 두면 보드 여러 장이 겹칠 때 프로세스 수가
-// 그 곱으로 는다. 8 은 컨테이너 CPU(12) 아래로 둔 값이다, git status 는 대개 디스크를 기다린다.
+// 그 곱으로 는다. 8 은 화면만 놓고 컨테이너 CPU(12) 아래로 둔 값이다, git status 는 대개
+// 디스크를 기다린다(판정 자리와 겹친 순간은 judgeParallel 참조).
 const deriveParallel = 8
+
+// judgeParallel 은 판정 자리(readNow: pick · amend · finish 가 지나는 sessionCards)의 git 자리다.
+// 화면 자리와 **따로** 둔다.
+//
+// ★ 한 자리로 줄 서던 앞 판은 화면 읽기를 몰아칠 때(보드 여러 장 · 뒤의 새로 읽기) 판정이 그
+// 뒤에 섰다. 실측(judge_slots_measure_test.go, git 한 번 100ms · 워크트리 18 · 화면 프로젝트 셋 ·
+// 보드 6장): 판정 sessionCards p50 이 부하 없이 1.05초, 부하에서 6.09초였다. 자리를 가른 뒤 부하에서
+// 1.06초(부하 없음 1.11초). 판정은 드물고(사람 · 세션의 동작 하나에
+// 한 번) 늘 지금 읽어야 하므로 화면에 밀리면 안 된다.
+// 크기는 화면과 같은 8 이다. 판정 읽기는 드물어 둘이 함께 꽉 차는 때가 짧고, 판정은 워크트리
+// 수만큼 읽어 자리를 줄이면 그만큼 느려진다(같은 측정에서 4 자리는 p50 1.52~1.55초). 둘이 겹친
+// 순간 카드 파생 git 의 상한은 16 이다. 카드 파생 밖의 git(pick 의 Ancestry, finish 의
+// worktreeFacts, session · workspace 의 Ref 등)은 어느 자리에도 서지 않는다, 이 상한 밖이다.
+const judgeParallel = 8
 
 // pureMemoLimit 은 커밋 쌍 기억의 상한이다. 넘으면 끝난 쌍을 통째로 비운다(다음 요청이 다시 채운다).
 // 살아 있는 브랜치 수의 몇 배면 충분하다, 브랜치가 앞으로 가면 옛 쌍은 다시 안 쓰인다.
@@ -97,7 +115,8 @@ const (
 
 // deriveCache 는 Service 하나가 쥐는 파생 보관소다. 0값으로는 못 쓴다, newDeriveCache.
 type deriveCache struct {
-	sem chan struct{} // 서버 전체 git 동시 실행 상한
+	screenSem chan struct{} // 화면 git 동시 실행 상한(서버 전체, deriveParallel)
+	judgeSem  chan struct{} // 판정 자리 git 동시 실행 상한(서버 전체, judgeParallel)
 
 	refreshAfter time.Duration
 	maxAge       time.Duration // 0 이면 화면 보관본을 안 쓴다
@@ -115,27 +134,36 @@ type deriveCache struct {
 
 func newDeriveCache() *deriveCache {
 	return &deriveCache{
-		sem:   make(chan struct{}, deriveParallel),
-		pure:  map[pureKey]*pureEntry{},
-		wt:    cells[wtSnap]{},
-		lists: cells[listSnap]{},
-		refs:  cells[refSnap]{},
+		screenSem: make(chan struct{}, deriveParallel),
+		judgeSem:  make(chan struct{}, judgeParallel),
+		pure:      map[pureKey]*pureEntry{},
+		wt:        cells[wtSnap]{},
+		lists:     cells[listSnap]{},
+		refs:      cells[refSnap]{},
 	}
 }
 
 func (c *deriveCache) screenSnapshots(mode readMode) bool { return mode == readScreen && c.maxAge > 0 }
 
-// acquire 는 git 실행 자리 하나를 잡는다. ctx 가 먼저 끝나면 false.
-func (c *deriveCache) acquire(ctx context.Context) bool {
+// slots 는 mode 가 줄 서는 git 실행 자리다. 판정 자리는 화면 자리와 따로 선다(judgeParallel).
+func (c *deriveCache) slots(mode readMode) chan struct{} {
+	if mode == readNow {
+		return c.judgeSem
+	}
+	return c.screenSem
+}
+
+// acquire 는 mode 의 git 실행 자리 하나를 잡는다. ctx 가 먼저 끝나면 false.
+func (c *deriveCache) acquire(ctx context.Context, mode readMode) bool {
 	select {
-	case c.sem <- struct{}{}:
+	case c.slots(mode) <- struct{}{}:
 		return true
 	case <-ctx.Done():
 		return false
 	}
 }
 
-func (c *deriveCache) release() { <-c.sem }
+func (c *deriveCache) release(mode readMode) { <-c.slots(mode) }
 
 // evict 는 memoIdle 넘게 아무도 안 쓴 보관본을 버린다. 도는 읽기는 안 건드린다.
 //
@@ -198,7 +226,7 @@ func (s *Service) readCardFacts(ctx context.Context, g GitReader, proj model.Pro
 			// 변경집합 보관은 읽은 그 자리에서 한다. 화면이 기다림을 넘겨도 뒤에서 끝난 쌍이
 			// change_set 에 들어가야 한다(조립 단계에서 하면 늦게 끝난 쌍은 영영 빠진다).
 			remember := func(f branchFacts) { s.rememberChangeSet(readCtx, proj.ID, f.fork, bk.sha, f.paths) }
-			ch <- got{i: i, f: s.dc.branchFactsOf(readCtx, g, proj.Path, proj.DefaultBranch, mainSHA, bk.name, bk.sha, s.now(), remember)}
+			ch <- got{i: i, f: s.dc.branchFactsOf(readCtx, g, mode, proj.Path, proj.DefaultBranch, mainSHA, bk.name, bk.sha, s.now(), remember)}
 		}()
 	}
 	for i, wt := range wts {
@@ -265,6 +293,8 @@ type pureEntry struct {
 	done chan struct{}
 	f    branchFacts // done 이 닫힌 뒤에만 읽는다
 	used time.Time   // mu 아래에서만 쓴다
+	// judge 는 판정 자리가 연 칸인지다(판정 자리에서 읽는다). 판정은 이런 칸에만 올라탄다.
+	judge bool
 }
 
 // branchFacts 는 브랜치 하나의 커밋 축 셋이다. 축마다 실패가 따로 산다(호출부가 축마다 고백한다).
@@ -294,11 +324,16 @@ func failedFacts(err error) branchFacts {
 // 같은 쌍을 누가 읽는 중이면 그 읽기에 올라탄다(겹친 보드가 같은 git 을 다시 띄우지 않게).
 // 셋이 다 성공했을 때만 기억하고, 그때 한 번 remember 를 부른다. 실패는 일시적일 수 있어
 // 기억하지 않는다, 올라탔던 쪽은 다시 시도한다.
-func (c *deriveCache) branchFactsOf(ctx context.Context, g GitReader, repo, defBranch, mainSHA, branch, headSHA string,
+//
+// ★ 판정 자리(readNow)는 **화면이 연 도는 읽기에 올라타지 않는다**. 그 읽기는 화면 자리
+// (deriveParallel)가 비기를 기다리는 중일 수 있고, 올라타면 판정이 다시 화면 줄 뒤에 선다.
+// 판정은 자기 자리로 따로 읽는다(쌍의 답은 같으니 결과는 같다). 기억과 remember 는 칸을 쥔 읽기가
+// 한다, 판정의 따로 읽기는 둘 다 안 한다. 판정이 연 칸에는 판정도 올라탄다(같은 판정 자리다).
+func (c *deriveCache) branchFactsOf(ctx context.Context, g GitReader, mode readMode, repo, defBranch, mainSHA, branch, headSHA string,
 	t time.Time, remember func(branchFacts)) branchFacts {
 
 	if mainSHA == "" || headSHA == "" {
-		return c.readFacts(ctx, g, defBranch, branch)
+		return c.readFacts(ctx, g, mode, defBranch, branch)
 	}
 	key := pureKey{repo: filepath.Clean(repo), base: mainSHA, head: headSHA}
 	for {
@@ -306,6 +341,9 @@ func (c *deriveCache) branchFactsOf(ctx context.Context, g GitReader, repo, defB
 		if e := c.pure[key]; e != nil {
 			e.used = t
 			c.mu.Unlock()
+			if mode == readNow && !e.judge && !settled(e.done) {
+				return c.readFacts(ctx, g, mode, mainSHA, headSHA)
+			}
 			select {
 			case <-e.done:
 			case <-ctx.Done():
@@ -323,11 +361,11 @@ func (c *deriveCache) branchFactsOf(ctx context.Context, g GitReader, repo, defB
 				}
 			}
 		}
-		e := &pureEntry{done: make(chan struct{}), used: t}
+		e := &pureEntry{done: make(chan struct{}), used: t, judge: mode == readNow}
 		c.pure[key] = e
 		c.mu.Unlock()
 
-		f := c.readFacts(ctx, g, mainSHA, headSHA)
+		f := c.readFacts(ctx, g, mode, mainSHA, headSHA)
 		if f.ok() && remember != nil {
 			remember(f)
 		}
@@ -342,12 +380,12 @@ func (c *deriveCache) branchFactsOf(ctx context.Context, g GitReader, repo, defB
 	}
 }
 
-// readFacts 는 커밋 축 셋을 지금 읽는다.
-func (c *deriveCache) readFacts(ctx context.Context, g GitReader, base, head string) branchFacts {
-	if !c.acquire(ctx) {
+// readFacts 는 커밋 축 셋을 mode 의 git 자리에서 지금 읽는다.
+func (c *deriveCache) readFacts(ctx context.Context, g GitReader, mode readMode, base, head string) branchFacts {
+	if !c.acquire(ctx, mode) {
 		return failedFacts(ctx.Err())
 	}
-	defer c.release()
+	defer c.release(mode)
 	var f branchFacts
 	if f.fork, f.forkErr = g.MergeBase(ctx, base, head); f.forkErr == nil {
 		f.paths, f.delta, f.pathsErr = g.ChangedPaths(ctx, f.fork, head)
@@ -416,7 +454,8 @@ func (e *cell[T]) store(ctx context.Context, v T, keepGood bool) {
 	e.val, e.have = v, true
 }
 
-// observe 는 키 하나의 관측을 낸다. read 는 지금 읽는다(git 자리 sem 은 read 가 잡는다).
+// observe 는 키 하나의 관측을 낸다. read 는 지금 읽는다(git 자리는 read 가 mode 대로 잡는다,
+// 뒤의 새로 읽기는 화면만 띄우므로 화면 자리에 선다).
 //
 // 판정 자리(readNow)나 보관본이 꺼진 화면은 **언제나 지금 읽는다**, 도는 읽기에 올라타지도
 // 않는다(그 읽기는 이 요청보다 먼저 시작했을 수 있다). 그 읽기도 보관본을 고친다.
@@ -480,12 +519,12 @@ func readInto[T snapshot](c *deriveCache, e *cell[T], ctx context.Context, read 
 	return v
 }
 
-// withSlot 은 git 실행 자리를 잡고 fn 을 부른다. 못 잡으면(ctx 끝남) failed 를 낸다.
-func withSlot[T any](c *deriveCache, ctx context.Context, failed func(error) T, fn func() T) T {
-	if !c.acquire(ctx) {
+// withSlot 은 mode 의 git 실행 자리를 잡고 fn 을 부른다. 못 잡으면(ctx 끝남) failed 를 낸다.
+func withSlot[T any](c *deriveCache, ctx context.Context, mode readMode, failed func(error) T, fn func() T) T {
+	if !c.acquire(ctx, mode) {
 		return failed(ctx.Err())
 	}
-	defer c.release()
+	defer c.release(mode)
 	return fn()
 }
 
@@ -506,7 +545,7 @@ func (c *deriveCache) worktreeState(ctx context.Context, g GitReader, wt string,
 	wt = filepath.Clean(wt)
 	return observe(c, c.wt, wt, ctx, mode, now, func(ctx context.Context) wtSnap {
 		at := now()
-		return withSlot(c, ctx, func(err error) wtSnap { return wtSnap{at: at, pathsErr: err, deltaErr: err} }, func() wtSnap {
+		return withSlot(c, ctx, mode, func(err error) wtSnap { return wtSnap{at: at, pathsErr: err, deltaErr: err} }, func() wtSnap {
 			sn := wtSnap{at: at}
 			sn.paths, sn.pathsErr = g.UncommittedPaths(ctx, wt)
 			sn.delta, sn.deltaErr = g.UncommittedDelta(ctx, wt)
@@ -533,7 +572,7 @@ func (l listSnap) ok() bool              { return l.err == nil }
 func (c *deriveCache) worktreeList(ctx context.Context, g GitReader, repo string, mode readMode, now func() time.Time) listSnap {
 	return observe(c, c.lists, filepath.Clean(repo), ctx, mode, now, func(ctx context.Context) listSnap {
 		at := now()
-		return withSlot(c, ctx, func(err error) listSnap { return listSnap{err: err, at: at} }, func() listSnap {
+		return withSlot(c, ctx, mode, func(err error) listSnap { return listSnap{err: err, at: at} }, func() listSnap {
 			wts, err := g.Worktrees(ctx)
 			return listSnap{wts: wts, err: err, at: at}
 		})
@@ -557,7 +596,7 @@ func (c *deriveCache) refState(ctx context.Context, g GitReader, repo, ref strin
 
 	return observe(c, c.refs, filepath.Clean(repo)+"\x00"+ref, ctx, mode, now, func(ctx context.Context) refSnap {
 		at := now()
-		r := withSlot(c, ctx, func(err error) refSnap { return refSnap{err: err, at: at} }, func() refSnap {
+		r := withSlot(c, ctx, mode, func(err error) refSnap { return refSnap{err: err, at: at} }, func() refSnap {
 			r, err := g.Ref(ctx, ref)
 			return refSnap{ref: r, err: err, at: at}
 		})
