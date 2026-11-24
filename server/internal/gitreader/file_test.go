@@ -88,6 +88,10 @@ func TestFileAtRefusesOversizeInsteadOfTruncating(t *testing.T) {
 	if !strings.Contains(err.Error(), "상한") {
 		t.Fatalf("사유가 상한을 안 말한다: %v", err)
 	}
+	// 호출부(명부 읽기)가 이것을 git 의 일시 오류와 가른다 — 고쳐질 때까지 같은 답이다.
+	if !errors.Is(err, ErrFileTooLarge) || errors.Is(err, ErrFileNotInRef) {
+		t.Fatalf("상한 초과의 표식이 아니다: %v", err)
+	}
 }
 
 // 경로 가드 — 절대경로·제어문자·빈 값은 git 에 안 넘긴다.

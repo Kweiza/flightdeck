@@ -25,6 +25,12 @@ import (
 // 배타가 안 서는 것으로만 나타난다.
 var ErrFileNotInRef = errors.New("그 ref 에 그 경로가 없다")
 
+// ErrFileTooLarge 는 그 ref 의 파일이 크기 상한(maxFileBytes)을 넘었다는 표식이다.
+//
+// ★ git 이 못 답한 것과 가른다. 이쪽은 **커밋된 파일의 성질**이라 고쳐질 때까지 몇 번을
+// 읽어도 같은 답이 나온다 — 호출부는 이것을 일시 오류가 아니라 꼴의 결함으로 읽는다.
+var ErrFileTooLarge = errors.New("크기 상한을 넘어 읽지 않았다")
+
 // pathNotInRefMarkers 는 「경로가 없다」를 가르는 stderr 문구다.
 //
 // ★ git 판·명령마다 문구가 다르다. `git show <ref>:<path>` 는 경로가 없으면
@@ -81,8 +87,8 @@ func (r *Reader) FileAt(ctx context.Context, ref, path string) ([]byte, error) {
 		return nil, fmt.Errorf("%s:%s 읽기 실패: %w", ref, p, err)
 	}
 	if len(out) > maxFileBytes {
-		return nil, fmt.Errorf("%s:%s 가 %d바이트다 — 상한 %d바이트를 넘어 읽지 않았다"+
-			"(자르면 뒤쪽 선언이 조용히 사라진다)", ref, p, len(out), maxFileBytes)
+		return nil, fmt.Errorf("%s:%s 가 %d바이트다 — %w(상한 %d바이트, "+
+			"자르면 뒤쪽 선언이 조용히 사라진다)", ref, p, len(out), ErrFileTooLarge, maxFileBytes)
 	}
 	return out, nil
 }

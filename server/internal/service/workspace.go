@@ -123,10 +123,17 @@ type rosterRead struct {
 	ref string
 	// absent 가 비지 않으면 워크스페이스가 아니다(파일이 그 커밋에 없거나 블록이 없다) — 사유.
 	absent string
-	// failure 가 비지 않으면 명부를 **통째로** 못 읽었다(파일 읽기 실패·꼴을 못 읽음) — 사유.
-	failure  string
-	members  []model.WorkspaceMember
-	rejected []judge.RejectedMember
+	// unread 가 비지 않으면 git 이 그 순간 파일을 못 내줬다(일시 오류 · 자리를 못 잡은 ctx
+	// 종료) — 사유. **파일에 대해 아무것도 모른다.** 다음 읽기가 다시 잰다.
+	unread string
+	// malformed 가 비지 않으면 파일은 받았는데 꼴을 **통째로** 못 읽었다(블록 꼴 · 크기 상한) —
+	// 사유. 이쪽은 파일의 성질이라 고쳐질 때까지 같은 답이 나온다.
+	//
+	// ★ 둘을 가른 이유: 하나로 접혀 있을 때 명부 파일이 없는 저장소나 git 이 한 번 못 답한
+	// 순간에도 배너가 「명부 캐시가 낡았다」를 말했다(RosterHealth). 낡음은 malformed 만 말한다.
+	malformed string
+	members   []model.WorkspaceMember
+	rejected  []judge.RejectedMember
 }
 
 // rosterRef 는 명부를 읽는 ref 다 — 기본 브랜치, 모르면 main. 읽는 자리와 sha 를 재는 자리
@@ -144,16 +151,19 @@ func (s *Service) readRoster(ctx context.Context, proj model.Project, g GitReade
 	rr := rosterRead{ref: ref}
 	raw, err := g.FileAt(ctx, ref, WorkspaceConfigFile)
 	if err != nil {
-		if errors.Is(err, gitreader.ErrFileNotInRef) {
+		switch {
+		case errors.Is(err, gitreader.ErrFileNotInRef):
 			rr.absent = WorkspaceConfigFile + " 가 " + ref + " 에 없다 — 워크스페이스가 아니다"
-		} else {
-			rr.failure = "명부를 못 읽었다: " + clip(err.Error(), 200)
+		case errors.Is(err, gitreader.ErrFileTooLarge):
+			rr.malformed = WorkspaceConfigFile + " 가 크기 상한을 넘어 읽지 않았다"
+		default:
+			rr.unread = "명부를 못 읽었다: " + clip(err.Error(), 200)
 		}
 		return rr
 	}
 	ws, perr := judge.ParseWorkspace(string(raw))
 	if perr != nil {
-		rr.failure = WorkspaceConfigFile + " 의 workspace 블록을 못 읽었다: " + clip(perr.Error(), 200)
+		rr.malformed = WorkspaceConfigFile + " 의 workspace 블록을 못 읽었다: " + clip(perr.Error(), 200)
 		return rr
 	}
 	if !ws.Declared {
@@ -176,6 +186,7 @@ func (s *Service) readRoster(ctx context.Context, proj model.Project, g GitReade
 //   - `workspace:` 블록이 없어도 같다(judge.Workspace.Declared 가 그 축이다).
 //   - 꼴을 통째로 못 읽으면 **캐시를 안 건드리고 사유를 낸다.** 줄 경계부터 못 믿는 파일로
 //     덮으면 자원 배타가 조용히 좁아진다. 그 낡음은 보드 배너와 doctor 가 말한다(RosterHealth).
+//   - git 이 파일을 못 내줬어도(일시 오류) 캐시를 안 건드리고 사유를 낸다. 이쪽은 낡음이 아니다.
 //
 // **멤버 한 줄의 결함은 그 줄만 뺀다**(judge.RejectedMember 의 사유). 예전에는 한 줄이
 // 명부 전체를 거절해, 마지막으로 받아들인 명부가 몇 주 동안 남고 새 멤버가 조용히 빠졌다.
@@ -205,10 +216,13 @@ func (s *Service) refreshWorkspace(ctx context.Context, proj model.Project, g Gi
 		// 정상 상태다. sha 는 기록한다 — 그래야 다음 세션이 같은 커밋에서 또 안 읽는다.
 		s.stampWorkspaceSHA(ctx, proj.ID, headSHA)
 		return false, rr.absent
-	case rr.failure != "":
+	case rr.malformed != "":
 		// ★ sha 를 **안 적는다.** 적으면 다음 세션이 "이미 읽었다"고 판정해 이 오류가
 		//   한 번 뜨고 영영 조용해진다. 파일이 고쳐질 때까지 매번 말하는 것이 맞다.
-		return false, rr.failure
+		return false, rr.malformed
+	case rr.unread != "":
+		// sha 를 안 적는다 — 못 읽은 커밋을 «봤다»로 적으면 그 커밋의 명부가 영영 안 들어온다.
+		return false, rr.unread
 	}
 
 	stamp := headSHA
@@ -272,7 +286,9 @@ func sameMembers(cur, next []model.WorkspaceMember) bool {
 type RosterHealth struct {
 	CacheSHA string `json:"cache_sha,omitempty"` // 캐시가 마지막으로 깨끗하게 읽은 커밋(project.config_from_sha)
 	HeadSHA  string `json:"head_sha,omitempty"`  // 지금 기본 브랜치의 tip
-	// Failure 가 비지 않으면 명부를 통째로 못 읽어 **캐시가 기본 브랜치보다 낡았다.**
+	// Failure 가 비지 않으면 명부 파일의 꼴을 통째로 못 읽어 **캐시가 기본 브랜치보다 낡았다.**
+	// git 이 파일을 못 내준 것(일시 오류)은 여기 오지 않는다 — 파일에 대해 아무것도 모르는
+	// 것을 «낡았다»로 지어내지 않는다(rosterRead.unread).
 	Failure string `json:"failure,omitempty"`
 	// Rejected 는 받은 명부에서 뺀 줄이다(캐시에는 나머지가 들어가 있다).
 	Rejected []judge.RejectedMember `json:"rejected,omitempty"`
@@ -312,16 +328,17 @@ func rejectedLine(rejected []judge.RejectedMember) string {
 // headSHA 를 모르면 재지 않는다 — 모르는 것을 «낡았다»로 지어내지 않는다.
 //
 // 워크스페이스가 아니거나(absent) 캐시가 그저 한 커밋 뒤인 것뿐이면(다음 세션 열기가
-// 따라잡는다) nil 이다.
+// 따라잡는다) nil 이다. git 이 파일을 못 내줬어도(unread) nil 이다 — 명부 파일이 없는
+// 저장소에서도 그 실패는 나고, 그때 «낡았다»는 거짓 경보다. 다음 읽기가 다시 잰다.
 func (s *Service) rosterHealth(ctx context.Context, proj model.Project, g GitReader, headSHA string) *RosterHealth {
 	if headSHA == "" || headSHA == proj.ConfigFromSHA || strings.TrimSpace(proj.Path) == "" {
 		return nil
 	}
 	rr := s.readRoster(ctx, proj, g)
-	if rr.absent != "" || (rr.failure == "" && len(rr.rejected) == 0) {
+	if rr.absent != "" || rr.unread != "" || (rr.malformed == "" && len(rr.rejected) == 0) {
 		return nil
 	}
-	return &RosterHealth{CacheSHA: proj.ConfigFromSHA, HeadSHA: headSHA, Failure: rr.failure, Rejected: rr.rejected}
+	return &RosterHealth{CacheSHA: proj.ConfigFromSHA, HeadSHA: headSHA, Failure: rr.malformed, Rejected: rr.rejected}
 }
 
 // stampWorkspaceSHA 는 "이 커밋은 봤다"만 적는다. 실패해도 진행한다 —

@@ -197,8 +197,8 @@ type BoardView struct {
 	// 언제나 나간다** — 없는 것을 없다고 말하는 것과, 있는 것을 안 보여 주면서 말도 안
 	// 하는 것은 다르다.
 	Workspace judge.Roster `json:"workspace,omitzero"`
-	// Roster 는 **이 프로젝트가 커밋한 명부가 캐시와 갈린 사실**이다(뺀 줄 · 통째로 못 읽어
-	// 낡은 캐시). 깨끗하면 nil 이다. 배너가 Workspace 와 **함께** 이 줄을 낸다 — 명부를 통째로
+	// Roster 는 **이 프로젝트가 커밋한 명부가 캐시와 갈린 사실**이다(뺀 줄 · 꼴을 통째로 못
+	// 읽어 낡은 캐시). 깨끗하면 nil 이고, git 이 그 파일을 못 내준 순간에도 nil 이다(모르는 것). 배너가 Workspace 와 **함께** 이 줄을 낸다 — 명부를 통째로
 	// 못 읽으면 배너는 옛 캐시로 떠서 정상처럼 보이고, 첫 명부부터 못 읽었으면 배너 자체가
 	// 없다. 두 경우 다 이 값이 유일한 표시다(service.RosterHealth).
 	Roster *RosterHealth `json:"roster,omitempty"`
@@ -411,7 +411,8 @@ func (s *Service) Board(ctx context.Context, project string, opt BoardOptions) (
 	}
 	// ★ 명부의 건강은 **이 프로젝트가 주인인 명부**만 잰다(루트 자신의 파일). 기본 브랜치 sha 는
 	//   위 카드 파생이 이미 읽은 보관본을 다시 꺼낸다 — 캐시 sha 와 같으면 git 을 더 안 친다
-	//   (rosterHealth 의 머리말).
+	//   (rosterHealth 의 머리말). 기본 브랜치를 못 읽었거나 파일 읽기가 자리를 못 잡고 끝나면
+	//   (ctx 종료) **아무 말도 안 한다** — 모르는 것을 «낡았다»로 내지 않는다.
 	if strings.TrimSpace(proj.Path) != "" {
 		rs := s.dc.refState(ctx, s.git(proj.Path), proj.Path, rosterRef(proj), readScreen, s.now,
 			func(ctx context.Context, r model.RefState) { s.rememberRef(ctx, proj.ID, r) })

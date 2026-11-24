@@ -373,6 +373,38 @@ var catalog = [][2]string{
 	{"토큰이 설정돼 있다. 루프백 면제는 설정상 열려 있으나 이 서버에 루프백으로 도달한 요청이 아직 없다 — 면제를 받는 클라이언트가 하나도 없을 수 있다. 클라이언트에 토큰을 실어라. 이 값은 /healthz 로는 안 움직인다 — 재려면 루프백에서 API 요청을 한 번 보내라", "a token is set. The loopback exemption is configured, but no request has reached this server over loopback yet — there may be no client getting the exemption. Give clients the token. /healthz does not move this value — to measure it, send one API request over loopback"},
 	{"  프로젝트별 git 도달성은 서버 표면에 없다 — 이 도구는 그 축을 재지 않았다.", "  Per-project git reachability is not on the server surface — this tool did not measure that axis."},
 
+	// 워크스페이스 명부의 건강(service.RosterHealth.Line) — 보드 배너와 doctor 가 같은 줄을 낸다.
+	// 한 줄에 사유가 여럿 붙으므로 **조각**으로 옮긴다: 머리 · 낡음 · 뺀 줄 수, 그 뒤에 사유 하나하나.
+	{"워크스페이스 명부: ", "workspace roster: "},
+	{"명부 캐시가 기본 브랜치보다 낡았다(캐시 {} · 기본 브랜치 {}) — ", "the roster cache is older than the default branch (cache {1} · default branch {2}) — "},
+	{"{w} 의 workspace 블록을 못 읽었다: ", "could not read the workspace block of {1}: "},
+	{"{w} 가 크기 상한을 넘어 읽지 않았다", "{1} is over the size limit and was not read"},
+	{"명부에서 뺀 줄 {n}건: ", "{1} line(s) dropped from the roster: "},
+	// 뺀 줄의 사유(judge.memberPathOK · ParseWorkspace · AdoptRoster).
+	{"멤버 path 가 절대경로다({}) — 커밋되는 값이라 루트 상대여야 한다", "member path is absolute ({1}) — it is a committed value, so it must be relative to the root"},
+	{"멤버 path 가 루트 자신이거나 부모 마디뿐이다({}) — 멤버 레포 폴더를 가리켜라", "member path is the root itself or only parent segments ({1}) — point at the member repo folder"},
+	{"멤버 path 가 루트의 형제 폴더 밖이다({}) — 루트 밖 멤버는 루트의 형제 폴더까지만(`../<이름>` 과 그 아래) 받는다", "member path is beyond the root's sibling folders ({1}) — a member outside the root is accepted only up to the root's sibling folders (`../<name>` and below)"},
+	{"멤버에 path 가 없다 — 루트 상대 경로가 명부의 필수 칸이다", "the member has no path — a root-relative path is a required field of the roster"},
+	{"멤버의 프로젝트 id 가 비었다(path={}) — path 의 마지막 마디가 경계 문자뿐이면 id 를 지을 수 없다. project 를 명시해라", "the member's project id is empty (path={1}) — no id can be made when the last path segment is only separator characters. Set project explicitly"},
+	{"멤버 {} 가 루트 자신과 같은 프로젝트 id 다", "member {1} has the same project id as the root itself"},
+	{"멤버 프로젝트 id {} 가 두 번 나온다 — 먼저 적힌 줄을 쓴다", "member project id {1} appears twice — the line written first is used"},
+	// 명부 파일의 꼴을 통째로 못 읽은 사유(judge.ParseWorkspace).
+	{"workspace: 뒤에 값 {} 가 붙어 있다 — 이 파서는 블록 스타일만 읽는다(다음 줄부터 `  members:` 로 들여써라)", "workspace: has a value {1} after it — this parser reads block style only (indent `  members:` from the next line)"},
+	{"members: 뒤에 값 {} 가 붙어 있다 — 이 파서는 블록 시퀀스만 읽는다(다음 줄부터 `    - path: …` 로 써라)", "members: has a value {1} after it — this parser reads block sequences only (write `    - path: …` from the next line)"},
+	{"members 아래에 시퀀스가 아닌 줄이 있다: ", "a line under members is not a sequence item: "},
+	{"멤버 줄을 `키: 값` 으로 못 읽었다: ", "could not read a member line as `key: value`: "},
+	{"값에 탭이 있다({}) — YAML 은 탭 들여쓰기를 금지한다", "the value has a tab ({1}) — YAML forbids tab indentation"},
+	{"플로우 스타일({})은 이 파서가 안 읽는다 — 블록으로 써라", "this parser does not read flow style ({1}) — write it as a block"},
+	// doctor 의 멤버 축(service.workspaceAxes). 한 줄에 사실 여럿이 ` · ` 로 붙는다.
+	{"HEAD 를 못 읽었다: ", "could not read HEAD: "},
+	{"ref \"{}\" 관측 실패: ", "reading ref \"{1}\" failed: "},
+	{"루트 밖 멤버다 — 서버가 컨테이너면 그 자리도 마운트돼야 한다", "member outside the root — if the server runs in a container, that location must be mounted too"},
+	{"루트 밖 멤버다 — 루트 세션의 발자국과는 겹침을 못 잰다", "member outside the root — overlap with root sessions' footprints cannot be measured"},
+	{"원장에 아직 없다 — 그 레포에서 세션이 한 번도 안 열렸다(결함이 아니다)", "not in the ledger yet — no session has opened in that repo (not a defect)"},
+	{"명부의 id({})와 경로의 마지막 마디({})가 다르다 — 그 레포에서 띄운 세션은 {w} 로 등록한다", "the roster id ({1}) differs from the last path segment ({2}) — a session started in that repo registers as {3}"},
+	{"루트 {} 에 함께 등재돼 있다 — 자원 스코프는 그중 하나만 쓴다", "listed under roots {1} together — the resource scope uses only one of them"},
+	{"프로젝트 조회 실패: ", "project lookup failed: "},
+
 	{"획득 경과", "Held for"},
 	{"판정 시각", "Checked at"},
 	{"쥐어진 자원", "Held resources"},

@@ -144,6 +144,11 @@ func TestParseWorkspaceRejectsOnlyTheFaultyMember(t *testing.T) {
 		{"루트 자신", "    - path: .\n", "루트 자신"},
 		{"루트의 부모 자신", "    - path: ../\n", "루트 자신이거나 부모 마디뿐"},
 		{"부모 마디뿐", "    - path: ../..\n", "루트 자신이거나 부모 마디뿐"},
+		// ★ 루트 밖은 **루트의 형제까지만**이다. 상한이 없으면 커밋된 명부 한 줄로 서버가 디스크
+		//   아무 자리에서 git 을 돈다(doctor · 멤버 요약이 그 경로를 연다).
+		{"형제 밖(두 마디 위)", "    - path: ../../far/away\n", "루트의 형제 폴더까지만"},
+		{"형제 밖(시스템 폴더)", "    - path: ../../../../etc/x\n", "루트의 형제 폴더까지만"},
+		{"형제 밖(안에서 돌아 나간다)", "    - path: a/../../../b\n", "루트의 형제 폴더까지만"},
 		{"path 없음", "    - project: only-a-name\n", "path 가 없다"},
 		{"id 를 못 짓는다", "    - path: \"...\"\n", "프로젝트 id 가 비었다"},
 	}
@@ -167,18 +172,19 @@ func TestParseWorkspaceRejectsOnlyTheFaultyMember(t *testing.T) {
 	}
 }
 
-// 루트 밖 멤버(`../x`)는 **받는다.** 멤버 저장소를 워크스페이스 폴더 밖으로 옮긴 배치가
+// 루트 밖 멤버(`../x` 와 그 아래)는 **받는다.** 멤버 저장소를 워크스페이스 폴더 밖으로 옮긴 배치가
 // 실재하고, 그 멤버도 루트 경로와 합쳐 읽히는 자리다(service.MemberRepoPath).
 // id 는 여전히 마지막 마디다 — 그 레포에서 띄운 세션이 스스로 등록하는 이름과 같아야 한다.
 func TestParseWorkspaceAcceptsMembersOutsideTheRoot(t *testing.T) {
-	ws, err := ParseWorkspace("workspace:\n  members:\n    - path: ../sibling\n    - path: ../../far/away\n")
+	ws, err := ParseWorkspace("workspace:\n  members:\n    - path: ../sibling\n    - path: ../far/away\n" +
+		"    - path: inner/../../back\n")
 	if err != nil {
 		t.Fatalf("오류: %v", err)
 	}
 	if len(ws.Rejected) != 0 {
 		t.Fatalf("루트 밖 멤버를 뺐다: %+v", ws.Rejected)
 	}
-	if len(ws.Members) != 2 {
+	if len(ws.Members) != 3 {
 		t.Fatalf("멤버=%+v", ws.Members)
 	}
 	if got := MemberProjectID(ws.Members[0]); got != "sibling" {
@@ -186,6 +192,9 @@ func TestParseWorkspaceAcceptsMembersOutsideTheRoot(t *testing.T) {
 	}
 	if got := MemberProjectID(ws.Members[1]); got != "away" {
 		t.Errorf("id=%q — away 여야 한다", got)
+	}
+	if got := MemberProjectID(ws.Members[2]); got != "back" {
+		t.Errorf("id=%q — back 이어야 한다", got)
 	}
 }
 

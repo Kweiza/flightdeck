@@ -1,10 +1,14 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kweiza/flightdeck/internal/gitreader"
 )
 
 // commitRoster 는 루트의 명부를 고쳐 커밋하고 그 커밋의 sha 를 낸다.
@@ -153,5 +157,75 @@ func TestCleanRosterAddsNothingToBoardOrDoctor(t *testing.T) {
 	}
 	if rep := svc.Doctor(ctx()); len(rep.Rosters) != 0 {
 		t.Fatalf("깨끗한 명부인데 doctor 가 실었다: %+v", rep.Rosters)
+	}
+}
+
+// fileAtFails 는 명부 파일 읽기만 죽인다 — git 이 그 순간 못 답한 것(일시 오류 · 자리를 못 잡은
+// ctx 종료)이다. 「파일이 없다」(ErrFileNotInRef)도 「꼴이 틀렸다」도 아니다.
+type fileAtFails struct{ GitReader }
+
+var errFileAtFlaky = errors.New("주입된 실패: git show 가 답하지 않았다")
+
+func (f fileAtFails) FileAt(context.Context, string, string) ([]byte, error) {
+	return nil, errFileAtFlaky
+}
+
+// 명부를 **읽지 못한 것**은 명부의 건강에 대해 아무것도 말하지 않는다. 낡았다고 말하면
+// 명부 파일이 없는 저장소(워크스페이스가 아니다)나 git 이 한 번 못 답한 순간에 「명부 캐시가
+// 기본 브랜치보다 낡았다」 거짓 경보가 배너에 뜬다. 다음 읽기가 다시 잰다.
+func TestRosterReadFailureSaysNothingAboutRosterHealth(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{"워크스페이스 루트", twoMemberYAML},
+		{"명부 파일이 없는 저장소", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			svc, st := newSvc(t)
+			var root string
+			if c.yaml != "" {
+				root = wsRepo(t, c.yaml, "member-a", "member-b")
+			} else {
+				root = newRepo(t)
+			}
+			sess := openSession(t, svc, "repo", root, root, "cc-1", "")
+			// 기본 브랜치를 한 커밋 옮긴다 — 캐시 sha 와 갈려야 rosterHealth 가 파일을 읽는다.
+			writeFile(t, root, "note.txt", "moved\n")
+			runGit(t, root, "add", "-A")
+			runGit(t, root, "commit", "-q", "-m", "옮긴다")
+
+			flaky := New(st, nil, WithGitFactory(func(repoPath string) GitReader {
+				return fileAtFails{GitReader: gitreader.New(repoPath)}
+			}))
+			view, err := flaky.Board(ctx(), "repo", BoardOptions{Self: sess.Session.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if view.Roster != nil {
+				t.Fatalf("읽기 실패가 명부 건강을 말했다: %q", view.Roster.Line())
+			}
+			if rep := flaky.Doctor(ctx()); len(rep.Rosters) != 0 {
+				t.Fatalf("읽기 실패를 doctor 가 실었다: %+v", rep.Rosters)
+			}
+		})
+	}
+}
+
+// 파일의 **꼴**을 못 읽는 것은 일시 오류가 아니다 — 크기 상한을 넘은 명부는 고쳐질 때까지
+// 매번 같은 이유로 못 읽는다. 읽기 실패와 함께 접으면 캐시가 조용히 얼어붙는다.
+func TestOversizedRosterSaysTheCacheIsStale(t *testing.T) {
+	svc, _ := newSvc(t)
+	root := wsRepo(t, twoMemberYAML, "member-a", "member-b")
+	sess := openSession(t, svc, "repo", root, root, "cc-1", "")
+	commitRoster(t, root, twoMemberYAML+"# "+strings.Repeat("x", 300*1024)+"\n")
+
+	view, err := svc.Board(ctx(), "repo", BoardOptions{Self: sess.Session.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Roster == nil || view.Roster.Failure == "" || !strings.Contains(view.Roster.Line(), "낡았다") {
+		t.Fatalf("상한을 넘은 명부가 낡음을 안 말한다: %+v", view.Roster)
 	}
 }
