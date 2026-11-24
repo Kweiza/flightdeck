@@ -54,7 +54,9 @@ list card the first line of the question and a "추천: name" chip.
     선택: Option A | Option B (추천)
 
 - Headings are literally `###`. A card is a decision card only with `### 질문` and at least one `### 보기:`
-  (otherwise the old form: a row of `선택:` buttons). Each section runs until the next `##` · `###` heading;
+  (otherwise the old form: a row of `선택:` buttons). Lines starting with `질문: text` · `배경:` · `추천: text` read as the
+  same headings, and a `- name: text` list under a `보기:` line is one option per item (indented lines continue it).
+  New cards use the `###` form above. Each section runs until the next `##` · `###` heading;
   convention lines inside it are taken out of the section text (they show in their own place). Section text is Markdown.
 - Names after `### 보기:` and in the `선택:` line are matched with a trailing 「(추천)」 removed. An option with no match has no button.
   The recommendation mark may sit on either side.

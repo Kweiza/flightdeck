@@ -181,6 +181,8 @@ def directives_of(body, bases=None):
 
 # 결정 카드 본문 꼴(README 「소유자에게 고르게 할 때」): ### 질문 / ### 배경 / ### 보기: 이름 / ### 추천
 DECISION_HEAD_RE = re.compile(r"^###\s+(질문|배경|추천|보기\s*[:：]\s*(.+?))\s*$")
+COLON_HEAD_RE = re.compile(r"^(질문|배경|추천|보기)\s*[:：]\s*(.*?)\s*$")  # 줄 맨 앞만(목록 · 들여쓰기 안은 내용)
+OPTION_ITEM_RE = re.compile(r"^[-*]\s+(.+?)\s*[:：]\s+(.+?)\s*$")  # 「보기:」 아래 「- 이름: 설명」
 RECOMMEND_MARK = "(추천)"
 JUDGE_RE = re.compile(r"^\s*[-*]?\s*(Claude|Codex|Fable|Opus|astra)[^:：]{0,30}[:：]\s*(.+?)\s*$", re.I)
 SPLIT_WORDS = ("의견 갈림", "의견이 갈", "갈렸")
@@ -195,16 +197,29 @@ def bare_choice(name):
 
 
 def decision_sections(body):
-    """본문을 결정 꼴 머리로 나눈다 -> [(머리, 보기 이름 또는 None, 내용 줄)]. 규약 줄은 내용에서 뺀다."""
-    out, cur = [], None
+    """본문을 결정 꼴 머리로 나눈다 -> [(머리, 보기 이름 또는 None, 내용 줄)]. 규약 줄은 내용에서 뺀다.
+
+    머리는 두 꼴을 같게 읽는다: 「### 질문」 · 「### 보기: 이름」 머리 줄, 또는 줄 맨 앞의 「질문: 내용」 ·
+    「보기:」(아래 「- 이름: 설명」 목록이 보기 하나씩, 들여 쓴 이음 줄은 그 보기 본문) 줄.
+    """
+    out, cur, option_list = [], None, False
     for line in (body or "").splitlines():
-        m = DECISION_HEAD_RE.match(line.strip())
-        if m:
-            kind = "보기" if m.group(2) is not None else m.group(1)
-            cur = (kind, m.group(2), [])
+        m, c = DECISION_HEAD_RE.match(line.strip()), COLON_HEAD_RE.match(line)
+        item = OPTION_ITEM_RE.match(line) if option_list else None
+        if m or c:
+            kind, name, rest = (m.group(1), m.group(2), "") if m else (c.group(1), None, c.group(2))
+            if kind.startswith("보기"):
+                kind, name = "보기", name if m else (rest or None)
+                rest = ""
+            option_list = c is not None and kind == "보기" and name is None
+            cur = None if option_list else (kind, name, [rest] if rest else [])
+            if cur:
+                out.append(cur)
+        elif item:
+            cur = ("보기", item.group(1), [item.group(2)])
             out.append(cur)
         elif line.strip().startswith("## ") or line.strip().startswith("### "):
-            cur = None  # 꼴 밖의 머리가 나오면 그 절은 끝난다
+            cur, option_list = None, False  # 꼴 밖의 머리가 나오면 그 절은 끝난다
         elif cur is not None and not DIRECTIVE_RE.match(line):
             cur[2].append(line)
     return [(k, n, "\n".join(ls).strip()) for k, n, ls in out]

@@ -96,7 +96,45 @@ class Directives(unittest.TestCase):
         self.assertEqual(B.github_url("git@gitlab.com:a/b.git"), "")
 
 
+COLON_DECISION = """질문: 청크를 어떤 크기로 자를까요? 측정에서 떨어졌습니다.
+
+배경:
+- 1,500자는 500자보다 낮다: 0.917→0.817
+- 원인은 하루 기록 하나
+
+보기:
+- 하루 기록만 500자 (추천): 날짜 노트만 500자로.
+  합치기 전에 다시 채점한다.
+- 1,500자 그대로 + qwen3: 원가 그대로.
+
+추천: 하루 기록만 500자. 떨어진 곳만 고친다.
+Fable: 하루 기록만 500자, 구현이 작다
+astra: 1,500자 그대로 + qwen3, 원가가 먼저
+선택: 하루 기록만 500자 (추천) | 1,500자 그대로 + qwen3
+"""
+
+
 class Decision(unittest.TestCase):
+    def test_colon_form(self):
+        """머리를 ### 대신 「질문:」 줄로, 보기를 「보기:」 아래 「- 이름: 설명」 목록으로 써도 같은 결정 묶음이다."""
+        d = B.decision_of(COLON_DECISION, B.directives_of(COLON_DECISION)["choices"])
+        self.assertEqual(d["question"], "청크를 어떤 크기로 자를까요? 측정에서 떨어졌습니다.")
+        self.assertEqual(d["background"], "- 1,500자는 500자보다 낮다: 0.917→0.817\n- 원인은 하루 기록 하나")
+        self.assertEqual([o["name"] for o in d["options"]], ["하루 기록만 500자", "1,500자 그대로 + qwen3"])
+        self.assertEqual(d["options"][0]["body"], "날짜 노트만 500자로.\n  합치기 전에 다시 채점한다.")
+        self.assertEqual([o["choice"] for o in d["options"]], ["하루 기록만 500자 (추천)", "1,500자 그대로 + qwen3"])
+        self.assertEqual(d["recommended"], "하루 기록만 500자")
+        self.assertEqual(d["recommendation"], "하루 기록만 500자. 떨어진 곳만 고친다.")
+        self.assertEqual(len(d["judges"]), 2)
+        self.assertTrue(d["split"])
+
+    def test_heading_option_keeps_bullets(self):
+        """### 보기: 이름 아래의 「- 가: 나」 목록은 보기 본문이다(보기로 쪼개지 않는다)."""
+        body = "### 질문\n고를까?\n### 보기: 가\n- 좋은 점: 빠름\n- 나쁜 점: 비쌈\n### 보기: 나\n그대로\n선택: 가 | 나"
+        d = B.decision_of(body, B.directives_of(body)["choices"])
+        self.assertEqual([o["name"] for o in d["options"]], ["가", "나"])
+        self.assertEqual(d["options"][0]["body"], "- 좋은 점: 빠름\n- 나쁜 점: 비쌈")
+
     def test_four_parts(self):
         d = B.decision_of(DECISION, B.directives_of(DECISION)["choices"])
         self.assertEqual(d["question"], "붉은 테두리를 쓸까?\n지금 정해야 카드 그림을 뽑는다.")
