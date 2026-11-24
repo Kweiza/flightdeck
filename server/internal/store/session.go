@@ -453,12 +453,10 @@ func (s *Store) Rekey(ctx context.Context, id, ccSessionID string) (model.Sessio
 // 침묵하면 "겹침 없음"과 "이 축을 안 본다"가 구분되지 않는다.
 //
 // ★ **세션 수와 무관한 질의 수(4번)다(2026-11-23).** 앞 판은 세션마다 신호 · 발자국 · 선점을
-// 따로 물었다(1+3N). 보드는 창 밖 건수를 세려고 since=0 으로 이것을 부르는데, 큰 프로젝트는
-// 그 세션이 1239개라 요청 하나가 질의 3700여 번에 약 2초를 썼다. 지금은 세션 목록 하나와
-// 세 축을 같은 거름(liveSessionFilter)의 하위 질의로 한 번씩 묻는다.
+// 따로 물었다(1+3N). 지금은 세션 목록 하나와 세 축을 같은 거름의 하위 질의로 한 번씩 묻는다
+// (loadViews). 창 밖 세션은 이것으로 세지 않는다, SummarizeOutside 가 SQL 로 센다.
 func (s *Store) ListLive(ctx context.Context, project string, since time.Time) ([]model.SessionView, error) {
 	cut := fmtTime(since)
-	args := []any{project, cut, cut}
 	// 네 질의를 읽기 트랜잭션 하나에서 묻는다. 세 축의 하위 질의는 거름을 다시 평가하므로, 따로
 	// 물으면 그 사이 끝난 세션이 목록에는 있고 축에는 없을 수 있다. 한 트랜잭션은 한 스냅숏을 본다.
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
@@ -466,12 +464,25 @@ func (s *Store) ListLive(ctx context.Context, project string, since time.Time) (
 		return nil, fmt.Errorf("살아 있는 세션 조회 트랜잭션 시작 실패(project=%q): %w", clip(project, 64), err)
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `
-		SELECT `+sessionCols+` FROM session s
-		WHERE `+liveSessionFilter+`
-		ORDER BY s.opened_at DESC`, args...)
+	out, err := loadViews(ctx, tx, liveSessionFilter, []any{project, cut, cut})
 	if err != nil {
 		return nil, fmt.Errorf("살아 있는 세션 조회 실패(project=%q): %w", clip(project, 64), err)
+	}
+	return out, nil
+}
+
+// loadViews 는 거름(filter, 인자 args)에 걸린 세션을 신호 · 발자국 · 선점과 함께 opened_at 내림차순으로
+// 낸다. 질의는 넷(세션 목록, 세 축)이고 세 축은 같은 거름의 하위 질의다. 결과가 없으면 빈 조각이다.
+//
+// ★ ListLive 와 SummarizeOutside 의 선점자가 **같은 적재**를 쓴다. 두 벌이면 한쪽 축만 고친 순간
+// 창 안 카드와 창 밖 선점 줄이 다른 조건으로 갈린다.
+func loadViews(ctx context.Context, tx dbtx, filter string, args []any) ([]model.SessionView, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+sessionCols+` FROM session s
+		WHERE `+filter+`
+		ORDER BY s.opened_at DESC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("세션 목록 조회 실패: %w", err)
 	}
 	defer rows.Close()
 
@@ -493,7 +504,7 @@ func (s *Store) ListLive(ctx context.Context, project string, since time.Time) (
 		return out, nil
 	}
 
-	ids := `SELECT s.id FROM session s WHERE ` + liveSessionFilter
+	ids := `SELECT s.id FROM session s WHERE ` + filter
 	if err := eachRow(ctx, tx, `SELECT session_id, kind, at FROM signal WHERE session_id IN (`+ids+`)`, args,
 		"신호", func(r *sql.Rows) error {
 			var id, kind, ts string
@@ -547,9 +558,85 @@ func (s *Store) ListLive(ctx context.Context, project string, since time.Time) (
 
 // liveSessionFilter 는 ListLive 의 거름이다(인자: project, since, since). 세션 목록과 세 축의
 // 하위 질의가 **같은 문장**을 쓴다, 두 벌이면 한쪽만 고친 순간 축이 다른 세션 집합을 본다.
-const liveSessionFilter = `s.project = ? AND s.state <> 'done'
-		  AND (s.opened_at >= ?
+//
+// 두 조각(끝나지 않은 세션 · 창 안)으로 지어 창 밖 거름(outsideSessionFilter)과 나눠 쓴다.
+// 창 밖은 「끝나지 않았고 창 안이 아니다」라서, 창 안 조건을 따로 적으면 보드의 카드와
+// 창 밖 건수가 다른 판정으로 갈린다.
+const liveSessionFilter = openSessionCond + ` AND ` + inWindowCond
+
+// outsideSessionFilter 는 SummarizeOutside 의 거름이다(인자: project, since, since). 끝나지 않았는데
+// since 뒤로 열리지도 신호를 내지도 않은 세션, 곧 같은 since 의 ListLive 에서 빠지는 세션이다.
+// opened_at 은 NOT NULL 이고 EXISTS 는 0 · 1 이라 NOT 이 NULL 로 새지 않는다.
+const outsideSessionFilter = openSessionCond + ` AND NOT ` + inWindowCond
+
+// outsideClaimFilter 는 창 밖인데 풀리지 않은 선점을 든 세션이다(인자: outsideSessionFilter 와 같다).
+//
+// claim 에는 session_id 색인이 없다. 세션마다 EXISTS 로 물으면 claim 표를 세션 수만큼 훑는다
+// (실측 1295 세션에 0.13초, 적재 질의 넷이 써서 0.5초). 풀리지 않은 선점 목록을 한 번 지어 IN 으로 건다.
+const outsideClaimFilter = outsideSessionFilter +
+	` AND s.id IN (SELECT session_id FROM claim WHERE released_at IS NULL)`
+
+// openSessionCond 는 프로젝트의 끝나지 않은 세션이다(인자: project).
+const openSessionCond = `s.project = ? AND s.state <> 'done'`
+
+// inWindowCond 는 since 뒤로 열렸거나 신호를 낸 세션이다(인자: since, since).
+const inWindowCond = `(s.opened_at >= ?
 		       OR EXISTS (SELECT 1 FROM signal g WHERE g.session_id = s.id AND g.at >= ?))`
+
+// OutsideSummary 는 창 밖 세션의 요약이다. 보드는 창 밖을 카드로 안 그리고 건수 · 가장 오래된
+// 마지막 신호 · 선점을 든 세션만 말한다.
+type OutsideSummary struct {
+	// Count 는 창 밖 세션 수다.
+	Count int
+	// Oldest 는 창 밖 세션마다의 마지막 신호 중 가장 이른 것이다. 신호가 있는 창 밖 세션이
+	// 없으면 0값이다(언제 봤는지 답할 재료가 없다).
+	Oldest time.Time
+	// Claimed 는 풀리지 않은 선점을 든 창 밖 세션이다. ListLive 와 같은 적재(loadViews)라
+	// 신호 · 발자국 · 선점이 다 찬다. git 파생(브랜치 등)은 비어 있다.
+	Claimed []model.SessionView
+}
+
+// SummarizeOutside 는 since 의 창 밖 세션을 센다.
+//
+// ★ 보드는 창 밖 건수를 세려고 ListLive(since=0) 로 끝나지 않은 세션 전부를 신호 · 발자국 ·
+// 선점까지 실어 와 Go 에서 창 안 카드를 뺐다(큰 프로젝트는 1300개 가까이). 쓰는 것은 건수와
+// 위 두 값뿐이라 여기서 SQL 로 센다, 행을 싣는 것은 선점자뿐이다.
+// 질의는 건수 · 마지막 신호 한 문장에, 창 밖이 있으면 선점자 목록 하나, 선점자가 있으면 세 축이
+// 더 붙어 많아야 다섯이다. 읽기 트랜잭션 하나에서 묻는다(ListLive 와 같은 까닭, 한 스냅숏).
+func (s *Store) SummarizeOutside(ctx context.Context, project string, since time.Time) (OutsideSummary, error) {
+	cut := fmtTime(since)
+	args := []any{project, cut, cut}
+	var out OutsideSummary
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return out, fmt.Errorf("창 밖 세션 조회 트랜잭션 시작 실패(project=%q): %w", clip(project, 64), err)
+	}
+	defer tx.Rollback()
+
+	// 시각은 고정 폭 UTC 문자열이라(fmtTime) 글자 순서가 시간 순서다, 거름의 g.at >= ? 와 같은 전제.
+	// 세션마다 마지막 신호(MAX)를 내고 그중 가장 이른 것(MIN)을 고른다. 신호 없는 세션은 NULL 이라 빠진다.
+	var oldest sql.NullString
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*), MIN((SELECT MAX(g.at) FROM signal g WHERE g.session_id = s.id))
+		FROM session s WHERE `+outsideSessionFilter, args...).Scan(&out.Count, &oldest); err != nil {
+		return out, fmt.Errorf("창 밖 세션 수 조회 실패(project=%q): %w", clip(project, 64), err)
+	}
+	if out.Count == 0 {
+		return out, nil
+	}
+	if oldest.Valid {
+		if out.Oldest, err = parseTime(oldest.String); err != nil {
+			return out, err
+		}
+	}
+	if out.Claimed, err = loadViews(ctx, tx, outsideClaimFilter, args); err != nil {
+		return out, fmt.Errorf("창 밖 선점 세션 조회 실패(project=%q): %w", clip(project, 64), err)
+	}
+	if len(out.Claimed) == 0 {
+		out.Claimed = nil // 앞 판처럼 「없음」은 nil 이다(JSON omitempty)
+	}
+	return out, nil
+}
 
 // eachRow 는 질의 하나의 행마다 fn 을 부른다. what 은 오류 문구의 대상 이름이다.
 func eachRow(ctx context.Context, db dbtx, query string, args []any, what string, fn func(*sql.Rows) error) error {

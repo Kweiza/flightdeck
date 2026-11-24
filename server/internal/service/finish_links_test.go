@@ -555,7 +555,7 @@ func TestFinishSeparatesLinkedFromCreatedInTheLedger(t *testing.T) {
 // (service.go:88, WithClock 로 주입한다)가 **정확히 그 창 안에서** 불린다 — finish.go 의
 // now := s.now() 는 classifyFollowups 뒤·s.st.Tx 앞이고, Finish 를 통틀어 시계를 읽는 자리가
 // 거기 하나뿐이다. 그래서 주입한 시계 안에서 대상을 닫으면 창이 **결정론적으로** 벌어진다.
-// 시험 전용 후크의 선례는 outOfWindowLister(service.go:93-99)이고, "주입은 실물로 만들기
+// 시험 전용 후크의 선례는 outsideSummarizer(service.go)이고, "주입은 실물로 만들기
 // 어려운 실패에만 쓴다"는 이 패키지의 규율(helper_test.go 머리)과 같은 자리다.
 //
 // ★ **이 축은 이 시험만 잡는다.** 위 두 시험은 정상 경로라 만들 것 ∪ 이을 것 == in.Followups

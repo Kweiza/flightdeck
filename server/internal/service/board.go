@@ -184,8 +184,8 @@ type BoardView struct {
 	// 항목을 쥔 세션)가 먼저 사라진다. 실측: 마지막 활동 709분 전인 세션이 항목 하나를
 	// 12시간째 쥐고 있었다.
 	//
-	// ★ **아무것도 안 거른다.** Sessions·OutOfWindow 는 그대로다. 이미 도는 순회
-	// (OldestOutside)에 조건 하나를 얹은 것뿐이라 새 질의도 새 git 호출도 없다.
+	// ★ **아무것도 안 거른다.** Sessions·OutOfWindow 는 그대로다. OutOfWindow · OldestOutside 와
+	// 같은 질의 묶음(store.SummarizeOutside, 읽기 트랜잭션 하나)이 내고 git 호출은 없다.
 	//
 	// ★ 카드가 아니라 **원시 뷰**다. git 파생(브랜치·ahead·미커밋)이 안 붙어 있다 —
 	// 파생은 카드당 git 호출 2~5회고(미커밋 규모가 조건 없이 붙어 하한도 올랐다) 캐시가
@@ -276,7 +276,10 @@ func (s *Service) Board(ctx context.Context, project string, opt BoardOptions) (
 	if window <= 0 {
 		window = s.window
 	}
-	cards, roots, closed, err := s.sessionCardsAndRoots(ctx, proj, s.cut(now, window), opt.Self, readScreen, d)
+	// cut 은 한 번 짓는다. 카드 · 창 밖 건수 · 멤버 요약 · 형제 레포가 같은 경계를 봐야 하고,
+	// 자리마다 다시 지으면 하나만 바뀌어도 조용히 갈린다.
+	cut := s.cut(now, window)
+	cards, roots, closed, err := s.sessionCardsAndRoots(ctx, proj, cut, opt.Self, readScreen, d)
 	if err != nil {
 		return BoardView{}, err
 	}
@@ -309,52 +312,28 @@ func (s *Service) Board(ctx context.Context, project string, opt BoardOptions) (
 	}
 
 	// 창 밖 건수 — 카드를 안 만든다. 세는 것만 한다(파생 비용을 안 늘린다).
-	listAll := s.outOfWindowLister
-	if listAll == nil {
-		listAll = s.st.ListLive
+	//
+	// ★ 창 밖은 카드와 **같은 판정**이다, 같은 cut 으로 store 의 같은 거름(창 안)을 뒤집어 센다.
+	// 여기서 opened_at · 신호 조건을 새로 판단하면 그 판정이 SQL 쪽과 갈라질 수 있다(같은
+	// 판정을 두 자리에 두면 한쪽만 고치는 순간 조용히 어긋난다는 것을 이 파일이 이미 한 번 겪었다).
+	// 앞 판은 ListLive(since=0) 로 끝나지 않은 세션 전부를 발자국까지 실어 와 카드를 뺐다.
+	//
+	// ★ OldestOutside 는 **숨은 세션**만의 값이다. 보이는 세션의 옛 신호(예: 6시간 전 commit)는
+	// 그 세션이 최근 신호로 창 안에 있으면 안 섞인다, store 가 숨은 세션의 신호만 본다.
+	//
+	// ★ OutsideClaims 는 창 밖인데 항목을 쥔 세션이다. 화면 ①이 선점을 필터로 쓰면서 창은 안
+	// 걸기 때문에 이 줄이 필요하다, 이 조건이 없으면 **회수가 가장 필요한 카드**가 정확히 창
+	// 때문에 화면에서 사라진다. 그 세션만 행을 싣고(카드와 같은 적재) git 파생은 안 한다.
+	summarize := s.outsideSummarizer
+	if summarize == nil {
+		summarize = s.st.SummarizeOutside
 	}
-	if all, aerr := listAll(ctx, proj.ID, time.Time{}); aerr != nil {
+	if out, aerr := summarize(ctx, proj.ID, cut); aerr != nil {
 		d.fail("out-of-window", aerr) // 못 세면 침묵하지 않고 파생 실패로 남긴다
 	} else {
-		view.OutOfWindow = len(all) - len(cards)
-
-		// ★ OldestOutside 는 **숨은 세션**만의 값이어야 한다. cards 에 이미 나온 세션의
-		// 신호 하나하나를 다시 훑으면, 그 세션이 최근 신호로 창 안에 있어도 다른 종류의
-		// 옛 신호(예: 6시간 전 commit) 때문에 "창 밖"으로 잘못 집힌다 — 보이는 세션의
-		// 신호로 숨은 세션 지표를 오염시키는 것이다. 숨은지 여부는 cards(= 실제로 사용한
-		// ListLive(cut) 결과)와 **같은 판정**을 다시 쓴다 — 여기서 opened_at·신호 조건을
-		// 새로 판단하면 그 판정이 SQL 쪽과 갈라질 수 있다(같은 판정을 두 자리에 두면
-		// 한쪽만 고치는 순간 조용히 어긋난다는 것을 이 파일이 이미 한 번 겪었다).
-		shown := make(map[string]bool, len(cards))
-		for _, c := range cards {
-			shown[c.View.Session.ID] = true
-		}
-		for _, v := range all {
-			if shown[v.Session.ID] {
-				continue
-			}
-			// ★ 창 밖인데 항목을 쥔 세션. 화면 ①이 선점을 필터로 쓰면서 창은 안 걸기
-			// 때문에 이 줄이 필요하다 — 이 조건이 없으면 **회수가 가장 필요한 카드**가
-			// 정확히 창 때문에 화면에서 사라진다. 여기서 모으는 이유는 이 순회가 이미
-			// 돌고 있어서다: 새 질의도 새 git 파생도 안 는다(all 은 DB 전용이고
-			// store.ListLive 가 Claims 를 이미 채워 준다).
-			if len(v.Claims) > 0 {
-				view.OutsideClaims = append(view.OutsideClaims, v)
-			}
-			// 숨은 세션의 "마지막으로 언제 봤나" — 그 세션 신호들의 최댓값이다.
-			var lastSeen time.Time
-			for _, at := range v.Signals {
-				if at.After(lastSeen) {
-					lastSeen = at
-				}
-			}
-			if lastSeen.IsZero() {
-				continue // 신호가 하나도 없다 — 언제 봤는지 답할 재료가 없다
-			}
-			if view.OldestOutside.IsZero() || lastSeen.Before(view.OldestOutside) {
-				view.OldestOutside = lastSeen
-			}
-		}
+		view.OutOfWindow = out.Count
+		view.OldestOutside = out.Oldest
+		view.OutsideClaims = out.Claimed
 	}
 
 	if opt.IncludeQueue {
@@ -418,12 +397,12 @@ func (s *Service) Board(ctx context.Context, project string, opt BoardOptions) (
 	} else {
 		view.Workspace = roster
 		if opt.Workspace {
-			view.Members, view.MembersOmitted = s.memberSummaries(ctx, roster, project, s.cut(now, window), d)
+			view.Members, view.MembersOmitted = s.memberSummaries(ctx, roster, project, cut, d)
 		}
 		// ★ **옵션과 무관하게 채운다.** 겹침은 사람이 물어서 보는 축이 아니라
 		//   **묻지 않아도 떠야 하는** 축이다 — 그 경고가 뜨는 순간이 곧 조율이 필요한
 		//   순간이고, 그때 세션은 board(workspace:true) 를 부를 이유를 아직 모른다.
-		view.SiblingLive = s.siblingLive(ctx, roster, project, s.cut(now, window), d)
+		view.SiblingLive = s.siblingLive(ctx, roster, project, cut, d)
 	}
 
 	view.Derived = d.result(now)

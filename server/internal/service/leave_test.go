@@ -232,7 +232,7 @@ func TestLeaveClaimWithNothingHeldIsRefused(t *testing.T) {
 // LeaveClaim 은 `now := s.now()` 를 **후보 조회와 Tx 사이에서 정확히 한 번** 부른다.
 // 주입한 시계 안에서 y 를 회수하면 경합이 결정론이 된다 — helper_test.go 의
 // newSvcWithClock 주석이 지정한 용법("시계가 불리는 자리가 곧 창인 갈래")이고
-// 선례는 outOfWindowLister 다.
+// 선례는 outsideSummarizer 다.
 //
 // ## 변이로 닿는 것을 실측했다(둘 다 빨간)
 //

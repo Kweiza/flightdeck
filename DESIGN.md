@@ -877,6 +877,12 @@ merge-base · diff · rev-list · status · diff HEAD 다섯, 같은 브랜치·
   서로 다른 것은 함께 읽는다(서버 전체 동시 8). 한 시간 아무도 안 쓴 보관본은 버린다.
 - `ListLive` 는 세 축을 같은 거름의 하위 질의로 한 번씩(질의 4번, 읽기 트랜잭션 하나), 프로젝트 행 수는
   표마다 `GROUP BY` 한 번.
+- 창 밖은 싣지 않고 센다(`store.SummarizeOutside`, 2026-11-24). 보드는 창 밖 건수 · 숨은 세션의 가장 오래된
+  마지막 신호 · 창 밖 선점자만 쓰는데 `ListLive(since=0)` 로 끝나지 않은 세션 전부를 발자국까지 실었다.
+  지금은 창 안 거름을 `NOT` 으로 뒤집은 거름 하나로 건수와 마지막 신호를 한 문장에 묻고, 선점자만
+  `ListLive` 와 같은 적재(`loadViews`)로 싣는다. 창 밖 1295 세션 자료 사본에서 그 단계가 11ms → 4ms,
+  `dashboard.json` 중앙값 68 → 60ms(따뜻할 때). claim 에 session_id 색인이 없어 선점자 거름은 `EXISTS`
+  가 아니라 `IN` 이다(`EXISTS` 는 세션마다 claim 을 훑어 0.5초였다).
 
 보관본은 서버(`fd serve`)만 켠다(`WithScreenSnapshots`). `service.New` 의 기본은 끔, 화면도 지금 읽는다.
 **잠금:** `TestBoardDeriveCostDoesNotGrowWithCards` 가 워크트리 3 · 12 에서 둘째 보드의 git 호출이

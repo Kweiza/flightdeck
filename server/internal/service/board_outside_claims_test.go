@@ -16,7 +16,7 @@ import (
 // 항목 하나를 12시간째 쥐고 있었다.
 //
 // ★ 이 필드는 **아무것도 안 거른다.** view.Sessions 도 OutOfWindow 도 그대로다.
-// 이미 도는 순회(OldestOutside)에 조건 하나를 얹은 것뿐이라 질의도 git 호출도 안 는다.
+// 창 밖 건수 · OldestOutside 와 같은 질의 묶음(store.SummarizeOutside)이 내고 git 호출은 없다.
 func TestBoardNamesClaimHoldersOutsideTheWindow(t *testing.T) {
 	s, st := newSvc(t)
 	repo := newRepo(t)

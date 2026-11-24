@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/kweiza/flightdeck/internal/model"
+	"github.com/kweiza/flightdeck/internal/store"
 )
 
 // stamp 는 t 시각을 store 가 쓰는 표기로 옮긴다. 시험이 신호·개시 시각을 직접
@@ -297,8 +298,8 @@ func TestBoardRecordsFailureWhenOutOfWindowCountFails(t *testing.T) {
 	openSession(t, s, "p", repo, repo, "cc-1", "트랙2")
 
 	boom := errors.New("out-of-window 질의 실패(시험)")
-	s.outOfWindowLister = func(_ context.Context, _ string, _ time.Time) ([]model.SessionView, error) {
-		return nil, boom
+	s.outsideSummarizer = func(_ context.Context, _ string, _ time.Time) (store.OutsideSummary, error) {
+		return store.OutsideSummary{}, boom
 	}
 
 	view, err := s.Board(ctx(), "p", BoardOptions{})
