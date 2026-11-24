@@ -31,8 +31,9 @@ CLAUDE_CODE_MESSAGING_TOKEN 은 어디에도 없다: 훅이 읽지도 보내지�
 지움), 연결이 안 되는 소켓(죽은 세션)의 받는 곳은 보드가 지운다(DELETE, 소켓이 같을 때만).
 
 옮겨 가는 동안(옛 등록 파일): 0.45.x 플러그인으로 뜬 세션은 받는 곳을 원장이 아니라 BOARD_SESSIONS/<session_id>.json
-에 적는다. 그 파일의 cc 를 같은 GET 의 legacy 로 물어, 원장이 이 프로젝트 · 이 기계의 닫히지 않은 카드라고 답한
-것에만 보낸다(폴더 판정 없음). 원장에 받는 곳이 있는 세션 · 소켓은 파일보다 이긴다. 그 세션들이 다 끝나면 이 길을 뺀다.
+에 적는다. 그 파일의 cc 와 그 세션을 띄운 폴더(project_dir)를 같은 GET 의 legacy 로 물어, 원장이 이 프로젝트 · 이
+기계에서 그 폴더를 품은 닫히지 않은 카드가 있다고 답한 것에만 보낸다. cc 만으로 묻지 않는다: 한 세션(조정 세션)은
+여러 프로젝트에 카드를 열어, cc 만 보면 남의 프로젝트 초인종이 그 세션에 간다. 폴더를 모르는 파일은 묻지 않는다. 원장에 받는 곳이 있는 세션 · 소켓은 파일보다 이긴다. 그 세션들이 다 끝나면 이 길을 뺀다.
 """
 import json
 import os
@@ -96,8 +97,9 @@ def legacy_entries(registry):
             continue
         if not isinstance(e.get("socket"), str) or not e["socket"] or not isinstance(e.get("mode", ""), str):
             continue
+        d = e.get("project_dir") or e.get("cwd") or ""  # 그 세션을 띄운 폴더(옛 훅: CLAUDE_PROJECT_DIR, 없으면 cwd)
         found[e["session_id"]] = {"session_id": e["session_id"], "socket": e["socket"], "mode": e.get("mode") or "",
-                                  "source": "legacy"}
+                                  "dir": d if isinstance(d, str) and os.path.isabs(d) else "", "source": "legacy"}
     return found
 
 
@@ -110,8 +112,9 @@ def targets(project, fetch, registry=None, environ=None):
         return [], "이 맥의 fd machine-id 를 모름"
     legacy = legacy_entries(registry)
     query = {"project": project, "machine": machine}
-    if legacy:
-        query["legacy"] = ",".join(sorted(legacy))
+    asks = ["%s:%s" % (cc, e["dir"]) for cc, e in sorted(legacy.items()) if e["dir"]]
+    if asks:
+        query["legacy"] = asks  # 옛 등록 하나마다 「cc:띄운 폴더」 하나(되풀이 인자)
     code, body = fetch("/api/v1/inbox", **query)
     if code in (404, 405):
         return [], "fd 서버가 받는 곳 경로를 모름(018 이전 서버, 컨테이너를 올려라)"

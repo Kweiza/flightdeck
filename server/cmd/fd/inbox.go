@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/kweiza/flightdeck/internal/model"
 )
 
 // 세션이 받는 곳: 보드 초인종의 배달 주소(board/README 「세션에 알림」).
@@ -23,6 +25,10 @@ import (
 //   값이고 macOS · Linux 에서는 연결에 없어도 되며, 자식이 아닌 보드가 내밀어도 쓸모가 없다(실측 2.1.330).
 //   보내지 않으면 원장 · 로그 · 응답 어디에도 샐 것이 없다.
 // ★ 사람이 연 세션만 적는다. -p · SDK 작업자는 보드 알림을 받을 사람이 없다(attended).
+// ★ Claude Code 하네스로 선언된 훅만 적는다. 소켓 환경 변수는 그 Claude Code 프로세스의 것인데 자식 프로세스에
+//   그대로 물려간다: 조정 세션이 띄운 codex 의 훅이 부모 소켓(과 ATTENDED=1)을 보고 자기 카드의 받는 곳으로 적자,
+//   보드가 부모 소켓에 codex 세션 id 를 실어 보내 부모는 버렸고(id 불일치), 같은 소켓의 맞는 등록까지 밀려났다.
+//   미상(빈 값)도 적지 않는다: 하네스는 환경으로 못 가른다(app.go 의 harness).
 // ★ 보드를 깔지 않은 기계(보드 설정 폴더가 없음)에서는 아무것도 안 보낸다: 그 기계의 받는 곳은 읽을 보드가 없다.
 // ★ 실패는 훅을 막지 않는다(hook.go 머리말). 옛 서버(018 이전)는 이 경로를 몰라 404 · 405 를 내고,
 //   그때는 다음 프롬프트가 다시 적으므로 서버가 올라간 뒤 저절로 채워진다.
@@ -125,6 +131,9 @@ func (a *App) inboxSkip() (socket, why string) {
 	}
 	if st, err := os.Stat(filepath.Join(home, boardConfigDir)); err != nil || !st.IsDir() {
 		return "", "no_board"
+	}
+	if a.harness != model.HarnessClaude {
+		return "", "not_claude"
 	}
 	if !sessionAttended(a.env) {
 		return "", "unattended"

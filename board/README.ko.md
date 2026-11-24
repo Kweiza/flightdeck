@@ -228,14 +228,17 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
   까닭: 아래 「전송」처럼 이 줄은 권한 확인을 건너뛰는 세션에 대화상자 없이 들어간다. 그 안에 누가 쓴 글이든 실리면 세션을 부리는 글이 된다.
 - **등록**: fd 훅(SessionStart · UserPromptSubmit)이 세션을 연 김에 그 카드의 받는 곳을 fd 원장에 적는다(`PUT /api/v1/sessions/{id}/inbox`,
   표 `session_inbox`: 소켓 `CLAUDE_CODE_MESSAGING_SOCKET` · 권한 모드 · 적은 때). 보드 설정 폴더(`~/.config/flightdeck-board`)가 없는 기계,
-  `-p` · SDK 작업자(`CLAUDE_CODE_SESSION_ATTENDED=0`)는 적지 않는다. 한 기계 · 한 소켓에는 한 세션만 남는다(같은 소켓의 옛 행은 적을 때 지운다).
+  `-p` · SDK 작업자(`CLAUDE_CODE_SESSION_ATTENDED=0`), Claude Code 가 아닌 하네스(`--harness claude` 가 아닌 훅)는 적지 않는다.
+  소켓 · ATTENDED 환경 변수는 자식 프로세스에 물려가서, 조정 세션이 띄운 codex 의 훅도 부모 소켓을 본다. 그것을 codex 카드에 적으면
+  보드가 부모 소켓에 codex 세션 id 를 실어 보내고 부모는 버린다. 한 기계 · 한 소켓에는 한 세션만 남는다(같은 소켓의 옛 행은 적을 때 지운다).
   `CLAUDE_CODE_MESSAGING_TOKEN` 은 훅이 읽지도 보내지도 않고 원장에 칸도 없다(macOS · Linux 에서는 없어도 되고, 자식이 아닌 보드가 내밀어도 쓸모가 없다).
   그래서 Windows 는 아직 안 된다. 권한 모드는 프롬프트마다 페이로드의 `permission_mode` 로 고쳐 적고, 세션 시작 때는 명령줄 다음 설정 파일로 짐작한다.
   서버가 닿지 않으면 적지 못하고(줄 세워 두지 않는다), 다음 프롬프트가 다시 적는다.
 - **읽기**: 보드는 `GET /api/v1/inbox?project=<카드 프로젝트>&machine=<이 맥의 fd machine-id>` 로 받는 곳을 읽는다(machine-id 는 fd 클라이언트와 같은 자리,
   `FD_STATE_DIR/machine-id` 또는 `~/.flightdeck/machine-id`). 다른 기계의 소켓 경로는 이 맥에서 뜻이 없고 남의 세션 것일 수 있어 기계로 가른다. 닫힌 카드(done)는 빠진다.
-- **옮겨 가는 동안(옛 등록 파일)**: 0.45.x 플러그인으로 이미 떠 있는 세션은 받는 곳을 `BOARD_SESSIONS/<session_id>.json` 에만 적는다. 보드는 그 파일들의 cc 를
-  같은 GET 의 `legacy` 로 묻고, 원장이 「이 프로젝트 · 이 기계의 닫히지 않은 카드」라고 답한 것에만 보낸다(폴더 판정 없음). 원장에 받는 곳이 있는 세션 · 소켓은 파일보다 이긴다.
+- **옮겨 가는 동안(옛 등록 파일)**: 0.45.x 플러그인으로 이미 떠 있는 세션은 받는 곳을 `BOARD_SESSIONS/<session_id>.json` 에만 적는다. 보드는 그 파일마다 cc 와 그 세션을 띄운 폴더
+  (`project_dir`, 없으면 `cwd`)를 같은 GET 의 `legacy=<cc>:<폴더>`(되풀이 인자)로 묻고, 원장이 「이 프로젝트 · 이 기계에서 그 폴더를 품은 닫히지 않은 카드가 있다」고
+  답한 것에만 보낸다. cc 만으로 묻지 않는다: 조정 세션 하나가 여러 프로젝트에 카드를 열어, cc 만 보면 남의 프로젝트 초인종이 그 세션에 간다. 폴더를 모르는 파일은 묻지 않는다. 원장에 받는 곳이 있는 세션 · 소켓은 파일보다 이긴다.
   죽은 소켓의 파일과 원장으로 옮겨 간 세션 · 소켓의 파일은 지운다. 그 세션들이 플러그인을 다시 읽으면(재시작) 원장으로 옮겨 가고, 다 옮겨 가면 이 길과 `BOARD_SESSIONS` 를 뺀다.
 - **올리는 순서**: 보드는 이 체크아웃의 `board.py` 를 launchd 로 띄우므로 코드가 바뀌어도 다시 띄울 때까지 옛 코드다. 서버(컨테이너, 증분 018) →
   보드 다시 띄우기(`launchctl kickstart -k gui/$(id -u)/<BOARD_LABEL>`) → 플러그인 순으로 올린다. 새 보드가 옛 서버를 만나면 「알림 못 보냄: fd 서버가 받는 곳 경로를 모름」,

@@ -134,7 +134,7 @@ func TestInboxRefusesUnknownSession(t *testing.T) {
 	}
 }
 
-// 옛 등록 파일의 cc 중 이 프로젝트 · 이 기계의 닫히지 않은 카드만 답한다.
+// 옛 등록 파일의 cc 중 이 프로젝트 · 이 기계에서 그 폴더를 품은 닫히지 않은 카드만 답한다.
 func TestLiveSessionsOfAnswersOnlyThisProjectAndMachine(t *testing.T) {
 	s := newStore(t)
 	seed(t, s, "p1")
@@ -146,7 +146,8 @@ func TestLiveSessionsOfAnswersOnlyThisProjectAndMachine(t *testing.T) {
 	if err := s.SetSessionState(ctx, d.ID, model.SessionDone, ""); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.LiveSessionsOf(ctx, "p1", "m1", []string{"cc-a", "cc-b", "cc-d", "cc-x"})
+	asks := []LegacyAsk{{"cc-a", "/w/cc-a"}, {"cc-b", "/w/cc-b"}, {"cc-d", "/w/cc-d"}, {"cc-x", "/w/cc-x"}}
+	got, err := s.LiveSessionsOf(ctx, "p1", "m1", asks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,5 +156,39 @@ func TestLiveSessionsOfAnswersOnlyThisProjectAndMachine(t *testing.T) {
 	}
 	if got, _ := s.LiveSessionsOf(ctx, "p1", "m1", nil); len(got) != 0 {
 		t.Fatalf("빈 물음에 %v", got)
+	}
+}
+
+// 한 cc 가 두 프로젝트에 카드를 가졌다(조정 세션이 남의 프로젝트에도 카드를 연다). 그 세션을 띄운 폴더를 품은
+// 카드의 프로젝트만 그 세션의 것이다: cc 만 보면 p2 의 초인종이 p1 에서 뜬 세션에 간다.
+func TestLiveSessionsOfDoesNotCrossProjectsOnOneCC(t *testing.T) {
+	s := newStore(t)
+	seed(t, s, "p1")
+	seed(t, s, "p2")
+	ctx := context.Background()
+	if _, _, err := s.OpenSession(ctx, "p1", "m1", "/r/home", "cc-coord", "", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.OpenSession(ctx, "p2", "m1", "/r/other", "cc-coord", "", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		project, dir string
+		want         []string
+	}{
+		{"p1", "/r/home", []string{"cc-coord"}},
+		{"p1", "/r/home/sub", []string{"cc-coord"}}, // 저장소 안 하위 폴더에서 띄운 세션
+		{"p2", "/r/home", []string{}},               // 남의 프로젝트 카드는 그 세션을 그 프로젝트 것으로 만들지 않는다
+		{"p1", "/r/homework", []string{}},           // 접두가 경로 조각 단위다
+		{"p1", "", []string{}},                      // 폴더 없는 물음(옛 보드)은 답하지 않는다
+		{"p1", "rel/home", []string{}},
+	} {
+		got, err := s.LiveSessionsOf(ctx, c.project, "m1", []LegacyAsk{{"cc-coord", c.dir}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s · %q = %v, 기대 %v", c.project, c.dir, got, c.want)
+		}
 	}
 }

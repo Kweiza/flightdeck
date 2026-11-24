@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -98,35 +100,72 @@ func (s *Store) ListInbox(ctx context.Context, project, machineID string) ([]mod
 	return out, rows.Err()
 }
 
-// LiveSessionsOf 는 주어진 cc 중 그 프로젝트 · 그 기계의 닫히지 않은 세션 카드에 있는 것이다.
+// LegacyAsk 는 옛 등록 파일 하나의 물음이다: 그 세션의 cc 와 그 세션을 띄운 폴더(등록 파일의 project_dir).
+type LegacyAsk struct {
+	CC  string
+	Dir string
+}
+
+// LiveSessionsOf 는 물은 옛 등록 중 그 프로젝트 · 그 기계에서 **그 폴더를 품은** 닫히지 않은 카드가 있는 cc 다.
 //
 // ★ 옮겨 가는 동안만 쓰는 길이다(board/README 「세션에 알림」의 「옛 등록 파일」). 옛 플러그인으로 뜬
-// 세션은 받는 곳을 보드 폴더에만 적고 여기에는 안 적는다. 보드가 그 파일의 cc 를 물으면 원장이
-// 어느 것이 이 프로젝트 · 이 기계 것인지 답한다: 폴더 접두 판정을 보드에 다시 두지 않으려고.
-func (s *Store) LiveSessionsOf(ctx context.Context, project, machineID string, ccs []string) ([]string, error) {
+// 세션은 받는 곳을 보드 폴더에만 적고 여기에는 안 적는다. 보드가 그 파일의 cc 와 폴더를 물으면 원장이
+// 어느 것이 이 프로젝트 · 이 기계 것인지 답한다.
+//
+// ★ cc 만으로 답하지 않는다. 한 Claude Code 세션은 여러 프로젝트에 카드를 연다(조정 세션이 남의 프로젝트에
+// MCP 로 쓰거나 작업자가 다른 저장소에서 훅을 쏜다). cc 만 보면 그 세션의 소켓이 카드를 가진 모든
+// 프로젝트의 초인종을 받는다: 한 조정 세션이 남의 프로젝트 알림을 받고, 그 프로젝트 세션은 못 받았다.
+// 소켓은 프로세스 하나의 것이고 그 프로세스가 뜬 폴더가 그 세션의 프로젝트다.
+func (s *Store) LiveSessionsOf(ctx context.Context, project, machineID string, asks []LegacyAsk) ([]string, error) {
 	out := []string{}
-	if len(ccs) == 0 {
+	dirs := map[string][]string{}
+	for _, a := range asks {
+		if a.CC != "" && filepath.IsAbs(a.Dir) {
+			dirs[a.CC] = append(dirs[a.CC], filepath.Clean(a.Dir))
+		}
+	}
+	if len(dirs) == 0 {
 		return out, nil
 	}
-	marks := strings.TrimSuffix(strings.Repeat("?,", len(ccs)), ",")
 	args := []any{project, machineID, string(model.SessionDone)}
-	for _, c := range ccs {
+	for c := range dirs {
 		args = append(args, c)
 	}
+	marks := strings.TrimSuffix(strings.Repeat("?,", len(dirs)), ",")
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT DISTINCT cc_session_id FROM session
-		 WHERE project = ? AND machine_id = ? AND state <> ? AND cc_session_id IN (`+marks+`)
-		 ORDER BY cc_session_id`, args...)
+		SELECT DISTINCT cc_session_id, worktree FROM session
+		 WHERE project = ? AND machine_id = ? AND state <> ? AND cc_session_id IN (`+marks+`)`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("옛 등록 세션 조회 실패(project=%q): %w", clip(project, 64), err)
 	}
 	defer rows.Close()
+	hit := map[string]bool{}
 	for rows.Next() {
-		var c string
-		if err := rows.Scan(&c); err != nil {
+		var c, wt string
+		if err := rows.Scan(&c, &wt); err != nil {
 			return nil, fmt.Errorf("옛 등록 세션 해석 실패: %w", err)
 		}
+		for _, d := range dirs[c] {
+			if dirWithin(d, wt) {
+				hit[c] = true
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for c := range hit {
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	sort.Strings(out)
+	return out, nil
+}
+
+// dirWithin 은 dir 가 root 와 같거나 그 아래인가다(둘 다 절대 경로, 경로 조각 단위). 순수 함수다.
+func dirWithin(dir, root string) bool {
+	root = filepath.Clean(root)
+	if !filepath.IsAbs(root) {
+		return false
+	}
+	return dir == root || strings.HasPrefix(dir, strings.TrimSuffix(root, string(filepath.Separator))+string(filepath.Separator))
 }

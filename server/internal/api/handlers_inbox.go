@@ -3,6 +3,8 @@ package api
 import (
 	"net/http"
 	"strings"
+
+	"github.com/kweiza/flightdeck/internal/store"
 )
 
 // 세션이 받는 곳(board/README 「세션에 알림」). 훅이 PUT 으로 적고, 보드가 GET 으로 읽고 죽은 소켓을 DELETE 한다.
@@ -47,7 +49,8 @@ func (s *server) handleDropInbox(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, r, http.StatusOK, map[string]any{"dropped": n})
 }
 
-// handleInbox 는 한 프로젝트 · 한 기계의 받는 곳을 읽는다. legacy 는 쉼표로 이은 옛 등록 cc(옮겨 가는 동안만).
+// handleInbox 는 한 프로젝트 · 한 기계의 받는 곳을 읽는다. legacy 는 옛 등록 하나마다 「cc:띄운 폴더」 값 하나(되풀이,
+// 옮겨 가는 동안만).
 func (s *server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	project, ok := s.requireQuery(w, r, "project", "어느 프로젝트의 세션인지 적어라.")
 	if !ok {
@@ -57,10 +60,12 @@ func (s *server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var legacy []string
-	for _, c := range strings.Split(r.URL.Query().Get("legacy"), ",") {
-		if c = strings.TrimSpace(c); c != "" {
-			legacy = append(legacy, c)
+	var legacy []store.LegacyAsk
+	for _, v := range r.URL.Query()["legacy"] {
+		// cc 에는 ':' 가 없다(보드가 꼴을 검사한 cc). 폴더가 없는 값(0.46.0 보드의 cc 만 이은 꼴)은 버린다:
+		// 폴더 없이 cc 만으로 답하면 남의 프로젝트 초인종이 그 세션에 간다(store.LiveSessionsOf).
+		if cc, dir, ok := strings.Cut(v, ":"); ok && cc != "" && dir != "" {
+			legacy = append(legacy, store.LegacyAsk{CC: cc, Dir: dir})
 		}
 	}
 	out, err := s.svc.Inbox(r.Context(), project, machine, legacy)

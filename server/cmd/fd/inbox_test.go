@@ -59,7 +59,7 @@ func TestHooksPutTheInboxIntoTheLedger(t *testing.T) {
 	h := newHarness(t)
 	env := inboxEnv(h, nil)
 	startup := `{"session_id":"cc-session-uuid-1","cwd":"/tmp","hook_event_name":"SessionStart","source":"startup"}`
-	if code, out := h.runEnv(env, startup, "hook", "session-start"); code != 0 {
+	if code, out := h.runEnv(env, startup, "hook", "session-start", "--harness", "claude"); code != 0 {
 		t.Fatalf("session-start 종료코드 %d: %s", code, out)
 	}
 	rows := h.inboxRows()
@@ -69,14 +69,14 @@ func TestHooksPutTheInboxIntoTheLedger(t *testing.T) {
 	}
 
 	prompt := `{"session_id":"cc-session-uuid-1","cwd":"/tmp","hook_event_name":"UserPromptSubmit","prompt":"x","permission_mode":"bypassPermissions"}`
-	if code, out := h.runEnv(env, prompt, "hook", "user-prompt"); code != 0 {
+	if code, out := h.runEnv(env, prompt, "hook", "user-prompt", "--harness", "claude"); code != 0 {
 		t.Fatalf("user-prompt 종료코드 %d: %s", code, out)
 	}
 	if rows := h.inboxRows(); len(rows) != 1 || rows[0].Mode != "bypassPermissions" {
 		t.Fatalf("프롬프트 뒤 받는 곳 = %+v, 모드가 bypassPermissions 로 고쳐져야 한다", rows)
 	}
 	// 이어지는 SessionStart(clear · compact …)는 프롬프트가 고친 모드를 설정 파일 짐작(default)으로 덮지 않는다.
-	if code, out := h.runEnv(env, sessionStartPayload("cc-session-uuid-1", "/tmp"), "hook", "session-start"); code != 0 {
+	if code, out := h.runEnv(env, sessionStartPayload("cc-session-uuid-1", "/tmp"), "hook", "session-start", "--harness", "claude"); code != 0 {
 		t.Fatalf("session-start(clear) 종료코드 %d: %s", code, out)
 	}
 	if rows := h.inboxRows(); len(rows) != 1 || rows[0].Mode != "bypassPermissions" {
@@ -106,16 +106,20 @@ func TestHooksPutTheInboxIntoTheLedger(t *testing.T) {
 	}
 }
 
-// 사람이 안 연 세션(-p · SDK 작업자), 보드를 안 깐 기계, 소켓이 없는 세션은 적지 않는다.
+// 사람이 안 연 세션(-p · SDK 작업자), 보드를 안 깐 기계, 소켓이 없는 세션, Claude Code 가 아닌 하네스는 적지 않는다.
+// codex · 미상은 부모 Claude Code 의 소켓 · ATTENDED 를 물려받은 환경 그대로 돈다(inbox.go 머리말).
 func TestHooksSkipTheInboxWhenNobodyCanBeTold(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		extra map[string]string
-		board bool
+		name    string
+		extra   map[string]string
+		board   bool
+		harness string
 	}{
-		{"작업자", map[string]string{"CLAUDE_CODE_SESSION_ATTENDED": "0"}, true},
-		{"소켓 없음", map[string]string{EnvMessagingSocket: ""}, true},
-		{"보드 없음", nil, false},
+		{"작업자", map[string]string{"CLAUDE_CODE_SESSION_ATTENDED": "0"}, true, "claude"},
+		{"소켓 없음", map[string]string{EnvMessagingSocket: ""}, true, "claude"},
+		{"보드 없음", nil, false, "claude"},
+		{"codex 가 물려받은 소켓", nil, true, "codex"},
+		{"하네스 미상", nil, true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
@@ -125,7 +129,11 @@ func TestHooksSkipTheInboxWhenNobodyCanBeTold(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if code, out := h.runEnv(env, sessionStartPayload("cc-session-uuid-1", "/tmp"), "hook", "session-start"); code != 0 {
+			args := []string{"hook", "session-start"}
+			if tc.harness != "" {
+				args = append(args, "--harness", tc.harness)
+			}
+			if code, out := h.runEnv(env, sessionStartPayload("cc-session-uuid-1", "/tmp"), args...); code != 0 {
 				t.Fatalf("종료코드 %d: %s", code, out)
 			}
 			if rows := h.inboxRows(); len(rows) != 0 {

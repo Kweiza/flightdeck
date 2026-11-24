@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/kweiza/flightdeck/internal/model"
+	"github.com/kweiza/flightdeck/internal/store"
 )
 
 // 세션이 받는 곳(board/README 「세션에 알림」). 훅이 적고 보드가 읽는다.
@@ -23,13 +24,14 @@ const inboxSocketMax = 512
 
 // InboxListing 은 보드가 한 번에 읽는 것이다.
 //   - Inbox: 받는 곳이 원장에 있는 세션.
-//   - Legacy: 물은 옛 등록 cc 중 이 프로젝트 · 이 기계의 닫히지 않은 카드(옮겨 가는 동안만, store.LiveSessionsOf).
+//   - Legacy: 물은 옛 등록(cc · 띄운 폴더) 중 이 프로젝트 · 이 기계에서 그 폴더를 품은 닫히지 않은 카드가 있는 cc
+//     (옮겨 가는 동안만, store.LiveSessionsOf).
 type InboxListing struct {
 	Inbox  []model.SessionInbox `json:"inbox"`
 	Legacy []string             `json:"legacy"`
 }
 
-// legacyAskMax 는 한 번에 물을 수 있는 옛 등록 cc 수다(보드 폴더의 파일 수, 대개 한 자리).
+// legacyAskMax 는 한 번에 물을 수 있는 옛 등록 수다(보드 폴더의 파일 수, 대개 한 자리).
 const legacyAskMax = 200
 
 func inboxRefused(reason string) error {
@@ -69,8 +71,8 @@ func (s *Service) DropInbox(ctx context.Context, sessionID, socket string) (int6
 	return s.st.DropInbox(ctx, sessionID, socket)
 }
 
-// Inbox 는 한 프로젝트 · 한 기계의 받는 곳과, 물은 옛 등록 cc 중 그 프로젝트 · 기계의 것이다.
-func (s *Service) Inbox(ctx context.Context, project, machineID string, legacy []string) (InboxListing, error) {
+// Inbox 는 한 프로젝트 · 한 기계의 받는 곳과, 물은 옛 등록 중 그 프로젝트 · 기계의 것이다.
+func (s *Service) Inbox(ctx context.Context, project, machineID string, legacy []store.LegacyAsk) (InboxListing, error) {
 	if project == "" || machineID == "" {
 		return InboxListing{}, inboxRefused("project 와 machine 이 둘 다 필요하다: 보드는 자기 기계의 세션에만 보낸다")
 	}

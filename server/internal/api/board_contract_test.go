@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"net/url"
 	"testing"
 )
 
@@ -141,7 +142,9 @@ func TestBoardReadsTheseFields(t *testing.T) {
 	e.okBody(t, e.write(http.MethodPut, "/api/v1/sessions/"+sess+"/inbox", map[string]any{
 		"socket": "/tmp/fd-test/inbox.sock", "mode": "bypassPermissions",
 	}), "받는 곳 적기")
-	ib := e.okBody(t, e.do(http.MethodGet, "/api/v1/inbox?project="+testProject+"&machine=m1&legacy=cc-board,cc-none", nil), "inbox")
+	// legacy 는 옛 등록 하나마다 「cc:띄운 폴더」 하나다. 폴더 없는 값(cc 만)은 답하지 않는다(store.LiveSessionsOf).
+	ib := e.okBody(t, e.do(http.MethodGet, "/api/v1/inbox?project="+testProject+"&machine=m1&"+url.Values{
+		"legacy": {"cc-board:" + e.repo, "cc-none:" + e.repo, "cc-board"}}.Encode(), nil), "inbox")
 	has("inbox", ib, "inbox", "legacy")
 	rows := list("inbox.inbox", ib["inbox"])
 	if len(rows) != 1 {

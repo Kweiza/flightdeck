@@ -229,7 +229,9 @@ The receiving session sees exactly these two lines (the first is the preview lin
   "보드에 변경 있음" goes. Why: as Send explains, this line enters bypass sessions without a dialog, and any text it carried would become text that drives the session.
 - **Registration**: the fd hooks (SessionStart, UserPromptSubmit) write the card's address into the fd ledger while opening the session
   (`PUT /api/v1/sessions/{id}/inbox`, table `session_inbox`: socket `CLAUDE_CODE_MESSAGING_SOCKET`, permission mode, time). Machines without the
-  board's config folder (`~/.config/flightdeck-board`) and `-p` / SDK workers (`CLAUDE_CODE_SESSION_ATTENDED=0`) write nothing. One socket on one
+  board's config folder (`~/.config/flightdeck-board`), `-p` / SDK workers (`CLAUDE_CODE_SESSION_ATTENDED=0`) and hooks of other harnesses (not
+  `--harness claude`) write nothing. The socket and ATTENDED variables are inherited by child processes, so a codex started by a coordinating session
+  sees the parent's socket; written on the codex card, the board would send the codex session id to the parent's socket and the parent would drop it. One socket on one
   machine keeps one session (older rows with the same socket are removed on write). `CLAUDE_CODE_MESSAGING_TOKEN` is neither read nor sent by the
   hook and has no column (optional on macOS and Linux, and useless when presented by a non-child process), so Windows is not supported yet. The mode
   is rewritten from the payload's `permission_mode` on every prompt and guessed from the command line, then settings files, at session start. If the
@@ -238,8 +240,9 @@ The receiving session sees exactly these two lines (the first is the preview lin
   keeps it, `FD_STATE_DIR/machine-id` or `~/.flightdeck/machine-id`). Socket paths from another machine mean nothing here and may belong to someone
   else's session, hence the machine filter. Closed (done) cards are left out.
 - **While moving over (old registry files)**: sessions already running on a 0.45.x plugin write their address only to `BOARD_SESSIONS/<session_id>.json`.
-  The board sends those files' ids as `legacy` in the same GET and sends only to the ones the ledger answers are open cards of this project on this
-  machine (no folder judgement). A session or socket that has a ledger address wins over a file. Files whose socket is dead, and files of
+  For each file the board sends the id and the folder the session was started in (`project_dir`, else `cwd`) as `legacy=<cc>:<folder>` (repeated) in
+  the same GET, and sends only to the ones the ledger answers have an open card of this project on this machine containing that folder. Not by id
+  alone: one coordinating session opens cards in several projects, and by id alone other projects' doorbells reach it. Files without a folder are not asked. A session or socket that has a ledger address wins over a file. Files whose socket is dead, and files of
   sessions or sockets that moved to the ledger, are removed. Those
   sessions move to the ledger when they reload the plugin (restart); once all have, this path and `BOARD_SESSIONS` go away.
 - **Rollout order**: the board runs this checkout's `board.py` under launchd, so a code change takes effect only after a restart. Roll out the

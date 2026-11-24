@@ -1008,7 +1008,7 @@ POST   /sessions/{id}/signals       POST   /sessions/{id}/workspaces  ← 클라
 POST   /sessions/{id}/rekey         (훅 전용 — /clear·compact 로 갈린 대화의 새 cc 를 카드에 반영)
 PUT    /sessions/{id}/inbox         (훅 전용: 사람이 연 세션의 받는 곳(소켓 · 권한 모드), 보드 초인종의 배달 주소. 토큰은 칸이 없다)
 DELETE /sessions/{id}/inbox         (보드 전용: 연결이 안 되는 소켓의 받는 곳을 지운다, 소켓이 같을 때만)
-GET    /inbox?project&machine&legacy  (보드 전용: 그 프로젝트 · 그 기계의 받는 곳. legacy 는 옮겨 가는 동안 옛 등록 파일의 cc 를 묻는다)
+GET    /inbox?project&machine&legacy  (보드 전용: 그 프로젝트 · 그 기계의 받는 곳. legacy 는 옮겨 가는 동안 옛 등록 파일의 「cc:띄운 폴더」를 묻는다)
 GET    /items/next                  POST   /items
 GET    /items/{id}?project&session_id  (항목 하나를 **읽는다** — 지금 본문 + 개정 이력 + 걸린 판단. 닫힌 항목도 준다, 자르지 않는다. session_id 는 선택 — 워크스페이스 관문에만 쓴다)
 GET    /items?project&state&limit  (닫힌 항목을 최근에 닫힌 순으로 **읽는다** — state 는 closed·done·dropped, 열린 항목은 dashboard.json 의 open_items 가 정본이라 안 받는다)

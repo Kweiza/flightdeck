@@ -588,7 +588,7 @@ def fd_call(method, path, body=None, **query):
     except (OSError, ValueError) as e:
         return 502, {"error": {"code": "fd_unconfigured",
                                "message": "fd 주소 · 토큰을 못 읽음(%s, 또는 환경 FD_URL · FD_TOKEN): %s" % (CONFIG, e)}}
-    url = base + path + ("?" + urllib.parse.urlencode(query) if query else "")
+    url = base + path + ("?" + urllib.parse.urlencode(query, doseq=True) if query else "")  # 목록 값은 되풀이 인자
     headers = {"Authorization": "Bearer " + token} if token else {}
     data = None
     if body is not None:

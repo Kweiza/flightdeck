@@ -67,7 +67,8 @@ class FakeSession:
 
 class FakeFd:
     """fd 원장의 받는 곳 한 벌: GET /api/v1/inbox 와 DELETE /api/v1/sessions/{id}/inbox 를 흉내 낸다.
-    rows 는 (project, machine, fd 카드 id, cc, socket, mode), live 는 옛 등록 물음에 「이 프로젝트 · 기계의 카드」라고 답할 cc."""
+    rows 는 (project, machine, fd 카드 id, cc, socket, mode), live 는 cc -> 그 cc 의 닫히지 않은 카드 (project, machine,
+    그 카드가 품은 폴더) 들. 옛 등록 물음은 「cc:띄운 폴더」 이고 그 폴더의 카드가 그 프로젝트 · 기계에 있을 때만 답한다."""
     def __init__(self):
         self.rows, self.live, self.asked, self.dropped, self.code = [], {}, [], [], 200
 
@@ -75,10 +76,10 @@ class FakeFd:
         self.asked.append((path, dict(q)))
         if self.code != 200:
             return self.code, {"error": {"code": "http_%d" % self.code}}
-        legacy = [c for c in (q.get("legacy") or "").split(",") if c]
+        asks = [a.partition(":") for a in q.get("legacy") or []]
         return 200, {"inbox": [{"session_id": r[2], "cc_session_id": r[3], "socket": r[4], "mode": r[5]}
                                for r in self.rows if (r[0], r[1]) == (q["project"], q["machine"])],
-                     "legacy": [c for c in legacy if self.live.get(c) == (q["project"], q["machine"])]}
+                     "legacy": [c for c, _, d in asks if d and (q["project"], q["machine"], d) in self.live.get(c, ())]}
 
     def drop(self, sid, sock):
         self.dropped.append((sid, sock))
@@ -112,13 +113,14 @@ class Base(unittest.TestCase):
     def row(self, cc, sock, mode="bypassPermissions", project="proj", machine="m-here", sid=None):
         self.fd.rows.append((project, machine, sid or "fd-" + cc, cc, sock, mode))
 
-    def legacy(self, cc, sock, mode="bypassPermissions", live=("proj", "m-here")):
-        """옛 플러그인 훅이 남긴 등록 파일 하나(0.45.x 꼴). live 가 있으면 원장이 그 카드를 안다."""
+    def legacy(self, cc, sock, mode="bypassPermissions", live=("proj", "m-here"), project_dir="/r/proj", more=()):
+        """옛 플러그인 훅이 남긴 등록 파일 하나(0.45.x 꼴). live 가 있으면 원장이 그 폴더의 카드를 안다.
+        more 는 같은 cc 가 다른 폴더(다른 프로젝트)에 연 카드들."""
         with open(os.path.join(self.registry, cc + ".json"), "w") as f:
-            json.dump({"session_id": cc, "socket": sock, "cwd": "/somewhere", "project_dir": "", "mode": mode,
+            json.dump({"session_id": cc, "socket": sock, "cwd": "/somewhere", "project_dir": project_dir, "mode": mode,
                        "seen_at": 1, "registered_at": 1}, f)
-        if live:
-            self.fd.live[cc] = live
+        cards = [live + (project_dir,)] if live else []
+        self.fd.live[cc] = cards + list(more)
 
     def notify(self, item="card-1", action="note", project="proj"):
         logs = []
@@ -203,7 +205,28 @@ class Legacy(Base):
         self.assertEqual(line["session_id"], "sid-old")
         self.assertIn('from-mode="prompting"', line["message"]["content"])
         self.assertEqual((theirs.lines, gone.lines), ([], []))
-        self.assertEqual(self.fd.asked[-1][1]["legacy"], "sid-closed,sid-old,sid-their")
+        self.assertEqual(self.fd.asked[-1][1]["legacy"], ["sid-closed:/r/proj", "sid-old:/r/proj", "sid-their:/r/proj"])
+
+    def test_one_session_with_cards_in_two_projects_gets_only_its_own_project(self):
+        """조정 세션은 남의 프로젝트에도 카드를 연다. 그 세션을 띄운 폴더의 프로젝트 초인종만 그 세션에 간다."""
+        coord = self.fake()
+        self.legacy("sid-coord", coord.path, live=("proj-home", "m-here"), project_dir="/r/home",
+                    more=[("proj", "m-here", "/r/proj")])
+        out, _ = self.notify(project="proj")
+        self.assertEqual((out["sent"], coord.lines), (0, []))
+        out, _ = self.notify(project="proj-home")
+        self.assertEqual(out["sent"], 1)
+        self.assertEqual(coord.wait(1)[0]["session_id"], "sid-coord")
+
+    def test_file_without_a_folder_is_not_asked(self):
+        f = self.fake()
+        self.legacy("sid-nodir", f.path, project_dir="")
+        os.remove(os.path.join(self.registry, "sid-nodir.json"))
+        with open(os.path.join(self.registry, "sid-nodir.json"), "w") as fh:
+            json.dump({"session_id": "sid-nodir", "socket": f.path, "mode": "default"}, fh)
+        out, _ = self.notify()
+        self.assertEqual((out["sent"], f.lines), (0, []))
+        self.assertNotIn("legacy", self.fd.asked[-1][1])
 
     def test_ledger_wins_over_the_file(self):
         f = self.fake()
