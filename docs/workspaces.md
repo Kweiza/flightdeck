@@ -62,10 +62,9 @@ root tree, so **no overlap warning fires between root sessions and that member's
 path is not readable by the server (outside the container's `FD_REPOS` mount — a member outside the root
 needs its own mount), that member's branch stays `?(못 읽음)` ("? (unreadable)").
 
-> **After changing the roster, compare the banner's member count with the file.** When parsing fails
-> the server **keeps the last roster it read** — so the banner still shows, and only the newly added
-> members silently go missing. A single unreadable entry rejects the **whole** roster. The easiest
-> one to hit is a **path outside the root** (`../other-repo`) — members must live under the root.
+> **After changing the roster, compare the banner's member count with the file.** The two lines above
+> (dropped entries, stale cache) report that mismatch, but until the server reads the new roster (it is not
+> committed on the default branch yet, or no session has opened since) the banner still shows the old one.
 
 **4. Hand off from umbrella to detail.**
 
