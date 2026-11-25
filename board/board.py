@@ -341,6 +341,9 @@ def board_of(project, dash, closed, bases=None):
     counts = {k: 0 for k in ("owner", "running", "waiting", "done")}
     for c in cards:
         counts[c["column"]] += 1
+    total = closed.get("total")  # 원장의 닫힌 항목 전체 수(불러온 장 수가 아니다). 옛 서버는 없어 불러온 수로 둔다
+    if isinstance(total, int) and not isinstance(total, bool) and total > counts["done"]:
+        counts["done"] = total
     return {"project": project, "at": dash.get("at"), "counts": counts, "repo": (bases or {}).get("repo") or "", "cards": cards}
 
 

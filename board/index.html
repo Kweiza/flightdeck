@@ -234,7 +234,7 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
     get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
   };
-  const state = { project: null, done: DONE_STEP, cards: [], sig: "", open: null, dragging: false };
+  const state = { project: null, done: DONE_STEP, cards: [], counts: {}, sig: "", open: null, dragging: false };
   const params = new URLSearchParams(location.search);
 
   const theme = store.get("fd-board-theme");
@@ -347,7 +347,8 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
       const sec = $(`[data-col="${col}"]`), box = $(".cards", sec), top = box.scrollTop;
       const list = state.cards.filter((c) => c.column === col && matches(c, q, label));
       list.sort((a, b) => (col === "done" ? -1 : 1) * String(a.updated_at).localeCompare(String(b.updated_at)));
-      $(".n", sec).textContent = list.length;
+      // 끝남 열은 불러온 장 수가 아니라 원장의 전체 수(counts.done)를 센다. 거르는 중에는 불러온 것 가운데 맞는 수뿐이다.
+      $(".n", sec).textContent = col === "done" && !q && !label && Number.isFinite(state.counts.done) ? state.counts.done : list.length;
       let kids;
       if (!list.length) kids = [el("div", "empty", q || label ? "찾은 것 없음" : "없음")];
       else if (col === "owner") {
@@ -359,7 +360,8 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
       box.replaceChildren(...kids);
       box.scrollTop = top;
     }
-    $(".more").hidden = state.cards.filter((c) => c.column === "done").length < state.done;
+    const loaded = state.cards.filter((c) => c.column === "done").length;
+    $(".more").hidden = Number.isFinite(state.counts.done) ? loaded >= state.counts.done : loaded < state.done;
   }
 
   // 보낸 알림은 도착이 아니다(README 「세션에 알림」): 조정 세션이 수신함을 N 분 넘게 안 읽은 소유자 동작이 있으면 경고.
@@ -380,11 +382,11 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
     if (!state.project) return;
     try {
       const b = await getJSON(`/api/board?project=${encodeURIComponent(state.project)}&done=${state.done}`);
-      const sig = JSON.stringify(b.cards);
+      const sig = JSON.stringify([b.cards, b.counts]);
       setStatus(`새로 읽음 ${fmt(new Date().toISOString())}`);
       try { showUnread(b.unread); } catch (e) { console.warn("unread", e); }  // 경고는 덤: 카드 그리기를 막지 않는다
       if (!force && (sig === state.sig || state.dragging)) return;  // 바뀐 것 없으면 화면을 건드리지 않는다
-      state.cards = b.cards; state.sig = sig;
+      state.cards = b.cards; state.counts = b.counts || {}; state.sig = sig;
       fillLabels(); render();
     } catch (e) {
       setStatus(`못 읽음: ${e.message}`, true);

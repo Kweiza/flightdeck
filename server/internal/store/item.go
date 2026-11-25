@@ -632,24 +632,27 @@ func (s *Store) ListItems(ctx context.Context, project string) ([]model.Item, er
 	return out, nil
 }
 
-// ListClosed 는 닫힌 항목을 **최근에 닫힌 순**으로 limit 개까지 낸다.
+// ListClosed 는 닫힌 항목을 **최근에 닫힌 순**으로 limit 개까지 내고, limit 에 안 잘린 전체 수를 함께 낸다.
 //
 // state 는 done · dropped 중 하나이거나 빈 문자열(둘 다)이다. 열린 항목은 여기서 안 낸다 —
 // 그 정의는 ListOpen 한 곳에 있고(그쪽 주석의 술어 규율), 여기서 'open' 을 받으면 같은 이름의
 // 목록이 두 곳에서 갈린다. 칸반 화면의 「끝남」 열이 이 함수의 유일한 소비자라 정렬을
 // 오래된 순(ListItems)이 아니라 closed_at 최근순으로 둔다 — 끝난 것 중 볼 것은 최근 것이다.
-func (s *Store) ListClosed(ctx context.Context, project string, state model.ItemState, limit int) ([]model.Item, error) {
-	q := `SELECT ` + itemCols + ` FROM item WHERE project = ? AND state IN ('done','dropped')`
+// 전체 수는 그 열의 배지다(더 불러오기와 상관없이 끝난 것이 모두 몇 장인가). 목록과 같은 술어를 쓴다.
+func (s *Store) ListClosed(ctx context.Context, project string, state model.ItemState, limit int) ([]model.Item, int, error) {
+	where := ` FROM item WHERE project = ? AND state IN ('done','dropped')`
 	args := []any{project}
 	if state != "" {
-		q = `SELECT ` + itemCols + ` FROM item WHERE project = ? AND state = ?`
+		where = ` FROM item WHERE project = ? AND state = ?`
 		args = append(args, string(state))
 	}
-	q += ` ORDER BY closed_at DESC, id LIMIT ?`
-	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+where, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("닫힌 항목 수 조회 실패(project=%q): %w", clip(project, 64), err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+itemCols+where+` ORDER BY closed_at DESC, id LIMIT ?`, append(args, limit)...)
 	if err != nil {
-		return nil, fmt.Errorf("닫힌 항목 조회 실패(project=%q): %w", clip(project, 64), err)
+		return nil, 0, fmt.Errorf("닫힌 항목 조회 실패(project=%q): %w", clip(project, 64), err)
 	}
 	defer rows.Close()
 
@@ -657,14 +660,14 @@ func (s *Store) ListClosed(ctx context.Context, project string, state model.Item
 	for rows.Next() {
 		it, err := scanItem(rows)
 		if err != nil {
-			return nil, fmt.Errorf("항목 행 해석 실패: %w", err)
+			return nil, 0, fmt.Errorf("항목 행 해석 실패: %w", err)
 		}
 		out = append(out, it)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("닫힌 항목 목록 순회 실패: %w", err)
+		return nil, 0, fmt.Errorf("닫힌 항목 목록 순회 실패: %w", err)
 	}
-	return out, nil
+	return out, total, nil
 }
 
 // ValidateFinish 는 종료 인자가 성립하는지 본다.

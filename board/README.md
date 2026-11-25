@@ -155,7 +155,7 @@ Decided in one place, `column_of` in `board.py`.
 
 | Column | Rule |
 | --- | --- |
-| Done | closed items (done · dropped) |
+| Done | closed items (done · dropped). Loaded 30 at a time, newest first; the column count is the ledger total (while filtering by search or label, the matches among loaded cards) |
 | Running | label `status:running`, or claimed by any session |
 | Owner's turn | label `status:owner` (owner to do), `status:owner-done` · `status:owner-ask` (back to the coordinator, shown on top) |
 | Waiting | every other open item |

@@ -147,7 +147,7 @@ func (s *server) handleListClosedItems(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
-	items, err := s.st.ListClosed(r.Context(), project, state, limit)
+	items, total, err := s.st.ListClosed(r.Context(), project, state, limit)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -160,7 +160,7 @@ func (s *server) handleListClosedItems(w http.ResponseWriter, r *http.Request) {
 		stateName = "closed"
 	}
 	s.writeJSON(w, r, http.StatusOK, map[string]any{
-		"project": project, "state": stateName, "limit": limit, "count": len(items), "items": items,
+		"project": project, "state": stateName, "limit": limit, "count": len(items), "total": total, "items": items,
 	})
 }
 

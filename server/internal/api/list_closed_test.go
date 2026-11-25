@@ -58,6 +58,15 @@ func TestListClosedItemsNewestFirst(t *testing.T) {
 	if got := ids(one); len(got) != 1 || got[0] != "lc-drop" {
 		t.Fatalf("limit=1 목록이 %v 다", got)
 	}
+	// total 은 limit 에 잘리지 않은 그 state 의 전체 수다 — 칸반 「끝남」 배지가 불러온 장 수가 아니라 이것을 센다.
+	for _, c := range []struct {
+		body  map[string]any
+		total float64
+	}{{one, 2}, {all, 2}, {done, 1}} {
+		if c.body["total"] != c.total || c.body["count"] == nil {
+			t.Errorf("state=%v limit=%v 의 total 이 %v 다 — %v 여야 한다", c.body["state"], c.body["limit"], c.body["total"], c.total)
+		}
+	}
 
 	if w := e.do(http.MethodGet, "/api/v1/items?project="+testProject+"&state=open", nil); w.Code != http.StatusBadRequest {
 		t.Fatalf("state=open 이 %d 다 — 열린 목록은 dashboard.json 몫이라 거절이어야 한다", w.Code)

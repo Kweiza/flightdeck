@@ -154,7 +154,7 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 
 | 열 | 판정 |
 | --- | --- |
-| 끝남 | 닫힌 항목(done · dropped) |
+| 끝남 | 닫힌 항목(done · dropped). 최근 30장씩 더 불러오되, 열 머리 수는 원장의 전체 수다(검색 · 꼬리표로 거르는 중에는 불러온 것 가운데 맞는 수) |
 | 진행 중 | 꼬리표 `status:running`, 또는 어느 세션이 선점 중 |
 | 소유자 차례 | 꼬리표 `status:owner`(소유자가 할 일), `status:owner-done` · `status:owner-ask`(맨 위 「조정자에게 돌아간 것」) |
 | 대기 | 그 밖의 열린 항목 |

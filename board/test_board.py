@@ -114,6 +114,17 @@ astra: 1,500자 그대로 + qwen3, 원가가 먼저
 """
 
 
+class Counts(unittest.TestCase):
+    def test_done_counts_ledger_total_not_loaded(self):
+        closed = {"items": [{"ID": "d%d" % i, "State": "done"} for i in range(3)], "count": 3, "total": 120}
+        dash = {"open_items": [{"ID": "o1", "State": "open"}]}
+        self.assertEqual(B.board_of("p", dash, closed)["counts"], {"owner": 0, "running": 0, "waiting": 1, "done": 120})
+        del closed["total"]  # 옛 서버: 불러온 수
+        self.assertEqual(B.board_of("p", dash, closed)["counts"]["done"], 3)
+        for bad in ("120", True, -1):
+            self.assertEqual(B.board_of("p", dash, dict(closed, total=bad))["counts"]["done"], 3)
+
+
 class Decision(unittest.TestCase):
     def test_colon_form(self):
         """머리를 ### 대신 「질문:」 줄로, 보기를 「보기:」 아래 「- 이름: 설명」 목록으로 써도 같은 결정 묶음이다."""
