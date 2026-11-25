@@ -323,6 +323,7 @@ class BoardWiring(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="fdbw")
         self.now = [1000.0]
         B.WATCH = W.Watch(os.path.join(self.tmp, "w.json"), 15, clock=lambda: self.now[0])
+        B.SETTLE_ASKED.clear()
         B.fd_get = lambda path, **q: (200, {"item": {"ID": "c1", "Title": "카드", "State": "open",
                                                      "Labels": ["status:owner"], "Body": "선택: A | B"}})
         B.fd_post = lambda path, body: (200, {"ok": True, "item": {"ID": "owner-x"}})
@@ -332,6 +333,42 @@ class BoardWiring(unittest.TestCase):
     def tearDown(self):
         B.fd_get, B.fd_post, B.session_inbox.notify, B.project_of, B.WATCH = self.keep
         shutil.rmtree(self.tmp)
+
+    def test_handled_at_reads_session_traces_after_owner(self):
+        body = {"item": {"ID": "c1", "ClosedAt": None},
+                "judgments": [{"At": "2026-11-25T03:34:04.635698Z", "Title": "[fdboard] 소유자 댓글", "SessionID": ""},
+                              {"At": "2026-11-25T04:32:18.206476123Z", "Title": "소유자: A", "SessionID": "s1"}],
+                "revisions": [{"At": "2026-11-24T16:52:41Z", "SessionID": "s1"}]}
+        self.assertEqual(B.handled_at(body), B.parse_at("2026-11-25T04:32:18.206476Z"))
+        body["item"]["ClosedAt"] = "2026-11-25T05:00:00Z"
+        self.assertEqual(B.handled_at(body), B.parse_at("2026-11-25T05:00:00Z"))
+        self.assertEqual(B.handled_at(body, 2e9), 2e9)  # 선점(pick) 때
+        self.assertIsNone(B.handled_at({"item": {}, "judgments": [body["judgments"][0]]}))  # 소유자 노트는 세션 흔적이 아니다
+        self.assertIsNone(B.parse_at("x"))
+        dash = {"sessions": [{"view": {"Claims": [{"ItemID": "c1", "At": "2026-11-25T06:00:00Z"}, "c2",
+                                                  {"ItemID": "c1", "At": "2026-11-25T07:00:00Z", "ReleasedAt": "2026-11-25T07:10:00Z"}]}}]}
+        self.assertEqual(B.claims_at(dash), {"c1": B.parse_at("2026-11-25T07:00:00Z")})
+
+    def test_unread_settles_late_card_from_ledger(self):
+        """알림을 받고 /api/inbox 대신 fd 로 카드를 읽어 처리한 세션: 원장 흔적이 경고를 지운다."""
+        B.perform("/api/note", "p", {"id": "c1", "text": "진행해"}, tell=True)  # 소유자 동작 at=1000
+        self.now[0] = 1000 + 16 * 60
+        seen = []
+        def get(path, **q):
+            seen.append(path)
+            return 200, {"item": {"ID": "c1"}, "judgments": [{"At": "1970-01-01T00:20:00Z", "SessionID": "s1", "Title": "고침"}]}
+        B.fd_get = get
+        u = B.unread_or_empty("p", {"sessions": []})
+        self.assertEqual((u["count"], u["late"]), (0, 0))
+        self.assertEqual(seen, ["/api/v1/items/c1"])
+        B.perform("/api/note", "p", {"id": "c1", "text": "또"}, tell=False)  # 로컬 포트 쓰기는 세지 않는다
+        B.fd_get = lambda path, **q: seen.append(path) or (200, {"item": {"ID": "c1"}, "judgments": []})
+        B.WATCH.acted("p", "c2", "note")
+        self.now[0] += 16 * 60
+        self.assertEqual(B.unread_or_empty("p", {"sessions": []})["late_items"], ["c2"])  # 흔적이 없으면 경고는 남는다
+        n = len(seen)
+        B.unread_or_empty("p", {"sessions": []})
+        self.assertEqual(len(seen), n)  # 같은 카드를 매 화면 새로 고침마다 다시 묻지 않는다
 
     def test_every_action_has_a_told_entry(self):
         self.assertEqual(set(B.TOLD), set(B.ACTIONS) | {"/api/add"})
@@ -537,6 +574,20 @@ class Watch(unittest.TestCase):
         W.record_action(st, "p", "c2", "note", 105)  # 읽는 도중(100.5 에 시작, 110 에 끝)
         W.record_read(st, "p", 100.5)
         self.assertEqual(W.unread_of(st, "p", 110, 15)["count"], 1)
+
+    def test_handled_on_card_clears_only_that_card_up_to_then(self):
+        """세션이 그 카드를 원장에서 다룬 때(노트 · 마무리 · 선점 …)까지의 그 카드 동작만 읽힘으로 친다."""
+        st = {}
+        W.record_action(st, "p", "c1", "note", 100)
+        W.record_action(st, "p", "c2", "note", 100)
+        W.record_action(st, "p", "c1", "label", 300)  # 다룬 뒤 소유자가 또 한 동작
+        W.record_handled(st, "p", "c1", 200)
+        u = W.unread_of(st, "p", 10 ** 6, 15)
+        self.assertEqual((u["count"], u["late_items"]), (2, ["c1", "c2"]))
+        self.assertEqual([(a["item"], a["at"]) for a in st["projects"]["p"]["pending"]], [("c2", 100), ("c1", 300)])
+        self.assertNotIn("read_at", st["projects"]["p"])  # 수신함 읽기로 적지 않는다(마지막 읽은 때는 그대로)
+        W.record_handled(st, "q", "c1", 10 ** 6)  # 다른 프로젝트의 같은 id 는 셈하지 않는다
+        self.assertEqual(W.unread_of(st, "p", 10 ** 6, 15)["count"], 2)
 
     def test_persists_private_and_survives_broken_file(self):
         tmp = tempfile.mkdtemp(prefix="fdbw")

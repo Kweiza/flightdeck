@@ -5,6 +5,7 @@
 수신함을 안 읽었는지는 보드가 모른다. 그래서 보드는 두 가지를 적는다.
   - 소유자 동작(바깥 포트의 저장된 쓰기): 프로젝트 · 카드 · 동작 · 때
   - 수신함 읽기(로컬 포트의 GET /api/inbox): 프로젝트 · 때
+  - 카드를 원장에서 다룬 때(보드가 늦은 카드의 원장 흔적에서 읽는다): 프로젝트 · 카드 · 때
 읽은 때보다 늦은 동작이 N 분(BOARD_UNREAD_MINUTES, 기본 15) 넘게 남으면 보드 화면이 경고한다.
 
 순수 규칙(record_action · record_read · unread_of)과 파일 보관(Watch)을 나눈다. 파일은 보드 설정 폴더의 0600 JSON 하나
@@ -47,6 +48,14 @@ def record_read(state, project, now):
     if p.get("dropped_at", now + 1) <= now:  # 버린 것도 그때까지의 동작이면 읽힘
         p.pop("dropped", None)
         p.pop("dropped_at", None)
+    return state
+
+
+def record_handled(state, project, item, at):
+    """세션이 그 카드를 원장에서 다뤘다(노트 · 마무리 · 개정 · 닫힘 · 선점): 그때까지의 그 카드 동작은 읽힘.
+    수신함 읽기가 아니라 read_at 은 그대로다 — 알림은 깨우기, 처리 확인은 원장 기록, 수신함은 놓친 알림 되읽기다."""
+    p = _project(state, project)
+    p["pending"] = [a for a in p["pending"] if not (a["item"] == item and a["at"] <= at)]
     return state
 
 
@@ -114,6 +123,11 @@ class Watch:
         """at: 읽기를 시작한 때(그 뒤에 저장된 동작은 그 읽기에 없었다). 없으면 지금."""
         with self.lock:
             record_read(self.state, project, self.clock() if at is None else at)
+            self._save()
+
+    def handled(self, project, item, at):
+        with self.lock:
+            record_handled(self.state, project, item, at)
             self._save()
 
     def unread(self, project):

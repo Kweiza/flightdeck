@@ -14,6 +14,7 @@
 카드 본문 규약(README 「카드 본문 규약」)은 directives_of() 한 곳에서 읽는다.
 결정 카드 꼴(### 질문 · 배경 · 보기: · 추천)은 decision_of(), 소유자가 고른 보기는 chosen_of() 에서 읽는다.
 """
+import datetime
 import hmac
 import ipaddress
 import json
@@ -843,9 +844,65 @@ def tell_sessions(project, path, req, body):
     return body
 
 
-def unread_or_empty(project):
+AT_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)$")
+
+
+def parse_at(s):
+    """fd 의 RFC 3339 때(나노초까지) -> 유닉스 초, 못 읽으면 None."""
+    m = AT_RE.match(s or "") if isinstance(s, str) else None
+    if not m:
+        return None
+    frac = (m.group(2) or ".0")[:7]  # 파이썬은 마이크로초까지
+    try:
+        return datetime.datetime.fromisoformat(m.group(1) + frac + ("+00:00" if m.group(3) == "Z" else m.group(3))).timestamp()
+    except ValueError:
+        return None
+
+
+def claims_at(dash):
+    """대시보드의 선점 -> {카드: 가장 늦게 선점한 때}. 놓은 선점도 집었던 흔적이다. 문자열 선점(옛 서버)은 때가 없어 뺀다."""
+    out = {}
+    for s in dash.get("sessions") or []:
+        for c in (s.get("view") or {}).get("Claims") or []:
+            at = parse_at(c.get("At")) if isinstance(c, dict) and c.get("ItemID") else None
+            if at is not None:
+                out[c["ItemID"]] = max(at, out.get(c["ItemID"], at))
+    return out
+
+
+def handled_at(body, claimed_at=None):
+    """항목 응답(GET /api/v1/items/{id}) -> 세션이 그 카드를 원장에서 다룬 가장 늦은 때, 없으면 None.
+    세는 것: 소유자 노트가 아닌 판단(note · finish), 개정(amend), 닫힘, 선점(pick, claimed_at).
+    fd show 같은 읽기는 원장에 남지 않아 셀 수 없다."""
+    item = body.get("item") or {}
+    times = [parse_at(j.get("At")) for j in body.get("judgments") or [] if isinstance(j, dict) and not is_owner_note(j)]
+    times += [parse_at(r.get("At")) for r in body.get("revisions") or [] if isinstance(r, dict)]
+    times += [parse_at(item.get("ClosedAt")), claimed_at]
+    return max((t for t in times if t is not None), default=None)
+
+
+SETTLE_ASKED = {}  # (프로젝트, 카드) -> 원장에 마지막으로 물은 때(화면 새로 고침마다 다시 묻지 않게)
+SETTLE_EVERY = 60
+
+
+def settle_unread(project, dash):
+    """늦은 소유자 동작의 카드마다 원장 흔적을 읽어, 세션이 그 뒤 다뤘으면 읽힘으로 친다."""
+    claims = claims_at(dash or {})
+    for iid in WATCH.unread(project)["late_items"]:
+        now = WATCH.clock()
+        if now - SETTLE_ASKED.get((project, iid), -SETTLE_EVERY) < SETTLE_EVERY:
+            continue
+        SETTLE_ASKED[(project, iid)] = now
+        code, body = fd_get(item_path(iid), project=project)
+        at = handled_at(body, claims.get(iid)) if code == 200 and isinstance(body, dict) else claims.get(iid)
+        if at is not None:
+            WATCH.handled(project, iid, at)
+
+
+def unread_or_empty(project, dash=None):
     """화면의 안 읽힘 경고. 덤이라 터지면 빈 값(보드 화면을 막지 않는다)."""
     try:
+        settle_unread(project, dash)
         return WATCH.unread(project)
     except Exception as e:  # noqa: BLE001
         sys.stderr.write("BOARD_INBOX_WATCH_FAILED %s\n" % e.__class__.__name__)
@@ -998,7 +1055,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(502, err("closed_list_failed",
                                           "닫힌 항목 목록(GET /api/v1/items)을 못 읽음: %s" % code, fd=closed))
             out = board_of(project, dash, closed, bases_of(project))
-            out["unread"] = unread_or_empty(project)
+            out["unread"] = unread_or_empty(project, dash)
             return self.send(200, out)
         if path == "/api/item":
             iid = q.get("id", "")

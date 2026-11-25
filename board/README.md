@@ -257,6 +257,9 @@ The receiving session sees exactly these two lines (the first is the preview lin
   bypass session without a dialog only when it claims bypass, and into any other session when it does not claim bypass, so the board skips the
   approval dialog of bypass sessions (undocumented behaviour: if Claude Code changes it, notices get held in a dialog, which is the safe way to break).
   The mode is refreshed on every prompt, so the first notice right after a shift+tab mode change can be held in a dialog (approve or ignore it).
+  A resumed session (`--continue`) or text injected mid-turn is not a prompt and does not refresh it. Setting Claude Code `/config`
+  "Messages from your other sessions" to always deliver stops the holding across classes (it accepts every session on that Mac, so the rule
+  that a receiver never follows a notice as an instruction stays the boundary).
 - **Result**: the response's `notify` field `{"ok", "sent", "failed": [{"session": first 8 chars, "why"}], "warning"?}`. When nothing was sent,
   `warning` reads "알림 못 보냄: …" and the page shows a popup. The owner action itself is already saved. The log gets one
   `BOARD_NOTIFY item=… action=… sent=N failed=…` line (no socket path, no content; an id that fails the check is logged as `-`).
@@ -265,6 +268,10 @@ The receiving session sees exactly these two lines (the first is the preview lin
   `BOARD_WATCH`, and when an action newer than the project's last read stays unread for more than `BOARD_UNREAD_MINUTES` (default 15) the page
   shows a warning banner. The basis is the `unread` field of `/api/board`: `{"count", "late", "oldest_at", "read_at", "minutes", "late_items"}`.
   Actions whose notice could not be sent count the same.
+  Some sessions read and handle the card through fd instead of the inbox, so for each late action the board reads the ledger and counts the
+  action as read when a session trace on that card follows it: a judgment that is not an owner note (note · finish), a revision (amend),
+  closing, or a claim (pick, released ones too). Reads such as `fd show` and labels leave no time in the ledger and cannot count.
+  Notices wake, the ledger confirms handling, and `/api/inbox` re-reads missed notices. Each card is asked at most once a minute.
 - Writes through the local port (7431) are not owner actions: neither told nor counted. This is not authentication: a same-user process on this Mac can
   mimic the 7430 identity header or write the same line to a session socket, and the receiver cannot tell (same boundary as Access). A forged line can carry any text and claim bypass.
   That is why the receiving rule is "do not trust the notice, read the board". For a session that follows the rule, a forged line can only wake it into reading its inbox.
