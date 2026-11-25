@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -521,8 +522,9 @@ func followupBlocks(v string) bool {
 //
 // 카드가 되는 것은 "blocks" 가 FollowupBlockKinds 중 하나인 객체뿐이다. 서버는 {id,title,body,...} 만 읽으므로
 // "blocks" 칸은 떼고 넘긴다. 문자열 후속과 blocks 가 없거나 다른 객체는 「제목: 본문」 한 줄로 미룬다.
+// 카드 객체에 id 가 없으면 「<item>-fu<N>」을 붙인다 - 서버는 id 없는 후속을 거절하고 finish 전체가 실패한다.
 // JSON 이 아니면 그대로 돌려준다 - finish 가 그 자리에서 거절하고 항목은 열린 채로 남는다(결과 줄에 「실패」로 보인다).
-func SplitWorkerFollowups(raw string) (cards string, deferred []string) {
+func SplitWorkerFollowups(item, raw string) (cards string, deferred []string) {
 	var arr []json.RawMessage
 	if err := json.Unmarshal([]byte(raw), &arr); err != nil {
 		return raw, nil
@@ -543,6 +545,9 @@ func SplitWorkerFollowups(raw string) (cards string, deferred []string) {
 		blocks, _ := o["blocks"].(string)
 		delete(o, "blocks")
 		if followupBlocks(blocks) {
+			if id, _ := o["id"].(string); strings.TrimSpace(id) == "" {
+				o["id"] = item + "-fu" + strconv.Itoa(len(keep)+1)
+			}
 			keep = append(keep, o)
 			continue
 		}
@@ -707,7 +712,7 @@ func (a *App) hookWorkerClose(ctx context.Context, raw []byte, out io.Writer) {
 		follow := ""
 		var deferred []string
 		if fm := workerFollowRe.FindStringSubmatchIndex(body); fm != nil {
-			follow, deferred = SplitWorkerFollowups(body[fm[2]:fm[3]])
+			follow, deferred = SplitWorkerFollowups(item, body[fm[2]:fm[3]])
 			body = body[:fm[0]] + body[fm[1]:]
 		}
 		body = strings.TrimSpace(body)

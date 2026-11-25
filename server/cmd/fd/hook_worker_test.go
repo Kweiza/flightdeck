@@ -357,17 +357,20 @@ func TestWorkerCloseFailureIsLoud(t *testing.T) {
 }
 
 func TestSplitWorkerFollowups(t *testing.T) {
-	cards, deferred := SplitWorkerFollowups(`["한글 후속", {"id":"k","title":"t","body":"b"}, {"id":"m","title":"돈","body":"b2","blocks":" Money "}]`)
+	cards, deferred := SplitWorkerFollowups("it", `["한글 후속", {"id":"k","title":"t","body":"b"}, {"id":"m","title":"돈","body":"b2","blocks":" Money "}]`)
 	if want := `[{"body":"b2","id":"m","title":"돈"}]`; cards != want {
 		t.Fatalf("cards =\n%s\n기대\n%s", cards, want)
 	}
 	if want := []string{"한글 후속", "t: b"}; strings.Join(deferred, "|") != strings.Join(want, "|") {
 		t.Fatalf("deferred = %q", deferred)
 	}
-	if cards, deferred := SplitWorkerFollowups(`[{"id":"x","title":"x","blocks":"nice-to-have"}]`); cards != "" || len(deferred) != 1 {
+	if cards, deferred := SplitWorkerFollowups("it", `[{"id":"x","title":"x","blocks":"nice-to-have"}]`); cards != "" || len(deferred) != 1 {
 		t.Fatalf("목록 밖 blocks 는 미뤄야 한다: %q %q", cards, deferred)
 	}
-	if got, d := SplitWorkerFollowups("[깨짐"); got != "[깨짐" || d != nil {
+	if cards, _ := SplitWorkerFollowups("nu/x", `[{"title":"배포 전 적용","blocks":"deploy"}]`); cards != `[{"id":"nu/x-fu1","title":"배포 전 적용"}]` {
+		t.Fatalf("id 없는 카드에 id 를 붙여야 한다(서버가 빈 id 를 거절): %s", cards)
+	}
+	if got, d := SplitWorkerFollowups("it", "[깨짐"); got != "[깨짐" || d != nil {
 		t.Fatalf("깨진 JSON 은 그대로 넘겨야 한다(finish 가 거절해 항목이 열린 채 남는다): %s", got)
 	}
 }
