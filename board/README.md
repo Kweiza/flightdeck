@@ -175,7 +175,7 @@ When a coordinating session launches and collects a worker (sub-agent), two plug
   A worker launched by a worker passes with no label and no footer (still refused without a card marker), and its words close no card.
   Cards handed over later with SendMessage are not recorded for that launch and are not closed on stop (the coordinator closes them by hand).
 - On stop (`SubagentStop`, `fd hook worker-close`): reads the worker's last message.
-  `FD_FINISH <id> [done|dropped]` then lines up to `FD_END` are the finish body (an `FD_FOLLOWUPS [...]` line inside adds followups; a list of strings is accepted),
+  `FD_FINISH <id> [done|dropped]` then lines up to `FD_END` are the finish body (an `FD_FOLLOWUPS [...]` line inside adds followups). Only followup objects whose `"blocks"` field is one of `money|data|privacy|security|loss|deploy|owner` become items. String followups and objects without blocks create no item: they go into the finish body as "deferred followups" lines and, when `FD_FOLLOWUP_SINK` names an item id, into one not-done judgment on that item (this keeps per-worker polish items from swelling the queue far beyond the real work),
   `FD_OWNER <id>` swaps `status:running` for `status:owner`, `FD_BLOCKED <id> <reason>` removes `status:running` and records a blocked judgment.
   It closes only cards **this session's launch hook labelled for the call that launched this worker (`toolUseId` in the `.meta.json` next to the worker transcript)**
   (records in `hooks/fd-worker-cards/` under the config folder, one 0600 file per launch; closed cards drop out). If the meta cannot be read or has `parentAgentId` (a worker launched by a worker), nothing is closed. Ids must match `^[A-Za-z0-9][A-Za-z0-9._/-]*$`. Anything else is refused and reported.

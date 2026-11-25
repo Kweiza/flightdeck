@@ -175,7 +175,7 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
   작업자가 띄운 작업자는 꼬리표도 꼬리글도 없이 지나가고(카드 표시가 없으면 여전히 거절), 그 말로는 아무 카드도 닫지 않는다.
   SendMessage 로 새로 맡긴 카드는 그 띄우기에 기록되지 않아 끝날 때 닫히지 않는다(조정 세션이 손으로 닫는다).
 - 끝날 때(`SubagentStop`, `fd hook worker-close`): 작업자의 마지막 말에서 줄을 읽는다.
-  `FD_FINISH <id> [done|dropped]` 다음 줄부터 `FD_END` 까지가 finish 본문(안에 `FD_FOLLOWUPS [...]` 한 줄을 두면 후속, 문자열 목록도 받는다),
+  `FD_FINISH <id> [done|dropped]` 다음 줄부터 `FD_END` 까지가 finish 본문(안에 `FD_FOLLOWUPS [...]` 한 줄을 두면 후속). 후속이 카드가 되는 것은 `"blocks"` 칸이 `money|data|privacy|security|loss|deploy|owner` 중 하나인 객체뿐이다. 문자열 후속과 blocks 가 없는 객체는 카드를 만들지 않고 finish 본문에 「미룬 후속」 줄로, 환경 변수 `FD_FOLLOWUP_SINK` 에 항목 id 가 있으면 그 항목에 not-done 판단 하나로 모인다(작업자마다 잔손질 카드가 쌓여 큐가 실제 일보다 불어나는 것을 막는다),
   `FD_OWNER <id>` 는 `status:running` 을 떼고 `status:owner`, `FD_BLOCKED <id> <사유>` 는 `status:running` 을 떼고 blocked 판단.
   닫는 것은 **그 작업자를 띄운 호출(작업자 기록 옆 `.meta.json` 의 `toolUseId`)에 이 세션의 띄울 때 훅이 꼬리표를 단 카드**뿐이다
   (설정 폴더의 `hooks/fd-worker-cards/` 기록, 띄우기마다 0600 파일, 닫은 카드는 빠진다). meta 를 못 읽거나 `parentAgentId` 가 있으면(작업자가 띄운 작업자) 아무것도 닫지 않는다. id 는 `^[A-Za-z0-9][A-Za-z0-9._/-]*$` 꼴만 받는다. 그 밖은 거절하고 결과 줄로 알린다.

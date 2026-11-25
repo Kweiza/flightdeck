@@ -95,7 +95,7 @@ func WorkerCardFooter(ids []string, readme string) string {
 	first := ids[0]
 	return "\n\n## 보드 카드 닫기 (훅이 붙임, 카드 " + strings.Join(ids, ", ") + ")\n" +
 		"fd 항목을 pick · finish 하지 않는다. 일이 **완전히 끝난 마지막 보고**의 끝에 아래 중 하나를 그대로 쓴다(중간 보고에는 쓰지 않는다). 조정 세션의 훅이 이 줄을 읽어 카드를 닫는다.\n" +
-		"- 끝남: 줄 `FD_FINISH " + first + "` (버리면 `FD_FINISH " + first + " dropped`), 다음 줄부터 finish 본문(카드 본문 규약 줄: 무엇을 했나 · `커밋: <sha>` · `파일: <절대 경로>` 등, 정본 " + readme + "), 후속이 있으면 `FD_FOLLOWUPS [{\"id\":\"…\",\"title\":\"…\",\"body\":\"…\"}]` 한 줄, 마지막 줄 `FD_END`.\n" +
+		"- 끝남: 줄 `FD_FINISH " + first + "` (버리면 `FD_FINISH " + first + " dropped`), 다음 줄부터 finish 본문(카드 본문 규약 줄: 무엇을 했나 · `커밋: <sha>` · `파일: <절대 경로>` 등, 정본 " + readme + "), 후속이 있으면 `FD_FOLLOWUPS [{\"id\":\"…\",\"title\":\"…\",\"body\":\"…\",\"blocks\":\"…\"}]` 한 줄(카드가 되는 것은 blocks 가 " + strings.Join(FollowupBlockKinds, "|") + " 인 것뿐, 그 밖 잔손질·확인은 blocks 없이 적으면 미룬 목록 한 줄로 간다), 마지막 줄 `FD_END`.\n" +
 		"- 소유자에게 고르게 돌림(선택 카드를 다 썼을 때): 줄 `FD_OWNER " + first + "`.\n" +
 		"- 막힘: 줄 `FD_BLOCKED " + first + " <사유 한 줄>`.\n"
 }
@@ -501,38 +501,79 @@ var (
 	workerSlugRe   = regexp.MustCompile(`[^a-z0-9]+`)
 )
 
-// WorkerFollowups 는 FD_FOLLOWUPS 의 JSON 을 서버가 읽는 꼴로 고친다. 순수 함수다.
+// FollowupBlockKinds 는 후속을 따로 카드로 열어도 되는 까닭이다. 후속 객체의 "blocks" 칸이 이 중 하나여야
+// 카드가 된다: 돈이 잘못 빠짐 · 남의 데이터 · 개인정보 · 보안 · 자료 손실 · 배포에 꼭 필요한 설정 · 소유자 결정.
+// 그 밖(잔손질 · 확인 · 드문 경우)은 카드를 만들지 않고 finish 본문과 미룬 목록 항목(FD_FOLLOWUP_SINK)에 한 줄로 남는다.
+// 작업자마다 후속 카드를 1~5개씩 열어 큐가 실제 일보다 몇 배 불어나는 것을 막는다.
+var FollowupBlockKinds = []string{"money", "data", "privacy", "security", "loss", "deploy", "owner"}
+
+func followupBlocks(v string) bool {
+	v = strings.ToLower(strings.TrimSpace(v))
+	for _, k := range FollowupBlockKinds {
+		if v == k {
+			return true
+		}
+	}
+	return false
+}
+
+// SplitWorkerFollowups 는 FD_FOLLOWUPS 의 JSON 을 카드로 만들 것과 미룰 것으로 나눈다. 순수 함수다.
 //
-// 작업자가 문자열 목록으로 적어도 받는다: 서버는 {id,title,body} 객체만 읽으므로 문자열 하나를
-// `<항목 id 끝 조각>-fu<n>-<slug>` 항목으로 바꾼다. JSON 이 아니면 그대로 돌려준다 -
-// finish 가 그 자리에서 거절하고 항목은 열린 채로 남는다(결과 줄에 「실패」로 보인다).
-func WorkerFollowups(item, raw string) string {
+// 카드가 되는 것은 "blocks" 가 FollowupBlockKinds 중 하나인 객체뿐이다. 서버는 {id,title,body,...} 만 읽으므로
+// "blocks" 칸은 떼고 넘긴다. 문자열 후속과 blocks 가 없거나 다른 객체는 「제목: 본문」 한 줄로 미룬다.
+// JSON 이 아니면 그대로 돌려준다 - finish 가 그 자리에서 거절하고 항목은 열린 채로 남는다(결과 줄에 「실패」로 보인다).
+func SplitWorkerFollowups(raw string) (cards string, deferred []string) {
 	var arr []json.RawMessage
 	if err := json.Unmarshal([]byte(raw), &arr); err != nil {
-		return raw
+		return raw, nil
 	}
-	tail := item[strings.LastIndex(item, "/")+1:]
-	fixed := make([]any, 0, len(arr))
-	for n, f := range arr {
+	keep := make([]map[string]any, 0, len(arr))
+	for _, f := range arr {
 		var s string
-		if json.Unmarshal(f, &s) != nil {
-			fixed = append(fixed, f)
+		if json.Unmarshal(f, &s) == nil {
+			if s = strings.TrimSpace(s); s != "" {
+				deferred = append(deferred, runeHead(s, 200))
+			}
 			continue
 		}
-		slug := runeHead(strings.Trim(workerSlugRe.ReplaceAllString(strings.ToLower(s), "-"), "-"), 40)
-		if slug == "" {
-			slug = fmt.Sprintf("f%d", n+1)
+		var o map[string]any
+		if json.Unmarshal(f, &o) != nil {
+			return raw, nil
 		}
-		id := runeHead(strings.Trim(fmt.Sprintf("%s-fu%d-%s", tail, n+1, slug), "-"), 60)
-		fixed = append(fixed, map[string]string{"id": id, "title": runeHead(s, 80), "body": s})
+		blocks, _ := o["blocks"].(string)
+		delete(o, "blocks")
+		if followupBlocks(blocks) {
+			keep = append(keep, o)
+			continue
+		}
+		title, _ := o["title"].(string)
+		body, _ := o["body"].(string)
+		if strings.TrimSpace(title) == "" {
+			title, _ = o["id"].(string)
+		}
+		line := strings.TrimSpace(title)
+		if b := strings.TrimSpace(body); b != "" && b != line {
+			line += ": " + b
+		}
+		if line != "" {
+			deferred = append(deferred, runeHead(line, 200))
+		}
+	}
+	if len(keep) == 0 {
+		return "", deferred
 	}
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
 	enc.SetEscapeHTML(false)
-	if enc.Encode(fixed) != nil {
-		return raw
+	if enc.Encode(keep) != nil {
+		return raw, deferred
 	}
-	return strings.TrimSpace(b.String())
+	return strings.TrimSpace(b.String()), deferred
+}
+
+// deferredFollowupBody 는 미룬 후속을 본문에 붙일 꼴이다.
+func deferredFollowupBody(item string, lines []string) string {
+	return "미룬 후속(카드 안 만듦, " + item + "):\n- " + strings.Join(lines, "\n- ")
 }
 
 // workerConventionWord 는 닫는 줄의 낱말이다. 말에 이것이 있는데 규약 꼴로 맞은 줄이 없으면
@@ -664,14 +705,18 @@ func (a *App) hookWorkerClose(ctx context.Context, raw []byte, out io.Writer) {
 			outcome = "done"
 		}
 		follow := ""
+		var deferred []string
 		if fm := workerFollowRe.FindStringSubmatchIndex(body); fm != nil {
-			follow = WorkerFollowups(item, body[fm[2]:fm[3]])
+			follow, deferred = SplitWorkerFollowups(body[fm[2]:fm[3]])
 			body = body[:fm[0]] + body[fm[1]:]
 		}
 		body = strings.TrimSpace(body)
 		if body == "" {
 			add(clip(item, 80)+": FD_FINISH 본문이 비어 닫지 않음", false)
 			continue
+		}
+		if len(deferred) > 0 {
+			body += "\n\n" + deferredFollowupBody(item, deferred)
 		}
 		if !allowed(item) {
 			continue
@@ -690,6 +735,9 @@ func (a *App) hookWorkerClose(ctx context.Context, raw []byte, out io.Writer) {
 		if code == 0 {
 			a.forgetWorkerCard(p.SessionID, launch.ToolUseID, item)
 			add(item+": finish "+outcome+" 완료", true)
+			if len(deferred) > 0 {
+				add(a.sinkDeferred(call, item, deferred))
+			}
 		} else {
 			add(item+": finish "+outcome+" 실패 "+runeHead(o, 300)+labelNote, false)
 		}
@@ -733,4 +781,20 @@ func (a *App) hookWorkerClose(ctx context.Context, raw []byte, out io.Writer) {
 	if !matched && workerConventionWord.MatchString(msg) {
 		add(workerCloseMisshapen, false)
 	}
+}
+
+// sinkDeferred 는 미룬 후속을 FD_FOLLOWUP_SINK 항목에 not-done 판단 하나로 모은다. 결과 줄과 성공 여부를 낸다.
+// 자리가 없으면 finish 본문에만 남았다고 알린다(실패가 아니다).
+func (a *App) sinkDeferred(call func(func(*App, context.Context, []string, io.Writer) int, string, ...string) (int, string), item string, lines []string) (string, bool) {
+	n := fmt.Sprintf("후속 %d건은 카드 대신 미룬 목록으로", len(lines))
+	sink, _ := a.env("FD_FOLLOWUP_SINK")
+	sink = strings.TrimSpace(sink)
+	if sink == "" || !ValidWorkerCardID(sink) {
+		return n + "(finish 본문에만, FD_FOLLOWUP_SINK 없음)", true
+	}
+	code, o := call((*App).runNote, deferredFollowupBody(item, lines), "--kind", "not-done", "--item", sink, "--body", "-")
+	if code != 0 {
+		return n + "(" + sink + " 에 적기 실패 " + runeHead(o, 160) + ", finish 본문에는 있음)", false
+	}
+	return n + "(" + sink + ")", true
 }

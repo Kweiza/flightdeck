@@ -253,8 +253,12 @@ func TestWorkerCloseFinishesWithStringFollowups(t *testing.T) {
 	h := newHarness(t)
 	repo := fdRepo(t, true)
 	h.addItem("wc-f")
+	h.addItem("wc-sink")
+	h.env["FD_FOLLOWUP_SINK"] = "wc-sink"
 	tu := h.launch(repo, "fd:wc-f 하라")
-	msg := "보고\nFD_FINISH wc-f\n무엇을 했나: 고침\n커밋: abc\nFD_FOLLOWUPS [\"Next thing to do\"]\nFD_END\n"
+	msg := "보고\nFD_FINISH wc-f\n무엇을 했나: 고침\n커밋: abc\n" +
+		`FD_FOLLOWUPS ["Next thing to do", {"id":"wc-f-polish","title":"문구 다듬기","body":"잔손질"}, {"id":"wc-f-money","title":"이중 청구 막기","body":"b","blocks":"money"}]` +
+		"\nFD_END\n"
 	payload := closePayload(t, repo, "agent-12345678xyz", tu, msg)
 	_, out := h.run(payload, "hook", "worker-close")
 	var sm struct {
@@ -263,21 +267,52 @@ func TestWorkerCloseFinishesWithStringFollowups(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &sm); err != nil {
 		t.Fatalf("systemMessage 가 아니다: %v\n%s", err, out)
 	}
-	if sm.SystemMessage != "fd 카드: wc-f: finish done 완료" {
+	if sm.SystemMessage != "fd 카드: wc-f: finish done 완료 | 후속 2건은 카드 대신 미룬 목록으로(wc-sink)" {
 		t.Fatalf("systemMessage 가 %q 다", sm.SystemMessage)
 	}
 	it := h.item("wc-f")
 	if it.State != model.ItemDone || hasLabel(it, "status:running") {
 		t.Fatalf("닫히지 않았거나 꼬리표가 남았다: %s %v", it.State, it.Labels)
 	}
-	fu := h.item("wc-f-fu1-next-thing-to-do")
-	if fu.Title != "Next thing to do" {
-		t.Fatalf("문자열 후속이 객체로 안 바뀌었다: %+v", fu)
+	// blocks 까닭이 있는 후속만 카드가 된다
+	if fu := h.item("wc-f-money"); fu.Title != "이중 청구 막기" {
+		t.Fatalf("blocks 후속이 카드가 안 됐다: %+v", fu)
+	}
+	// 나머지는 미룬 목록 항목에 not-done 판단 하나로 모인다
+	found := false
+	for _, j := range h.judgments(model.JudgmentNotDone) {
+		for _, l := range j.Links {
+			if l.TargetID == "wc-sink" && strings.Contains(j.Body, "Next thing to do") && strings.Contains(j.Body, "문구 다듬기: 잔손질") && !strings.Contains(j.Body, "이중 청구") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("미룬 후속이 미룬 목록 항목에 안 모였다")
 	}
 	mustContain(t, "로그", h.closeLog(), "agent=agent-12 wc-f: finish done 완료")
 	// 같은 작업자의 같은 말이 둘째 자리에서 또 와도 두 번 닫지 않는다(둘째가 「실패」로 찍히지 않는다)
 	if _, again := h.run(payload, "hook", "worker-close"); again != "" {
 		t.Fatalf("같은 SubagentStop 에 두 번 일했다: %s", again)
+	}
+}
+
+func TestWorkerCloseDeferredWithoutSinkStaysInBody(t *testing.T) {
+	h := newHarness(t)
+	repo := fdRepo(t, true)
+	h.addItem("wc-n")
+	tu := h.launch(repo, "fd:wc-n 하라")
+	msg := "FD_FINISH wc-n\n무엇을 했나: 고침\nFD_FOLLOWUPS [\"나중에 볼 것\"]\nFD_END\n"
+	_, out := h.run(closePayload(t, repo, "ag-n", tu, msg), "hook", "worker-close")
+	mustContain(t, "systemMessage", out, "wc-n: finish done 완료", "후속 1건은 카드 대신 미룬 목록으로(finish 본문에만")
+	found := false
+	for _, j := range h.judgments(model.JudgmentHandoff) {
+		if strings.Contains(j.Body, "미룬 후속(카드 안 만듦, wc-n)") && strings.Contains(j.Body, "나중에 볼 것") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("미룬 후속이 finish 본문에 안 남았다")
 	}
 }
 
@@ -321,13 +356,18 @@ func TestWorkerCloseFailureIsLoud(t *testing.T) {
 	}
 }
 
-func TestWorkerFollowups(t *testing.T) {
-	got := WorkerFollowups("grp/x", `["한글 후속", {"id":"k","title":"t","body":"b"}]`)
-	want := `[{"body":"한글 후속","id":"x-fu1-f1","title":"한글 후속"},{"id":"k","title":"t","body":"b"}]`
-	if got != want {
-		t.Fatalf("WorkerFollowups =\n%s\n기대\n%s", got, want)
+func TestSplitWorkerFollowups(t *testing.T) {
+	cards, deferred := SplitWorkerFollowups(`["한글 후속", {"id":"k","title":"t","body":"b"}, {"id":"m","title":"돈","body":"b2","blocks":" Money "}]`)
+	if want := `[{"body":"b2","id":"m","title":"돈"}]`; cards != want {
+		t.Fatalf("cards =\n%s\n기대\n%s", cards, want)
 	}
-	if got := WorkerFollowups("a", "[깨짐"); got != "[깨짐" {
+	if want := []string{"한글 후속", "t: b"}; strings.Join(deferred, "|") != strings.Join(want, "|") {
+		t.Fatalf("deferred = %q", deferred)
+	}
+	if cards, deferred := SplitWorkerFollowups(`[{"id":"x","title":"x","blocks":"nice-to-have"}]`); cards != "" || len(deferred) != 1 {
+		t.Fatalf("목록 밖 blocks 는 미뤄야 한다: %q %q", cards, deferred)
+	}
+	if got, d := SplitWorkerFollowups("[깨짐"); got != "[깨짐" || d != nil {
 		t.Fatalf("깨진 JSON 은 그대로 넘겨야 한다(finish 가 거절해 항목이 열린 채 남는다): %s", got)
 	}
 }
