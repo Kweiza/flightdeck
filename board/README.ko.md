@@ -191,7 +191,7 @@ MCP 안내문 한 줄(`server/internal/mcpsrv/protocol.go` 의 `Instructions`)�
 
 | 동작 | 꼬리표 | 판단 노트(제목 / 본문) |
 | --- | --- | --- |
-| 댓글 | 그대로 | `[fdboard] 소유자 댓글` / 쓴 글 |
+| 댓글(버튼 또는 글칸에서 ⌘/Ctrl+Enter) | 그대로 | `[fdboard] 소유자 댓글` / 쓴 글 |
 | 「했어」(status:owner 카드만) | `-status:owner +status:owner-done` | `[fdboard] 소유자: 했어` / `소유자: 했어` |
 | 선택 버튼 | `-status:owner +status:owner-done` | `[fdboard] 소유자 선택: <보기>` / `소유자 선택: <보기>` |
 | 상태 옮기기(끌어 놓기 · 상세 메뉴) | 진행 중 `+status:running`, 소유자 차례 `+status:owner`, 대기 = 넷 다 뗌(옮길 때 다른 status:* 는 뗌) | `[fdboard] 소유자: 옮김 -> <열>` / 같은 글(꼬리표가 바뀌었을 때만) |

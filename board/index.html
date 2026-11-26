@@ -594,8 +594,22 @@ dialog .d-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 0 
     const ta = el("textarea"); ta.placeholder = "조정자에게 남길 말"; ta.rows = 3;
     const b = el("button", "primary", "댓글 남기기");
     b.onclick = async () => { const text = ta.value.trim(); if (!text) return; b.disabled = true; await act("/api/note", { id: it.ID, text }, "댓글 남김"); b.disabled = false; };
+    submitOnModEnter(ta, b);
+    ta.placeholder += " (⌘/Ctrl+Enter 로 남기기)";
     const row = el("div", "row"); row.style.marginTop = "6px"; row.append(b);
     return section("댓글", ta, row);
+  }
+
+  // 글칸에서 ⌘+Enter(맥) · Ctrl+Enter 를 누르면 그 글칸의 보내기 버튼을 누른 것과 같다.
+  // 한글 조합 중에 누르면 마지막 글자가 아직 값에 없으니, 조합이 끝난 뒤 누른다.
+  function submitOnModEnter(ta, button) {
+    ta.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" || !(e.metaKey || e.ctrlKey)) return;
+      e.preventDefault();
+      if (button.disabled) return;
+      if (e.isComposing) { ta.addEventListener("compositionend", () => button.click(), { once: true }); return; }
+      button.click();
+    });
   }
 
   async function openDetail(id) {

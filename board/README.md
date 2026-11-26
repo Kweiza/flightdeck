@@ -191,7 +191,7 @@ Every note is kind `decision`, titled with the `[fdboard]` prefix, linked to the
 
 | Action | Labels | Judgment note (title / body) |
 | --- | --- | --- |
-| Comment | unchanged | `[fdboard] 소유자 댓글` / the text |
+| Comment (button, or ⌘/Ctrl+Enter in the text box) | unchanged | `[fdboard] 소유자 댓글` / the text |
 | 「했어」 (status:owner cards only) | `-status:owner +status:owner-done` | `[fdboard] 소유자: 했어` / `소유자: 했어` |
 | Choose button | `-status:owner +status:owner-done` | `[fdboard] 소유자 선택: <option>` / `소유자 선택: <option>` |
 | Move (drag · detail menu) | running `+status:running`, owner `+status:owner`, waiting = all four removed | `[fdboard] 소유자: 옮김 -> <column>` / same (only when labels changed) |
