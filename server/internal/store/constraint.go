@@ -345,7 +345,7 @@ func Unabsorbable(err error) bool {
 }
 
 // asFault 는 트랜잭션 실패(잠금 못 얻음 · 직렬화 실패 · 교착 · 버려진 트랜잭션)를 *TxFault 로 감싼다.
-// 아니면 그대로 낸다. 트랜잭션의 끝(runTx · ReadTx · applyStep)이 부른다 - 어느 문장에서 났든 거기서 한 번 옮긴다.
+// 아니면 그대로 낸다. 트랜잭션의 끝(runTx · ReadTx · stepTx)이 부른다 - 어느 문장에서 났든 거기서 한 번 옮긴다.
 func asFault(err error) error {
 	if err == nil {
 		return nil

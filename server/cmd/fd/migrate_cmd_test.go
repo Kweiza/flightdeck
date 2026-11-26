@@ -266,7 +266,7 @@ func TestMigrateRollbackNamesThePostgresDump(t *testing.T) {
 		t.Fatalf("덤프 없는 되돌리기가 원장 식별을 안 말한다: %s", out)
 	}
 	dump := filepath.Join(dir, fmt.Sprintf("fd-%s-from%d-20261126T160203Z.dump", id[1], store.SchemaVersion))
-	if err := os.WriteFile(dump, []byte("PGDMP-test"), 0o600); err != nil {
+	if err := os.WriteFile(dump, []byte(storetest.FakeDump(strings.TrimPrefix(u.Path, "/"), 16)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	db, err := sql.Open("pgx", dsn)

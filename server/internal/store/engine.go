@@ -383,20 +383,32 @@ func (e engine) versionTableQuery() string {
 
 // schemaObjectsQuery 는 스키마 객체 수를 세는 질의다. PlanMigration 이 0(빈 DB) · 1 이하(판 표만) · 그 위를 가른다.
 //
-// ★ Postgres 판은 사용자 스키마 **전부**의 관계(표 · 인덱스 · 뷰 · 시퀀스 · 외부 표)를 센다. 시스템 스키마(pg_catalog ·
-// pg_toast · pg_temp_N 등 pg_ 로 시작하는 이름은 사용자가 못 만든다)와 information_schema 만 뺀다. 이름 없는 질의가
-// 닿는 스키마(current_schema)만 세면 public 은 비고 다른 스키마에 업무 표가 있는 DB 를 빈 DB 로 읽어, 백업 없이 기준선을
-// 깔고 DB 단위 권한(PUBLIC 의 TEMPORARY 회수)까지 바꾼다. 확장이 깐 것은 뺀다 - 준비(pg/bootstrap.sql)만 돈 DB 에는
-// pg_trgm 이 있지만 그것은 아직 빈 원장이다. 트리거 · 함수는 안 센다: 표 없이 그것만 있는 DB 는 기준선이 만들 수 없는
-// 모양이고, 기준선의 객체는 표부터 생긴다.
+// ★ Postgres 판은 사용자 스키마 **전부**의 객체를 센다: 관계(표 · 인덱스 · 뷰 · 구체화 뷰 · 시퀀스 · 외부 표), 함수
+// (pg_proc - 프로시저 · 집계 포함), 타입(pg_type - 열거 · 도메인 · 범위 · 독립 복합 타입 · 기본 타입). 시스템 스키마
+// (pg_catalog · pg_toast · pg_temp_N 등 pg_ 로 시작하는 이름은 사용자가 못 만든다)와 information_schema 만 뺀다. 이름 없는
+// 질의가 닿는 스키마(current_schema)만, 또는 표만 세면 public 은 비고 다른 스키마에 업무 객체가 있거나 함수 · 열거형만 있는
+// 업무 DB 를 빈 DB 로 읽어, 백업 없이 기준선을 깔고 DB 단위 권한(PUBLIC 의 TEMPORARY 회수)까지 바꾼다.
+//
+// 세지 않는 것(pg_depend 한 규칙): 확장이 깐 것(deptype 'e') - 준비(pg/bootstrap.sql)만 돈 DB 에는 pg_trgm 이 있지만 그것은
+// 아직 빈 원장이다. 다른 객체에 딸려 저절로 생긴 것(deptype 'i': 표 · 뷰의 행 타입, 배열 타입, 범위 타입의 다중 범위 타입과
+// 생성자 함수, 제약이 만든 인덱스, 식별 열의 시퀀스) - 그 주인(관계 · 원소 타입 · 범위 타입 · 제약의 표)이 따로 세이거나
+// 확장 것이다. 그래서 사람이 만든 객체 하나는 한 번만 세고, 거절 사유의 개수가 그 수다. 독립 복합 타입은 거꾸로 관계
+// (relkind 'c')가 타입에 딸리므로 타입 쪽에서 센다. 트리거는 표 없이 못 있다. 딸린 것을 빼도 판정(0 · 1 이하)은 안
+// 바뀐다: 딸린 것의 주인이 늘 함께 세인다.
 func (e engine) schemaObjectsQuery() string {
 	if e == enginePG {
-		return `SELECT count(*) FROM pg_catalog.pg_class c
-			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-			WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
-			  AND c.relkind IN ('r', 'p', 'v', 'm', 'i', 'S', 'f')
-			  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
-			                  WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')`
+		return `WITH ns AS (SELECT oid FROM pg_catalog.pg_namespace
+		                    WHERE nspname <> 'information_schema' AND nspname !~ '^pg_'),
+		          part AS (SELECT classid, objid FROM pg_catalog.pg_depend WHERE deptype IN ('e', 'i'))
+		     SELECT (SELECT count(*) FROM pg_catalog.pg_class c
+		              WHERE c.relnamespace IN (SELECT oid FROM ns) AND c.relkind IN ('r', 'p', 'v', 'm', 'i', 'S', 'f')
+		                AND (c.tableoid, c.oid) NOT IN (SELECT classid, objid FROM part))
+		          + (SELECT count(*) FROM pg_catalog.pg_proc p
+		              WHERE p.pronamespace IN (SELECT oid FROM ns)
+		                AND (p.tableoid, p.oid) NOT IN (SELECT classid, objid FROM part))
+		          + (SELECT count(*) FROM pg_catalog.pg_type t
+		              WHERE t.typnamespace IN (SELECT oid FROM ns)
+		                AND (t.tableoid, t.oid) NOT IN (SELECT classid, objid FROM part))`
 	}
 	return `SELECT count(*) FROM sqlite_master WHERE type IN ('table','index','trigger','view')`
 }
@@ -994,7 +1006,8 @@ func (e engine) lockStmt(sp txSpec) (string, []any) {
 }
 
 // begin 은 store 의 트랜잭션이 열리는 단 한 자리다. 종류가 격리 수준과 잠금을 정한다.
-// 부르는 자리는 runTx(Tx · ObsTx) · ReadTx · applyStep 셋뿐이다(engine_test.go 가 잠근다).
+// 부르는 자리는 runTx(Tx · ObsTx) · ReadTx · stepTx(증분) · exportSnapshot(판올림 전 덤프의 스냅숏) 넷뿐이다
+// (engine_test.go 가 잠근다).
 //
 // 쓰기 종류는 잠금을 받기까지 기다린 시간을 잰다(/metrics). Postgres 는 잠금 문장만 잰다 - 연결 풀 대기는
 // DBStats 의 풀 축이 따로 센다. SQLite 는 BEGIN IMMEDIATE 가 곧 잠금이라 BeginTx 전체를 잰다(풀 대기가 섞인다).

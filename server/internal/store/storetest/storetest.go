@@ -311,6 +311,35 @@ var srv struct {
 	err   error
 }
 
+// FakeDump 는 pg_dump 사용자 정의 형식(-Fc)의 머리(판 1.<vmin>, int 4바이트, DB 이름 db)와 그 뒤 아무 바이트다. 되돌리기가
+// 덤프 머리에서 DB 이름을 읽으므로 PGDMP 다섯 글자만으로는 덤프 노릇을 못 한다. 1.15 부터 압축이 1바이트, 그 전은 int 다
+// (pg_dump 의 WriteHead).
+func FakeDump(db string, vmin byte) string {
+	var b []byte
+	putInt := func(v int) {
+		sign := byte(0)
+		if v < 0 {
+			sign, v = 1, -v
+		}
+		b = append(b, sign, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+	}
+	b = append(b, "PGDMP"...)
+	b = append(b, 1, vmin, 0, 4, 8, 1)
+	if vmin >= 15 {
+		b = append(b, 0)
+	} else {
+		putInt(-1)
+	}
+	for _, v := range []int{3, 2, 1, 27, 10, 126, 0} {
+		putInt(v)
+	}
+	putInt(len(db))
+	b = append(b, db...)
+	putInt(4)
+	b = append(b, "17.2"...)
+	return string(b) + "-rest"
+}
+
 func server() (*url.URL, *sql.DB, error) {
 	srv.once.Do(func() {
 		if srv.base, srv.err = adminURL(os.Getenv(EnvDSN)); srv.err == nil {

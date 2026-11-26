@@ -968,7 +968,7 @@ func openMigrator(path string, opt MigrateOptions, log *slog.Logger) (*Store, mi
 		}
 		run.steps = pgMigrations
 		run.backup = func(ctx context.Context, sess *migrateSession, from int) (string, error) {
-			return backupPG(ctx, t, sess, opt.BackupDir, from, log)
+			return s.backupPG(ctx, t, sess, opt.BackupDir, from)
 		}
 		return s, run, nil
 	}
@@ -1265,16 +1265,27 @@ func (s *Store) applySteps(ctx context.Context, sess *migrateSession, steps []Mi
 // 끼어 반쯤 바뀐 스키마 위에서 커밋할 수 있다. 같은 잠금이면 적용이 도는 동안 들어온 쓰기는 적용이 끝날
 // 때까지 기다린다(pg_tx_test.go 의 DDL 중 쓰기 시험). SQLite 는 BEGIN IMMEDIATE 라 원래 그렇다. Postgres 는 실행기
 // 세션이 그 잠금을 이미 쥐고 있고, 트랜잭션을 그 세션에서 열므로 곧장 받는다(migrateSession 의 ★).
+func (s *Store) applyStep(ctx context.Context, sess *migrateSession, m Migration) error {
+	return s.stepTx(ctx, sess, m, stepBody)
+}
+
+// stepTx 는 증분 트랜잭션 하나의 수명이다: 실행기 세션에서 열고 → body → 커밋, 실패하면 되감는다. 안의 일(stepBody)과
+// 가른 것은 수명 규칙(어느 길로 나가도 닫는다)을 따로 재려고다. 끝에서 오류를 한 번 옮긴다(asFault) - 증분의 잠금 대기
+// 초과(55P03)도 Tx 와 같은 *TxFault 로 나간다.
 //
-// 끝에서 오류를 한 번 옮긴다(asFault) - 증분의 잠금 대기 초과(55P03)도 Tx 와 같은 *TxFault 로 나간다.
-func (s *Store) applyStep(ctx context.Context, sess *migrateSession, m Migration) (err error) {
+// ★ 열자마자 되감기를 미뤄 둔다(defer). body 가 패닉이면 명시 롤백을 건너뛰는데, 그러면 트랜잭션이 열린 채로 세션 해제
+// (migrateSession.release)까지 올라가고 *sql.Conn 의 Close 가 열린 트랜잭션이 끝나기를 영영 기다린다 - 패닉이 밖으로
+// 나가지도 못하고 실행기가 선다. defer 는 세션 해제보다 먼저 돈다(안쪽 함수의 defer 가 먼저다). 커밋한 뒤의 되감기는
+// sql.ErrTxDone 으로 아무것도 안 한다.
+func (s *Store) stepTx(ctx context.Context, sess *migrateSession, m Migration, body func(context.Context, *txConn, Migration) error) (err error) {
 	defer func() { err = asFault(err) }()
 	start := time.Now()
 	tx, err := s.begin(ctx, txSpec{kind: txWrite, on: sess})
 	if err != nil {
 		return fmt.Errorf("증분 %d(%s) 트랜잭션 시작 실패(path=%q): %w", m.To, m.Name, s.path, err)
 	}
-	if err := stepBody(ctx, tx, m); err != nil {
+	defer func() { _ = tx.Rollback() }()
+	if err := body(ctx, tx, m); err != nil {
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 			return fmt.Errorf("증분 %d(%s) 실패(path=%q): %w (롤백도 실패: %v)", m.To, m.Name, s.path, err, rbErr)
 		}

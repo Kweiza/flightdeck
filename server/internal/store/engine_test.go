@@ -498,7 +498,7 @@ func TestNoRawDatabaseOutsideStore(t *testing.T) {
 }
 
 // TestTxKindsAreFour 는 트랜잭션을 여는 자리를 잠근다: BeginTx 는 begin 한 곳, begin 을 부르는 것은
-// runTx(Tx · ObsTx) · ReadTx · applyStep(증분 적용) 셋뿐이다.
+// runTx(Tx · ObsTx) · ReadTx · stepTx(증분 적용) · exportSnapshot(판올림 전 덤프의 스냅숏) 넷뿐이다.
 //
 // ★ 직렬성 규칙(격리 수준 · 전역 잠금)은 begin 에만 산다. 다른 자리에서 트랜잭션을 열면 그 트랜잭션은
 // 잠금도 격리 수준도 없이 돈다 - Postgres 에서 조용히 깨지는 바로 그 모양이다.
@@ -520,7 +520,7 @@ func TestTxKindsAreFour(t *testing.T) {
 	})
 	for name, want := range map[string][]site{
 		"BeginTx": {{"engine.go", "begin"}},
-		"begin":   {{"store.go", "ReadTx"}, {"store.go", "applyStep"}, {"store.go", "runTx"}},
+		"begin":   {{"pgdump.go", "exportSnapshot"}, {"store.go", "ReadTx"}, {"store.go", "runTx"}, {"store.go", "stepTx"}},
 		"runTx":   {{"store.go", "ObsTx"}, {"store.go", "Tx"}},
 	} {
 		var got []site

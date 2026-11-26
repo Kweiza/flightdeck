@@ -177,6 +177,7 @@ The server reads environment variables through compose; sessions read `~/.flight
 | `FD_REPOS2`–`FD_REPOS4` | server | Extra mounts when repositories live in several trees |
 | `FD_UID` · `FD_GID` | server | Host user and group id (default 1000) |
 | `FD_LEDGER_HOST` | server | Where the ledger backup goes (default `~/.flightdeck-ledger`) |
+| `FD_BACKUP_DIR` | server | Where `fd migrate` writes the dump it takes before upgrading a Postgres ledger (`--backup-dir` wins; when both are empty, `/backups` if it exists). **Give each deployment its own directory**: a test system cloned by physical replication shares the ledger identity (cluster identifier and database name) with its source, so in a shared directory a rollback could pick the other deployment's dump |
 | `FD_URL` | session | Server address (default `http://127.0.0.1:7420`) |
 | `FD_STATE_DIR` | session | Put the state files (outbox, caches, machine id) in one place |
 | `FD_LANG` | server · session | Output language. `en` for English (default Korean). The server side covers the dashboard; the session side covers the CLI, hooks and MCP replies |
