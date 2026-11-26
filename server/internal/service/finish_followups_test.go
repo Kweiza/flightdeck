@@ -1,6 +1,9 @@
 package service
 
 import (
+	"errors"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -141,5 +144,83 @@ func TestFinishFollowupGateIsPerItem(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "spun-off-b") {
 		t.Fatalf("둘째 항목의 거절이 자기 후속을 안 낸다:\n%s", err.Error())
+	}
+}
+
+// TestFollowupEligibilityStaysInItsProject 는 후속 자격이 마무리하는 항목의 프로젝트에서 만든 것만 보는지 두 엔진에서
+// 잰다. 루트를 선점한 세션이 멤버 프로젝트에 twin 을 만들고, 루트에는 남의 열린 twin 이 있다. 세션 이벤트를 프로젝트
+// 없이 읽던 판은 멤버에서 만든 twin 의 생성 이벤트로 루트의 남의 twin 을 「이 세션이 만든 열린 항목」으로 보고, 이
+// 마무리의 판단을 걸었다(관문도 그것을 바닥에 떨어뜨린 후속으로 봤다).
+//
+// 대조: 같은 세션이 멤버 프로젝트의 항목을 마무리할 때는 그 프로젝트에서 만든 twin 을 잇는다 - 거르기가 정당한 자격까지
+// 죽이지 않는지 본다.
+func TestFollowupEligibilityStaysInItsProject(t *testing.T) {
+	for _, e := range bothLedgers() {
+		t.Run(e.name, func(t *testing.T) {
+			s, st := e.open(t)
+			root := wsRepo(t, twoMemberYAML, "member-a", "member-b")
+			me := openSession(t, s, "repo", root, root, "cc-root", "").Session.ID
+			a := filepath.Join(root, "member-a")
+			openSession(t, s, "search-api", a, a, "cc-a", "") // 멤버 프로젝트를 원장에 세운다
+			other := openSession(t, s, "repo", root, root, "cc-other", "").Session.ID
+			addItem(t, s, "repo", "batch7", nil, nil)
+			addItem(t, s, "search-api", "member7", nil, nil)
+			claimed(t, s, "repo", me, "batch7")
+			claimed(t, s, "search-api", me, "member7")
+
+			addItemAs(t, s, "search-api", me, "twin") // 이 세션이 멤버에 만든 것
+			addItemAs(t, s, "repo", other, "twin")    // 루트의 같은 id 는 남의 것이다
+
+			if got := s.followupCandidates(ctx(), FinishInput{Project: "repo", SessionID: me, ItemID: "batch7"}); slices.Contains(got, "twin") {
+				t.Errorf("관문이 루트에 있는 남의 twin 을 이 세션이 바닥에 떨어뜨린 후속으로 본다: %v", got)
+			}
+			_, err := s.Finish(ctx(), FinishInput{
+				Project: "repo", SessionID: me, ItemID: "batch7",
+				Outcome: model.ItemDone, Title: "끝냈다", Body: "판단 본문",
+				Followups: []FollowupInput{{ID: "twin"}},
+			})
+			var ref *RefusedError
+			if !errors.As(err, &ref) {
+				t.Fatalf("멤버에서 만든 twin 으로 루트의 남의 twin 을 잇는 마무리가 거절되지 않았다: %v", err)
+			}
+			if n := countRows(t, st, `SELECT count(*) FROM judgment_link WHERE target_kind = 'item' AND target_id = 'twin'`); n != 0 {
+				t.Fatalf("남의 twin 에 이 마무리의 판단 링크가 %d건 걸렸다", n)
+			}
+
+			res, err := s.Finish(ctx(), FinishInput{
+				Project: "search-api", SessionID: me, ItemID: "member7",
+				Outcome: model.ItemDone, Title: "끝냈다", Body: "판단 본문",
+				Followups: []FollowupInput{{ID: "twin"}},
+			})
+			if err != nil {
+				t.Fatalf("멤버에서 만든 twin 을 그 멤버의 마무리가 못 잇는다: %v", err)
+			}
+			if !slices.Equal(res.LinkedFollowups, []string{"twin"}) {
+				t.Fatalf("이은 후속이 %v 다(기대 [twin])", res.LinkedFollowups)
+			}
+		})
+	}
+}
+
+// TestFinishGatesRememberFiringPerProject 는 두 「한 번만 막는」 관문(후속 · 폐기 종속)이 이미 막았는지를 마무리하는 항목의
+// 프로젝트 안에서만 찾는지 잰다. 항목은 (프로젝트, id) 로 하나라, 다른 프로젝트의 같은 id 에 낸 발화로 이 항목의 관문을
+// 건너뛰면 그 관문은 한 번도 안 막는다.
+func TestFinishGatesRememberFiringPerProject(t *testing.T) {
+	s, st := newSvc(t)
+	for _, c := range []struct {
+		kind   string
+		warned func(FinishInput) bool
+	}{
+		{followupsMissingEvent, func(in FinishInput) bool { return s.alreadyWarnedFollowups(ctx(), in) }},
+		{droppedDepsEvent, func(in FinishInput) bool { return s.alreadyWarnedDroppedDeps(ctx(), in) }},
+	} {
+		sess := "sess-" + c.kind
+		st.LogEvent(ctx(), c.kind, "member", sess, map[string]any{"item": "batch7"})
+		if c.warned(FinishInput{Project: "root", SessionID: sess, ItemID: "batch7"}) {
+			t.Errorf("%s: 다른 프로젝트의 같은 id 에 낸 발화를 이 항목의 것으로 본다", c.kind)
+		}
+		if !c.warned(FinishInput{Project: "member", SessionID: sess, ItemID: "batch7"}) {
+			t.Errorf("%s: 같은 프로젝트 · 항목에 낸 발화를 못 본다", c.kind)
+		}
 	}
 }

@@ -119,13 +119,17 @@ func markTxOutcome(payload any, committed bool) any {
 	}
 }
 
-// PayloadRolledBack 은 예약 이벤트 payload 의 결말 표시(TxOutcomeKey)가 롤백인가다. 표시가 없거나 payload 를 못
-// 읽으면 거짓이다 - 롤백을 단정할 관측이 없다(QueueReproduction 의 「결말 표시가 없는 행은 센다」와 같은 규율).
+// PayloadCommitted 는 예약 이벤트 payload 의 결말 표시(TxOutcomeKey)가 커밋인가다. 표시가 없거나 payload 를 못
+// 읽으면 거짓이다 - 커밋을 단정할 관측이 없다.
 //
-// store 밖에서 결말을 읽는 자리(service 의 후속 자격)가 키 이름을 다시 적지 않게 여기 둔다.
-func PayloadRolledBack(payload string) bool {
+// ★ 계측과 방향이 반대다. QueueReproduction 은 표시 없는 행을 센다(안 세면 표시 이전 구간이 통째로 0이 된다). 이 판정을
+// 쓰는 쪽은 그 행을 근거로 쓰기를 하는 자리라(service 의 후속 자격: 판단 링크를 건다) 커밋이 확인된 행만 근거로 삼는다.
+// 표시 이전 코드도 이벤트를 삽입 전에 예약하고 롤백 뒤에 흘렸으므로, 표시 없는 행에는 실패한 시도가 섞여 있고 가를 길이 없다.
+//
+// store 밖에서 결말을 읽는 자리가 키 이름을 다시 적지 않게 여기 둔다.
+func PayloadCommitted(payload string) bool {
 	var p map[string]any
-	return json.Unmarshal([]byte(payload), &p) == nil && p[TxOutcomeKey] == TxRolledBack
+	return json.Unmarshal([]byte(payload), &p) == nil && p[TxOutcomeKey] == TxCommitted
 }
 
 // ListEvents 는 종류로 걸러 최신순으로 낸다. kind 가 비면 전 종류다.

@@ -25,8 +25,9 @@ import (
 //	흡수: e 가 있을 때 들어가는 갈래(e != nil, errors.As(e, &DB 오류 타입), 분류기(e))에 오류를 내며 나가지 않는 길이 있다.
 //	      마지막 값이 nil 인 return(return nil · return v, nil)도 오류를 버린다. 갈래를 그냥 빠져나가도 바로 다음 문장이
 //	      그 e 를 내는 return 이면(if e != nil { 기록 }; return e) 전파라 안 친다
-//	통과: if 의 Init 에서 받은 e 를 e == nil 로 보고, 오류일 때 오류를 내며 나가는 갈래가 사슬에 없다(return nil 로
-//	      나가는 else if · else 는 오류를 버린 것이라 나가는 갈래로 안 친다)
+//	통과: if 의 Init 에서 받은 e 를 e == nil 로 보고, 뒤 사슬(else if · else)에서 문장 실패를 받을 수 있는 갈래 중 하나라도
+//	      오류를 내며 나가지 않거나(return nil 로 나가는 것 포함), 실패가 사슬을 빠져나간다. 갈래마다 따로 본다 - 표지 ·
+//	      도메인 오류만 고르는 갈래는 안 보고, 실패를 전부 고른 갈래가 오류를 내며 나가면 그 뒤 갈래에는 실패가 안 온다
 //	이어 쓰기: e 가 있을 때 들어가는 갈래 안에서 다시 트랜잭션 호출을 한다(저장점 열기도 이미 버려진 트랜잭션에선 실패한다)
 //
 // ★ 문장 실패가 아닌 오류는 흡수해도 된다: 표지 오류(errors.Is(e, …), ErrNotFound 등은 행이 없다는 뜻이다)와
@@ -182,6 +183,13 @@ func fine(t *Tx) error {
 	} else if !errors.Is(cerr, ErrNotFound) {
 		return cerr
 	}
+	if c, cerr := t.claimRow(p, id); cerr == nil {
+		use(c)
+	} else if errors.Is(cerr, ErrNotFound) {
+		return nil
+	} else {
+		return cerr
+	}
 	if _, err := t.GetItem(p, id); err == nil {
 		return nil
 	} else {
@@ -194,6 +202,17 @@ func passElseIfNil(t *Tx) error {
 		use(c)
 	} else if !errors.Is(cerr, ErrNotFound) {
 		return nil
+	}
+	return nil
+}
+
+func passEarlyNil(t *Tx) error {
+	if c, cerr := t.claimRow(p, id); cerr == nil {
+		use(c)
+	} else if !errors.Is(cerr, ErrNotFound) {
+		return nil
+	} else {
+		return cerr
 	}
 	return nil
 }
@@ -273,7 +292,7 @@ func otherTx(t *Tx) error {
 		"absorb " + ruleAbsorb: true, "writeAfter " + ruleWriteAfter: true, "returnNil " + ruleAbsorb: true,
 		"returnValueNil " + ruleAbsorb: true, "propagateReset " + ruleAbsorb: true, "obs " + ruleAbsorb: true,
 		"ledger " + ruleAbsorb:      true,
-		"passElseIfNil " + rulePass: true, "passElseNil " + rulePass: true,
+		"passElseIfNil " + rulePass: true, "passEarlyNil " + rulePass: true, "passElseNil " + rulePass: true,
 		"passThrough " + rulePass: true, "closure " + ruleAbsorb: true, "duplicate " + ruleAbsorb: true,
 	}
 	gotCtx := map[string]bool{}
@@ -282,7 +301,8 @@ func otherTx(t *Tx) error {
 	}
 	wantCtx := map[string]bool{
 		"absorb": true, "writeAfter": true, "returnNil": true, "returnValueNil": true, "propagate": true,
-		"propagateReset": true, "obs": true, "ledger": true, "fine": true, "passElseIfNil": true, "passElseNil": true,
+		"propagateReset": true, "obs": true, "ledger": true, "fine": true, "passElseIfNil": true, "passEarlyNil": true,
+		"passElseNil": true,
 		"passThrough": true, "closure": true, "duplicate": true,
 	}
 	if !maps.Equal(got, want) || !maps.Equal(gotCtx, wantCtx) {
@@ -878,14 +898,25 @@ func initDefines(init ast.Stmt, name string) bool {
 	return false
 }
 
-// chainExitsOnFailure 는 if · else if 사슬에 문장 실패일 수 있는 오류를 전부 받아 오류를 내며 나가는 갈래가 있는가다.
-// 그 갈래가 return nil 로 나가면 오류를 버린 것이라 나가는 갈래로 안 친다(errBranch 의 returnsNil 과 같은 판정).
+// chainExitsOnFailure 는 if · else if 사슬에서 문장 실패를 받을 수 있는 갈래가 모두 오류를 내며 나가고, 실패가 사슬을
+// 빠져나가는 길이 없는가다. 머리가 e == nil 이라 뒤 갈래는 모두 오류를 받는다.
+//
+// ★ 갈래마다 따로 판정한다. 오류를 내며 나가는 갈래 하나만 찾으면 앞 갈래가 버린 실패를 못 본다:
+// else if !errors.Is(e, ErrNotFound) { return nil } else { return e } 에서 실패는 앞 갈래로 가 버려지고 뒤 else 는
+// ErrNotFound 만 받는다. 표지 · 도메인 오류만 고르는 갈래(notStatementFailure)에는 실패가 안 오므로 안 본다. 실패를 전부
+// 고른 갈래(coversFailures)가 오류를 내며 나가면 그 뒤에는 실패가 안 온다. return nil 로 나가는 갈래는 오류를 버린 것이다
+// (errBranch 의 returnsNil 과 같은 판정).
 func (f *fnScan) chainExitsOnFailure(n *ast.IfStmt) bool {
 	for {
 		switch els := n.Else.(type) {
 		case *ast.IfStmt:
-			if f.coversFailures(els.Cond) && f.raises(els.Body.List) {
-				return true
+			if !f.notStatementFailure(els.Cond) {
+				if !f.raises(els.Body.List) {
+					return false
+				}
+				if f.coversFailures(els.Cond) {
+					return true
+				}
 			}
 			n = els
 		case *ast.BlockStmt:

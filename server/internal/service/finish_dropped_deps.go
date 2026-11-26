@@ -79,7 +79,7 @@ func (s *Service) judgeDroppedWithDependents(ctx context.Context, in FinishInput
 // 항목 id 까지 보는 이유는 alreadyWarnedFollowups 와 같다 — 한 세션이 항목 여럿을 마무리한다.
 // 세션만 보면 첫 항목에서 발화한 뒤 둘째 항목은 조용히 지나간다.
 func (s *Service) alreadyWarnedDroppedDeps(ctx context.Context, in FinishInput) bool {
-	evs, err := s.st.ListSessionEvents(ctx, in.SessionID, droppedDepsEvent, time.Time{})
+	evs, err := s.sessionEventsIn(ctx, in.Project, in.SessionID, droppedDepsEvent, time.Time{})
 	if err != nil {
 		return true // 못 읽었으면 막지 않는다 — 관문의 실패가 마무리를 막으면 안 된다
 	}

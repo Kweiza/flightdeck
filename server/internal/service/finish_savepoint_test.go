@@ -248,14 +248,29 @@ func armJudgmentFailure(t *testing.T, engine string, st *store.Store) (disarm fu
 //	               id 를 만든다 → 같은 마무리를 다시 보낸다.
 //	등록 실패:     남이 먼저 만든 id 를 이 세션이 add 하다 중복으로 롤백된다(item.add 가 롤백 표시로 남는다) → 그 id 를
 //	               후속으로 싣는다.
+//	표시 없는 옛 실패: 표시가 생기기 전 코드도 생성 이벤트를 삽입 전에 예약하고 롤백 뒤에 흘렸다. 그 행은 결말 표시 없이
+//	               남는다 → 선점이 업그레이드를 넘어 이어지면 그 id 의 남의 항목을 후속으로 싣는다. 표시를 안 붙이는
+//	               Store.LogEvent 로 그 행을 그대로 심는다(두 kind 각각).
 func TestFinishDoesNotAdoptAnItemWhoseCreationRolledBack(t *testing.T) {
+	const (
+		rolledBack = `AND payload LIKE '%"tx":"rolled_back"%'`
+		unmarked   = `AND payload NOT LIKE '%"tx":%'`
+	)
+	// plantUnmarked 는 남이 gone-x 를 만든 뒤, 이 세션이 그 id 를 만들려다 실패한 옛 행(결말 표시 없음)을 심는다.
+	plantUnmarked := func(kind string) func(t *testing.T, s *Service, st *store.Store, in FinishInput, other string) {
+		return func(t *testing.T, s *Service, st *store.Store, in FinishInput, other string) {
+			addItemAs(t, s, "p", other, "gone-x")
+			st.LogEvent(ctx(), kind, "p", in.SessionID, map[string]any{"item": "gone-x"})
+		}
+	}
 	for _, e := range bothLedgers() {
 		for _, c := range []struct {
 			name  string
 			kind  string
+			mark  string // 전제: 이 세션의 gone-x 생성 이벤트가 어떤 결말 표시로 남았나
 			spoil func(t *testing.T, s *Service, st *store.Store, in FinishInput, other string)
 		}{
-			{"마무리 재시도", followupCreatedEvent, func(t *testing.T, s *Service, st *store.Store, in FinishInput, other string) {
+			{"마무리 재시도", followupCreatedEvent, rolledBack, func(t *testing.T, s *Service, st *store.Store, in FinishInput, other string) {
 				disarm := armJudgmentFailure(t, e.name, st)
 				if _, err := s.Finish(ctx(), in); err == nil {
 					t.Fatal("판단 저장이 실패했는데 마무리가 성공했다 - 시험 준비가 안 걸렸다")
@@ -266,13 +281,15 @@ func TestFinishDoesNotAdoptAnItemWhoseCreationRolledBack(t *testing.T) {
 				}
 				addItemAs(t, s, "p", other, "gone-x")
 			}},
-			{"등록 실패", "item.add", func(t *testing.T, s *Service, st *store.Store, in FinishInput, other string) {
+			{"등록 실패", "item.add", rolledBack, func(t *testing.T, s *Service, st *store.Store, in FinishInput, other string) {
 				addItemAs(t, s, "p", other, "gone-x")
 				if _, err := s.AddItem(ctx(), AddItemInput{Project: "p", SessionID: in.SessionID, ID: "gone-x",
 					Title: "내 항목", Body: "본문"}); err == nil {
 					t.Fatal("남이 먼저 만든 id 를 다시 만들었다 - 시험 준비가 안 걸렸다")
 				}
 			}},
+			{"표시 없는 옛 add", "item.add", unmarked, plantUnmarked("item.add")},
+			{"표시 없는 옛 후속 생성", followupCreatedEvent, unmarked, plantUnmarked(followupCreatedEvent)},
 		} {
 			t.Run(e.name+"/"+c.name, func(t *testing.T) {
 				s, st := e.open(t)
@@ -289,10 +306,13 @@ func TestFinishDoesNotAdoptAnItemWhoseCreationRolledBack(t *testing.T) {
 					Followups: []FollowupInput{{ID: "gone-x", Title: "후속", Body: "후속 본문"}},
 				}
 				c.spoil(t, s, st, in, other.Session.ID)
-				// 전제: 이 세션의 생성 이벤트가 롤백 표시를 달고 남았고, 지금 그 id 는 남의 열린 항목이다.
+				// 전제: 이 세션의 생성 이벤트가 그 결말 표시로 남았고(롤백 · 표시 없음), 지금 그 id 는 남의 열린 항목이다.
 				if n := countRows(t, st, `SELECT count(*) FROM event WHERE kind = '`+c.kind+`'
-					AND session_id = '`+me.Session.ID+`' AND payload LIKE '%gone-x%' AND payload LIKE '%"tx":"rolled_back"%'`); n != 1 {
-					t.Fatalf("이 세션의 롤백된 생성 이벤트(%s)가 %d건이다(기대 1) - 시험이 그 갈래를 못 밟았다", c.kind, n)
+					AND session_id = '`+me.Session.ID+`' AND payload LIKE '%gone-x%' `+c.mark); n != 1 {
+					t.Fatalf("이 세션의 실패한 생성 이벤트(%s, %s)가 %d건이다(기대 1) - 시험이 그 갈래를 못 밟았다", c.kind, c.mark, n)
+				}
+				if n := countRows(t, st, `SELECT count(*) FROM item WHERE id = 'gone-x' AND state = 'open'`); n != 1 {
+					t.Fatalf("남의 열린 gone-x 가 %d건이다(기대 1)", n)
 				}
 
 				if got := s.followupCandidates(ctx(), FinishInput{Project: "p", SessionID: me.Session.ID, ItemID: "batch7"}); slices.Contains(got, "gone-x") {
@@ -301,7 +321,7 @@ func TestFinishDoesNotAdoptAnItemWhoseCreationRolledBack(t *testing.T) {
 				_, err := s.Finish(ctx(), in)
 				var ref *RefusedError
 				if !errors.As(err, &ref) {
-					t.Fatalf("롤백으로 사라진 생성의 id 를 남이 만든 뒤 그 항목을 잇는 마무리가 거절되지 않았다: %v", err)
+					t.Fatalf("이 세션의 생성이 실패한 id 의 남의 항목을 잇는 마무리가 거절되지 않았다: %v", err)
 				}
 				if n := countRows(t, st, `SELECT count(*) FROM judgment_link WHERE target_kind = 'item' AND target_id = 'gone-x'`); n != 0 {
 					t.Fatalf("남의 항목에 이 마무리의 판단 링크가 %d건 걸렸다", n)

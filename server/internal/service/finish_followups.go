@@ -150,9 +150,11 @@ func (s *Service) sessionSpawnedOpen(ctx context.Context, in FinishInput) ([]str
 	}
 	// ★ 두 질의를 합친다. kind 를 빈 문자열로 주면 전 kind 가 오는데(ListSessionEvents 의
 	// `? = ''` 갈래) 그러면 이 세션의 beat 수천 건을 훑게 된다 — kind 를 명시해 둘만 읽는다.
+	// ★ 이 프로젝트의 생성만 읽는다(sessionEventsIn). 아래 GetItem 이 in.Project 에서 찾으므로, 멤버 프로젝트에 만든
+	//   x 를 섞으면 이 프로젝트에 있는 남의 열린 x 가 「이 세션이 만든 것」이 된다.
 	var evs []model.Event
 	for _, kind := range []string{"item.add", followupCreatedEvent} {
-		part, err := s.st.ListSessionEvents(ctx, in.SessionID, kind, claim.At)
+		part, err := s.sessionEventsIn(ctx, in.Project, in.SessionID, kind, claim.At)
 		if err != nil {
 			return nil, false // 한쪽이라도 못 읽으면 "관측 못 했다"다 — 반쪽 목록은 거짓이다
 		}
@@ -162,12 +164,18 @@ func (s *Service) sessionSpawnedOpen(ctx context.Context, in FinishInput) ([]str
 	var out []string
 	for _, e := range evs {
 		id := eventItemID(e)
-		// ★ **롤백된 생성은 만든 것이 아니다.** 두 kind 다 Tx.LogEvent 로 예약돼 롤백 뒤에도 원장에 남고, 결말은
-		//   payload 의 표시(store.TxOutcomeKey)만 말한다. 그것을 안 보면 롤백으로 사라진 id 를 남이 나중에 만들었을 때
-		//   그 남의 항목이 「이 세션이 만든 열린 항목」이 된다 - 판단 저장이 실패한 마무리를 다시 보내면 잇기가 남의
-		//   항목에 판단을 걸고, 관문은 남의 항목을 바닥에 떨어뜨렸다고 막는다. 표시가 없는 행(표시 이전의 옛 행)은
-		//   QueueReproduction 과 같이 롤백으로 단정하지 않는다.
-		if id == "" || id == in.ItemID || seen[id] || store.PayloadRolledBack(e.Payload) {
+		// ★ **커밋이 확인된 생성만 만든 것이다.** 두 kind 다 Tx.LogEvent 로 예약돼 롤백 뒤에도 원장에 남고, 결말은
+		//   payload 의 표시(store.TxOutcomeKey)만 말한다. 실패한 시도를 세면 그 id 를 남이 만들었을 때(먼저 있던 남의 id 를
+		//   add 하다 실패했거나, 판단 저장이 실패해 롤백된 마무리의 후속 id 를 남이 나중에 만들었을 때) 그 남의 항목이
+		//   「이 세션이 만든 열린 항목」이 된다 - 잇기가 남의 항목에 판단을 걸고, 관문은 남의 항목을 바닥에 떨어뜨렸다고 막는다.
+		//
+		// ★ 표시가 없는 행도 인정하지 않는다(store.PayloadCommitted). 표시 이전 코드도 삽입 전에 예약하고 롤백 뒤에 흘렸으므로
+		//   그 행에는 실패한 시도가 섞여 있고 가를 길이 없다. 계측(QueueReproduction)은 같은 행을 세는데, 그쪽은 안 세면 표시
+		//   이전 구간이 0이 되고 여기는 세면 남의 항목에 판단이 걸린다 - 틀렸을 때의 대가가 반대라 접는 방향도 반대다.
+		//   대가: 표시가 없는 생성(표시가 들어온 2026-08-09 전의 item.add. item.followup_created 는 그 뒤에 생겨 늘 표시가
+		//   있다)은 그 선점을 아직 쥔 세션도 후속으로 잇지 못하고, 관문도 그 항목을 안 본다(관문이 덜 막는 쪽). 그 항목에
+		//   판단을 걸 길은 note(kind='handoff', item_id=…) 다.
+		if id == "" || id == in.ItemID || seen[id] || !store.PayloadCommitted(e.Payload) {
 			continue
 		}
 		seen[id] = true
@@ -244,7 +252,7 @@ func (s *Service) followupCandidates(ctx context.Context, in FinishInput) []stri
 // 항목 id 까지 보는 이유: 한 세션이 항목 여럿을 마무리한다(실측: 한 세션이 두 건을
 // 연달아 닫았다). 세션만 보면 첫 항목에서 발화한 뒤 둘째 항목은 조용히 지나간다.
 func (s *Service) alreadyWarnedFollowups(ctx context.Context, in FinishInput) bool {
-	evs, err := s.st.ListSessionEvents(ctx, in.SessionID, followupsMissingEvent, time.Time{})
+	evs, err := s.sessionEventsIn(ctx, in.Project, in.SessionID, followupsMissingEvent, time.Time{})
 	if err != nil {
 		return true // 못 읽었으면 막지 않는다 — 관문의 실패가 마무리를 막으면 안 된다
 	}
@@ -254,6 +262,26 @@ func (s *Service) alreadyWarnedFollowups(ctx context.Context, in FinishInput) bo
 		}
 	}
 	return false
+}
+
+// sessionEventsIn 은 이 세션이 project 에 남긴 kind 이벤트다(since 이후, 오래된 순).
+//
+// ★ 이벤트를 항목 id 로 맞추는 소비자는 이것으로 읽는다. ListSessionEvents 는 프로젝트를 안 거르는데 항목은 프로젝트와
+// id 의 짝으로 하나다 - 세션은 멤버 프로젝트에도 항목을 만들고 마무리하므로, 거르지 않으면 다른 프로젝트의 같은 id 가
+// 이 프로젝트의 항목으로 맞춰진다. 이벤트의 project 는 쓰는 쪽이 그 항목이 앉은 곳으로 적는다(item.add 는 등록 대상,
+// item.followup_created 는 후속이 앉은 곳, 두 관문의 발화는 마무리하는 항목의 프로젝트).
+func (s *Service) sessionEventsIn(ctx context.Context, project, sessionID, kind string, since time.Time) ([]model.Event, error) {
+	evs, err := s.st.ListSessionEvents(ctx, sessionID, kind, since)
+	if err != nil {
+		return nil, err
+	}
+	out := evs[:0]
+	for _, e := range evs {
+		if e.Project == project {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 // eventItemID 는 이벤트 payload 의 "item" 값이다. 못 읽으면 빈 문자열이다.
