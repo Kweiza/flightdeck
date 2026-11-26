@@ -242,6 +242,57 @@ func TestSavepointCleanupFailureStopsTheTx(t *testing.T) {
 	})
 }
 
+// TestBrokenTxFlushesItsEventsAfterRollback 은 저장점만 사라지고 바깥 트랜잭션은 열린 채 남은 정리 실패를 클로저가
+// 삼켰을 때, 커밋 거절 뒤 예약 이벤트가 롤백 표시를 달고 원장에 남는지 잰다. 망가진 트랜잭션의 커밋은 드라이버에 안
+// 가서 트랜잭션과 그 전역 잠금이 열린 채 남는다 - 롤백 전에 예약 이벤트를 흘리던 판은 이벤트 쓰기가 자기 잠금을 잠금
+// 대기 상한까지 기다리다 기록을 잃었다(두 엔진 다).
+//
+// ★ 실패를 바깥 저장점 안의 안쪽 저장점에서 낸다. Postgres 는 최상위에서 문장이 실패하면 그 자리에서 트랜잭션의 잠금을
+// 다 푼다(ROLLBACK 을 기다리는 버려진 블록만 남는다) - 그러면 잠금 대기가 안 생겨 이 갈래를 못 밟는다. 하위 트랜잭션
+// (저장점) 안의 실패는 그 저장점의 것만 풀고 최상위의 전역 잠금은 그대로 쥔다. SQLite 는 어느 쪽이든 쥔다.
+func TestBrokenTxFlushesItsEventsAfterRollback(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		var spErr error
+		start := time.Now()
+		err := s.Tx(context.Background(), func(x *Tx) error {
+			x.LogEvent("test.broken_tx", "", "", map[string]any{"step": "예약"})
+			if err := insertMachine(x, "before"); err != nil {
+				return err
+			}
+			_ = x.Savepoint(func(outer *Tx) error {
+				spErr = outer.Savepoint(func(in *Tx) error {
+					// 안쪽 저장점만 먼저 풀어 뒤의 ROLLBACK TO 가 실패하게 한다. 바깥 트랜잭션과 그 잠금은 그대로 산다.
+					if _, err := in.tx.raw.ExecContext(in.ctx, "RELEASE SAVEPOINT fd_sp_2"); err != nil {
+						return fmt.Errorf("시험 준비(저장점 풀기) 실패: %w", err)
+					}
+					return ErrNotFound
+				})
+				return nil
+			})
+			return nil // 정리 실패를 삼키고 끝까지 가는 꼴이다
+		})
+		elapsed := time.Since(start)
+
+		var se *SavepointError
+		if !errors.As(spErr, &se) || se.Step != "되돌리기" {
+			t.Fatalf("저장점만 사라진 정리 실패가 *SavepointError(되돌리기)로 오지 않았다 - 시험이 그 갈래를 못 밟았다: %v", spErr)
+		}
+		if !errors.Is(err, se) {
+			t.Fatalf("망가진 트랜잭션의 커밋이 그 까닭으로 거절되지 않았다: %v", err)
+		}
+		if n := pgCount(t, s, `SELECT count(*) FROM event WHERE kind = 'test.broken_tx' AND payload LIKE ?`,
+			`%"tx":"rolled_back"%`); n != 1 {
+			t.Fatalf("커밋이 거절된 트랜잭션의 예약 이벤트가 %d건 남았다(기대 1, 롤백 표시) - 열린 트랜잭션의 잠금 뒤에서 흘렸다", n)
+		}
+		if got := machineIDs(t, s); len(got) != 0 {
+			t.Fatalf("망가진 트랜잭션에서 쓴 것이 남았다: %v", got)
+		}
+		if elapsed >= lockTimeout {
+			t.Fatalf("트랜잭션이 %s 걸렸다 - 예약 이벤트가 자기 잠금을 대기 상한(%s)까지 기다렸다", elapsed, lockTimeout)
+		}
+	})
+}
+
 // TestSavepointPanicDoesNotCommitItsWrites 는 fn 이 쓰고 패닉하면 그 쓰기를 되돌린 뒤 패닉을 올리는지 잰다. 부른 쪽이 같은
 // 트랜잭션에서 recover 하고 커밋해도 패닉 전에 쓴 것은 안 남고, 트랜잭션은 그대로 이어 쓴다.
 func TestSavepointPanicDoesNotCommitItsWrites(t *testing.T) {

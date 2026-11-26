@@ -25,7 +25,8 @@ import (
 //	흡수: e 가 있을 때 들어가는 갈래(e != nil, errors.As(e, &DB 오류 타입), 분류기(e))에 오류를 내며 나가지 않는 길이 있다.
 //	      마지막 값이 nil 인 return(return nil · return v, nil)도 오류를 버린다. 갈래를 그냥 빠져나가도 바로 다음 문장이
 //	      그 e 를 내는 return 이면(if e != nil { 기록 }; return e) 전파라 안 친다
-//	통과: if 의 Init 에서 받은 e 를 e == nil 로 보고, 오류일 때 나가는 갈래가 사슬에 없다
+//	통과: if 의 Init 에서 받은 e 를 e == nil 로 보고, 오류일 때 오류를 내며 나가는 갈래가 사슬에 없다(return nil 로
+//	      나가는 else if · else 는 오류를 버린 것이라 나가는 갈래로 안 친다)
 //	이어 쓰기: e 가 있을 때 들어가는 갈래 안에서 다시 트랜잭션 호출을 한다(저장점 열기도 이미 버려진 트랜잭션에선 실패한다)
 //
 // ★ 문장 실패가 아닌 오류는 흡수해도 된다: 표지 오류(errors.Is(e, …), ErrNotFound 등은 행이 없다는 뜻이다)와
@@ -187,6 +188,26 @@ func fine(t *Tx) error {
 		return err
 	}
 }
+
+func passElseIfNil(t *Tx) error {
+	if c, cerr := t.claimRow(p, id); cerr == nil {
+		use(c)
+	} else if !errors.Is(cerr, ErrNotFound) {
+		return nil
+	}
+	return nil
+}
+
+func passElseNil(t *Tx) (Item, error) {
+	if c, cerr := t.claimRow(p, id); cerr == nil {
+		use(c)
+	} else if errors.Is(cerr, ErrNotFound) {
+		skip()
+	} else {
+		return Item{}, nil
+	}
+	return Item{}, nil
+}
 `
 	const serviceSrc = `package service
 
@@ -251,7 +272,8 @@ func otherTx(t *Tx) error {
 	want := map[string]bool{
 		"absorb " + ruleAbsorb: true, "writeAfter " + ruleWriteAfter: true, "returnNil " + ruleAbsorb: true,
 		"returnValueNil " + ruleAbsorb: true, "propagateReset " + ruleAbsorb: true, "obs " + ruleAbsorb: true,
-		"ledger " + ruleAbsorb:    true,
+		"ledger " + ruleAbsorb:      true,
+		"passElseIfNil " + rulePass: true, "passElseNil " + rulePass: true,
 		"passThrough " + rulePass: true, "closure " + ruleAbsorb: true, "duplicate " + ruleAbsorb: true,
 	}
 	gotCtx := map[string]bool{}
@@ -260,7 +282,7 @@ func otherTx(t *Tx) error {
 	}
 	wantCtx := map[string]bool{
 		"absorb": true, "writeAfter": true, "returnNil": true, "returnValueNil": true, "propagate": true,
-		"propagateReset": true, "obs": true, "ledger": true, "fine": true,
+		"propagateReset": true, "obs": true, "ledger": true, "fine": true, "passElseIfNil": true, "passElseNil": true,
 		"passThrough": true, "closure": true, "duplicate": true,
 	}
 	if !maps.Equal(got, want) || !maps.Equal(gotCtx, wantCtx) {
@@ -856,21 +878,27 @@ func initDefines(init ast.Stmt, name string) bool {
 	return false
 }
 
-// chainExitsOnFailure 는 if · else if 사슬에 문장 실패일 수 있는 오류를 전부 받아 나가는 갈래가 있는가다.
+// chainExitsOnFailure 는 if · else if 사슬에 문장 실패일 수 있는 오류를 전부 받아 오류를 내며 나가는 갈래가 있는가다.
+// 그 갈래가 return nil 로 나가면 오류를 버린 것이라 나가는 갈래로 안 친다(errBranch 의 returnsNil 과 같은 판정).
 func (f *fnScan) chainExitsOnFailure(n *ast.IfStmt) bool {
 	for {
 		switch els := n.Else.(type) {
 		case *ast.IfStmt:
-			if f.coversFailures(els.Cond) && f.exits(els.Body.List) {
+			if f.coversFailures(els.Cond) && f.raises(els.Body.List) {
 				return true
 			}
 			n = els
 		case *ast.BlockStmt:
-			return f.exits(els.List)
+			return f.raises(els.List)
 		default:
 			return false
 		}
 	}
+}
+
+// raises 는 stmts 가 모든 길에서 함수를 나가고, 오류를 버리는 return(마지막 값이 nil)이 없는가다.
+func (f *fnScan) raises(stmts []ast.Stmt) bool {
+	return f.exits(stmts) && !f.returnsNil(stmts)
 }
 
 // exits 는 stmts 가 모든 길에서 함수를 나가는가다(return · panic). 갈래 밖으로 가는 continue · break · goto 가

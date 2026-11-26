@@ -661,23 +661,27 @@ func (s *Store) runTx(ctx context.Context, sp txSpec, body func(*txConn) error, 
 	if after == nil {
 		after = func(bool) {}
 	}
-	if err := body(tx); err != nil {
-		err = asFault(err)
-		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			// 예약 이벤트는 롤백 뒤에도 흘린다 — 실패한 시도가 원장에 남는 것이 목적이다.
-			after(false)
+	// abort 는 실패한 트랜잭션을 끝낸다. **롤백이 먼저이고 예약 이벤트는 그 뒤다.** 예약 이벤트는 별도 연결로 같은
+	// 전역 잠금을 잡고 쓰므로(Store.LogEvent), 이 트랜잭션이 열린 채 흘리면 자기 잠금을 잠금 대기 상한까지 기다리다
+	// 기록을 잃는다. 커밋 거절 갈래가 그렇다 - 망가진 트랜잭션(txConn.broken)의 커밋은 드라이버에 안 가서 트랜잭션이
+	// 열린 채 남는다. 롤백 뒤에 흘려야 실패한 시도가 원장에 남는다.
+	abort := func(err error) error {
+		rbErr := tx.Rollback()
+		after(false)
+		if rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 			return fmt.Errorf("%w (롤백도 실패: %v)", err, rbErr)
 		}
-		after(false)
 		return err
+	}
+	if err := body(tx); err != nil {
+		return abort(asFault(err))
 	}
 	if err := tx.Commit(); err != nil {
 		// ★ 커밋 실패도 롤백이다. 여기를 true 로 두면 아무것도 안 쓴 트랜잭션이 원장에서
 		//   "썼다"고 말한다 — 롤백 갈래보다 되짚기 어려운 거짓이다(여기는 fn 이 오류를
 		//   안 냈으므로 service 쪽 실패 로그조차 안 남는다). Postgres 에서 클로저가 문장 오류를
 		//   삼키고 끝까지 가면 커밋이 ROLLBACK 으로 끝나 이 갈래로 온다(FaultAborted).
-		after(false)
-		return asFault(fmt.Errorf("커밋 실패: %w", err))
+		return abort(asFault(fmt.Errorf("커밋 실패: %w", err)))
 	}
 	after(true)
 	return nil

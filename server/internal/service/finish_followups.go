@@ -162,7 +162,12 @@ func (s *Service) sessionSpawnedOpen(ctx context.Context, in FinishInput) ([]str
 	var out []string
 	for _, e := range evs {
 		id := eventItemID(e)
-		if id == "" || id == in.ItemID || seen[id] {
+		// ★ **롤백된 생성은 만든 것이 아니다.** 두 kind 다 Tx.LogEvent 로 예약돼 롤백 뒤에도 원장에 남고, 결말은
+		//   payload 의 표시(store.TxOutcomeKey)만 말한다. 그것을 안 보면 롤백으로 사라진 id 를 남이 나중에 만들었을 때
+		//   그 남의 항목이 「이 세션이 만든 열린 항목」이 된다 - 판단 저장이 실패한 마무리를 다시 보내면 잇기가 남의
+		//   항목에 판단을 걸고, 관문은 남의 항목을 바닥에 떨어뜨렸다고 막는다. 표시가 없는 행(표시 이전의 옛 행)은
+		//   QueueReproduction 과 같이 롤백으로 단정하지 않는다.
+		if id == "" || id == in.ItemID || seen[id] || store.PayloadRolledBack(e.Payload) {
 			continue
 		}
 		seen[id] = true

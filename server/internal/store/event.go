@@ -119,6 +119,15 @@ func markTxOutcome(payload any, committed bool) any {
 	}
 }
 
+// PayloadRolledBack 은 예약 이벤트 payload 의 결말 표시(TxOutcomeKey)가 롤백인가다. 표시가 없거나 payload 를 못
+// 읽으면 거짓이다 - 롤백을 단정할 관측이 없다(QueueReproduction 의 「결말 표시가 없는 행은 센다」와 같은 규율).
+//
+// store 밖에서 결말을 읽는 자리(service 의 후속 자격)가 키 이름을 다시 적지 않게 여기 둔다.
+func PayloadRolledBack(payload string) bool {
+	var p map[string]any
+	return json.Unmarshal([]byte(payload), &p) == nil && p[TxOutcomeKey] == TxRolledBack
+}
+
 // ListEvents 는 종류로 걸러 최신순으로 낸다. kind 가 비면 전 종류다.
 func (s *Store) ListEvents(ctx context.Context, kind string, since time.Time, limit int) ([]model.Event, error) {
 	if limit <= 0 {

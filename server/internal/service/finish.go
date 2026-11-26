@@ -435,10 +435,14 @@ func (s *Service) Finish(ctx context.Context, in FinishInput) (FinishResult, err
 		//
 		// ★ 저장점 안에서 부른다. 저장점이 없으면 Postgres 에서 이 중복 흡수가 트랜잭션을 버려 ① 의 판단까지
 		//   사라지고, SQLite 에서도 AddItem 이 선행 행을 쓰다 실패하면 반쯤 만든 항목이 남는다.
+		//
+		// ★ 건너뛰는 것은 **item 표의 중복**뿐이다(ConflictError.Target, store/constraint.go). AddItem 은 item_after 도
+		//   쓰므로, 대상을 안 보면 선행 행의 키 충돌까지 「같은 id 의 항목이 이미 있다」로 접어 거짓 사유를 원장에
+		//   굳히고 커밋한다. 다른 표의 중복은 이 후속을 만들다 서버가 불변식을 깬 것이라 올린다.
 		for _, it := range creates {
 			if err := t.Savepoint(func(sp *store.Tx) error { return sp.AddItem(it) }); err != nil {
 				var conflict *store.ConflictError
-				if errors.As(err, &conflict) && conflict.Kind == store.ConflictDuplicate {
+				if errors.As(err, &conflict) && conflict.Kind == store.ConflictDuplicate && conflict.Target == store.TargetItem {
 					out.SkippedFollowups = append(out.SkippedFollowups, it.ID)
 					t.LogEvent("item.followup_skipped", in.Project, in.SessionID, map[string]any{
 						"item": it.ID,

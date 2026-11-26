@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"slices"
@@ -218,6 +219,132 @@ func TestLandReentryAndWaitingKeepTheTx(t *testing.T) {
 			}
 			if n := liveQueue(t, st); n != 2 {
 				t.Fatalf("살아 있는 줄 행이 %d개다(기대 2 - 둘 다 줄에 남는다)", n)
+			}
+		})
+	}
+}
+
+// armJudgmentFailure 는 판단이 들어가는 문장을 실패시키는 트리거를 건다. 돌려준 함수가 걷는다 - 원인이 사라진 뒤의
+// 재시도를 재려는 것이다.
+func armJudgmentFailure(t *testing.T, engine string, st *store.Store) (disarm func()) {
+	t.Helper()
+	if engine == "postgres" {
+		rawExec(t, st,
+			`CREATE FUNCTION fd_test_fail_judgment() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+				RAISE EXCEPTION 'fd test: 판단 저장 실패'; END $$`,
+			`CREATE TRIGGER fd_test_fail_judgment BEFORE INSERT ON judgment FOR EACH ROW EXECUTE FUNCTION fd_test_fail_judgment()`)
+		return func() { rawExec(t, st, `DROP TRIGGER fd_test_fail_judgment ON judgment`) }
+	}
+	rawExec(t, st, `CREATE TRIGGER fd_test_fail_judgment BEFORE INSERT ON judgment
+		BEGIN SELECT RAISE(ABORT, 'fd test: 판단 저장 실패'); END`)
+	return func() { rawExec(t, st, `DROP TRIGGER fd_test_fail_judgment`) }
+}
+
+// TestFinishDoesNotAdoptAnItemWhoseCreationRolledBack 은 이 세션의 생성이 롤백으로 사라진 id 를 남이 만든 뒤, 그 남의
+// 항목이 이 세션의 후속 자격(이을 수 있는 것 · 관문이 보는 것)에 안 드는지 실제 경로로 잰다. 생성 이벤트는 롤백 뒤에도
+// 원장에 남으므로, 결말 표시를 안 보던 판은 남의 항목에 이 마무리의 판단을 걸었다.
+//
+//	마무리 재시도: 후속을 만든 뒤 판단 저장이 실패해 롤백된다(item.followup_created 가 롤백 표시로 남는다) → 남이 같은
+//	               id 를 만든다 → 같은 마무리를 다시 보낸다.
+//	등록 실패:     남이 먼저 만든 id 를 이 세션이 add 하다 중복으로 롤백된다(item.add 가 롤백 표시로 남는다) → 그 id 를
+//	               후속으로 싣는다.
+func TestFinishDoesNotAdoptAnItemWhoseCreationRolledBack(t *testing.T) {
+	for _, e := range bothLedgers() {
+		for _, c := range []struct {
+			name  string
+			kind  string
+			spoil func(t *testing.T, s *Service, st *store.Store, in FinishInput, other string)
+		}{
+			{"마무리 재시도", followupCreatedEvent, func(t *testing.T, s *Service, st *store.Store, in FinishInput, other string) {
+				disarm := armJudgmentFailure(t, e.name, st)
+				if _, err := s.Finish(ctx(), in); err == nil {
+					t.Fatal("판단 저장이 실패했는데 마무리가 성공했다 - 시험 준비가 안 걸렸다")
+				}
+				disarm()
+				if n := countRows(t, st, `SELECT count(*) FROM item WHERE id = 'gone-x'`); n != 0 {
+					t.Fatalf("롤백된 마무리의 후속이 %d건 남았다", n)
+				}
+				addItemAs(t, s, "p", other, "gone-x")
+			}},
+			{"등록 실패", "item.add", func(t *testing.T, s *Service, st *store.Store, in FinishInput, other string) {
+				addItemAs(t, s, "p", other, "gone-x")
+				if _, err := s.AddItem(ctx(), AddItemInput{Project: "p", SessionID: in.SessionID, ID: "gone-x",
+					Title: "내 항목", Body: "본문"}); err == nil {
+					t.Fatal("남이 먼저 만든 id 를 다시 만들었다 - 시험 준비가 안 걸렸다")
+				}
+			}},
+		} {
+			t.Run(e.name+"/"+c.name, func(t *testing.T) {
+				s, st := e.open(t)
+				repo, wt := newRepoWithWorktree(t, "feat")
+				me := openSession(t, s, "p", repo, wt, "cc-a", "트랙A")
+				dirB := tmpBase(t)
+				other := openSession(t, s, "p", dirB, dirB, "cc-b", "트랙B")
+				addItem(t, s, "p", "batch7", nil, nil)
+				claimed(t, s, "p", me.Session.ID, "batch7")
+
+				in := FinishInput{
+					Project: "p", SessionID: me.Session.ID, ItemID: "batch7",
+					Outcome: model.ItemDone, Title: "끝냈다", Body: "판단 본문",
+					Followups: []FollowupInput{{ID: "gone-x", Title: "후속", Body: "후속 본문"}},
+				}
+				c.spoil(t, s, st, in, other.Session.ID)
+				// 전제: 이 세션의 생성 이벤트가 롤백 표시를 달고 남았고, 지금 그 id 는 남의 열린 항목이다.
+				if n := countRows(t, st, `SELECT count(*) FROM event WHERE kind = '`+c.kind+`'
+					AND session_id = '`+me.Session.ID+`' AND payload LIKE '%gone-x%' AND payload LIKE '%"tx":"rolled_back"%'`); n != 1 {
+					t.Fatalf("이 세션의 롤백된 생성 이벤트(%s)가 %d건이다(기대 1) - 시험이 그 갈래를 못 밟았다", c.kind, n)
+				}
+
+				if got := s.followupCandidates(ctx(), FinishInput{Project: "p", SessionID: me.Session.ID, ItemID: "batch7"}); slices.Contains(got, "gone-x") {
+					t.Errorf("관문이 남의 항목을 이 세션이 바닥에 떨어뜨린 후속으로 본다: %v", got)
+				}
+				_, err := s.Finish(ctx(), in)
+				var ref *RefusedError
+				if !errors.As(err, &ref) {
+					t.Fatalf("롤백으로 사라진 생성의 id 를 남이 만든 뒤 그 항목을 잇는 마무리가 거절되지 않았다: %v", err)
+				}
+				if n := countRows(t, st, `SELECT count(*) FROM judgment_link WHERE target_kind = 'item' AND target_id = 'gone-x'`); n != 0 {
+					t.Fatalf("남의 항목에 이 마무리의 판단 링크가 %d건 걸렸다", n)
+				}
+			})
+		}
+	}
+}
+
+// TestFinishSkipsOnlyItemDuplicates 는 후속 등록의 중복 흡수가 item 표의 중복만 건너뛰는지 두 엔진에서 잰다. 선행
+// 행(item_after)의 키 충돌은 「같은 id 의 항목이 이미 있다」가 아니다 - 건너뛰면 거짓 사유가 추가 전용 원장에 굳고
+// 마무리가 커밋된다. item 표의 중복을 건너뛰는 쪽은 TestFinishKeepsTheJudgmentWhenAFollowupTurnsOutDuplicate 가 잰다.
+//
+// ★ 운영 스키마의 item_after 에는 유니크 키가 없다. 시험이 (project, item_id) 유니크 인덱스를 걸어 선행 둘째 행이
+// 중복이 되게 한다 - 두 엔진 모두 같은 문장이다.
+func TestFinishSkipsOnlyItemDuplicates(t *testing.T) {
+	for _, e := range bothLedgers() {
+		t.Run(e.name, func(t *testing.T) {
+			s, st := e.open(t)
+			repo, wt := newRepoWithWorktree(t, "feat")
+			me := openSession(t, s, "p", repo, wt, "cc-a", "트랙A")
+			addItem(t, s, "p", "batch7", nil, nil)
+			claimed(t, s, "p", me.Session.ID, "batch7")
+			rawExec(t, st, `CREATE UNIQUE INDEX fd_test_one_after ON item_after(project, item_id)`)
+
+			_, err := s.Finish(ctx(), FinishInput{
+				Project: "p", SessionID: me.Session.ID, ItemID: "batch7",
+				Outcome: model.ItemDone, Title: "끝냈다", Body: "판단 본문",
+				Followups: []FollowupInput{{ID: "two-deps", Title: "후속", Body: "후속 본문",
+					After: []model.After{{Item: "batch7"}, {SHA: "0123456789abcdef0123456789abcdef01234567"}}}},
+			})
+			var conflict *store.ConflictError
+			if !errors.As(err, &conflict) || conflict.Kind != store.ConflictDuplicate || conflict.Target != store.TargetItemAfter {
+				t.Fatalf("선행 행의 키 충돌이 그대로 안 올라왔다: %v", err)
+			}
+			if n := countRows(t, st, `SELECT count(*) FROM judgment`); n != 0 {
+				t.Fatalf("판단이 %d건 커밋됐다 - 선행 행의 충돌을 항목 중복으로 흡수했다", n)
+			}
+			if n := countRows(t, st, `SELECT count(*) FROM event WHERE kind = 'item.followup_skipped'`); n != 0 {
+				t.Fatalf("건너뜀이 %d건 남았다 - 선행 행의 충돌이 「같은 id 의 항목이 이미 있다」로 굳었다", n)
+			}
+			if n := countRows(t, st, `SELECT count(*) FROM item WHERE id = 'batch7' AND state = 'done'`); n != 0 {
+				t.Fatal("실패한 마무리가 항목을 닫았다")
 			}
 		})
 	}
