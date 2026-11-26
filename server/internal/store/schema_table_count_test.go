@@ -2,11 +2,18 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
+
+	_ "github.com/jackc/pgx/v5/stdlib" // database/sql 드라이버 "pgx"
+
+	"github.com/kweiza/flightdeck/internal/store/pg"
+	"github.com/kweiza/flightdeck/internal/store/storetest"
 )
 
 // declaredTableRe 는 **사람이 선언한** 표를 찾는다.
@@ -17,19 +24,29 @@ import (
 var declaredTableRe = regexp.MustCompile(
 	`(?im)^\s*CREATE\s+(VIRTUAL\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)`)
 
-// declaredTables 는 schema.sql 과 증분 전부가 선언하는 표 이름을 정렬해 낸다.
+// declaredTables 는 SQLite 의 schema.sql 과 증분 전부가 선언하는 표 이름을 정렬해 낸다.
 //
 // 여기서 세는 것은 **정의가 이 레포에 있는 표**뿐이다. 살아 있는 DB 의 `sqlite_master`
 // 는 이보다 큰 수를 내는데(아래 시험의 주석을 보라) 그 차이는 엔진이 만든 것이라
 // 우리가 세는 대상이 아니다.
 func declaredTables(t *testing.T) []string {
 	t.Helper()
-
 	sources := map[string]string{"schema.sql": schemaSQL}
 	for _, m := range migrations {
 		sources[m.Name] = m.SQL
 	}
+	return declaredIn(t, sources)
+}
 
+// pgDeclaredTables 는 PG 기준선(준비 + 001_baseline.sql)이 선언하는 표 이름을 정렬해 낸다.
+func pgDeclaredTables(t *testing.T) []string {
+	t.Helper()
+	return declaredIn(t, map[string]string{"pg/bootstrap.sql": pg.Bootstrap, "pg/001_baseline.sql": pg.Baseline})
+}
+
+// declaredIn 은 SQL 묶음(이름 → 본문)이 선언하는 표 이름을 정렬해 낸다.
+func declaredIn(t *testing.T, sources map[string]string) []string {
+	t.Helper()
 	seen := make(map[string]string, 32)
 	var names []string
 	for src, sql := range sources {
@@ -51,7 +68,47 @@ func declaredTables(t *testing.T) []string {
 	return names
 }
 
-// TestDeclaredTablesMatchDesign 은 DESIGN §3 이 못박은 표 수를 스키마 쪽에서 지킨다.
+// wantTables 는 데이터 모델의 표 이름 전부다 — **PG 기준선이 정본이다.**
+//
+// ★ 재설계 스펙의 「스키마」 절이 정한 줄기다: 선언 28(SQLite) → PG 기준선 26 → 단위마다 늘어난다.
+// 표를 더하거나 지우는 단위는 **이 목록을 고친다.** SQLite 쪽 목록은 이것에 sqliteOnlyTables 를 더한 것으로
+// 얼어 있다(옮기는 동안만 산다).
+var wantTables = []string{
+	"change_set",
+	"claim",
+	"counter",
+	"event",
+	"footprint",
+	"idempotency", // SQLite 증분 002
+	"item",
+	"item_after",
+	"item_revision", // SQLite 증분 016
+	"job",
+	"judgment",
+	"judgment_link",
+	"landing_queue",          // SQLite 증분 003 — 랜딩 순서 큐
+	"landing_queue_resource", // SQLite 증분 008 — 줄 행이 자원 집합을 갖는다
+	"machine",
+	"pick_eval",
+	"project",
+	"project_member", // SQLite 증분 014 — 루트가 멤버 프로젝트 명부를 갖는다
+	"ref_state",
+	"resource_hold",
+	"schema_version", // SQLite 에서는 CREATE TABLE IF NOT EXISTS — 순진한 패턴이 놓치는 그 한 줄
+	"session",
+	"session_inbox", // SQLite 증분 018, 세션이 받는 곳(board/README 「세션에 알림」)
+	"session_workspace",
+	"signal",
+	"snapshot",
+}
+
+// sqliteOnlyTables 는 SQLite 가 선언했고 PG 기준선이 일부러 안 옮긴 표와 그 까닭이다.
+var sqliteOnlyTables = map[string]string{
+	"judgment_fts":    "CREATE VIRTUAL TABLE(FTS5) — PG 는 judgment 의 pg_trgm 식 인덱스가 그 자리다",
+	"item_dependents": "증분 011 이 걷은 죽은 표 — 선언만 schema.sql 에 남아 있다",
+}
+
+// TestDeclaredTablesMatchDesign 은 설계가 못박은 표 목록을 스키마 쪽에서 지킨다.
 //
 // ★ 왜 문서가 아니라 여기서 지키나 — `TestToolTableIsTen`(mcpsrv/protocol_test.go) 와 같은
 // 규율이다. 표를 **더하는 사람**의 빨간불이 여기서 나야 그 사람이 DESIGN 을 같이 고친다.
@@ -59,63 +116,51 @@ func declaredTables(t *testing.T) []string {
 //
 // 이름 목록을 통째로 못박는다(수만 세지 않는다). 표 하나를 지우고 하나를 더하면
 // 수는 그대로인데 데이터 모델은 달라지고, 그 변경이 리뷰에서 안 보이면 안 된다.
+//
+// 두 엔진을 함께 본다: PG 기준선의 선언 = wantTables(26), SQLite 의 선언 = wantTables + sqliteOnlyTables(28).
+// DESIGN §3 의 「테이블 N개」는 지금 도는 엔진(SQLite)의 28 이고, PG 로 넘어가는 작업이 26 으로 고친다.
+//
+// SQLite 의 살아 있는 DB `sqlite_master` 는 28 보다 **4 큰** 수를 낸다(2026-09-16 운영 원장
+// mode=ro 사본 실측: 판 16 에서 31). 축이 **둘** 어긋나기 때문이다:
+//
+//	⊕ SQLite 가 다섯을 더 만든다 — FTS5 가 judgment_fts 뒤에 자동 생성하는 그림자 표
+//	  4개(_config·_data·_docsize·_idx)와, AUTOINCREMENT 이 있으면 생기는 sqlite_sequence 1개.
+//	⊖ 증분 011 이 item_dependents 를 DROP 해서 하나가 빠진다. 그런데도 SQLite 목록이 그
+//	  이름을 계속 세는 이유는 **선언이 schema.sql 에 남아 있어서**다(정의를 두 자리에
+//	  두지 않는다는 규율). 세는 축이 "선언"이지 "살아 있는 DB"가 아니라는 뜻이다.
+//
+// **그 다섯은 우리가 정한 값이 아니다** — fts5 옵션이나 SQLite 판이 바뀌면 조용히 달라진다.
 func TestDeclaredTablesMatchDesign(t *testing.T) {
-	// DESIGN §3 — "SQLite 파일 하나, 테이블 N개, 계층 셋".
-	//
-	// 살아 있는 DB 의 `sqlite_master` 는 이보다 **4 큰** 수를 낸다(2026-09-16 운영 원장
-	// mode=ro 사본 실측: 판 16 에서 31). 축이 **둘** 어긋나기 때문이다:
-	//   ⊕ SQLite 가 다섯을 더 만든다 — FTS5 가 judgment_fts 뒤에 자동 생성하는 그림자 표
-	//     4개(_config·_data·_docsize·_idx)와, AUTOINCREMENT 이 있으면 생기는 sqlite_sequence 1개.
-	//   ⊖ 증분 011 이 item_dependents 를 DROP 해서 하나가 빠진다. 그런데도 아래 목록이 그
-	//     이름을 계속 세는 이유는 **선언이 schema.sql 에 남아 있어서**다(정의를 두 자리에
-	//     두지 않는다는 규율). 세는 축이 "선언"이지 "살아 있는 DB"가 아니라는 뜻이다.
-	// **그 다섯은 우리가 정한 값이 아니다** — fts5 옵션이나 SQLite 판이 바뀌면 조용히 달라진다.
-	// 데이터 모델은 사람이 선언한 것이므로 여기서 세는 것은 아래 목록뿐이다.
-	want := []string{
-		"change_set",
-		"claim",
-		"counter",
-		"event",
-		"footprint",
-		"idempotency", // 증분 002
-		"item",
-		"item_after",
-		"item_dependents",
-		"item_revision",
-		"job",
-		"judgment",
-		"judgment_fts", // CREATE VIRTUAL TABLE
-		"judgment_link",
-		"landing_queue",          // 증분 003 — 랜딩 순서 큐
-		"landing_queue_resource", // 증분 008 — 줄 행이 자원 집합을 갖는다
-		"machine",
-		"pick_eval",
-		"project",
-		"project_member", // 증분 014 — 루트가 멤버 프로젝트 명부를 갖는다
-		"ref_state",
-		"resource_hold",
-		"schema_version", // CREATE TABLE IF NOT EXISTS — 순진한 패턴이 놓치는 그 한 줄
-		"session",
-		"session_inbox", // 증분 018, 세션이 받는 곳(board/README 「세션에 알림」)
-		"session_workspace",
-		"signal",
-		"snapshot",
+	sqliteWant := append([]string{}, wantTables...)
+	for name := range sqliteOnlyTables {
+		sqliteWant = append(sqliteWant, name)
 	}
+	sort.Strings(sqliteWant)
 
-	got := declaredTables(t)
-
-	if len(got) != len(want) {
-		t.Fatalf("선언된 표가 %d개다 — 이 시험은 %d개를 안다.\n"+
-			"표를 더했거나 지웠으면 **DESIGN §3 의 '테이블 N개' 도 같이 고쳐라**"+
-			"(그 숫자가 곧 이 레포의 계약이고, 틀리면 아무도 계약을 검산할 수 없다).\n"+
-			"실측: %v", len(got), len(want), got)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("정렬 %d번 표가 %q다 — 기대 %q.\n"+
-				"수는 같은데 목록이 달라졌다(하나를 지우고 하나를 더했다).\n"+
-				"실측: %v", i, got[i], want[i], got)
+	for _, c := range []struct {
+		engine    string
+		got, want []string
+	}{
+		{"PG 기준선", pgDeclaredTables(t), wantTables},
+		{"SQLite", declaredTables(t), sqliteWant},
+	} {
+		if !slices.Equal(c.got, c.want) {
+			t.Errorf("%s: 선언한 표가 %d개다 — 이 시험은 %d개를 안다.\n"+
+				"표를 더했거나 지웠으면 **wantTables 와 DESIGN §3 의 '테이블 N개' 도 같이 고쳐라**"+
+				"(그 숫자가 곧 이 레포의 계약이고, 틀리면 아무도 계약을 검산할 수 없다).\n"+
+				"실측: %v\n기대: %v", c.engine, len(c.got), len(c.want), c.got, c.want)
 		}
+	}
+}
+
+// TestPGBaselineFoldsTheLastSQLiteVersion 은 PG 기준선이 접어 넣은 SQLite 판이 지금 SQLite 판과 같은지 본다.
+//
+// ★ 옮기는 동안 SQLite 에 증분이 오르면 기준선은 그 증분을 모른 채 「판 18 과 같은 뜻」이라고 말하게 된다.
+// 그 자리에서 빨갛게 한다 — SQLite 쪽 증분을 PG 기준선(또는 PG 증분)에도 실어야 한다.
+func TestPGBaselineFoldsTheLastSQLiteVersion(t *testing.T) {
+	if pg.BaselineVersion != SchemaVersion {
+		t.Fatalf("PG 기준선은 SQLite 판 %d 을 접었는데 지금 SQLite 판은 %d 다 — 그 사이 증분의 뜻을 PG 에도 실어라",
+			pg.BaselineVersion, SchemaVersion)
 	}
 }
 
@@ -127,13 +172,10 @@ func TestSchemaVersionTableIsCounted(t *testing.T) {
 	if !strings.Contains(schemaSQL, "CREATE TABLE IF NOT EXISTS schema_version") {
 		t.Skip("schema_version 의 선언 형태가 바뀌었다 — 이 시험이 지키던 함정이 사라졌다")
 	}
-	for _, name := range declaredTables(t) {
-		if name == "schema_version" {
-			return
-		}
+	if !slices.Contains(declaredTables(t), "schema_version") {
+		t.Fatal("schema_version 이 안 세졌다 — `IF NOT EXISTS` 를 건너뛰는 패턴이 깨졌다. " +
+			"이 상태로 센 수는 실제보다 1 작다")
 	}
-	t.Fatal("schema_version 이 안 세졌다 — `IF NOT EXISTS` 를 건너뛰는 패턴이 깨졌다. " +
-		"이 상태로 센 수는 실제보다 1 작다")
 }
 
 // migrationsDropTables 는 증분이 **걷어낸** 표다.
@@ -218,5 +260,39 @@ func TestLiveSchemaAfterAllMigrationsMatchesTheDeclaredList(t *testing.T) {
 				t.Errorf("migrationsDropTables 에 %q 가 있는데 DB 에 그대로 있다 — 증분이 안 걷었다", n)
 			}
 		}
+	}
+}
+
+// TestPGLiveSchemaMatchesTheDeclaredList 는 기준선을 **실제로 깐** PG DB 를 센다.
+//
+// ★ 위 SQLite 짝과 같은 까닭이다: 선언 목록은 SQL 글자를 세고 여기는 DB 에 남은 것을 센다. PG 는 그림자 표를
+// 만들지 않으므로(pg_trgm 도 표를 안 만든다) 걸러 낼 것 없이 둘이 같아야 한다.
+func TestPGLiveSchemaMatchesTheDeclaredList(t *testing.T) {
+	db, err := sql.Open("pgx", storetest.New(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(context.Background(),
+		`SELECT table_name FROM information_schema.tables
+		  WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name`)
+	if err != nil {
+		t.Fatalf("information_schema 조회 실패: %v", err)
+	}
+	defer rows.Close()
+	var live []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatalf("표 이름 해석 실패: %v", err)
+		}
+		live = append(live, n)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("순회 실패: %v", err)
+	}
+	if !slices.Equal(live, wantTables) {
+		t.Fatalf("기준선을 깐 PG DB 의 표가 %d개, 선언은 %d개다.\n실측(DB): %v\n기대(선언): %v",
+			len(live), len(wantTables), live, wantTables)
 	}
 }

@@ -39,6 +39,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib" // database/sql 드라이버 "pgx"
+
+	"github.com/kweiza/flightdeck/internal/store/pg"
 )
 
 // EnvDSN 은 시험 서버의 관리 DB URL 을 주는 환경 변수다.
@@ -70,11 +72,16 @@ func (s schema) fill(ctx context.Context, db *sql.DB) error {
 	return err
 }
 
-// fd 는 New 가 복제하는 원판이다.
+// fd 는 New 가 복제하는 원판이다. 내용은 PG 기준선 전부(준비 + 소유 역할로 기준선)다.
 //
-// ★ 지금은 비어 있다. PG 기준선 스키마가 생기면 그 SQL 바이트를 content 에 꽂는다 — 시험 쪽에서 고칠
-// 자리는 이 한 줄이다. 그 스키마 패키지는 store 를 import 하면 안 된다(위 순환과 같은 까닭).
-var fd = &template{prefix: "fd_tmpl", schema: schema{}}
+// ★ 준비가 역할 둘(클러스터 전역)을 만든다. 원판 만들기는 프로세스 사이에서 한 줄로 서므로(buildLock)
+// 겹치지 않고, 준비 자체도 이미 있는 역할을 그대로 둔다. 판 행은 비어 있다 — 그것은 이전 실행기의 몫이다.
+// 스키마 패키지는 store 를 import 하지 않는다(위 순환과 같은 까닭).
+//
+// ★ 준비는 복제한 DB 마다 다시 돈다(everyDB). 준비는 DB 하나에 한 번 도는 것이고, 그 안의 DB 단위 권한
+// (PUBLIC 의 TEMPORARY 회수)은 템플릿 복제로 안 따라온다 — 빠뜨리면 시험 DB 에서만 앱 역할이 임시 표로 원장을
+// 가릴 수 있다. 준비는 몇 번 돌려도 같다.
+var fd = &template{prefix: "fd_tmpl", schema: schema{content: []byte(pg.Fresh())}, everyDB: pg.Bootstrap}
 
 // New 는 이 시험만의 새 DB 를 만들어 그 접속 URL 을 돌려준다. 시험이 끝나면 DB 를 지운다.
 // FD_TEST_PG 가 없거나 서버에 못 붙으면 시험을 실패시킨다.
@@ -95,6 +102,10 @@ const buildLock int64 = 0x6664_7473_746d_706c
 type template struct {
 	prefix string
 	schema schema
+	// everyDB 는 복제한 DB 마다 관리 사용자로 한 번 돌리는 SQL 이다. 템플릿 복제가 옮기지 않는 것
+	// (DB 단위 권한 · ALTER DATABASE … SET)을 다시 적용하는 자리다. 원판 이름의 해시에는 안 들어간다 —
+	// 원판에 넣는 것이 아니다.
+	everyDB string
 
 	once sync.Once
 	name string
@@ -134,6 +145,14 @@ func (tp *template) clone(tb testing.TB) string {
 			tb.Errorf("시험 DB 지우기 실패(%s): %v", name, err)
 		}
 	})
+	if tp.everyDB != "" {
+		if err := atDB(ctx, dbURL(base, name), func(db *sql.DB) error {
+			_, err := db.ExecContext(ctx, tp.everyDB)
+			return err
+		}); err != nil {
+			tb.Fatalf("시험 DB 다시 준비 실패(%s): %v", name, err)
+		}
+	}
 	return dbURL(base, name)
 }
 
@@ -196,13 +215,18 @@ func (tp *template) build(ctx context.Context, base *url.URL, admin *sql.DB) (st
 	return name, nil
 }
 
-// fillAt 은 dsn 의 DB 에 내용을 넣고 연결을 다 닫는다. 남은 연결은 복제를 막는다.
+// fillAt 은 dsn 의 DB 에 내용을 넣는다.
 func fillAt(ctx context.Context, dsn string, s schema) error {
+	return atDB(ctx, dsn, func(db *sql.DB) error { return s.fill(ctx, db) })
+}
+
+// atDB 는 dsn 의 DB 에 붙어 f 를 돌리고 연결을 다 닫는다. 원판에 남은 연결은 복제를 막는다.
+func atDB(ctx context.Context, dsn string, f func(*sql.DB) error) error {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return err
 	}
-	err = s.fill(ctx, db)
+	err = f(db)
 	if cerr := db.Close(); err == nil {
 		err = cerr
 	}
