@@ -341,10 +341,12 @@ func (t *Tx) NextCounter(project, name string) (int64, error) {
 		return 0, fmt.Errorf("카운터 좌표가 비었다(project=%q name=%q)",
 			clip(project, 64), clip(name, 64))
 	}
+	// ★ 더하는 쪽은 표 이름으로 집는다(counter.value). Postgres 는 DO UPDATE 안에서 excluded 의 칸도 이름으로 보이게
+	//   하므로 맨 이름 value 는 「어느 쪽인지 모호하다」(42702)로 거절된다. SQLite 는 맨 이름을 표 쪽으로 읽어 같은 뜻이다.
 	var v int64
 	err := t.tx.QueryRowContext(t.ctx, `
 		INSERT INTO counter(project, name, value) VALUES (?, ?, 1)
-		ON CONFLICT(project, name) DO UPDATE SET value = value + 1
+		ON CONFLICT(project, name) DO UPDATE SET value = counter.value + 1
 		RETURNING value`, project, name).Scan(&v)
 	if err != nil {
 		return 0, writeErr(err, writeTarget{

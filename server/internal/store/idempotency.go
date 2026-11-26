@@ -85,9 +85,12 @@ func (s *Store) PutIdemRecord(ctx context.Context, r IdemRecord, ttl time.Durati
 			}
 		}
 		if max > 0 {
+			// 최신 max 개(시각 내림차순, 같으면 키 내림차순) 밖을 지운다. ★ 「앞 max 개를 건너뛴 나머지」로 적지 않는다:
+			// SQLite 는 OFFSET 을 LIMIT 없이 못 쓰고(그래서 `LIMIT -1` 이 「상한 없음」이었다) Postgres 는 음수 LIMIT 을
+			// 거절한다. 남길 쪽을 LIMIT 으로 집으면 한 문장이 두 엔진에서 같은 뜻이다(key 는 기본키라 NOT IN 에 NULL 이 없다).
 			if _, err := t.tx.ExecContext(t.ctx, `
-				DELETE FROM idempotency WHERE key IN (
-				  SELECT key FROM idempotency ORDER BY at DESC, key DESC LIMIT -1 OFFSET ?)`,
+				DELETE FROM idempotency WHERE key NOT IN (
+				  SELECT key FROM idempotency ORDER BY at DESC, key DESC LIMIT ?)`,
 				max); err != nil {
 				return fmt.Errorf("멱등 기록 초과분 청소 실패(max=%d): %w", max, err)
 			}

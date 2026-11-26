@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/kweiza/flightdeck/internal/model"
 )
@@ -274,7 +275,8 @@ func (s *Store) fillLinks(ctx context.Context, js []model.Judgment) ([]model.Jud
 // 전문 검색
 // ─────────────────────────────────────────────────────────────────────────────
 
-// FTSQuery 는 사람이 친 검색어를 FTS5 가 받는 안전한 질의로 바꾼다. 순수 함수다.
+// FTSQuery 는 사람이 친 검색어를 FTS5 가 받는 안전한 질의로 바꾼다. 순수 함수다. SQLite 판 검색(ftsSearch)만 쓴다 -
+// Postgres 판의 짝은 SearchTerms 다.
 //
 // ★ 왜 필요한가: FTS5 의 MATCH 는 자체 문법이 있어서 `-`·`"`·`*`·`(`·`:` 같은 문자가
 // 들어오면 **구문 오류로 죽는다**. 사용자가 친 문자열을 그대로 넘기면
@@ -293,30 +295,119 @@ func FTSQuery(raw string) string {
 	return strings.Join(toks, " ")
 }
 
+// SearchTerms 는 사람이 친 검색어를 Postgres 판 판단 검색의 조각으로 나눈다. 순수 함수다.
+//
+// 가름표는 FTS5 의 unicode61 과 같은 규칙이다: 글자(L*) · 숫자(N*) · 사용자 정의 글자(Co)가 아닌 것은 다 가름표다(공백도).
+// 하나만 일부러 다르다 - 결합 기호(Mn)를 unicode61 은 떼어 내고 앞뒤를 한 낱말로 잇지만(`cafe` + U+0301 + `bar` 는
+// `cafebar`) 여기서는 가름표다. Postgres 는 기호를 떼지 못하므로 이어 붙인 조각은 원문에 없는 글자열이 되고, 갈라 두면
+// 조각마다 원문 안에 그대로 있다. 조각마다 부분 일치(ILIKE)를 AND 로 건다(trgmSearch).
+//
+// ★ 왜 공백만이 아니라 가름표로도 나누나. SQLite 판(FTSQuery)은 공백 토큰 하나를 **구절**로 넘기고 unicode61 이 그것을
+// 구두점에서 낱말로 가른다 - 그래서 `fd-update` 는 구절 「fd update」 라 `fd update` · `fd, update` 에도 맞는다.
+// `ILIKE '%fd-update%'` 는 거기에 안 맞는다. 조각으로 나누면 FTS5 가 맞힌 판단은 조각을 다 품으므로 이쪽도 맞힌다
+// (낱말 단위 검색의 상위집합). 거꾸로는 아니다 - `판단` 이 `판단을` 에 맞는 것처럼 더 맞힌다.
+// 상위집합이 깨지는 것은 발음 구별 기호 접기(unicode61 의 remove_diacritics) 하나다: `é` 로 친 검색은 `e` 로 쓴 판단에
+// 안 맞는다.
+//
+// 조각이 없으면(가름표만 친 검색) 빈 슬라이스다 - 맞을 판단이 없다. SQLite 판도 그 검색에 0건이다.
+func SearchTerms(raw string) []string {
+	return strings.FieldsFunc(raw, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r) && !unicode.Is(unicode.Co, r)
+	})
+}
+
+// likeEscaper 는 LIKE 무늬의 특수 글자(`%` · `_` 와 이스케이프 글자 `\`)를 글자 그대로 찾게 막는다.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// likeContains 는 글을 「어디든 품는다」 LIKE 무늬로 만든다. Postgres 의 LIKE 는 `\` 가 기본 이스케이프 글자다.
+//
+// SearchTerms 의 조각에는 특수 글자가 없다(셋 다 가름표다). 그래도 막는 까닭은 이 함수의 계약이 「글자 그대로」라서다 -
+// 가름표 규칙이 바뀌는 날 무늬가 조용히 와일드카드가 되지 않게.
+func likeContains(text string) string {
+	return "%" + likeEscaper.Replace(text) + "%"
+}
+
+// searchQuery 는 판단 검색 질의 하나다. sql 이 비면 맞을 수 있는 판단이 없다(검색어에 글자 · 숫자가 없다).
+type searchQuery struct {
+	sql   string
+	args  []any
+	shown string // 오류 문구에 싣는 바꾼 검색어
+}
+
+// searchCols 는 검색 결과의 칸이다(judgmentCols 순서, 판단 표의 별칭 j). FTS5 표와 조인하면 title · body 가 겹쳐
+// 별칭이 필요하다.
+const searchCols = `j.id, j.project, j.session_id, j.at, j.kind, j.title, j.body, j.supersedes`
+
+// ftsSearch 는 SQLite 판의 검색이다. 결과는 FTS5 의 rank 순(관련도 높은 순)이다.
+func ftsSearch(project, raw string, limit int) searchQuery {
+	q := FTSQuery(raw)
+	return searchQuery{
+		sql: `SELECT ` + searchCols + `
+		FROM judgment_fts f
+		JOIN judgment j ON j.rowid = f.rowid
+		WHERE judgment_fts MATCH ? AND (? = '' OR j.project = ?)
+		ORDER BY rank
+		LIMIT ?`,
+		args:  []any{q, project, project, limit},
+		shown: q,
+	}
+}
+
+// judgmentText 는 Postgres 판 검색이 훑는 판단의 글이다.
+//
+// ★ 기준선의 식 인덱스 judgment_text_trgm 과 **같은 식**이어야 그 인덱스를 탄다(칸 앞의 별칭은 상관없다). 식이 갈리면
+// 검색은 그대로 맞지만 매번 표 전체를 훑는다 - 결과로는 안 보이는 결함이라 시험이 실행 계획으로 잠근다.
+const judgmentText = `(coalesce(j.title, '') || ' ' || j.body)`
+
+// trgmSearch 는 Postgres 판의 검색이다(pg_trgm 부분 일치). 조각(SearchTerms)마다 ILIKE 를 AND 로 걸고, 순위는 원문과의
+// trigram 유사도 내림차순, 같으면 최신 먼저다. 조각이 없으면 빈 질의다.
+func trgmSearch(project, raw string, limit int) searchQuery {
+	terms := SearchTerms(raw)
+	if len(terms) == 0 {
+		return searchQuery{}
+	}
+	args := []any{project, project}
+	var match strings.Builder
+	for _, t := range terms {
+		match.WriteString(` AND ` + judgmentText + ` ILIKE ?`)
+		args = append(args, likeContains(t))
+	}
+	return searchQuery{
+		sql: `SELECT ` + searchCols + `
+		FROM judgment j
+		WHERE (? = '' OR j.project = ?)` + match.String() + `
+		ORDER BY similarity(` + judgmentText + `, ?) DESC, j.at DESC, j.id DESC
+		LIMIT ?`,
+		args:  append(args, raw, limit),
+		shown: strings.Join(terms, " "),
+	}
+}
+
 // SearchJudgments 는 판단을 전문 검색한다.
 //
-// project 가 비어 있으면 전 프로젝트를 본다. 결과는 FTS5 의 rank 순(관련도 높은 순)이다.
+// project 가 비어 있으면 전 프로젝트를 본다. 결과는 관련도 높은 순이다. 무엇으로 찾고 어떻게 줄 세우는지는 엔진마다
+// 다르다(engine.judgmentSearch): SQLite 판은 FTS5 의 낱말 구절 검색과 rank, Postgres 판은 부분 일치와 trigram 유사도.
+// Postgres 판이 맞히는 집합은 SQLite 판의 상위집합이다(SearchTerms 의 ★). 순위는 같지 않으므로 상한(limit)에 잘린
+// 목록끼리는 상위집합이 안 선다.
 // 판단이 쌓이면 grep 이 유일한 도달 경로가 되는 것을 막는 자리다.
 func (s *Store) SearchJudgments(ctx context.Context, project, query string, limit int) ([]model.Judgment, error) {
-	q := FTSQuery(query)
-	if q == "" {
-		// 빈 질의를 MATCH 에 넘기면 구문 오류가 난다. 빈 결과와 구분되는 오류로 거절한다.
+	if strings.TrimSpace(query) == "" {
+		// 빈 결과와 구분되는 오류로 거절한다 - 「찾았는데 없다」와 「찾을 것이 없다」는 다르다(빈 질의를 MATCH 에
+		// 넘기면 구문 오류로 죽기도 한다).
 		return nil, fmt.Errorf("검색어가 비었다(원문 %q)", clip(query, 64))
 	}
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT j.id, j.project, j.session_id, j.at, j.kind, j.title, j.body, j.supersedes
-		FROM judgment_fts f
-		JOIN judgment j ON j.rowid = f.rowid
-		WHERE judgment_fts MATCH ? AND (? = '' OR j.project = ?)
-		ORDER BY rank
-		LIMIT ?`, q, project, project, limit)
+	sq := s.db.dialect().judgmentSearch(project, query, limit)
+	if sq.sql == "" {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, sq.sql, sq.args...)
 	if err != nil {
 		// 원인 전문을 담는다 — 변환된 질의까지 실어야 "무엇이 틀렸나"에 답이 된다.
 		return nil, fmt.Errorf("판단 검색 실패(원문=%q 변환=%q project=%q): %w",
-			clip(query, 64), clip(q, 128), clip(project, 64), err)
+			clip(query, 64), clip(sq.shown, 128), clip(project, 64), err)
 	}
 	out, err := collectJudgments(rows)
 	if err != nil {
@@ -360,10 +451,11 @@ func (t *Tx) PutSnapshot(s model.Snapshot) error {
 	if s.ComputedAt.IsZero() {
 		s.ComputedAt = nowStamp()
 	}
+	// 충돌 대상은 기본키다. 키 쪽 칸 이름이 엔진마다 다르다(snapshotKey - Postgres 판은 키의 지문).
 	if _, err := t.tx.ExecContext(t.ctx, `
 		INSERT INTO snapshot(project, key, value, method, evidence, input_digest, computed_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(project, key) DO UPDATE SET
+		ON CONFLICT(project, `+t.tx.dialect().snapshotKey()+`) DO UPDATE SET
 		  value = excluded.value, method = excluded.method, evidence = excluded.evidence,
 		  input_digest = excluded.input_digest, computed_at = excluded.computed_at`,
 		s.Project, s.Key, s.Value, string(s.Method),

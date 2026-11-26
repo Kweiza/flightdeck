@@ -1361,76 +1361,80 @@ func TestJudgmentBodyMustNotBeBlank(t *testing.T) {
 }
 
 func TestSearchJudgments(t *testing.T) {
-	s := newStore(t)
-	seed(t, s, "p")
-	ctx := context.Background()
-	a := mustSession(t, s, "p", "cc-A")
+	bothEngines(t, func(t *testing.T, s *Store) {
+		seed(t, s, "p")
+		ctx := context.Background()
+		a := mustSession(t, s, "p", "cc-A")
 
-	add := func(title, body string) {
-		t.Helper()
+		add := func(title, body string) {
+			t.Helper()
+			if _, err := s.AddJudgment(ctx, model.Judgment{
+				Project: "p", SessionID: a.ID, Kind: model.JudgmentHandoff, Title: title, Body: body,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		add("batch7 랜딩", "컨슈머 수렴 대기에서 DLQ 10건이 났다")
+		add("계약 개정", "raw-envelope 에 sync_mode 를 넣었다")
+		add("기각한 후보", "structlog 도입은 의존성 최소주의에 어긋나 기각")
+
+		// ── 대조 전제: FTS 인덱스에 실제로 3건이 들어갔는가.
+		//    external content FTS 는 트리거가 안 걸리면 조용히 0건이 되고,
+		//    그러면 "검색이 안 된다"와 "결과가 없다"가 구분되지 않는다.
+		//    Postgres 판은 FTS 표가 없다 - 판단 표를 바로 훑으므로(trgmSearch) 이 전제가 없다.
+		if !s.Postgres() {
+			var n int
+			if err := s.db.QueryRow(`SELECT count(*) FROM judgment_fts`).Scan(&n); err != nil {
+				t.Fatalf("FTS 표 조회 실패: %v", err)
+			}
+			if n != 3 {
+				t.Fatalf("전제가 성립하지 않았다: judgment_fts 에 %d건(기대 3건) — 삽입 트리거가 안 걸렸다", n)
+			}
+		}
+
+		hits, err := s.SearchJudgments(ctx, "p", "DLQ", 10)
+		if err != nil {
+			t.Fatalf("검색 실패: %v", err)
+		}
+		if len(hits) != 1 || !strings.Contains(hits[0].Body, "DLQ") {
+			t.Fatalf("DLQ 검색 결과가 틀렸다: %+v", hits)
+		}
+
+		// 제목도 검색된다.
+		if hits, err = s.SearchJudgments(ctx, "p", "batch7", 10); err != nil || len(hits) != 1 {
+			t.Errorf("제목 검색 결과가 틀렸다: %d건, err=%v", len(hits), err)
+		}
+
+		// 표 밖: FTS5 문법 문자가 든 검색어도 **죽지 않아야** 한다.
+		// 그대로 넘기면 구문 오류로 죽고, 그러면 결과 없음과 구분되지 않는다.
+		for _, q := range []string{"sync_mode", `"unbalanced`, "a AND", "-not", "*", "(", "OR OR"} {
+			if _, err := s.SearchJudgments(ctx, "p", q, 10); err != nil {
+				t.Errorf("검색어 %q 가 오류를 냈다: %v", q, err)
+			}
+		}
+		// 빈 검색어는 빈 결과가 아니라 오류다 — 둘을 뭉개면 "왜 안 나오나"에 답이 없다.
+		if _, err := s.SearchJudgments(ctx, "p", "   ", 10); err == nil {
+			t.Error("빈 검색어가 통과했다")
+		}
+
+		// 프로젝트 축으로 갈린다.
+		if err := s.UpsertProject(ctx, model.Project{ID: "q", Path: "/repo/q"}); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := s.AddJudgment(ctx, model.Judgment{
-			Project: "p", SessionID: a.ID, Kind: model.JudgmentHandoff, Title: title, Body: body,
+			Project: "q", Kind: model.JudgmentNow, Body: "DLQ 는 여기도 있다",
 		}); err != nil {
 			t.Fatal(err)
 		}
-	}
-	add("batch7 랜딩", "컨슈머 수렴 대기에서 DLQ 10건이 났다")
-	add("계약 개정", "raw-envelope 에 sync_mode 를 넣었다")
-	add("기각한 후보", "structlog 도입은 의존성 최소주의에 어긋나 기각")
-
-	// ── 대조 전제: FTS 인덱스에 실제로 3건이 들어갔는가.
-	//    external content FTS 는 트리거가 안 걸리면 조용히 0건이 되고,
-	//    그러면 "검색이 안 된다"와 "결과가 없다"가 구분되지 않는다.
-	var n int
-	if err := s.db.QueryRow(`SELECT count(*) FROM judgment_fts`).Scan(&n); err != nil {
-		t.Fatalf("FTS 표 조회 실패: %v", err)
-	}
-	if n != 3 {
-		t.Fatalf("전제가 성립하지 않았다: judgment_fts 에 %d건(기대 3건) — 삽입 트리거가 안 걸렸다", n)
-	}
-
-	hits, err := s.SearchJudgments(ctx, "p", "DLQ", 10)
-	if err != nil {
-		t.Fatalf("검색 실패: %v", err)
-	}
-	if len(hits) != 1 || !strings.Contains(hits[0].Body, "DLQ") {
-		t.Fatalf("DLQ 검색 결과가 틀렸다: %+v", hits)
-	}
-
-	// 제목도 검색된다.
-	if hits, err = s.SearchJudgments(ctx, "p", "batch7", 10); err != nil || len(hits) != 1 {
-		t.Errorf("제목 검색 결과가 틀렸다: %d건, err=%v", len(hits), err)
-	}
-
-	// 표 밖: FTS5 문법 문자가 든 검색어도 **죽지 않아야** 한다.
-	// 그대로 넘기면 구문 오류로 죽고, 그러면 결과 없음과 구분되지 않는다.
-	for _, q := range []string{"sync_mode", `"unbalanced`, "a AND", "-not", "*", "(", "OR OR"} {
-		if _, err := s.SearchJudgments(ctx, "p", q, 10); err != nil {
-			t.Errorf("검색어 %q 가 오류를 냈다: %v", q, err)
+		hits, _ = s.SearchJudgments(ctx, "p", "DLQ", 10)
+		if len(hits) != 1 {
+			t.Errorf("프로젝트 필터가 안 먹었다: %d건", len(hits))
 		}
-	}
-	// 빈 검색어는 빈 결과가 아니라 오류다 — 둘을 뭉개면 "왜 안 나오나"에 답이 없다.
-	if _, err := s.SearchJudgments(ctx, "p", "   ", 10); err == nil {
-		t.Error("빈 검색어가 통과했다")
-	}
-
-	// 프로젝트 축으로 갈린다.
-	if err := s.UpsertProject(ctx, model.Project{ID: "q", Path: "/repo/q"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.AddJudgment(ctx, model.Judgment{
-		Project: "q", Kind: model.JudgmentNow, Body: "DLQ 는 여기도 있다",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	hits, _ = s.SearchJudgments(ctx, "p", "DLQ", 10)
-	if len(hits) != 1 {
-		t.Errorf("프로젝트 필터가 안 먹었다: %d건", len(hits))
-	}
-	hits, _ = s.SearchJudgments(ctx, "", "DLQ", 10)
-	if len(hits) != 2 {
-		t.Errorf("전 프로젝트 검색이 %d건(기대 2건)", len(hits))
-	}
+		hits, _ = s.SearchJudgments(ctx, "", "DLQ", 10)
+		if len(hits) != 2 {
+			t.Errorf("전 프로젝트 검색이 %d건(기대 2건)", len(hits))
+		}
+	})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

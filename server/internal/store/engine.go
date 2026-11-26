@@ -25,8 +25,9 @@ import (
 // 저장 엔진
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// 엔진이 갈리는 자리는 이 파일(열기 · 트랜잭션 시작 · 자리표시)과 constraint.go(오류 번역) 둘뿐이다.
-// 질의를 쓰는 자리(item.go 등)는 엔진을 모른다 - `?` 자리표시로 쓰고 conn · txConn 을 지난다.
+// 엔진이 갈리는 자리는 이 파일(열기 · 트랜잭션 시작 · 자리표시 · 엔진마다 다른 질의 조각)과 constraint.go(오류 번역)
+// 둘뿐이다. 질의를 쓰는 자리(item.go 등)는 엔진을 모른다 - `?` 자리표시로 쓰고 conn · txConn 을 지난다. 스키마가
+// 엔진마다 달라 질의 조각이 갈려야 하는 자리는 dialect() 의 메서드가 고른다(itemAfterOrder · snapshotKey · judgmentSearch).
 // 날 *sql.DB · *sql.Tx 는 이 파일 밖으로 안 나간다. 예외는 DB() 하나이고, 시험만이 아니라 web 의 날 질의 넷
 // (query.go 의 pickEvals · closedItems · unackedJobs, page.go 의 claimHolders)이 아직 그것으로 질의한다.
 // 그 넷은 감싸개를 안 지나 Postgres 에서는 안 돈다 - 이전의 뒤 단계가 store 안으로 옮긴다.
@@ -791,6 +792,28 @@ func (e engine) itemAfterOrder() string {
 		return "seq"
 	}
 	return "rowid"
+}
+
+// snapshotKey 는 snapshot 의 기본키에서 키 쪽 칸이다(upsert 의 충돌 대상). SQLite 판은 (project, key) 이고, Postgres
+// 판은 키 원문 대신 그 지문을 둔다(pg/001_baseline.sql - 원문은 길이 제한이 없는데 B-tree 항목은 상한이 있다).
+// ON CONFLICT 는 유니크 인덱스의 칸을 그대로 적어야 하고 Postgres 의 DO UPDATE 는 대상을 뺄 수 없다. 한 문장(읽고 쓰기가
+// 문장 하나)으로 두 엔진을 같이 쓰는 길이 칸 이름 하나를 엔진이 고르는 것뿐이다. 지문이 같은 다른 키는 Postgres 의
+// 넣기 전 트리거가 거절하므로 「프로젝트 안에서 키 하나에 행 하나」는 두 판이 같다.
+func (e engine) snapshotKey() string {
+	if e == enginePG {
+		return "key_digest"
+	}
+	return "key"
+}
+
+// judgmentSearch 는 판단 전문 검색의 질의다. 검색 색인이 엔진마다 다른 물건이다: SQLite 판은 FTS5 가상 표
+// (judgment_fts)이고 Postgres 판은 그 자리의 pg_trgm 식 인덱스(judgment_text_trgm)다. 짓는 것은 judgment.go 의
+// ftsSearch · trgmSearch 이고, 여기는 고르기만 한다.
+func (e engine) judgmentSearch(project, raw string, limit int) searchQuery {
+	if e == enginePG {
+		return trgmSearch(project, raw, limit)
+	}
+	return ftsSearch(project, raw, limit)
 }
 
 // lockStmt 는 트랜잭션이 첫 문장으로 잡는 잠금이다. 빈 문자열이면 따로 잡지 않는다.
