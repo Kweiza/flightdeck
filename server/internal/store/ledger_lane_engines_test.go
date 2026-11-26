@@ -565,9 +565,6 @@ func TestLikeContainsMatchesLiterally(t *testing.T) {
 func TestSearchJudgmentsPGCoversFTS(t *testing.T) {
 	ctx := context.Background()
 	lite, pg := newStore(t), newPGStore(t, lockTimeout)
-	// FTS5 는 낱말을 32,768 바이트에서 자른다(fts5Int.h 의 FTS5_MAX_TOKEN_SIZE). 그 길이를 넘는 낱말 둘은 뒤가 달라도
-	// SQLite 판에서 같은 낱말이다.
-	long := strings.Repeat("z", 32768)
 	docs := []struct{ id, title, body string }{
 		{"d1", "배포 절차", "fd-update 로 판을 올린다"},
 		{"d2", "", "fd update 를 먼저 돌린다"},
@@ -586,7 +583,6 @@ func TestSearchJudgmentsPGCoversFTS(t *testing.T) {
 		{"d15", "", "ª 서수 표시"},
 		{"f1", "", "ẛqz1"}, {"f2", "", "µqz2"}, {"f3", "", "ϐqz3"}, {"f4", "", "ϵqz4"}, {"f5", "", "ϑqz5"},
 		{"f6", "", "ϰqz6"}, {"f7", "", "ϖqz7"}, {"f8", "", "ϱqz8"}, {"f9", "", "ϕqz9"},
-		{"g1", "", long + "b"},
 	}
 	for _, s := range []*Store{lite, pg} {
 		seed(t, s, "p")
@@ -647,8 +643,6 @@ func TestSearchJudgmentsPGCoversFTS(t *testing.T) {
 		{"πqz7", []string{"f7"}, nil, "받아들인 예외: 대소문자 특수 접기(ϖ→π)"},
 		{"ρqz8", []string{"f8"}, nil, "받아들인 예외: 대소문자 특수 접기(ϱ→ρ)"},
 		{"φqz9", []string{"f9"}, nil, "받아들인 예외: 대소문자 특수 접기(ϕ→φ)"},
-		{long + "c", []string{"g1"}, nil, "받아들인 예외: FTS5 는 32,768 바이트를 넘는 낱말을 잘라 뒤가 달라도 맞힌다"},
-		{long + "b", []string{"g1"}, []string{"g1"}, "대조: 긴 낱말도 똑같으면 두 판이 맞힌다"},
 		{"---", nil, nil, "가름표만 친 검색은 맞을 판단이 없다(조각 없는 검색이 전부를 내면 안 된다)"},
 	} {
 		if l, p := search(lite, c.q), search(pg, c.q); !slices.Equal(l, c.lite) || !slices.Equal(p, c.pg) {
@@ -698,6 +692,8 @@ func TestSearchJudgmentsHasNoTermLimit(t *testing.T) {
 		{strings.Join(words[:33], " "), "all,most,upper"},
 		{strings.Join(words[:33], "-"), "all,most,upper"},
 		{strings.Join(words, " "), "all,upper"},
+		// 검색어만 대문자(W090, 배열 거르기 쪽): 무늬도 소문자로 접어야 소문자 본문(all)이 맞는다.
+		{strings.Join(upper, " "), "all,upper"},
 		{strings.Join(words, " ") + " 없는낱말", ""},
 	} {
 		for _, s := range []*Store{lite, pg} {
@@ -719,21 +715,46 @@ func TestSearchJudgmentsHasNoTermLimit(t *testing.T) {
 // 않는다(FTS5 가 구절 7만 개에 십여 초를 쓴다). 두 엔진의 같은 결과는 TestSearchJudgmentsHasNoTermLimit 가 잰다.
 func TestTrgmSearchBindCountIsBounded(t *testing.T) {
 	ctx := context.Background()
+	// 질의 짓기는 상한과 무관하게 조각 수만 개에서도 바인드가 묶이는지 본다(순수).
 	const n = 70000
-	raw := strings.TrimSpace(strings.Repeat("낱말 ", n))
-	sq := trgmSearch("", raw, 10)
+	many := make([]string, n)
+	for i := range many {
+		many[i] = fmt.Sprintf("t%05x", i)
+	}
+	sq := trgmSearch("", strings.Join(many, " "), 10)
 	if pats, ok := sq.args[2+indexedTerms].([]string); len(sq.args) != indexedTerms+5 || !ok || len(pats) != n-indexedTerms {
 		t.Fatalf("바인드 %d개(기대 %d개), 무늬 배열 %T", len(sq.args), indexedTerms+5, sq.args[2+indexedTerms])
 	}
+	// 같은 조각의 되풀이는 일치 조건에서 한 번으로 준다. 긴 낱말 하나가 인덱스 조건 자리를 다 차지하지 않는다.
+	rep := strings.TrimSpace(strings.Repeat("longword ", 40)) + " ab"
+	if sq := trgmSearch("", rep, 10); len(sq.args) != 2+2+2 {
+		t.Fatalf("되풀이 조각 검색의 바인드 %d개(기대 6개: project 둘 · 조각 둘 · 유사도 · limit): %v", len(sq.args), sq.args)
+	}
+	// 실제 Postgres 에서는 원문 바이트 상한(MaxSearchQueryBytes) 안에서 조각을 가장 많이 넣은 검색이 돈다.
+	var parts []string
+	for i := 0; len(strings.Join(parts, " "))+6 <= MaxSearchQueryBytes; i++ {
+		parts = append(parts, fmt.Sprintf("t%04x", i))
+	}
+	raw := strings.Join(parts, " ")
+	if len(parts) <= indexedTerms {
+		t.Fatalf("조각 %d개라 배열 거르기에 닿지 않는다", len(parts))
+	}
 	s := newPGStore(t, lockTimeout)
 	seed(t, s, "p")
-	for _, d := range []struct{ id, body string }{{"hit", "낱말"}, {"miss", "다른 글"}} {
+	for _, d := range []struct{ id, body string }{{"hit", raw}, {"miss", strings.Join(parts[:len(parts)-1], " ")}} {
 		if _, err := s.AddJudgment(ctx, model.Judgment{ID: d.id, Project: "p", Kind: model.JudgmentDecision, Body: d.body}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if js, err := s.SearchJudgments(ctx, "", raw, 0); err != nil || judgmentIDs(js) != "hit" {
-		t.Fatalf("조각 %d개 검색: %q %v", n, judgmentIDs(js), err)
+		t.Fatalf("조각 %d개(%d 바이트) 검색: %q %v", len(parts), len(raw), judgmentIDs(js), err)
+	}
+	// 상한을 넘으면 두 엔진 모두 질의 전에 입력 오류다.
+	var tooLong *SearchQueryTooLongError
+	for _, st := range []*Store{newStore(t), s} {
+		if _, err := st.SearchJudgments(ctx, "", strings.Repeat("a", MaxSearchQueryBytes+1), 0); !errors.As(err, &tooLong) {
+			t.Fatalf("상한을 넘는 검색어: %v(SearchQueryTooLongError 를 기대)", err)
+		}
 	}
 }
 

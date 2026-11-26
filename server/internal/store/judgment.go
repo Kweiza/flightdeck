@@ -336,9 +336,9 @@ func cleanSearchText(s string) string {
 //   - 발음 구별 기호 접기: FTS5 는 `é` · `É` · `e` + U+0301 을 `e` 로 접는다. `cafe` 로 친 검색은 `café` 에 안 맞는다.
 //   - 대소문자 특수 접기 11자: `ſ` `ẛ`(→s) · `µ`(→μ) · `ς`(→σ) · `ϐ` `ϵ` `ϑ` `ϰ` `ϖ` `ϱ` `ϕ`(그리스 기호꼴). lower() 는
 //     이 글자들을 그대로 둔다. `ΛΟΓΟΣ` 로 친 검색은 `λογος` 에 안 맞는다.
-//   - 32,768 바이트를 넘는 낱말 하나: FTS5 는 낱말을 그 길이에서 자른다(fts5Int.h 의 FTS5_MAX_TOKEN_SIZE, 색인과 질의
-//     둘 다). 앞 32,768 바이트가 같고 뒤가 다른 검색어도 SQLite 판은 맞히고 Postgres 판은 못 맞힌다. 판단 본문에 그런
-//     낱말이 없어 고치지 않는다.
+//
+// FTS5 는 낱말을 32,768 바이트에서 자르지만(fts5Int.h 의 FTS5_MAX_TOKEN_SIZE) 예외가 아니다 - 검색어 원문이
+// MaxSearchQueryBytes(4KB)를 넘으면 질의 전에 거절하므로 그 길이의 검색 낱말이 닿지 않는다.
 //
 // 6.1 이후에 생긴 글자는 예외가 아니다 - 가름표는 표로 맞췄고, 접기는 FTS5 가 그 글자를 안 접어 Postgres 쪽이 더 맞힌다.
 //
@@ -431,7 +431,16 @@ func trgmSearch(project, raw string, limit int) searchQuery {
 	if len(terms) == 0 {
 		return searchQuery{}
 	}
-	byLen := slices.Clone(terms)
+	// 같은 조각이 되풀이되면 인덱스 조건 자리를 차지해 좁히는 데 보태지 않으므로 일치 조건에서만 한 번으로 줄인다
+	// (뜻은 AND 라 같다). 순위는 원문(cleanSearchText)으로 매기므로 되풀이가 그대로 남는다.
+	byLen := make([]string, 0, len(terms))
+	seenTerm := make(map[string]bool, len(terms))
+	for _, t := range terms {
+		if !seenTerm[t] {
+			seenTerm[t] = true
+			byLen = append(byLen, t)
+		}
+	}
 	slices.SortStableFunc(byLen, func(a, b string) int {
 		return cmp.Compare(utf8.RuneCountInString(b), utf8.RuneCountInString(a))
 	})
@@ -464,19 +473,36 @@ func trgmSearch(project, raw string, limit int) searchQuery {
 	}
 }
 
+// MaxSearchQueryBytes 는 검색어 원문의 바이트 상한이다.
+//
+// ★ 낱말 수가 아니라 바이트로 자른다. 낱말 수 상한은 예전 판이 찾던 정상 검색(낱말 수십 개)을 깨뜨렸다. 막을 것은
+// 머리글 한도(기본 1MB)까지 부풀린 검색어다. 그때는 SQLite FTS5 가 구절 수만 개에 10초 넘게 연결을 쥐고, Postgres 는
+// 행마다 조각 수에 비례한 거르기를 한다. 4KB 는 사람이 치는 검색어로 닿지 않는 크기다.
+const MaxSearchQueryBytes = 4096
+
+// SearchQueryTooLongError 는 검색어가 MaxSearchQueryBytes 를 넘는다는 입력 오류다(질의를 돌리기 전에 거절한다).
+type SearchQueryTooLongError struct{ Bytes int }
+
+func (e *SearchQueryTooLongError) Error() string {
+	return fmt.Sprintf("검색어가 %d 바이트다 - 상한은 %d 바이트다", e.Bytes, MaxSearchQueryBytes)
+}
+
 // SearchJudgments 는 판단을 전문 검색한다.
 //
 // project 가 비어 있으면 전 프로젝트를 본다. 결과는 관련도 높은 순이다. 무엇으로 찾고 어떻게 줄 세우는지는 엔진마다
 // 다르다(engine.judgmentSearch): SQLite 판은 FTS5 의 낱말 구절 검색과 rank, Postgres 판은 부분 일치와 trigram 유사도.
-// Postgres 판이 맞히는 집합은 받아들인 예외 셋(SearchTerms 의 ★: 발음 구별 기호 접기 · 대소문자 특수 접기 11자 ·
-// 32,768 바이트를 넘는 낱말)을 빼면 SQLite 판의 상위집합이다. 순위는 같지 않으므로 상한(limit)에 잘린 목록끼리는
-// 상위집합이 안 선다. 검색어의 낱말 수에는 두 엔진 모두 상한이 없다.
+// Postgres 판이 맞히는 집합은 받아들인 예외 둘(SearchTerms 의 ★: 발음 구별 기호 접기 · 대소문자 특수 접기 11자)을
+// 빼면 SQLite 판의 상위집합이다. 순위는 같지 않으므로 상한(limit)에 잘린 목록끼리는
+// 상위집합이 안 선다. 검색어의 낱말 수에는 두 엔진 모두 상한이 없고, 원문 바이트에만 상한이 있다(MaxSearchQueryBytes).
 // 판단이 쌓이면 grep 이 유일한 도달 경로가 되는 것을 막는 자리다.
 func (s *Store) SearchJudgments(ctx context.Context, project, query string, limit int) ([]model.Judgment, error) {
 	if strings.TrimSpace(query) == "" {
 		// 빈 결과와 구분되는 오류로 거절한다 - 「찾았는데 없다」와 「찾을 것이 없다」는 다르다(빈 질의를 MATCH 에
 		// 넘기면 구문 오류로 죽기도 한다). 표면은 이 자리에 닿기 전에 빈 검색어를 거절한다(api 의 requireQuery).
 		return nil, fmt.Errorf("검색어가 비었다(원문 %q)", clip(query, 64))
+	}
+	if len(query) > MaxSearchQueryBytes {
+		return nil, &SearchQueryTooLongError{Bytes: len(query)}
 	}
 	if limit <= 0 {
 		limit = 50

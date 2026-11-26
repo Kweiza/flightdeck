@@ -59,6 +59,17 @@ func ClassifyError(err error) Classified {
 		return Classified{Status: http.StatusOK, Code: "ok", Message: "오류가 없다"}
 	}
 
+	// 검색어가 상한보다 길다. 질의를 돌리기 전에 거절한 입력 오류라 400 이다.
+	var longSearch *store.SearchQueryTooLongError
+	if errors.As(err, &longSearch) {
+		return Classified{
+			Status:   http.StatusBadRequest,
+			Code:     "search_query_too_long",
+			Message:  longSearch.Error(),
+			Guidance: "검색어를 줄여 다시 보내라.",
+		}
+	}
+
 	var refused *service.RefusedError
 	if errors.As(err, &refused) {
 		return Classified{

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/kweiza/flightdeck/internal/model"
+	"github.com/kweiza/flightdeck/internal/store"
 )
 
 // 소비자 좌표계 시험 — 실제 HTTP 응답과 구조화 로그 실물 한 줄로만 단정한다.
@@ -552,6 +553,27 @@ func TestSearchJudgmentsTakesManyTerms(t *testing.T) {
 	}
 	if n, _ := decodeBody(t, w)["count"].(float64); n != 1 {
 		t.Fatalf("낱말 %d개 검색이 판단을 못 찾았다: %s", len(words), w.Body.String())
+	}
+}
+
+// TestSearchJudgmentsTooLongIs400 은 원문 바이트 상한을 넘는 검색어가 질의 전에 400 으로 거절되고, 상한과 같은
+// 길이는 받는지 HTTP 에서 잰다. ClassifyError 는 화이트리스트라 갈래가 빠지면 같은 오류가 조용히 500 이 된다.
+func TestSearchJudgmentsTooLongIs400(t *testing.T) {
+	e := newEnv(t, nil)
+	if err := e.st.UpsertProject(t.Context(), model.Project{ID: testProject, Path: e.repo}); err != nil {
+		t.Fatal(err)
+	}
+	at := strings.Repeat("a ", store.MaxSearchQueryBytes/2)
+	w := e.do(http.MethodGet, "/api/v1/judgments?"+url.Values{"project": {testProject}, "q": {at}}.Encode(), nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("상한(%d 바이트)과 같은 검색이 %d 로 나갔다: %s", len(at), w.Code, w.Body.String())
+	}
+	w = e.do(http.MethodGet, "/api/v1/judgments?"+url.Values{"project": {testProject}, "q": {at + "b"}}.Encode(), nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("상한을 1 바이트 넘는 검색이 %d 로 나갔다(400 을 기대): %s", w.Code, w.Body.String())
+	}
+	if ce := errorOf(t, w); ce["code"] != "search_query_too_long" {
+		t.Fatalf("오류 절이 다르다: %v", ce)
 	}
 }
 
