@@ -1381,10 +1381,11 @@ func TestSearchJudgments(t *testing.T) {
 		// ── 대조 전제: FTS 인덱스에 실제로 3건이 들어갔는가.
 		//    external content FTS 는 트리거가 안 걸리면 조용히 0건이 되고,
 		//    그러면 "검색이 안 된다"와 "결과가 없다"가 구분되지 않는다.
+		//    ★ 색인을 MATCH 로 읽는다. `count(*)` 는 external content 표의 원본(judgment)을 읽어 트리거가 없어도 3이다.
 		//    Postgres 판은 FTS 표가 없다 - 판단 표를 바로 훑으므로(trgmSearch) 이 전제가 없다.
 		if !s.Postgres() {
 			var n int
-			if err := s.db.QueryRow(`SELECT count(*) FROM judgment_fts`).Scan(&n); err != nil {
+			if err := s.db.QueryRow(`SELECT count(*) FROM judgment_fts WHERE judgment_fts MATCH '"DLQ" OR "envelope" OR "structlog"'`).Scan(&n); err != nil {
 				t.Fatalf("FTS 표 조회 실패: %v", err)
 			}
 			if n != 3 {

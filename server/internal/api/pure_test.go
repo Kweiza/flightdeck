@@ -208,6 +208,8 @@ func TestClassifyError(t *testing.T) {
 			http.StatusConflict, "item_closed", "dropped", false},
 		{"자원 점유", &store.ResourceHeldError{Resource: "staging", Holder: store.Holder{SessionID: "S2"}, AcquiredAt: at},
 			http.StatusConflict, "resource_held", "staging", false},
+		{"받을 수 없는 검색어", fmt.Errorf("감싼: %w", &store.SearchQueryError{Query: "a b", Reason: "낱말이 너무 많다"}),
+			http.StatusBadRequest, "bad_search_query", "낱말이 너무 많다", false},
 		{"없다", fmt.Errorf("항목 조회: %w", store.ErrNotFound),
 			http.StatusNotFound, "not_found", "없다", false},
 		{"모르는 오류", errors.New("SQL logic error near \"SELECT\": /data/fd.db"),

@@ -808,10 +808,11 @@ func (e engine) snapshotKey() string {
 
 // judgmentSearch 는 판단 전문 검색의 질의다. 검색 색인이 엔진마다 다른 물건이다: SQLite 판은 FTS5 가상 표
 // (judgment_fts)이고 Postgres 판은 그 자리의 pg_trgm 식 인덱스(judgment_text_trgm)다. 짓는 것은 judgment.go 의
-// ftsSearch · trgmSearch 이고, 여기는 고르기만 한다.
-func (e engine) judgmentSearch(project, raw string, limit int) searchQuery {
+// ftsSearch · trgmSearch 이고, 여기는 고르기만 한다. SQLite 판은 원문(raw)을 FTS5 구절로, Postgres 판은 조각(terms,
+// SearchTerms 의 결과)을 쓴다.
+func (e engine) judgmentSearch(project, raw string, terms []string, limit int) searchQuery {
 	if e == enginePG {
-		return trgmSearch(project, raw, limit)
+		return trgmSearch(project, terms, limit)
 	}
 	return ftsSearch(project, raw, limit)
 }

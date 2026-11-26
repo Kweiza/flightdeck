@@ -401,6 +401,8 @@ func TestFTSQuery(t *testing.T) {
 		{"별표", "tools*", `"tools*"`},
 		{"괄호와 콜론", "a:(b)", `"a:(b)"`},
 		{"OR 도 리터럴이 된다", "a OR b", `"a" "OR" "b"`},
+		// NUL 은 FTS5 해석기에서 글의 끝이다. 구절 안의 빈칸(같은 가름표)으로 바꾼다.
+		{"NUL 은 구절 안의 빈칸", "판단\x00남긴다 x", `"판단 남긴다" "x"`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

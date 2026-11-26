@@ -639,19 +639,19 @@ func (s *Store) closeDeclarationsByItem(ctx context.Context, project string, lim
 		if err := rows.Scan(&at, &session, &payload); err != nil {
 			return nil, fmt.Errorf("종료 선언 행 해석 실패: %w", err)
 		}
-		var p struct {
-			Item string `json:"item"`
-			Mode string `json:"mode"`
-		}
-		if json.Unmarshal([]byte(payload), &p) != nil {
+		// 항목과 mode 는 원장의 다른 판독(ClaimHolderAt · 결말 표시)과 같은 판독기로 읽는다: 중복 키는 첫 값, 키는 글자
+		// 그대로다. 구조체로 풀면 끝 값을 쓰고 "Item" 도 잡아, 같은 행이 판독기마다 다른 항목의 것이 된다.
+		rawItem, ok, err := payloadTopString(payload, "item")
+		if err != nil || !ok {
 			continue
 		}
-		item := strings.TrimSpace(p.Item)
+		item := strings.TrimSpace(rawItem)
 		if item == "" {
 			continue
 		}
+		mode, _, _ := payloadTopString(payload, "mode") // 문서는 위에서 읽혔다. 없거나 글이 아니면 빈 값이라 아래에서 안 센다
 		d := out[item]
-		switch p.Mode {
+		switch mode {
 		case string(model.ItemDone):
 			d.Done++
 		case string(model.ItemDropped):
@@ -667,7 +667,7 @@ func (s *Store) closeDeclarationsByItem(ctx context.Context, project string, lim
 			if err != nil {
 				return nil, err
 			}
-			d.Last, d.LastSession, d.LastMode = t, str(session), p.Mode
+			d.Last, d.LastSession, d.LastMode = t, str(session), mode
 		}
 		out[item] = d
 	}

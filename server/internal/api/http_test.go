@@ -1,7 +1,9 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -523,6 +525,29 @@ func TestQueueRoundTrip(t *testing.T) {
 	}
 	if n, _ := decodeBody(t, found)["count"].(float64); n < 1 {
 		t.Fatalf("방금 남긴 판단이 안 잡힌다: %s", found.Body.String())
+	}
+}
+
+// TestSearchJudgmentsTooManyTermsIs400 은 낱말이 상한을 넘는 검색어가 500 이 아니라 400 bad_search_query 로 나가는지
+// HTTP 에서 잰다. ClassifyError 는 화이트리스트라 갈래가 빠지면 같은 오류가 조용히 500 이 된다.
+func TestSearchJudgmentsTooManyTermsIs400(t *testing.T) {
+	e := newEnv(t, nil)
+	words := make([]string, 33)
+	for i := range words {
+		words[i] = fmt.Sprintf("w%d", i)
+	}
+	w := e.do(http.MethodGet, "/api/v1/judgments?"+url.Values{
+		"project": {testProject}, "q": {strings.Join(words, " ")}}.Encode(), nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("낱말 33개 검색이 %d 로 나갔다(400 을 기대): %s", w.Code, w.Body.String())
+	}
+	if ce := errorOf(t, w); ce["code"] != "bad_search_query" || !strings.Contains(fmt.Sprint(ce["message"]), "33") {
+		t.Fatalf("오류 절이 다르다: %v", ce)
+	}
+	ok := e.do(http.MethodGet, "/api/v1/judgments?"+url.Values{
+		"project": {testProject}, "q": {strings.Join(words[:32], " ")}}.Encode(), nil)
+	if ok.Code != http.StatusOK {
+		t.Fatalf("낱말 32개 검색은 받아야 한다: %d %s", ok.Code, ok.Body.String())
 	}
 }
 

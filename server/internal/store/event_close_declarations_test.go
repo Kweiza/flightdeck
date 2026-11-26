@@ -321,3 +321,43 @@ func TestCloseDeclarationsByItemEmptyIsEmptyMapNotError(t *testing.T) {
 		t.Fatalf("빈 원장인데 %d건이 나왔다: %+v", len(got), got)
 	}
 }
+
+// TestCloseDeclarationsByItemReadsFirstValueByExactKey 는 종료 선언의 항목 · mode 를 원장의 다른 판독(ClaimHolderAt ·
+// 결말 표시)과 같은 규칙으로 읽는지 두 엔진에서 잰다: 중복 키는 첫 값, 키는 글자 그대로.
+//
+// ★ 구조체로 풀면 `{"item":"A","item":"B"}` 를 B 로 세고 "Item" 도 item 으로 잡는다. 그러면 같은 원장 행이 선점 이력
+// (첫 값 A)과 종료 선언(끝 값 B)에서 다른 항목의 것이 된다.
+func TestCloseDeclarationsByItemReadsFirstValueByExactKey(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p")
+		a := mustSession(t, s, "p", "cc-a")
+		t0 := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+		for i, payload := range []string{
+			`{"item":"A","item":"B","mode":"done"}`,
+			`{"Item":"C","mode":"done"}`,
+			`{"item":"D","mode":"done","mode":"dropped"}`,
+			`{"item":"E","MODE":"dropped"}`,
+			`{"item":7,"item":"F","mode":"done"}`,
+		} {
+			insertEventAt(t, s, fmtTime(t0.Add(time.Duration(i)*time.Minute)), "p", a.ID, payload, "item.finish")
+		}
+		got, err := s.CloseDeclarationsByItem(ctx, "p")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]model.CloseDeclaration{
+			"A": {Done: 1, Last: t0, LastSession: a.ID, LastMode: "done"},
+			"D": {Done: 1, Last: t0.Add(2 * time.Minute), LastSession: a.ID, LastMode: "done"},
+		}
+		if len(got) != len(want) {
+			t.Fatalf("집계된 항목이 %v 다(기대 A · D 둘: 첫 값 · 글자 그대로의 키)", got)
+		}
+		for k, w := range want {
+			g, ok := got[k]
+			if !ok || g.Done != w.Done || g.Dropped != w.Dropped || g.LastMode != w.LastMode || g.LastSession != w.LastSession || !g.Last.Equal(w.Last) {
+				t.Fatalf("항목 %s: %+v(기대 %+v)", k, g, w)
+			}
+		}
+	})
+}

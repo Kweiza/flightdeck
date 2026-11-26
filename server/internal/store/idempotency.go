@@ -87,10 +87,15 @@ func (s *Store) PutIdemRecord(ctx context.Context, r IdemRecord, ttl time.Durati
 		if max > 0 {
 			// 최신 max 개(시각 내림차순, 같으면 키 내림차순) 밖을 지운다. ★ 「앞 max 개를 건너뛴 나머지」로 적지 않는다:
 			// SQLite 는 OFFSET 을 LIMIT 없이 못 쓰고(그래서 `LIMIT -1` 이 「상한 없음」이었다) Postgres 는 음수 LIMIT 을
-			// 거절한다. 남길 쪽을 LIMIT 으로 집으면 한 문장이 두 엔진에서 같은 뜻이다(key 는 기본키라 NOT IN 에 NULL 이 없다).
+			// 거절한다. 남길 쪽을 LIMIT 으로 집으면 한 문장이 두 엔진에서 같은 뜻이다.
+			//
+			// ★ NULL 키. Postgres 의 기본키는 NOT NULL 이지만 SQLite 의 `key TEXT PRIMARY KEY` 는 옛 호환 때문에 NULL 을
+			// 받는다(손으로 만진 DB 에서만 생긴다 - 이 함수는 빈 키를 거절한다). 남길 목록에 NULL 이 하나라도 들면
+			// `NOT IN` 이 모든 행에서 NULL 이 되어 청소가 조용히 0건이 된다. 그래서 남길 목록은 NULL 아닌 키에서만 고르고,
+			// NULL 키 행은 같이 지운다 - `key = ?` 로는 어느 요청도 그 행을 못 읽으니(멱등 재생에 못 쓴다) 둘 까닭이 없다.
 			if _, err := t.tx.ExecContext(t.ctx, `
-				DELETE FROM idempotency WHERE key NOT IN (
-				  SELECT key FROM idempotency ORDER BY at DESC, key DESC LIMIT ?)`,
+				DELETE FROM idempotency WHERE key IS NULL OR key NOT IN (
+				  SELECT key FROM idempotency WHERE key IS NOT NULL ORDER BY at DESC, key DESC LIMIT ?)`,
 				max); err != nil {
 				return fmt.Errorf("멱등 기록 초과분 청소 실패(max=%d): %w", max, err)
 			}

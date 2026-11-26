@@ -400,6 +400,53 @@ func TestIdemSweepKeepsTheNewest(t *testing.T) {
 	})
 }
 
+// TestIdemSweepSurvivesNullKey 는 NULL 키 행이 있어도 초과분 청소가 돌고, 그 행도 같이 걷히는지 잰다.
+//
+// ★ SQLite 의 `key TEXT PRIMARY KEY` 는 NULL 을 받는다(Postgres 는 거절한다). 남길 목록에 NULL 이 들면 `NOT IN` 이
+// 모든 행에서 NULL 이 되어 청소가 조용히 0건이었다. NULL 행을 가장 새 시각에 두어야 남길 목록에 든다 - 그래야 이
+// 시험이 그 결함에 닿는다.
+func TestIdemSweepSurvivesNullKey(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		t0 := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+		put := func(key string, m, max int) {
+			t.Helper()
+			r := IdemRecord{Key: key, Fingerprint: "f", Status: 200, ContentType: "x", Body: []byte(key), At: t0.Add(time.Duration(m) * time.Minute)}
+			if err := s.PutIdemRecord(ctx, r, 0, max); err != nil {
+				t.Fatalf("PutIdemRecord(%s): %v", key, err)
+			}
+		}
+		for i, k := range []string{"a", "b", "c"} {
+			put(k, i, 0) // 아직 청소하지 않는다
+		}
+		_, err := s.db.ExecContext(ctx, `INSERT INTO idempotency(key, fingerprint, status, ctype, body, at) VALUES (NULL, 'f', 200, 'x', ?, ?)`,
+			[]byte("n"), fmtTime(t0.Add(time.Hour)))
+		if s.Postgres() {
+			if err == nil {
+				t.Fatal("Postgres 의 기본키가 NULL 을 받았다")
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("전제: SQLite 의 TEXT PRIMARY KEY 는 NULL 을 받는다: %v", err)
+		}
+		put("d", 10, 2)
+		var nulls int
+		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM idempotency WHERE key IS NULL`).Scan(&nulls); err != nil {
+			t.Fatal(err)
+		}
+		n, err := s.CountIdemRecords(ctx)
+		if err != nil || nulls != 0 || n != 2 {
+			t.Fatalf("청소 뒤 %d행(NULL 키 %d행), 기대 c · d 두 행: %v", n, nulls, err)
+		}
+		for _, k := range []string{"c", "d"} {
+			if _, err := s.GetIdemRecord(ctx, k); err != nil {
+				t.Fatalf("최신 %s 가 남아야 한다: %v", k, err)
+			}
+		}
+	})
+}
+
 // TestNextCounterHandsOutEachNumberOnce 는 동시 발번이 두 엔진에서 1 부터 빠짐 · 겹침 없이 나오는지 잰다.
 //
 // ★ Postgres 는 upsert 의 DO UPDATE 안에서 맨 칸 이름 value 를 excluded 와 모호하다(42702)며 거절해 발번이 한 번도
@@ -445,26 +492,44 @@ func TestNextCounterHandsOutEachNumberOnce(t *testing.T) {
 // 판단 검색 - SQLite 판은 FTS5, Postgres 판은 pg_trgm 부분 일치
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestSearchTermsSplitsLikeUnicode61 은 조각 나누기가 unicode61 의 가름표 규칙(글자 · 숫자 · Co 가 아니면 가름표)인지 잰다.
+// TestSearchTermsSplitsLikeUnicode61 은 조각 나누기의 대표 사례를 범주별로 고정한다. 판정 하나하나는 SQLite 에 물어
+// 얻은 값이다(코드포인트 전부의 대조는 unicode61_test.go). 「지금 범주」와 「unicode61 의 판정」이 갈리는 글자를 일부러
+// 넣었다 - unicode61 의 표는 Unicode 6.1 에 멈춰 있고, 그 뒤에 생긴 글자는 미지정이라 낱말 글자다.
 func TestSearchTermsSplitsLikeUnicode61(t *testing.T) {
 	for _, c := range []struct {
 		raw  string
 		want []string
+		why  string
 	}{
-		{"fd-update", []string{"fd", "update"}},
-		{"  fd   update ", []string{"fd", "update"}},
-		{"sync_mode", []string{"sync", "mode"}},
-		{`"unbalanced`, []string{"unbalanced"}},
-		{"a%b_c\\d", []string{"a", "b", "c", "d"}},
-		{"판단을, 남긴다.", []string{"판단을", "남긴다"}},
-		{"v1.2·β３", []string{"v1", "2", "β３"}}, // 전각 숫자도 숫자다
-		{"x\ue000y", []string{"x\ue000y"}},     // 사용자 정의 글자(Co)는 낱말 글자다
-		{"e\u0301", []string{"e"}},             // 결합 기호(Mn)는 가름표다(unicode61 과 일부러 다른 자리)
-		{"--- * ( )", nil},
-		{"", nil},
+		{"fd-update", []string{"fd", "update"}, "Pd 가름표"},
+		{"  fd   update ", []string{"fd", "update"}, "Zs 가름표"},
+		{"sync_mode", []string{"sync", "mode"}, "Pc 가름표"},
+		{`"unbalanced`, []string{"unbalanced"}, "Po 가름표"},
+		{"a%b_c\\d", []string{"a", "b", "c", "d"}, "LIKE 특수 글자는 다 가름표"},
+		{"판단을, 남긴다.", []string{"판단을", "남긴다"}, "Lo 낱말"},
+		{"v1.2·β３", []string{"v1", "2", "β３"}, "Nd 낱말(전각 숫자도)"},
+		{"x\ue000y", []string{"x\ue000y"}, "Co 낱말"},
+		{"🦊", []string{"🦊"}, "So 인데 낱말: Unicode 9.0 글자라 6.1 표에서 미지정"},
+		{"a©b", []string{"a", "b"}, "So 가름표: 6.1 표에 있는 기호"},
+		{"₺100", []string{"₺100"}, "Sc 인데 낱말: U+20BA 는 6.2 글자"},
+		{"$100+1", []string{"100", "1"}, "Sc · Sm 가름표"},
+		{"x\u0378y", []string{"x\u0378y"}, "Cn(지금도 미지정)은 낱말"},
+		{"x\ufffey", []string{"x", "y"}, "비문자 U+FFFE 는 가름표"},
+		{"x\u19b0y", []string{"x", "y"}, "Lo 인데 가름표: 6.1 에서는 Mc 였다"},
+		{"x\u0305y", []string{"x", "y"}, "Mn 가름표"},
+		{"e\u0301", []string{"e"}, "unicode61 이 떼어 내는 결합 기호는 가름표로 둔다(SearchTerms 의 ★)"},
+		{"x\u07fdy", []string{"x\u07fdy"}, "Mn 인데 낱말: 6.1 이후 글자"},
+		{"x\u00ady", []string{"x", "y"}, "Cf(소프트 하이픈) 가름표"},
+		{"x\u0605y", []string{"x\u0605y"}, "Cf 인데 낱말: 6.1 이후 글자"},
+		{"x\u2e40y", []string{"x\u2e40y"}, "Pd 인데 낱말: 6.1 이후 글자"},
+		{"x\ufffdy", []string{"x", "y"}, "U+FFFD 는 가름표"},
+		{"x\x00y", []string{"x", "y"}, "NUL 은 가름표"},
+		{"x\xffy\xc3", []string{"x", "y"}, "깨진 UTF-8 바이트는 가름표(조각이 Postgres 에서 22021 이 되지 않게)"},
+		{"--- * ( )", nil, "가름표뿐"},
+		{"", nil, "빈 글"},
 	} {
 		if got := SearchTerms(c.raw); !slices.Equal(got, c.want) {
-			t.Errorf("SearchTerms(%q) = %q, 기대 %q", c.raw, got, c.want)
+			t.Errorf("SearchTerms(%q) = %q, 기대 %q(%s)", c.raw, got, c.want, c.why)
 		}
 	}
 }
@@ -495,7 +560,8 @@ func TestLikeContainsMatchesLiterally(t *testing.T) {
 // (상한 없이 - 순위가 엔진마다 달라 잘린 목록끼리는 상위집합이 안 선다).
 //
 // ★ 이것이 가름표 나누기(SearchTerms)의 까닭이다. 공백 토큰을 통째로 ILIKE 에 걸면 `fd-update` 가 FTS5 는 맞히는
-// `fd update` · `fd, update` 를 못 맞힌다.
+// `fd update` · `fd, update` 를 못 맞힌다. 받아들인 예외(글자 접기 둘)는 상위집합 고리에 넣지 않고 아래 표에
+// 「SQLite 만 맞힌다」로 고정한다. 조각 하나만 품은 판단(d10 · d11)은 조각을 AND 로 거는지 본다.
 func TestSearchJudgmentsPGCoversFTS(t *testing.T) {
 	ctx := context.Background()
 	lite, pg := newStore(t), newPGStore(t, lockTimeout)
@@ -509,6 +575,11 @@ func TestSearchJudgmentsPGCoversFTS(t *testing.T) {
 		{"d7", "sync_mode", "계약 개정"},
 		{"d8", "", "Ωmega ÉCOLE"},
 		{"d9", "", "café crème"},
+		{"d10", "", "fd 하나만 적었다"},
+		{"d11", "", "update 하나만 적었다"},
+		{"d12", "", "🦊"},
+		{"d13", "", "λογος"},
+		{"d14", "", "ſun"},
 	}
 	for _, s := range []*Store{lite, pg} {
 		seed(t, s, "p")
@@ -532,7 +603,7 @@ func TestSearchJudgmentsPGCoversFTS(t *testing.T) {
 		return ids
 	}
 	for _, q := range []string{"fd-update", "fd update", "FD", "update", "판단", "판단을", "sync_mode", "ωmega", "école",
-		`"unbalanced`, "-not", "*", "(", "OR OR", "a AND", "없는낱말", "---"} {
+		`"unbalanced`, "-not", "*", "(", "OR OR", "a AND", "없는낱말", "---", "🦊", "판단을\x00남긴다\xff"} {
 		l, p := search(lite, q), search(pg, q)
 		for _, id := range l {
 			if !slices.Contains(p, id) {
@@ -547,15 +618,45 @@ func TestSearchJudgmentsPGCoversFTS(t *testing.T) {
 		why      string
 	}{
 		{"fd-update", []string{"d1", "d2", "d3", "d4"}, []string{"d1", "d2", "d3", "d4", "d6"}, "구절은 순서를 보고 조각은 안 본다"},
+		{"fd update", []string{"d1", "d2", "d3", "d4", "d6"}, []string{"d1", "d2", "d3", "d4", "d6"}, "조각은 AND 다(d10 · d11 은 하나만 품는다)"},
+		{"🦊", []string{"d12"}, []string{"d12"}, "6.1 이후 이모지도 두 판에서 낱말이다"},
+		{"판단을\x00남긴다\xff", []string{"d5"}, []string{"d5"}, "NUL · 깨진 바이트가 든 검색도 두 판에서 돈다"},
 		{"판단", nil, []string{"d5"}, "낱말 단위와 부분 일치"},
 		{"ωmega", []string{"d8"}, []string{"d8"}, "한글 밖 대소문자 접기"},
 		{"cafe", []string{"d9"}, nil, "받아들인 예외: 발음 구별 기호 접기는 FTS5 에만 있다"},
+		{"ΛΟΓΟΣ", []string{"d13"}, nil, "받아들인 예외: 대소문자 특수 접기(ς→σ)는 FTS5 에만 있다"},
+		{"sun", []string{"d14"}, nil, "받아들인 예외: 대소문자 특수 접기(ſ→s)는 FTS5 에만 있다"},
 		{"---", nil, nil, "가름표만 친 검색은 맞을 판단이 없다(조각 없는 검색이 전부를 내면 안 된다)"},
 	} {
 		if l, p := search(lite, c.q), search(pg, c.q); !slices.Equal(l, c.lite) || !slices.Equal(p, c.pg) {
 			t.Errorf("%q(%s): SQLite %v(기대 %v), Postgres %v(기대 %v)", c.q, c.why, l, c.lite, p, c.pg)
 		}
 	}
+}
+
+// TestSearchJudgmentsRejectsTooManyTerms 는 조각이 상한을 넘는 검색어와 빈 검색어를 두 엔진이 같은 입력 오류
+// (*SearchQueryError)로 거절하는지 잰다. 표면은 이 타입을 400 으로 낸다(api 의 TestSearchJudgmentsTooManyTermsIs400).
+func TestSearchJudgmentsRejectsTooManyTerms(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p")
+		words := make([]string, maxSearchTerms+1)
+		for i := range words {
+			words[i] = fmt.Sprintf("w%d", i)
+		}
+		if _, err := s.SearchJudgments(ctx, "", strings.Join(words[:maxSearchTerms], " "), 0); err != nil {
+			t.Fatalf("조각 %d개는 받아야 한다: %v", maxSearchTerms, err)
+		}
+		var qe *SearchQueryError
+		for _, q := range []string{strings.Join(words, " "), strings.Join(words, "-")} { // 빈칸이 없어도 조각으로 센다
+			if _, err := s.SearchJudgments(ctx, "", q, 0); !errors.As(err, &qe) || !strings.Contains(err.Error(), fmt.Sprint(maxSearchTerms+1)) {
+				t.Fatalf("조각 %d개 검색이 입력 오류가 아니다: %v", maxSearchTerms+1, err)
+			}
+		}
+		if _, err := s.SearchJudgments(ctx, "", " \t ", 0); !errors.As(err, &qe) {
+			t.Fatalf("빈 검색어가 입력 오류가 아니다: %v", err)
+		}
+	})
 }
 
 // TestTrgmSearchRanksBySimilarityThenNewest 는 Postgres 판의 순위를 잰다: 원문과 비슷한 판단이 먼저, 같으면 최신 먼저.
@@ -592,7 +693,7 @@ func TestTrgmSearchRanksBySimilarityThenNewest(t *testing.T) {
 func TestTrgmSearchUsesTheIndex(t *testing.T) {
 	ctx := context.Background()
 	s := newPGStore(t, lockTimeout)
-	sq := trgmSearch("", "판단을 남긴다", 10)
+	sq := trgmSearch("", SearchTerms("판단을 남긴다"), 10)
 	q, err := bindDollar(sq.sql)
 	if err != nil {
 		t.Fatal(err)

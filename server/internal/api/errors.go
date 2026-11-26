@@ -115,6 +115,17 @@ func ClassifyError(err error) Classified {
 		}
 	}
 
+	// 검색어 자체를 받을 수 없다(비었거나 낱말이 너무 많다). 질의를 돌리기 전에 거절한 입력 오류라 400 이다.
+	var badSearch *store.SearchQueryError
+	if errors.As(err, &badSearch) {
+		return Classified{
+			Status:   http.StatusBadRequest,
+			Code:     "bad_search_query",
+			Message:  badSearch.Error(),
+			Guidance: "검색어를 고쳐 다시 보내라 - 무엇을 고칠지는 문구에 있다.",
+		}
+	}
+
 	// ★ store.ConflictError(아래) 와 같은 자리에 안 둔 이유가 store.RemovalBlockedError
 	// 의 타입 주석에 있다 — conflictOf/ConflictAdvice 는 INSERT 방향("가리키는 좌표가
 	// 없다")만을 위해 지어졌고, 이 오류는 DELETE 방향("아직 이 좌표를 가리키는 행이
