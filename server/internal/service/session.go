@@ -240,9 +240,14 @@ func (s *Service) OpenSession(ctx context.Context, in OpenSessionInput) (Session
 			//
 			// ★ 이 조회의 실패는 관측을 건너뛸 뿐 등록을 막지 않는다. 그래서 저장점 안에서 읽는다 - 아니면
 			//   Postgres 에서 읽기 실패가 트랜잭션을 버려(25P02) 등록까지 커밋되지 않는다(store.Tx 의 「오류의 뜻」).
+			//   건너뛰는 것은 없음 · 행 값을 못 푼 것뿐이다. 저장층 실패(store.Unabsorbable)는 올린다 - 그것을 삼키면
+			//   잘못된 project 로 고아 프로젝트를 만드는 위 결함이 원인 없이 다시 열린다.
 			prior, perr := store.SavepointValue(t, func(sp *store.Tx) (model.Session, error) {
 				return sp.FindSession(in.MachineID, in.Worktree, in.CCSessionID)
 			})
+			if store.Unabsorbable(perr) {
+				return perr
+			}
 			if perr == nil && prior.Project != "" && prior.Project != in.Project {
 
 				// ★ I-2(최종 리뷰): 이 이벤트를 무조건 남기면 안 된다. 이 갈래는 3중키가
@@ -337,6 +342,11 @@ func (s *Service) OpenSession(ctx context.Context, in OpenSessionInput) (Session
 			others, derr := store.SavepointValue(t, func(sp *store.Tx) ([]model.Session, error) {
 				return sp.DivergentSessions(in.CCSessionID, in.Project, in.MachineID)
 			})
+			if store.Unabsorbable(derr) {
+				// 저장층 실패(잠금 · 직렬화 · 교착 · 문맥 끝 · 스키마 어긋남)는 관측 실패가 아니라 이 트랜잭션의
+				// 실패다 - 올린다. 다시 열면 풀리고, 삼키면 이 대화의 갈라짐이 영영 안 남는다(created 는 한 번뿐이다).
+				return derr
+			}
 			if derr != nil {
 				// 관측 실패가 세션 등록을 죽이면 안 된다 — 조정이 관측 때문에 멈추면
 				// 이 도구의 존재 이유가 사라진다. 삼키지 않고 사유만 남긴다.

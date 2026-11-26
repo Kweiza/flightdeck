@@ -137,6 +137,10 @@ func ValidateResourceName(name string) error {
 	return nil
 }
 
+// landingOneLivePerSession 은 landing_queue 의 재진입 인덱스 landing_queue_one_live_per_session 의 정의 그대로다
+// (migrations/003_landing_queue.sql · pg/001_baseline.sql). EnqueueLanding 의 ON CONFLICT 대상이다.
+const landingOneLivePerSession = `(project, session_id) WHERE left_at IS NULL`
+
 // EnqueueLanding 은 랜딩 줄에 선다. **재진입 안전하다** — 이미 살아 있는 줄 행이 있으면
 // 새로 넣지 않고 그것을 그대로 돌려준다.
 //
@@ -179,7 +183,7 @@ func (t *Tx) EnqueueLanding(project, sessionID string, resources []string, at ti
 	at = atStamp(at)
 	id, inserted, err := t.insertUnlessTaken(`
 		INSERT INTO landing_queue(project, session_id, enqueued_at, left_at, left_kind, left_detail)
-		VALUES (?, ?, ?, NULL, NULL, NULL)`,
+		VALUES (?, ?, ?, NULL, NULL, NULL)`, landingOneLivePerSession,
 		project, sessionID, fmtTime(at))
 	if err == nil && !inserted {
 		// 이미 서 있다. **자원 집합까지 채워** 그대로 낸다(liveLandingRow 가
@@ -187,7 +191,7 @@ func (t *Tx) EnqueueLanding(project, sessionID string, resources []string, at ti
 		// service 몫이다. 여기서 거절하면 재진입 안전이 깨진다.
 		row, qErr := liveLandingRow(t.ctx, t.tx, project, sessionID)
 		if qErr != nil {
-			// 충돌했는데 살아 있는 행이 없다면 재진입 인덱스가 아닌 유니크 제약에 걸린 것이다(지금 스키마에는 없다).
+			// 같은 트랜잭션에서 막힌 것을 바로 읽으므로 살아 있는 행은 있어야 한다. 못 읽었으면 그 까닭을 그대로 올린다.
 			return model.LandingRow{}, fmt.Errorf(
 				"랜딩 줄 서기가 유니크 충돌로 막혔는데 살아 있는 줄 행을 못 읽었다(project=%q session=%q): %w",
 				clip(project, 64), clip(sessionID, 64), qErr)

@@ -518,13 +518,31 @@ func (r *row) Err() error { return r.err }
 type txConn struct {
 	raw *sql.Tx
 	eng engine
+
+	// broken 은 이 트랜잭션을 더 쓸 수 없게 된 까닭이다(저장점 정리 실패, Tx.Savepoint). 차면 문장과 커밋을 다
+	// 거절한다 - 바깥 트랜잭션이 사라진 SQLite 연결은 뒤 문장을 자동 커밋으로 돌리므로, 부른 쪽이 그 오류를
+	// 흡수하고 이어 가도 아무것도 쓰이지 않게 여기서 막는다. 롤백은 막지 않는다.
+	broken error
+}
+
+// poison 은 이 트랜잭션을 망가진 것으로 표시한다. 처음 까닭만 남긴다.
+func (t *txConn) poison(err error) {
+	if t.broken == nil {
+		t.broken = err
+	}
 }
 
 func (t *txConn) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	if t.broken != nil {
+		return nil, t.broken
+	}
 	return t.eng.exec(ctx, t.raw, q, args)
 }
 
 func (t *txConn) QueryContext(ctx context.Context, q string, args ...any) (*rowSet, error) {
+	if t.broken != nil {
+		return nil, t.broken
+	}
 	return t.eng.query(ctx, t.raw, q, args)
 }
 
@@ -534,8 +552,19 @@ func (t *txConn) QueryRowContext(ctx context.Context, q string, args ...any) *ro
 
 // Commit · Rollback 도 드라이버와 주고받는다(연결이 그 사이 끊기면 네트워크 오류다). 버려진 트랜잭션의 커밋
 // (pgx.ErrTxCommitRollback)은 connError 의 표지로 남아 runTx 가 TxFault(aborted)로 낸다.
-func (t *txConn) Commit() error   { return t.eng.connFault(t.raw.Commit()) }
+//
+// 망가진 트랜잭션(broken)의 커밋은 드라이버에 안 보내고 그 까닭으로 거절한다 - runTx 가 롤백으로 끝낸다.
+func (t *txConn) Commit() error {
+	if t.broken != nil {
+		return t.broken
+	}
+	return t.eng.connFault(t.raw.Commit())
+}
 func (t *txConn) Rollback() error { return t.eng.connFault(t.raw.Rollback()) }
+
+// dialect 는 이 핸들의 엔진이다. 질의 본문이 엔진마다 다른 자리(itemAfterOrder)가 고른다.
+func (t *txConn) dialect() engine { return t.eng }
+func (c *conn) dialect() engine   { return c.eng }
 
 // bind 는 질의를 엔진의 자리표시로 옮긴다. SQLite 는 `?` 그대로다.
 func (e engine) bind(q string) (string, error) {
@@ -752,6 +781,16 @@ func (e engine) txOptions(k txKind) *sql.TxOptions {
 	default:
 		return nil
 	}
+}
+
+// itemAfterOrder 는 item_after 의 삽입 순서 칸이다. SQLite 판은 PK 가 없어 행 정체 rowid 가 그 축이고, Postgres
+// 판은 같은 자리를 seq identity 로 둔다(pg/001_baseline.sql). 이관이 rowid 값을 seq 에 그대로 옮겨 두 판의 순서가 같다.
+// 스키마를 안 바꾸고 두 엔진에서 같은 순서를 내는 길이 칸 이름 하나를 엔진이 고르는 것뿐이다.
+func (e engine) itemAfterOrder() string {
+	if e == enginePG {
+		return "seq"
+	}
+	return "rowid"
 }
 
 // lockStmt 는 트랜잭션이 첫 문장으로 잡는 잠금이다. 빈 문자열이면 따로 잡지 않는다.

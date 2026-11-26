@@ -158,6 +158,7 @@ type Reader interface {
 type dbtx interface {
 	Reader
 	ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error)
+	dialect() engine
 }
 
 // Store 는 열린 DB 하나다.
@@ -253,24 +254,38 @@ func (t *Tx) LogEvent(kind, project, sessionID string, payload any) {
 // ★ 되돌리기는 fn 전체다. fn 이 문장 둘을 쓰고 둘째에서 실패하면 첫째도 되돌아간다 - 반쯤 쓴 것을 남기지 않는다.
 // 예약 이벤트(t.LogEvent)는 되돌리지 않는다 - 시도의 기록이라 트랜잭션 버퍼에 그대로 남는다.
 //
+// ★ 저장점을 만들거나 되돌리거나 풀지 못하면 fn 의 오류 대신 *SavepointError 를 내고 트랜잭션을 망가진 것으로
+// 표시한다(그 뒤 문장과 커밋은 거절된다). 그 오류는 흡수하면 안 된다 - fn 의 오류(중복 · 없음)로 읽히지 않게
+// 품지 않는다. fn 이 패닉해도 저장점까지 되돌린 뒤 패닉을 그대로 올린다 - 부른 쪽이 같은 트랜잭션에서 recover 하고
+// 커밋하면 패닉 전에 쓴 것이 함께 커밋되기 때문이다.
+//
+// 흡수는 의도한 오류만 한다: 저장점 안에서 받은 오류라도 Unabsorbable 이면 위로 올린다.
+//
 // fn 은 같은 *Tx 를 받는다. 저장점은 중첩해도 된다(이름에 번호가 붙고, 되돌리기 · 풀기는 늘 가장 안쪽부터다).
 func (t *Tx) Savepoint(fn func(*Tx) error) error {
 	t.savepoints++
 	name := "fd_sp_" + strconv.Itoa(t.savepoints)
 	if _, err := t.tx.ExecContext(t.ctx, "SAVEPOINT "+name); err != nil {
-		return fmt.Errorf("저장점 %s 만들기 실패: %w", name, err)
+		return t.savepointBroke(name, "만들기", nil, err)
 	}
-	if err := fn(t); err != nil {
-		// 되돌린 뒤 풀어 둔다 - ROLLBACK TO 는 저장점을 남기므로, 안 풀면 같은 트랜잭션 안에 저장점이 쌓인다.
-		if _, rbErr := t.tx.ExecContext(t.ctx, "ROLLBACK TO SAVEPOINT "+name); rbErr != nil {
-			return fmt.Errorf("%w (저장점 %s 되돌리기도 실패: %v)", err, name, rbErr)
+	returned := false
+	defer func() {
+		if !returned {
+			_ = t.undoSavepoint(name, errors.New("패닉"))
 		}
-		if relErr := t.releaseSavepoint(name); relErr != nil {
-			return fmt.Errorf("%w (%v)", err, relErr)
+	}()
+	err := fn(t)
+	returned = true
+	if err != nil {
+		if uerr := t.undoSavepoint(name, err); uerr != nil {
+			return uerr
 		}
 		return err
 	}
-	return t.releaseSavepoint(name)
+	if _, rerr := t.tx.ExecContext(t.ctx, "RELEASE SAVEPOINT "+name); rerr != nil {
+		return t.savepointBroke(name, "풀기", nil, rerr)
+	}
+	return nil
 }
 
 // SavepointValue 는 값을 돌려주는 fn 을 저장점 안에서 부르는 Savepoint 다(읽기를 저장점에 가둘 때의 꼴).
@@ -289,22 +304,59 @@ func SavepointValue[T any](t *Tx, fn func(*Tx) (T, error)) (T, error) {
 	return v, nil
 }
 
-func (t *Tx) releaseSavepoint(name string) error {
+// undoSavepoint 는 저장점까지 되돌리고 푼다. ROLLBACK TO 는 저장점을 남기므로, 안 풀면 같은 트랜잭션 안에 쌓인다.
+func (t *Tx) undoSavepoint(name string, cause error) error {
+	if _, err := t.tx.ExecContext(t.ctx, "ROLLBACK TO SAVEPOINT "+name); err != nil {
+		return t.savepointBroke(name, "되돌리기", cause, err)
+	}
 	if _, err := t.tx.ExecContext(t.ctx, "RELEASE SAVEPOINT "+name); err != nil {
-		return fmt.Errorf("저장점 %s 풀기 실패: %w", name, err)
+		return t.savepointBroke(name, "풀기", cause, err)
 	}
 	return nil
 }
 
-// insertUnlessTaken 은 `INSERT …` 한 문장에 `ON CONFLICT DO NOTHING RETURNING id` 를 붙여 돌린다.
-// 유니크 충돌로 안 들어갔으면 inserted 가 거짓이고 오류는 없다 - 트랜잭션은 멀쩡하다(Tx 주석의 「오류의 뜻」).
-// 유니크 충돌이 아닌 위반(FK · CHECK · NOT NULL)은 그대로 오류로 온다.
+// savepointBroke 는 저장점 정리 실패를 *SavepointError 로 내고 트랜잭션을 망가진 것으로 표시한다.
+func (t *Tx) savepointBroke(name, step string, cause, err error) error {
+	e := &SavepointError{Name: name, Step: step, Err: err}
+	if cause != nil {
+		e.Cause = cause.Error()
+	}
+	t.tx.poison(e)
+	return e
+}
+
+// SavepointError 는 저장점을 만들거나 되돌리거나 풀지 못한 것이다. 그 뒤로는 트랜잭션이 어디까지 살아 있는지 모른다 -
+// SQLite 는 바깥 트랜잭션이 사라진 연결에서 뒤 문장을 자동 커밋으로 돌린다. 그래서 이것이 나면 그 트랜잭션은 문장 ·
+// 커밋을 더 받지 않는다(txConn.broken).
 //
-// ★ 충돌 대상을 적지 않는다: 그 표의 유니크 제약 · 인덱스 전부(부분 유니크 인덱스 포함)가 대상이다. 그래서 이것을
-// 쓰는 표는 「막혔다」가 곧 「살아 있는 것이 이미 있다」인 표여야 한다(resource_hold · landing_queue).
-func (t *Tx) insertUnlessTaken(insert string, args ...any) (id int64, inserted bool, err error) {
+// ★ fn 의 오류를 품지 않는다(Unwrap 은 실패한 저장점 문장의 오류다). 품으면 errors.Is · As 가 그것을 중복 · 없음으로
+// 읽어 부른 쪽이 흡수하고 이어 간다. fn 의 오류는 문구(Cause)로만 싣는다.
+type SavepointError struct {
+	Name  string // 저장점 이름
+	Step  string // 실패한 단계: 만들기 · 되돌리기 · 풀기
+	Cause string // fn 이 낸 오류의 문구. fn 이 성공했거나 안 돌았으면 빈 값
+	Err   error
+}
+
+func (e *SavepointError) Error() string {
+	msg := fmt.Sprintf("저장점 %s %s 실패 - 이 트랜잭션은 더 쓸 수 없다: %v", e.Name, e.Step, e.Err)
+	if e.Cause != "" {
+		msg += " (저장점 안의 오류: " + e.Cause + ")"
+	}
+	return msg
+}
+
+func (e *SavepointError) Unwrap() error { return e.Err }
+
+// insertUnlessTaken 은 `INSERT …` 한 문장에 `ON CONFLICT <liveKey> DO NOTHING RETURNING id` 를 붙여 돌린다.
+// liveKey 의 부분 유니크 인덱스에 막혀 안 들어갔으면 inserted 가 거짓이고 오류는 없다 - 트랜잭션은 멀쩡하다(Tx 주석의
+// 「오류의 뜻」). 다른 위반(PK 등 다른 유니크 · FK · CHECK · NOT NULL)은 그대로 오류로 온다.
+//
+// liveKey 는 「살아 있는 것은 하나」를 지키는 부분 유니크 인덱스의 정의 그대로다(칸과 WHERE). 두 엔진 모두 그 정의와
+// 맞는 인덱스가 없으면 문장을 거절하므로(42P10 · SQLite 의 「ON CONFLICT clause does not match」) 어긋나면 시험이 잡는다.
+func (t *Tx) insertUnlessTaken(insert, liveKey string, args ...any) (id int64, inserted bool, err error) {
 	err = t.tx.QueryRowContext(t.ctx, insert+`
-		ON CONFLICT DO NOTHING
+		ON CONFLICT `+liveKey+` DO NOTHING
 		RETURNING id`, args...).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil

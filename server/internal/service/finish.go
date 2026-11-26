@@ -347,6 +347,10 @@ func (s *Service) Finish(ctx context.Context, in FinishInput) (FinishResult, err
 		//   Postgres 는 문장 하나가 실패하면 트랜잭션을 통째로 버려(25P02) 판단까지 커밋되지 않는다.
 		//   ON CONFLICT 로 오류를 안 만드는 길을 안 고른 까닭: 읽기 오류는 충돌이 아니고, 후속 등록은
 		//   중복이 거절이어야 하는 다른 호출자(add)와 같은 store 메서드다.
+		//
+		// ★ 건너뛰는 것은 뜻이 정해진 오류뿐이다. 저장점 안에서 받았어도 store.Unabsorbable(잠금 · 직렬화 · 교착 ·
+		//   문맥 끝 · 스키마 어긋남 같은 저장층 실패)이면 판단과 함께 올린다. 건너뛰면 「이 후속은 못 만들었다 ·
+		//   못 이었다」가 원인 없이 추가 전용 원장에 굳는데, 그 실패는 같은 요청을 다시 보내면 풀리는 것이다.
 		creates := make([]model.Item, 0, len(plan.Create))
 		for _, c := range plan.Create {
 			// ★ **c.Project 로 본다 — in.Project 가 아니다.** 후속이 멤버 레포로 갈 수
@@ -354,16 +358,20 @@ func (s *Service) Finish(ctx context.Context, in FinishInput) (FinishResult, err
 			//   id 가 있나»를 엉뚱한 곳에서 묻게 된다. 그러면 이미 있는 항목 위에 덮어
 			//   쓰려다 아래 AddItem 의 중복 갈래로 빠지고, 그 이벤트는 원인을 틀리게 적는다.
 			//
-			// 못 읽은 것(ErrNotFound 밖의 오류)은 「없다」와 같이 만들기로 간다 - 실제로 있으면 아래 중복 갈래가 받는다.
-			if _, err := store.SavepointValue(t, func(sp *store.Tx) (model.Item, error) {
+			// 없음과 행 값을 못 푼 것은 「없다」와 같이 만들기로 간다 - 실제로 있으면 아래 중복 갈래가 받는다.
+			_, err := store.SavepointValue(t, func(sp *store.Tx) (model.Item, error) {
 				return sp.GetItem(c.Project, c.Item.ID)
-			}); err == nil {
+			})
+			switch {
+			case err == nil:
 				out.SkippedFollowups = append(out.SkippedFollowups, c.Item.ID)
 				t.LogEvent("item.followup_skipped", c.Project, in.SessionID, map[string]any{
 					"item": c.Item.ID,
 					"why":  "분류 뒤 이 트랜잭션 사이에 같은 id 의 항목이 생겼다 — 판단을 지키려고 이 후속만 건너뛴다",
 				})
 				continue
+			case store.Unabsorbable(err):
+				return fmt.Errorf("후속 %s 가 이미 있는지 못 읽었다: %w", c.Item.ID, err)
 			}
 			creates = append(creates, model.Item{
 				Project: c.Project, ID: c.Item.ID, Title: c.Item.Title, Body: c.Item.Body,
@@ -380,20 +388,22 @@ func (s *Service) Finish(ctx context.Context, in FinishInput) (FinishResult, err
 			//   영구히 남는다 — "사라졌거나 닫혔다" 한 문구로 접으면 DB 를 못 읽었을 뿐인 것이
 			//   "닫혔다"로 굳고, 그 거짓은 나중에 되짚을 방법이 없다. 같은 파일의 itemExists 가
 			//   (exists, observed) 로 가르고 refuseIneligibleFollowup 이 사유를 셋으로 가르는
-			//   것과 같은 규율이다.
+			//   것과 같은 규율이다. DB 가 못 읽은 것(Unabsorbable)은 사유로 적지 않고 올린다(위 ★).
 			//
 			// ★ "item" 키는 세 갈래 모두에 남긴다 — 빼면 나중에 **어느** 후속이 빠졌는지 못 되짚는다.
 			//
 			// ★ 이 갈래들은 **분류 뒤 이 트랜잭션 사이**에만 도달한다. 그 창은 Service.now 가
 			//   불리는 자리라 시계 후크로 결정론적으로 벌릴 수 있다 — 닫힘 갈래는
-			//   TestFinishSkipsALinkTargetThatClosedBetweenClassifyAndTx 가 잠근다.
-			//   나머지 둘(지워짐·못 읽음)은 아직 시험이 못 밟는다.
+			//   TestFinishSkipsALinkTargetThatClosedBetweenClassifyAndTx 가, 올리는 갈래는
+			//   TestFinishRaisesALinkTargetReadFailure 가 잠근다. 지워짐 · 값을 못 푼 갈래는 아직 시험이 못 밟는다.
 			var why string
 			switch {
+			case store.Unabsorbable(err):
+				return fmt.Errorf("이을 후속 %s 를 못 읽었다: %w", id, err)
 			case errors.Is(err, store.ErrNotFound):
 				why = "이을 대상이 분류 뒤 지워졌다 — 판단을 지키려고 이 후속만 건너뛴다"
 			case err != nil:
-				why = "이을 대상을 못 읽었다(원인 미상) — 판단을 지키려고 이 후속만 건너뛴다"
+				why = "이을 대상의 행을 못 풀었다(값 해석 실패) — 판단을 지키려고 이 후속만 건너뛴다"
 			case it.State != model.ItemOpen:
 				why = "이을 대상이 분류 뒤 닫혔다 — 판단을 지키려고 이 후속만 건너뛴다"
 			}
@@ -407,37 +417,12 @@ func (s *Service) Finish(ctx context.Context, in FinishInput) (FinishResult, err
 			linked = append(linked, id)
 		}
 
-		// ① 판단 — 가장 먼저 저장한다. 이것이 원리적으로 파생 불가한 유일한 자산이다.
+		// ② 후속 등록 — **새로 만들 것만** 돈다. **① 의 판단보다 먼저** 돈다.
 		//
-		// 링크 = 이 항목 + 호출자가 준 링크 + **실제로 만들 것** + **실제로 이을 것**.
-		// dedupeLinks 를 지나는 이유는 그 함수 주석에 있다(겹치면 판단이 통째로 사라진다).
-		links := append([]model.JudgmentLink{{TargetKind: "item", TargetID: in.ItemID}}, in.Links...)
-		for _, it := range creates {
-			// ★ **교차 프로젝트 링크는 target_project 를 채운다**(증분 009). 안 채우면
-			//   읽는 쪽이 판단 자신의 project 로 잘라서, 멤버 레포에 만든 후속을 집는
-			//   세션에게 「왜 이것이 생겼나」가 영영 안 보인다 — 그 침묵이 009 를 만든
-			//   결함 자체다. 같은 프로젝트면 비운다(옛 링크 4240건과 같은 모양).
-			tp := ""
-			if it.Project != in.Project {
-				tp = it.Project
-			}
-			links = append(links, model.JudgmentLink{
-				TargetKind: "item", TargetID: it.ID, TargetProject: tp,
-			})
-		}
-		for _, id := range linked {
-			links = append(links, model.JudgmentLink{TargetKind: "item", TargetID: id})
-		}
-		j, err := t.AddJudgment(model.Judgment{
-			Project: in.Project, SessionID: in.SessionID, At: now,
-			Kind: model.JudgmentHandoff, Title: in.Title, Body: in.Body, Links: dedupeLinks(links),
-		})
-		if err != nil {
-			return err
-		}
-		out.Judgment = j
-
-		// ② 후속 등록 — **새로 만들 것만** 돈다.
+		// ★ 순서가 링크의 정직성이다. 판단의 링크는 이 마무리가 **실제로 만든** 항목만 가리켜야 한다. 판단을 먼저
+		//   쓰면 아래 중복 갈래로 건너뛴 후속에도 링크가 이미 박혀, 이 판단이 먼저 있던 남의 항목을 「이 마무리의
+		//   후속」으로 영구히 가리킨다(judgment_link 도 추가 전용이다). 같은 트랜잭션이라 무엇을 먼저 써도 커밋은
+		//   함께다 - 번호(① 판단 · ② 후속)는 자산의 이름으로 두고(다른 파일이 그 번호로 부른다) 실행 순서만 바꿨다.
 		//
 		// ★ 중복 흡수 갈래는 남는다. 바로 위 t.GetItem 이 "없다"고 본 뒤에도 같은
 		//   트랜잭션 안에서 부딪히는 길이 남아 있고(같은 호출의 중복은 tx 전에 거절하지만
@@ -445,7 +430,7 @@ func (s *Service) Finish(ctx context.Context, in FinishInput) (FinishResult, err
 		//   함께 죽는다. lane.release_skipped 갈래와 같은 성격의 최후 방어다.
 		//
 		// ★ 이 갈래는 바로 위 t.GetItem 선검사와 쓰기 직렬화(전역 잠금) 때문에 운영에서는 거의 안 밟힌다.
-		//   시험은 판단을 넣는 순간 같은 id 의 항목을 만드는 트리거로 갈래를 결정론적으로 고른다
+		//   시험은 앞 후속이 들어가는 순간 뒤 후속과 같은 id 의 항목을 만드는 트리거로 갈래를 결정론적으로 고른다
 		//   (finish_savepoint_test.go, 두 엔진).
 		//
 		// ★ 저장점 안에서 부른다. 저장점이 없으면 Postgres 에서 이 중복 흡수가 트랜잭션을 버려 ① 의 판단까지
@@ -488,6 +473,36 @@ func (s *Service) Finish(ctx context.Context, in FinishInput) (FinishResult, err
 			})
 			out.Followups = append(out.Followups, it)
 		}
+
+		// ① 판단 — 이것이 원리적으로 파생 불가한 유일한 자산이다. 실행은 ② 뒤다(② 머리의 ★).
+		//
+		// 링크 = 이 항목 + 호출자가 준 링크 + **실제로 만든 것**(out.Followups) + **실제로 이을 것**.
+		// dedupeLinks 를 지나는 이유는 그 함수 주석에 있다(겹치면 판단이 통째로 사라진다).
+		links := append([]model.JudgmentLink{{TargetKind: "item", TargetID: in.ItemID}}, in.Links...)
+		for _, it := range out.Followups {
+			// ★ **교차 프로젝트 링크는 target_project 를 채운다**(증분 009). 안 채우면
+			//   읽는 쪽이 판단 자신의 project 로 잘라서, 멤버 레포에 만든 후속을 집는
+			//   세션에게 「왜 이것이 생겼나」가 영영 안 보인다 — 그 침묵이 009 를 만든
+			//   결함 자체다. 같은 프로젝트면 비운다(옛 링크 4240건과 같은 모양).
+			tp := ""
+			if it.Project != in.Project {
+				tp = it.Project
+			}
+			links = append(links, model.JudgmentLink{
+				TargetKind: "item", TargetID: it.ID, TargetProject: tp,
+			})
+		}
+		for _, id := range linked {
+			links = append(links, model.JudgmentLink{TargetKind: "item", TargetID: id})
+		}
+		j, err := t.AddJudgment(model.Judgment{
+			Project: in.Project, SessionID: in.SessionID, At: now,
+			Kind: model.JudgmentHandoff, Title: in.Title, Body: in.Body, Links: dedupeLinks(links),
+		})
+		if err != nil {
+			return err
+		}
+		out.Judgment = j
 
 		// ②' 잇기는 원장에만 남는다 — 항목을 안 만들었으므로 out.Followups 에 안 담는다.
 		for _, id := range linked {

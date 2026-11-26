@@ -29,7 +29,8 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func newSvc(t *testing.T) (*Service, *store.Store) {
+// newSvc 는 새 SQLite 원장 위의 서비스다. opts 는 New 에 그대로 넘긴다.
+func newSvc(t *testing.T, opts ...Option) (*Service, *store.Store) {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	dbp1 := filepath.Join(t.TempDir(), "fd.db")
@@ -42,7 +43,7 @@ func newSvc(t *testing.T) (*Service, *store.Store) {
 		t.Fatalf("DB 열기 실패: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	return New(st, log), st
+	return New(st, log, opts...), st
 }
 
 // newSvcWithClock 은 newSvc 와 같되 시계를 주입한다.
@@ -53,18 +54,7 @@ func newSvc(t *testing.T) (*Service, *store.Store) {
 // outsideSummarizer(service.go)다.
 func newSvcWithClock(t *testing.T, clock func() time.Time) (*Service, *store.Store) {
 	t.Helper()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	dbp2 := filepath.Join(t.TempDir(), "fd.db")
-	// ★ 적용은 기동에서 분리돼 있다(설계 §7 ①) — 열기 전에 올린다.
-	if err := store.Migrate(context.Background(), dbp2, nil); err != nil {
-		t.Fatalf("DB 적용 실패: %v", err)
-	}
-	st, err := store.OpenWithLogger(dbp2, log)
-	if err != nil {
-		t.Fatalf("DB 열기 실패: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
-	return New(st, log, WithClock(clock)), st
+	return newSvc(t, WithClock(clock))
 }
 
 // runGit 은 시험이 저장소를 **준비**할 때 쓰는 git 이다(피시험 코드가 아니다).

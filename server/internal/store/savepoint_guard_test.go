@@ -16,12 +16,15 @@ import (
 // 소스 잠금 - 트랜잭션 안에서 DB 오류를 받고 이어 가는 자리는 저장점 안에서만
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Postgres 는 문장 하나가 실패하면 그 트랜잭션의 뒤 문장을 다 거절하고(25P02) 커밋도 롤백으로 끝난다. 그래서 트랜잭션
-// 핸들(*Tx · *ObsTx · Reader · dbtx · *txConn)을 쥔 함수에서 그 핸들로 낸 호출의 오류를 받고 이어 가는 꼴은 Postgres
-// 에서 틀린다 - 오류를 Tx.Savepoint 안에서 받거나, ON CONFLICT DO NOTHING 으로 오류를 안 만들어야 한다(Tx 주석).
-// 이 시험은 그 꼴 셋을 구문으로 찾는다(e = 트랜잭션 호출에서 받은 오류 변수, 저장점 호출에서 받은 것은 뺀다):
+// Postgres 는 문장 하나가 실패하면 그 트랜잭션의 뒤 문장을 다 거절하고(25P02) 커밋도 롤백으로 끝난다. 그래서 store 의
+// 트랜잭션 핸들(*Tx · *ObsTx · Reader · dbtx · *txConn - store 밖에서는 store.X 로 쓴 것만)을 쥔 함수에서 그 핸들로 낸
+// 호출의 오류를 받고 이어 가는 꼴은 Postgres 에서 틀린다 - 오류를 Tx.Savepoint 안에서 받거나, ON CONFLICT DO NOTHING
+// 으로 오류를 안 만들어야 한다(Tx 주석). 이 시험은 그 꼴 셋을 구문으로 찾는다(e = 트랜잭션 호출에서 받은 오류 변수,
+// 저장점 호출에서 받은 것은 뺀다):
 //
-//	흡수: e 가 있을 때 들어가는 갈래(e != nil, errors.As(e, &DB 오류 타입), 분류기(e))에 return 하지 않는 길이 있다
+//	흡수: e 가 있을 때 들어가는 갈래(e != nil, errors.As(e, &DB 오류 타입), 분류기(e))에 오류를 내며 나가지 않는 길이 있다.
+//	      마지막 값이 nil 인 return(return nil · return v, nil)도 오류를 버린다. 갈래를 그냥 빠져나가도 바로 다음 문장이
+//	      그 e 를 내는 return 이면(if e != nil { 기록 }; return e) 전파라 안 친다
 //	통과: if 의 Init 에서 받은 e 를 e == nil 로 보고, 오류일 때 나가는 갈래가 사슬에 없다
 //	이어 쓰기: e 가 있을 때 들어가는 갈래 안에서 다시 트랜잭션 호출을 한다(저장점 열기도 이미 버려진 트랜잭션에선 실패한다)
 //
@@ -38,10 +41,23 @@ func TestTxErrorsAreAbsorbedOnlyInsideSavepoints(t *testing.T) {
 
 	fset, files := parseServerSource(t)
 	hits, contexts := scanTxAbsorbs(fset, files)
-	t.Logf("파일 %d개, 트랜잭션 문맥 %d개, 걸린 자리 %d개", len(files), contexts, len(hits))
-	// 빈 탐지가 초록으로 숨지 않게 트랜잭션 문맥 수를 먼저 잰다(이 판에서 잰 값은 183 이고, 바닥은 그보다 조금 낮게 둔다).
-	if contexts < 150 {
-		t.Fatalf("트랜잭션 핸들을 쥔 함수를 %d개만 찾았다 - 문맥 인식이 죽었거나 좌표가 틀렸다", contexts)
+	t.Logf("파일 %d개, 트랜잭션 문맥 %d개, 걸린 자리 %d개", len(files), len(contexts), len(hits))
+	// 빈 탐지가 초록으로 숨지 않게 문맥 인식을 대표 자리로 잰다. 핸들 종류(받는 쪽 *Tx · 매개 dbtx · Reader · 클로저의
+	// *store.Tx)마다 하나씩, 그리고 핸들이 아닌 같은 이름(io.Reader)은 문맥이 아니어야 한다.
+	for at, want := range map[site]bool{
+		{"internal/store/resource.go", "AcquireResource"}:   true,
+		{"internal/store/landing.go", "EnqueueLanding"}:     true,
+		{"internal/store/store.go", "Savepoint"}:            true,
+		{"internal/store/resource.go", "heldBy"}:            true,
+		{"internal/store/backup.go", "readLedgerJudgments"}: true,
+		{"internal/service/finish.go", "Finish"}:            true,
+		{"internal/service/session.go", "OpenSession"}:      true,
+		{"cmd/fd/hook.go", "runHook"}:                       false,
+		{"internal/mcpsrv/mcpsrv.go", "Serve"}:              false,
+	} {
+		if contexts[at] != want {
+			t.Errorf("%s 의 트랜잭션 문맥 판정이 %v 다(기대 %v) - 문맥 인식이 죽었거나 좌표가 틀렸다", at, contexts[at], want)
+		}
 	}
 
 	allowed := map[site]string{
@@ -69,22 +85,17 @@ func TestTxErrorsAreAbsorbedOnlyInsideSavepoints(t *testing.T) {
 }
 
 // probeTxAbsorbScanner 는 탐지가 살아 있는지 합성 소스로 잰다. 세 꼴이 각각 잡히고, 같은 꼴을 저장점 안에서 받거나
-// return 하거나 문장 실패가 아닌 오류만 흡수하는 것은 안 잡혀야 한다.
+// 오류를 내며 나가거나 바로 뒤에서 전파하거나 문장 실패가 아닌 오류만 흡수하는 것은 안 잡혀야 한다. 핸들은 store 의
+// 것만 문맥이다 - store 안의 맨 이름, 밖의 store.X.
 func probeTxAbsorbScanner(t *testing.T) {
 	t.Helper()
-	const src = `package p
+	const storeSrc = `package store
 
 func absorb(t *Tx) error {
 	if err := t.AddItem(x); err != nil {
 		log(err)
 	}
 	return nil
-}
-
-func passThrough(t *store.Tx) {
-	if it, err := t.GetItem(p, id); err == nil {
-		use(it)
-	}
 }
 
 func writeAfter(t *Tx) error {
@@ -96,26 +107,47 @@ func writeAfter(t *Tx) error {
 	return nil
 }
 
-func closure(s *Store) error {
-	return s.Tx(ctx, func(t *Tx) error {
-		v, err := t.GetItem(p, id)
-		switch {
-		case err != nil:
-			why = "못 읽었다"
-		}
-		return use(v)
-	})
+func returnNil(t *Tx) error {
+	if err := t.AddItem(x); err != nil {
+		return nil
+	}
+	return nil
 }
 
-func duplicate(t *store.Tx) error {
-	for _, it := range items {
-		if err := t.AddItem(it); err != nil {
-			var conflict *store.ConflictError
-			if errors.As(err, &conflict) && conflict.Kind == store.ConflictDuplicate {
-				continue
-			}
-			return err
-		}
+func returnValueNil(t *Tx) (Item, error) {
+	it, err := t.GetItem(p, id)
+	if err != nil {
+		return Item{}, nil
+	}
+	return it, nil
+}
+
+func propagate(t *Tx) error {
+	err := t.AddItem(x)
+	if err != nil {
+		log(err)
+	}
+	return err
+}
+
+func propagateReset(t *Tx) error {
+	err := t.AddItem(x)
+	if err != nil {
+		err = nil
+	}
+	return err
+}
+
+func obs(o *ObsTx) error {
+	if _, err := o.tx.ExecContext(o.ctx, "INSERT"); err != nil {
+		log(err)
+	}
+	return nil
+}
+
+func ledger(ctx context.Context, q Reader) error {
+	if _, err := q.QueryContext(ctx, "SELECT"); Unabsorbable(err) {
+		log(err)
 	}
 	return nil
 }
@@ -156,22 +188,83 @@ func fine(t *Tx) error {
 	}
 }
 `
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "probe.go", src, 0)
-	if err != nil {
-		t.Fatal(err)
+	const serviceSrc = `package service
+
+func passThrough(t *store.Tx) {
+	if it, err := t.GetItem(p, id); err == nil {
+		use(it)
 	}
-	hits, contexts := scanTxAbsorbs(fset, map[string]*ast.File{"probe.go": f})
+}
+
+func closure(s *store.Store) error {
+	return s.Tx(ctx, func(t *store.Tx) error {
+		v, err := t.GetItem(p, id)
+		switch {
+		case err != nil:
+			why = "못 읽었다"
+		}
+		return use(v)
+	})
+}
+
+func duplicate(t *store.Tx) error {
+	for _, it := range items {
+		if err := t.AddItem(it); err != nil {
+			var conflict *store.ConflictError
+			if errors.As(err, &conflict) && conflict.Kind == store.ConflictDuplicate {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func readsInput(r io.Reader) error {
+	if _, err := r.Read(b); err != nil {
+		log(err)
+	}
+	return nil
+}
+
+func otherTx(t *Tx) error {
+	if err := t.AddItem(x); err != nil {
+		log(err)
+	}
+	return nil
+}
+`
+	fset := token.NewFileSet()
+	files := map[string]*ast.File{}
+	for name, src := range map[string]string{"store.go": storeSrc, "service.go": serviceSrc} {
+		f, err := parser.ParseFile(fset, name, src, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[name] = f
+	}
+	hits, contexts := scanTxAbsorbs(fset, files)
 	got := map[string]bool{}
 	for _, h := range hits {
 		got[h.at.fn+" "+h.rule] = true
 	}
 	want := map[string]bool{
-		"absorb " + ruleAbsorb: true, "passThrough " + rulePass: true,
-		"writeAfter " + ruleWriteAfter: true, "closure " + ruleAbsorb: true, "duplicate " + ruleAbsorb: true,
+		"absorb " + ruleAbsorb: true, "writeAfter " + ruleWriteAfter: true, "returnNil " + ruleAbsorb: true,
+		"returnValueNil " + ruleAbsorb: true, "propagateReset " + ruleAbsorb: true, "obs " + ruleAbsorb: true,
+		"ledger " + ruleAbsorb:    true,
+		"passThrough " + rulePass: true, "closure " + ruleAbsorb: true, "duplicate " + ruleAbsorb: true,
 	}
-	if !maps.Equal(got, want) || contexts != 8 {
-		t.Fatalf("탐지가 합성 소스에서 어긋났다(문맥 %d개, 기대 8)\n 얻음 %v\n 기대 %v", contexts, got, want)
+	gotCtx := map[string]bool{}
+	for at := range contexts {
+		gotCtx[at.fn] = true
+	}
+	wantCtx := map[string]bool{
+		"absorb": true, "writeAfter": true, "returnNil": true, "returnValueNil": true, "propagate": true,
+		"propagateReset": true, "obs": true, "ledger": true, "fine": true,
+		"passThrough": true, "closure": true, "duplicate": true,
+	}
+	if !maps.Equal(got, want) || !maps.Equal(gotCtx, wantCtx) {
+		t.Fatalf("탐지가 합성 소스에서 어긋났다\n 걸림 얻음 %v\n 걸림 기대 %v\n 문맥 얻음 %v\n 문맥 기대 %v", got, want, gotCtx, wantCtx)
 	}
 }
 
@@ -230,38 +323,42 @@ func (h absorbHit) String(fset *token.FileSet) string {
 	return h.rule + " " + h.at.String() + " (" + fset.Position(h.pos).String() + ")"
 }
 
-// scanTxAbsorbs 는 files 에서 세 꼴을 찾는다. 둘째 값은 트랜잭션 핸들을 쥔 함수(함수 리터럴 포함)의 수다.
-func scanTxAbsorbs(fset *token.FileSet, files map[string]*ast.File) (hits []absorbHit, contexts int) {
+// scanTxAbsorbs 는 files 에서 세 꼴을 찾는다. 둘째 값은 트랜잭션 핸들을 쥔 함수(안의 함수 리터럴이 쥔 것 포함)의 자리다.
+func scanTxAbsorbs(fset *token.FileSet, files map[string]*ast.File) (hits []absorbHit, contexts map[site]bool) {
+	contexts = map[site]bool{}
 	names := make([]string, 0, len(files))
 	for n := range files {
 		names = append(names, n)
 	}
 	sort.Strings(names)
 	for _, name := range names {
+		pkg := files[name].Name.Name
 		for _, d := range files[name].Decls {
 			fd, ok := d.(*ast.FuncDecl)
 			if !ok || fd.Body == nil {
 				continue
 			}
 			handles := map[string]bool{}
-			addTxHandles(handles, fd.Recv)
-			addTxHandles(handles, fd.Type.Params)
-			sc := &txScan{at: site{name, fd.Name.Name}}
+			addTxHandles(handles, fd.Recv, pkg)
+			addTxHandles(handles, fd.Type.Params, pkg)
+			sc := &txScan{at: site{name, fd.Name.Name}, pkg: pkg}
 			sc.body(fd.Body, handles)
 			hits = append(hits, sc.hits...)
-			contexts += sc.contexts
+			if sc.context {
+				contexts[sc.at] = true
+			}
 		}
 	}
 	return hits, contexts
 }
 
-// addTxHandles 는 fields 중 트랜잭션 핸들 타입인 이름을 h 에 더한다.
-func addTxHandles(h map[string]bool, fields *ast.FieldList) {
+// addTxHandles 는 fields 중 트랜잭션 핸들 타입인 이름을 h 에 더한다. pkg 는 그 소스의 패키지 이름이다.
+func addTxHandles(h map[string]bool, fields *ast.FieldList, pkg string) {
 	if fields == nil {
 		return
 	}
 	for _, f := range fields.List {
-		if !isTxHandleType(f.Type) {
+		if !isTxHandleType(f.Type, pkg) {
 			continue
 		}
 		for _, n := range f.Names {
@@ -270,19 +367,32 @@ func addTxHandles(h map[string]bool, fields *ast.FieldList) {
 	}
 }
 
-func isTxHandleType(e ast.Expr) bool {
-	if star, ok := e.(*ast.StarExpr); ok {
-		switch typeName(star.X) {
-		case "Tx", "ObsTx", "txConn":
-			return true
+// isTxHandleType 은 e 가 store 의 트랜잭션 핸들 타입인가다: store 안에서는 맨 이름, 밖에서는 store.X 다. 같은 이름의
+// 남의 타입(io.Reader, 다른 패키지의 Tx)은 핸들이 아니다.
+func isTxHandleType(e ast.Expr, pkg string) bool {
+	star, ptr := e.(*ast.StarExpr)
+	if ptr {
+		e = star.X
+	}
+	var name string
+	switch e := e.(type) {
+	case *ast.Ident:
+		if pkg != "store" {
+			return false
 		}
+		name = e.Name
+	case *ast.SelectorExpr:
+		if x, ok := e.X.(*ast.Ident); !ok || x.Name != "store" {
+			return false
+		}
+		name = e.Sel.Name
+	default:
 		return false
 	}
-	switch typeName(e) {
-	case "Reader", "dbtx":
-		return true
+	if ptr {
+		return name == "Tx" || name == "ObsTx" || name == "txConn"
 	}
-	return false
+	return name == "Reader" || name == "dbtx"
 }
 
 // typeName 은 T · *T · pkg.T · *pkg.T 의 T 다.
@@ -300,9 +410,10 @@ func typeName(e ast.Expr) string {
 
 // txScan 은 함수 하나(그 안의 함수 리터럴은 따로)를 훑는다.
 type txScan struct {
-	at       site
-	hits     []absorbHit
-	contexts int
+	at      site
+	pkg     string
+	hits    []absorbHit
+	context bool // 이 함수나 그 안의 함수 리터럴이 트랜잭션 핸들을 쥐었다
 }
 
 // errOrigin 은 오류 변수가 마지막으로 어디서 왔나다.
@@ -318,18 +429,35 @@ type fnScan struct {
 	sc       *txScan
 	handles  map[string]bool
 	origin   map[string]errOrigin
-	varTypes map[string]string // 함수 안 var 선언의 타입 이름. 같은 이름이 다른 타입으로 둘이면 "" 다
+	varTypes map[string]string     // 함수 안 var 선언의 타입 이름. 같은 이름이 다른 타입으로 둘이면 "" 다
+	next     map[ast.Stmt]ast.Stmt // 문장 목록에서 바로 다음 문장. else if 는 사슬 머리의 다음을 물려받는다
 }
 
 func (sc *txScan) body(body *ast.BlockStmt, handles map[string]bool) {
-	f := &fnScan{sc: sc, handles: handles, origin: map[string]errOrigin{}, varTypes: map[string]string{}}
+	f := &fnScan{sc: sc, handles: handles, origin: map[string]errOrigin{}, varTypes: map[string]string{},
+		next: map[ast.Stmt]ast.Stmt{}}
 	if len(handles) > 0 {
-		sc.contexts++
+		sc.context = true
+	}
+	link := func(list []ast.Stmt) {
+		for i := 0; i+1 < len(list); i++ {
+			f.next[list[i]] = list[i+1]
+		}
 	}
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.FuncLit:
 			return false
+		case *ast.BlockStmt:
+			link(n.List)
+		case *ast.CaseClause:
+			link(n.Body)
+		case *ast.CommClause:
+			link(n.Body)
+		case *ast.IfStmt:
+			if els, ok := n.Else.(*ast.IfStmt); ok {
+				f.next[els] = f.next[n]
+			}
 		case *ast.ValueSpec:
 			if n.Type == nil {
 				return true
@@ -348,7 +476,7 @@ func (sc *txScan) body(body *ast.BlockStmt, handles map[string]bool) {
 		switch n := n.(type) {
 		case *ast.FuncLit:
 			inner := maps.Clone(handles)
-			addTxHandles(inner, n.Type.Params)
+			addTxHandles(inner, n.Type.Params, sc.pkg)
 			sc.body(n.Body, inner)
 			return false
 		case *ast.AssignStmt:
@@ -411,8 +539,9 @@ func isSavepointCall(call *ast.CallExpr) bool {
 	return false
 }
 
-// notStatements 는 핸들의 메서드 중 문장을 안 내는 것이다(LogEvent 는 커밋 뒤로 미뤄 쓴다).
-var notStatements = map[string]bool{"LogEvent": true, "Ctx": true}
+// notStatements 는 핸들의 메서드 중 문장을 안 내는 것이다(LogEvent 는 커밋 뒤로 미뤄 쓴다, savepointBroke 는 오류를
+// 만들고 트랜잭션에 표시만 한다).
+var notStatements = map[string]bool{"LogEvent": true, "Ctx": true, "savepointBroke": true}
 
 // isHandle 은 e 가 트랜잭션 핸들(이름 또는 <핸들>.tx)인가다.
 func (f *fnScan) isHandle(e ast.Expr) bool {
@@ -455,7 +584,8 @@ func (f *fnScan) txErr(e ast.Expr) bool {
 }
 
 // errClassifiers 는 오류가 있을 때만 참이 되는 값을 내는 store 의 분류기다.
-var errClassifiers = map[string]bool{"JudgeError": true, "ConstraintCode": true, "driverCodeOf": true, "conflictOf": true}
+var errClassifiers = map[string]bool{"JudgeError": true, "ConstraintCode": true, "driverCodeOf": true, "conflictOf": true,
+	"Unabsorbable": true}
 
 // dbErrorTypes 는 문장 실패를 나르는 오류 타입이다(errors.As 의 대상이 이것이면 그 갈래는 DB 오류를 받는다).
 var dbErrorTypes = map[string]bool{"ConflictError": true, "TxFault": true, "PgError": true, "Error": true}
@@ -578,14 +708,14 @@ func (f *fnScan) ifStmt(n *ast.IfStmt) {
 		f.assign(a)
 	}
 	if f.present(n.Cond) {
-		f.errBranch(n.Body.List, n.Body.Pos())
+		f.errBranch(n.Body.List, n.Body.Pos(), f.next[n])
 	}
 	e := f.absent(n.Cond)
 	if e == "" {
 		return
 	}
 	if els, ok := n.Else.(*ast.BlockStmt); ok {
-		f.errBranch(els.List, els.Pos())
+		f.errBranch(els.List, els.Pos(), f.next[n])
 		return
 	}
 	// 오류일 때 나가는 갈래가 사슬에 없으면 오류가 이 if 를 지나 흘러간다. Init 밖에서 받은 오류는 뒤에서 볼 수도 있어
@@ -606,21 +736,82 @@ func (f *fnScan) switchStmt(n *ast.SwitchStmt) {
 		cc := s.(*ast.CaseClause)
 		for _, e := range cc.List {
 			if f.present(e) {
-				f.errBranch(cc.Body, cc.Pos())
+				f.errBranch(cc.Body, cc.Pos(), f.next[n])
 				break
 			}
 		}
 	}
 }
 
-// errBranch 는 트랜잭션 오류가 있을 때 들어가는 갈래를 본다.
-func (f *fnScan) errBranch(stmts []ast.Stmt, pos token.Pos) {
-	if !f.exits(stmts) {
+// errBranch 는 트랜잭션 오류가 있을 때 들어가는 갈래를 본다. next 는 그 if · switch 바로 다음 문장이다(없으면 nil).
+func (f *fnScan) errBranch(stmts []ast.Stmt, pos token.Pos, next ast.Stmt) {
+	switch {
+	case f.returnsNil(stmts):
+		f.hit(ruleAbsorb, pos)
+	case f.exits(stmts), f.propagatesAfter(stmts, next):
+	default:
 		f.hit(ruleAbsorb, pos)
 	}
 	if f.callsTx(stmts) {
 		f.hit(ruleWriteAfter, pos)
 	}
+}
+
+// returnsNil 은 stmts 에 마지막 값이 nil 인 return 이 있는가다(오류를 버리고 나간다). 문장 실패가 아닌 오류만 고른 갈래
+// 안은 안 본다.
+func (f *fnScan) returnsNil(stmts []ast.Stmt) bool {
+	found := false
+	var visit func(n ast.Node) bool
+	visit = func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		switch n := n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.IfStmt:
+			if f.notStatementFailure(n.Cond) {
+				if n.Else != nil {
+					ast.Inspect(n.Else, visit)
+				}
+				return false
+			}
+		case *ast.ReturnStmt:
+			found = len(n.Results) > 0 && isNil(n.Results[len(n.Results)-1])
+		}
+		return !found
+	}
+	for _, s := range stmts {
+		ast.Inspect(s, visit)
+	}
+	return found
+}
+
+// propagatesAfter 는 갈래를 그대로 빠져나가면 바로 다음 문장이 그 오류를 내는 return 인가다(if e != nil { 기록 };
+// return e). 갈래 안에서 그 변수를 다시 쓰거나 갈래 밖으로 건너뛰면(continue 등) 전파가 아니다.
+func (f *fnScan) propagatesAfter(stmts []ast.Stmt, next ast.Stmt) bool {
+	ret, ok := next.(*ast.ReturnStmt)
+	if !ok || len(ret.Results) == 0 || f.escapes(stmts) {
+		return false
+	}
+	id, ok := ast.Unparen(ret.Results[len(ret.Results)-1]).(*ast.Ident)
+	if !ok || !f.txErr(id) {
+		return false
+	}
+	reassigned := false
+	for _, s := range stmts {
+		ast.Inspect(s, func(n ast.Node) bool {
+			if a, ok := n.(*ast.AssignStmt); ok {
+				for _, l := range a.Lhs {
+					if lid, ok := l.(*ast.Ident); ok && lid.Name == id.Name {
+						reassigned = true
+					}
+				}
+			}
+			return !reassigned
+		})
+	}
+	return !reassigned
 }
 
 // callsTx 는 stmts 가 트랜잭션 호출을 하는가다. 문장 실패가 아닌 오류만 고른 갈래 안은 안 본다.

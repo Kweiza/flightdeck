@@ -101,13 +101,13 @@ func (t *Tx) AcquireResource(project, resource string, h Holder, at time.Time) (
 	at = atStamp(at)
 	id, inserted, err := t.insertUnlessTaken(`
 		INSERT INTO resource_hold(project, resource, session_id, job_id, acquired_at, released_at, force_reason)
-		VALUES (?, ?, ?, ?, ?, NULL, NULL)`,
+		VALUES (?, ?, ?, ?, ?, NULL, NULL)`, resourceOneHolder,
 		project, resource, nullStr(h.SessionID), nullStr(h.JobID), fmtTime(at))
 	if err == nil && !inserted {
-		// 유니크 충돌로 안 들어갔다 - 트랜잭션은 멀쩡하니 점유자를 읽어 담는다.
+		// 배타 인덱스에 막혀 안 들어갔다 - 트랜잭션은 멀쩡하니 점유자를 읽어 담는다.
 		held, qErr := heldBy(t.ctx, t.tx, project, resource)
 		if qErr != nil {
-			// 충돌했는데 살아 있는 점유자가 없다면 배타 인덱스가 아닌 유니크 제약에 걸린 것이다(지금 스키마에는 없다).
+			// 같은 트랜잭션에서 막힌 것을 바로 읽으므로 점유자는 있어야 한다. 못 읽었으면 그 까닭을 그대로 올린다.
 			return model.ResourceHold{}, fmt.Errorf(
 				"자원 획득이 유니크 충돌로 막혔는데 점유자를 못 읽었다(project=%q resource=%q holder=%s): %w",
 				clip(project, 64), clip(resource, 64), h, qErr)
@@ -147,6 +147,10 @@ func (s *Store) AcquireResource(ctx context.Context, project, resource string, h
 	})
 	return out, err
 }
+
+// resourceOneHolder 는 resource_hold 의 배타 인덱스 resource_one_holder 의 정의 그대로다(schema.sql · pg/001_baseline.sql).
+// AcquireResource 의 ON CONFLICT 대상이다 - 이 인덱스에 막힌 것만 「남이 쥐었다」이고, PK 충돌 등은 오류로 온다.
+const resourceOneHolder = `(project, resource) WHERE released_at IS NULL`
 
 // heldBy 는 살아 있는 점유 행을 읽는다. 없으면 ErrNotFound.
 func heldBy(ctx context.Context, q dbtx, project, resource string) (model.ResourceHold, error) {

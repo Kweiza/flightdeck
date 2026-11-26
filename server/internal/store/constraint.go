@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -315,6 +316,33 @@ func driverCodeOf(err error) driverCode {
 
 // JudgeError 는 오류 하나를 엔진과 무관하게 판정한다. 드라이버 오류가 없으면 「제약 위반이 아니다」다.
 func JudgeError(err error) ConstraintVerdict { return driverCodeOf(err).judge() }
+
+// Unabsorbable 은 err 가 트랜잭션 안에서 흡수하면 안 되는 저장층 실패인가다. 저장점 안에서 받은 오류라도 이것이면
+// 위로 올린다 - 흡수하면 그 결과(링크 누락 · 관측 누락)가 원인 없이 추가 전용 원장에 굳는다.
+//   - 저장점 정리 실패(*SavepointError): 그 트랜잭션은 더 쓸 수 없다
+//   - 트랜잭션 결함(*TxFault, 그리고 판정이 잠금 · 직렬화 · 교착 · 버려진 트랜잭션인 드라이버 오류)
+//   - 부른 쪽 문맥의 끝(취소 · 시한)
+//   - 그 밖에 서버 · 드라이버가 낸 오류(SQLSTATE · SQLite 결과 코드 · 접속 오류). 스키마 어긋남(42703 등)이 여기다
+//
+// 없음(ErrNotFound)과 우리 쪽 값 해석 오류는 여기 안 든다 - 흡수할지는 부른 쪽이 뜻으로 정한다. 제약 위반은 드라이버
+// 오류라 여기 든다 - 그 뜻(중복 등)으로 흡수하려는 쪽은 이것보다 먼저 가른다(Finish 의 후속 등록).
+func Unabsorbable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *SavepointError
+	var tf *TxFault
+	var ce *connError
+	switch {
+	case errors.As(err, &se), errors.As(err, &tf), errors.As(err, &ce),
+		errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return true
+	case errors.Is(err, ErrNotFound):
+		return false
+	}
+	c := driverCodeOf(err)
+	return c.state != "" || c.sqlite != 0
+}
 
 // asFault 는 트랜잭션 실패(잠금 못 얻음 · 직렬화 실패 · 교착 · 버려진 트랜잭션)를 *TxFault 로 감싼다.
 // 아니면 그대로 낸다. 트랜잭션의 끝(runTx · ReadTx · applySteps)이 부른다 - 어느 문장에서 났든 거기서 한 번 옮긴다.

@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/kweiza/flightdeck/internal/model"
 )
 
@@ -90,8 +92,9 @@ func TestSavepointTrapsTheErrorAndKeepsTheTx(t *testing.T) {
 }
 
 // TestAcquireResourceNamesTheHolder 는 이미 쥔 자원을 잡으면 그 점유자를 담은 ResourceHeldError 가 오고, 그 뒤에도
-// 같은 트랜잭션이 이어 쓰고 커밋되는지 잰다. Postgres 에서 앞 판은 막힌 삽입 뒤의 점유자 조회가 25P02 로 죽어
-// 일반 오류가 나갔고, 첫 획득도 LastInsertId 가 없어 실패했다.
+// 같은 트랜잭션이 이어 쓰고 커밋되는지 잰다. Postgres 에서 앞 판은 첫 획득부터 LastInsertId(Postgres 드라이버가
+// 지원하지 않는다)에서 죽어 이 시험의 첫 단계도 못 지났다. 그것을 넘었어도 막힌 삽입 뒤의 점유자 조회는 버려진
+// 트랜잭션(25P02)에 닿는 자리였다.
 func TestAcquireResourceNamesTheHolder(t *testing.T) {
 	bothEngines(t, func(t *testing.T, s *Store) {
 		ctx := context.Background()
@@ -141,7 +144,9 @@ func TestAcquireResourceNamesTheHolder(t *testing.T) {
 }
 
 // TestEnqueueLandingReentersAndTheTxGoesOn 은 이미 줄에 선 세션이 다시 서면 그 행(자원 집합까지)이 그대로 오고, 같은
-// 트랜잭션이 자원 획득과 커밋까지 이어 가는지 잰다. Postgres 에서 앞 판은 막힌 삽입 뒤의 행 조회가 25P02 로 죽었다.
+// 트랜잭션이 자원 획득과 커밋까지 이어 가는지 잰다. Postgres 에서 앞 판은 첫 줄 서기부터 LastInsertId(Postgres
+// 드라이버가 지원하지 않는다)에서 죽었다. 그것을 넘었어도 막힌 삽입 뒤의 행 조회는 버려진 트랜잭션(25P02)에 닿는
+// 자리였다.
 func TestEnqueueLandingReentersAndTheTxGoesOn(t *testing.T) {
 	bothEngines(t, func(t *testing.T, s *Store) {
 		ctx := context.Background()
@@ -188,6 +193,121 @@ func TestEnqueueLandingReentersAndTheTxGoesOn(t *testing.T) {
 		var ce *ConflictError
 		if !errors.As(err, &ce) || ce.Kind != ConflictMissingRef || ce.Target != TargetLandingQueue {
 			t.Fatalf("등록 안 된 세션으로 섰는데 landing_queue 의 FK 위반이 아니다: %v", err)
+		}
+	})
+}
+
+// TestSavepointCleanupFailureStopsTheTx 는 저장점을 되돌리지 못하면 fn 의 오류(중복 · 없음) 대신 흡수할 수 없는
+// *SavepointError 가 오고, 부른 쪽이 그것을 삼키고 이어 써도 아무것도 커밋되지 않는지 잰다. fn 안의 ROLLBACK 이 바깥
+// 트랜잭션을 끝내 ROLLBACK TO 가 실패하는 길이다 - 그 연결에서 뒤 문장은 두 엔진 다 자동 커밋으로 돈다.
+func TestSavepointCleanupFailureStopsTheTx(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		var spErr, afterErr error
+		err := s.Tx(context.Background(), func(x *Tx) error {
+			if err := insertMachine(x, "before"); err != nil {
+				return err
+			}
+			spErr = x.Savepoint(func(sp *Tx) error {
+				if _, err := sp.tx.raw.ExecContext(sp.ctx, "ROLLBACK"); err != nil {
+					return fmt.Errorf("시험 준비(바깥 트랜잭션 끝내기) 실패: %w", err)
+				}
+				// 흡수하는 쪽이 찾는 두 뜻을 다 싣는다 - 정리 실패가 이것을 품으면 아래 단정이 잡는다.
+				return errors.Join(&ConflictError{Kind: ConflictDuplicate, Target: TargetItem}, ErrNotFound)
+			})
+			// 부른 쪽이 흡수하고 이어 가는 꼴이다(Finish 의 후속 등록 · 읽기 자리).
+			afterErr = insertMachine(x, "after")
+			return nil
+		})
+
+		var se *SavepointError
+		if !errors.As(spErr, &se) || se.Step != "되돌리기" {
+			t.Fatalf("정리 실패가 *SavepointError(되돌리기)로 오지 않았다: %v", spErr)
+		}
+		var ce *ConflictError
+		if errors.As(spErr, &ce) || errors.Is(spErr, ErrNotFound) {
+			t.Fatalf("정리 실패가 fn 의 오류(중복 · 없음)로 읽힌다 - 부른 쪽이 흡수하고 이어 간다: %v", spErr)
+		}
+		if !Unabsorbable(spErr) {
+			t.Fatalf("정리 실패를 흡수해도 된다고 판정했다: %v", spErr)
+		}
+		if !errors.Is(afterErr, se) {
+			t.Fatalf("망가진 트랜잭션이 뒤 문장을 받았다: %v", afterErr)
+		}
+		if !errors.Is(err, se) {
+			t.Fatalf("망가진 트랜잭션의 커밋이 그 까닭으로 거절되지 않았다: %v", err)
+		}
+		if got := machineIDs(t, s); len(got) != 0 {
+			t.Fatalf("망가진 트랜잭션에서 쓴 것이 남았다: %v", got)
+		}
+	})
+}
+
+// TestSavepointPanicDoesNotCommitItsWrites 는 fn 이 쓰고 패닉하면 그 쓰기를 되돌린 뒤 패닉을 올리는지 잰다. 부른 쪽이 같은
+// 트랜잭션에서 recover 하고 커밋해도 패닉 전에 쓴 것은 안 남고, 트랜잭션은 그대로 이어 쓴다.
+func TestSavepointPanicDoesNotCommitItsWrites(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		var recovered any
+		err := s.Tx(context.Background(), func(x *Tx) error {
+			if err := insertMachine(x, "before"); err != nil {
+				return err
+			}
+			func() {
+				defer func() { recovered = recover() }()
+				_ = x.Savepoint(func(sp *Tx) error {
+					if err := insertMachine(sp, "in-panic"); err != nil {
+						return err
+					}
+					panic("시험 패닉")
+				})
+			}()
+			return insertMachine(x, "after")
+		})
+		if recovered != "시험 패닉" {
+			t.Fatalf("패닉이 그대로 올라오지 않았다: %v", recovered)
+		}
+		if err != nil {
+			t.Fatalf("패닉을 되돌린 뒤 트랜잭션이 못 이어 갔다: %v", err)
+		}
+		if got := machineIDs(t, s); !slices.Equal(got, []string{"after", "before"}) {
+			t.Fatalf("커밋된 행 %v(기대 [after before]) - 패닉 전에 쓴 것이 남았거나 이어 쓴 것이 사라졌다", got)
+		}
+	})
+}
+
+// TestUnabsorbableRaisesStoreFailuresOnly 는 흡수 금지 판정이 저장층 실패(드라이버 오류 · 트랜잭션 결함 · 문맥 끝 ·
+// 저장점 정리 실패)는 다 잡고, 뜻으로 흡수하는 없음 · 값 해석 오류는 놓아 주는지 잰다. 드라이버 오류는 두 엔진에서
+// 실제로 낸다.
+func TestUnabsorbableRaisesStoreFailuresOnly(t *testing.T) {
+	for name, c := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"nil":       {nil, false},
+		"없음":        {fmt.Errorf("감쌈: %w", ErrNotFound), false},
+		"타입 있는 없음":  {&NotFoundError{Kind: NFItem, Project: "p", ID: "x"}, false},
+		"값 해석":      {errors.New("paths 칸을 못 풀었다"), false},
+		"잠금 대기 넘침":  {fmt.Errorf("감쌈: %w", &pgconn.PgError{Code: "55P03"}), true},
+		"직렬화":       {&pgconn.PgError{Code: "40001"}, true},
+		"트랜잭션 결함":   {&TxFault{Kind: FaultDeadlock}, true},
+		"저장점 정리 실패": {&SavepointError{Name: "fd_sp_1", Step: "풀기"}, true},
+		"취소":        {fmt.Errorf("감쌈: %w", context.Canceled), true},
+		"시한":        {context.DeadlineExceeded, true},
+		"접속 오류":     {&connError{fault: "끊겼다"}, true},
+	} {
+		if got := Unabsorbable(c.err); got != c.want {
+			t.Errorf("%s: Unabsorbable(%v) = %v(기대 %v)", name, c.err, got, c.want)
+		}
+	}
+	bothEngines(t, func(t *testing.T, s *Store) {
+		_, schemaErr := s.db.ExecContext(context.Background(), `SELECT no_such_column FROM machine`)
+		if schemaErr == nil || !Unabsorbable(schemaErr) {
+			t.Fatalf("스키마 어긋남을 흡수해도 된다고 판정했다: %v", schemaErr)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, cancelErr := s.db.ExecContext(ctx, `SELECT 1`)
+		if cancelErr == nil || !Unabsorbable(cancelErr) {
+			t.Fatalf("취소된 문맥의 오류를 흡수해도 된다고 판정했다: %v", cancelErr)
 		}
 	})
 }

@@ -455,12 +455,12 @@ func scanItem(sc interface{ Scan(...any) error }) (model.Item, error) {
 }
 
 func afterOf(ctx context.Context, q dbtx, project, itemID string) ([]model.After, error) {
-	// ORDER BY rowid = 삽입 순서다. 정렬을 안 걸면 SQLite 가 우연히 그 순서를 내주는 것에
-	// 기대게 되고, 그러면 되쓰기 산출물의 줄 순서가 판 바뀔 때 조용히 흔들린다 —
+	// 삽입 순서(SQLite 는 rowid, Postgres 는 seq - engine.itemAfterOrder)로 정렬한다. 정렬을 안 걸면 SQLite 가
+	// 우연히 그 순서를 내주는 것에 기대게 되고, 그러면 되쓰기 산출물의 줄 순서가 판 바뀔 때 조용히 흔들린다 —
 	// 원본과 diff 로 대조하는 것이 그 산출물의 존재 이유라 순서가 곧 계약이다.
 	rows, err := q.QueryContext(ctx,
 		`SELECT dep_item, dep_job, dep_sha, dep_project FROM item_after
-		 WHERE project = ? AND item_id = ? ORDER BY rowid`,
+		 WHERE project = ? AND item_id = ? ORDER BY `+q.dialect().itemAfterOrder(),
 		project, itemID)
 	if err != nil {
 		return nil, fmt.Errorf("선행 조건 조회 실패(project=%q item=%q): %w",
