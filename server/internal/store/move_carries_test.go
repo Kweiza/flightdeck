@@ -121,7 +121,7 @@ func TestMoveItemListCoversEveryTableKeyedToItem(t *testing.T) {
 		t.Fatal("표를 하나도 못 찾았다 — 훑기가 눈이 먼 것이지 통과가 아니다")
 	}
 	for _, tbl := range tables {
-		cols := tableColumns(t, s.db, tbl)
+		cols := tableColumns(t, s.DB(), tbl)
 		if cols["project"] && cols["item_id"] {
 			found = append(found, tbl)
 		}

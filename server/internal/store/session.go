@@ -457,14 +457,14 @@ func (s *Store) Rekey(ctx context.Context, id, ccSessionID string) (model.Sessio
 // (loadViews). 창 밖 세션은 이것으로 세지 않는다, SummarizeOutside 가 SQL 로 센다.
 func (s *Store) ListLive(ctx context.Context, project string, since time.Time) ([]model.SessionView, error) {
 	cut := fmtTime(since)
-	// 네 질의를 읽기 트랜잭션 하나에서 묻는다. 세 축의 하위 질의는 거름을 다시 평가하므로, 따로
+	// 네 질의를 읽기 트랜잭션 하나(ReadTx)에서 묻는다. 세 축의 하위 질의는 거름을 다시 평가하므로, 따로
 	// 물으면 그 사이 끝난 세션이 목록에는 있고 축에는 없을 수 있다. 한 트랜잭션은 한 스냅숏을 본다.
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return nil, fmt.Errorf("살아 있는 세션 조회 트랜잭션 시작 실패(project=%q): %w", clip(project, 64), err)
-	}
-	defer tx.Rollback()
-	out, err := loadViews(ctx, tx, liveSessionFilter, []any{project, cut, cut})
+	var out []model.SessionView
+	err := s.ReadTx(ctx, func(q Reader) error {
+		var err error
+		out, err = loadViews(ctx, q, liveSessionFilter, []any{project, cut, cut})
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("살아 있는 세션 조회 실패(project=%q): %w", clip(project, 64), err)
 	}
@@ -476,7 +476,7 @@ func (s *Store) ListLive(ctx context.Context, project string, since time.Time) (
 //
 // ★ ListLive 와 SummarizeOutside 의 선점자가 **같은 적재**를 쓴다. 두 벌이면 한쪽 축만 고친 순간
 // 창 안 카드와 창 밖 선점 줄이 다른 조건으로 갈린다.
-func loadViews(ctx context.Context, tx dbtx, filter string, args []any) ([]model.SessionView, error) {
+func loadViews(ctx context.Context, tx Reader, filter string, args []any) ([]model.SessionView, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT `+sessionCols+` FROM session s
 		WHERE `+filter+`
@@ -607,12 +607,18 @@ func (s *Store) SummarizeOutside(ctx context.Context, project string, since time
 	cut := fmtTime(since)
 	args := []any{project, cut, cut}
 	var out OutsideSummary
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return out, fmt.Errorf("창 밖 세션 조회 트랜잭션 시작 실패(project=%q): %w", clip(project, 64), err)
-	}
-	defer tx.Rollback()
+	err := s.ReadTx(ctx, func(tx Reader) error {
+		var err error
+		out, err = summarizeOutside(ctx, tx, project, args)
+		return err
+	})
+	return out, err
+}
 
+// summarizeOutside 는 SummarizeOutside 의 본체다. 읽기 트랜잭션 하나(ReadTx) 안에서 돈다.
+func summarizeOutside(ctx context.Context, tx Reader, project string, args []any) (OutsideSummary, error) {
+	var out OutsideSummary
+	var err error
 	// 시각은 고정 폭 UTC 문자열이라(fmtTime) 글자 순서가 시간 순서다, 거름의 g.at >= ? 와 같은 전제.
 	// 세션마다 마지막 신호(MAX)를 내고 그중 가장 이른 것(MIN)을 고른다. 신호 없는 세션은 NULL 이라 빠진다.
 	var oldest sql.NullString
@@ -639,7 +645,7 @@ func (s *Store) SummarizeOutside(ctx context.Context, project string, since time
 }
 
 // eachRow 는 질의 하나의 행마다 fn 을 부른다. what 은 오류 문구의 대상 이름이다.
-func eachRow(ctx context.Context, db dbtx, query string, args []any, what string, fn func(*sql.Rows) error) error {
+func eachRow(ctx context.Context, db Reader, query string, args []any, what string, fn func(*sql.Rows) error) error {
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("%s 조회 실패: %w", what, err)

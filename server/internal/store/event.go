@@ -26,6 +26,11 @@ import (
 //
 // ★ 호출자의 트랜잭션에 얹지 않고 별도 커넥션으로 쓴다. 상위 작업이 롤백돼도
 // "무엇을 시도했다 실패했나"는 남아야 하기 때문이다 — 그것이 감사 원장의 존재 이유다.
+//
+// ★ 그 별도 쓰기도 **업무 쓰기와 같은 전역 잠금**을 잡는다(자기 짧은 Tx). 불변식은 없지만 event.id 순서를
+// 삽입 순서로 읽는 자리가 있다(ClaimHolderAt · QueueReproduction · 배포 기록의 마지막 행). 잠금 없이 넣으면
+// Postgres 에서 id 를 먼저 받은 쪽이 늦게 커밋해, 읽는 쪽이 본 max(id) 아래에 나중 행이 끼어든다.
+// SQLite 는 쓰기가 원래 한 줄이라 같다. 그래서 트랜잭션 안에서 이것을 부르면 교착한다 - 거기서는 Tx.LogEvent 다.
 func (s *Store) LogEvent(ctx context.Context, kind, project, sessionID string, payload any) {
 	if err := s.TryLogEvent(ctx, kind, project, sessionID, payload); err != nil {
 		s.log.Warn("계측 이벤트 기록 실패(상위 동작은 계속한다)",
@@ -48,9 +53,13 @@ func (s *Store) TryLogEvent(ctx context.Context, kind, project, sessionID string
 		}
 		body = string(buf)
 	}
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO event(at, project, session_id, kind, payload) VALUES (?, ?, ?, ?, ?)`,
-		fmtTime(time.Now()), nullStr(project), nullStr(sessionID), kind, body); err != nil {
+	// 시각은 잠금을 받은 뒤에 잰다 - at 순서가 id 순서와 같게.
+	if err := s.Tx(ctx, func(t *Tx) error {
+		_, err := t.tx.ExecContext(t.ctx,
+			`INSERT INTO event(at, project, session_id, kind, payload) VALUES (?, ?, ?, ?, ?)`,
+			fmtTime(time.Now()), nullStr(project), nullStr(sessionID), kind, body)
+		return err
+	}); err != nil {
 		return fmt.Errorf("이벤트 기록 실패(kind=%q project=%q session=%q): %w",
 			clip(kind, 64), clip(project, 64), clip(sessionID, 64), err)
 	}

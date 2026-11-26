@@ -292,6 +292,9 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if s.svc != nil {
 		d := s.svc.DeriveStats()
 		snap.DeriveRuns, snap.DeriveCards, snap.DeriveSeconds = d.Runs, d.Cards, d.Seconds
+		if st := s.svc.Store(); st != nil {
+			snap.DB = st.DBStats()
+		}
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

@@ -1,6 +1,7 @@
-// Package store 는 flightdeck 의 SQLite 저장 계층이다.
+// Package store 는 flightdeck 의 저장 계층이다(SQLite, 그리고 옮겨 가는 Postgres).
 //
-// 정본은 schema.sql 이고 이 패키지는 그 위의 얇은 접근층이다. 스키마의 제약이
+// 정본은 schema.sql(Postgres 는 pg/001_baseline.sql)이고 이 패키지는 그 위의 얇은 접근층이다.
+// 엔진이 갈리는 자리는 engine.go(열기 · 트랜잭션 시작 · 자리표시)와 constraint.go(오류 번역)뿐이다. 스키마의 제약이
 // 실제로 났던 사고를 막으므로, 여기서 **제약을 미리 흉내 내 판정하지 않는다** —
 // 예를 들어 자원 배타는 부분 유니크 인덱스가 지키고, 이 코드는 그 위반을 받아
 // 점유자를 담은 오류로 옮길 뿐이다. 앱에서 먼저 조회해 판정하면 그 사이에 남이 잡는다.
@@ -23,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -144,24 +146,43 @@ var ErrNotFound = errors.New("없다")
 // Store · Tx
 // ─────────────────────────────────────────────────────────────────────────────
 
-// dbtx 는 *sql.DB 와 *sql.Tx 가 함께 만족하는 최소 면이다.
-// 질의 구현을 한 벌로 두기 위한 것이다 — 두 벌이 되면 트랜잭션 경로와 단발 경로가 표류한다.
-type dbtx interface {
-	ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error)
+// Reader 는 읽기만 하는 면이다. ReadTx 의 클로저가 받는다 - 쓰기 문장(ExecContext)이 타입에 없다.
+type Reader interface {
 	QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, q string, args ...any) *sql.Row
 }
 
+// dbtx 는 단발 핸들(conn)과 트랜잭션(txConn)이 함께 만족하는 최소 면이다.
+// 질의 구현을 한 벌로 두기 위한 것이다 — 두 벌이 되면 트랜잭션 경로와 단발 경로가 표류한다.
+type dbtx interface {
+	Reader
+	ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error)
+}
+
 // Store 는 열린 DB 하나다.
 type Store struct {
-	db   *sql.DB
-	path string
-	log  *slog.Logger
+	db *conn
+	// path 는 SQLite 파일 경로다. Postgres 면 비밀번호를 가린 접속 URL 이다(로그 · 오류에 실린다).
+	path  string
+	log   *slog.Logger
+	locks lockMeter
 }
 
 // Tx 는 진행 중인 쓰기 트랜잭션이다.
 //
-// 이 DB 핸들은 DSN 에 `_txlock=immediate` 가 걸려 있어 **BEGIN IMMEDIATE** 로 열린다.
+// ★ **직렬성: DB 전체에서 쓰기 트랜잭션 하나씩이다.** 두 엔진이 같은 뜻을 다른 수단으로 세운다(engine.go 의 begin).
+//
+//   - Postgres: READ COMMITTED 로 열고 첫 문장으로 전역 트랜잭션 advisory 잠금(globalLockKey)을 잡는다.
+//     잠금은 커밋 · 롤백과 함께 풀린다. 잠금을 받은 뒤의 문장마다 새 스냅숏이라 앞 쓰기의 커밋이 보인다 -
+//     그래서 「미선점 확인 → 삽입 사이에 창이 없다」 같은 클로저들의 정당화가 SQLite 때와 같이 선다.
+//     잠금 대기 상한은 연결의 lock_timeout(lockTimeout)이다. 재시도는 없다.
+//   - SQLite: DSN 의 `_txlock=immediate` 로 **BEGIN IMMEDIATE** 가 곧 전역 쓰기 잠금이다. 아래는 그 판의 근거다.
+//
+// ★ **오류의 뜻은 엔진마다 다르다.** SQLite 는 실패한 문장만 되돌리고 트랜잭션은 산다. Postgres 는 한 문장이
+// 실패하면 트랜잭션 전체를 버리고(25P02) 뒤 문장과 커밋이 다 실패한다. 클로저 안에서 DB 오류를 받고 이어 가면
+// Postgres 에서 그 트랜잭션은 커밋되지 않는다 - runTx 가 그것을 TxFault(FaultAborted)로 낸다.
+//
+// 이 아래는 SQLite 판의 근거다.
 //
 // 무엇을 사는가를 정확히 적는다. **배타 자체는 이것과 무관하다** — 두 트랜잭션이 같은 것을
 // 쓰려 하면 SQLite 가 어느 모드에서든 하나를 거절하므로, 이중 선점은 deferred 에서도 안 난다.
@@ -175,10 +196,11 @@ type Store struct {
 //
 // 대가: 읽기 전용 작업도 이 함수를 거치면 쓰기 잠금을 잡아 서로 직렬화된다.
 // 그래서 **읽기는 Tx 를 안 거치고** Store 의 조회 메서드가 s.db 로 바로 질의한다(WAL 이라 안 막힌다).
+// 여러 질의가 한 시점을 봐야 하는 읽기는 ReadTx 다.
 //
-// 중첩 트랜잭션은 지원하지 않는다(SQLite 의 SAVEPOINT 를 쓰지 않는다).
+// 중첩 트랜잭션은 지원하지 않는다(SAVEPOINT 를 쓰지 않는다).
 type Tx struct {
-	tx  *sql.Tx
+	tx  *txConn
 	ctx context.Context
 	s   *Store
 
@@ -207,7 +229,8 @@ type pendingEvent struct {
 
 // LogEvent 는 트랜잭션이 끝난 뒤에 남길 계측 이벤트를 예약한다.
 //
-// **트랜잭션 안에서는 반드시 이것을 쓴다.** `Store.LogEvent` 를 그대로 부르면 교착한다.
+// **트랜잭션 안에서는 반드시 이것을 쓴다.** `Store.LogEvent` 를 그대로 부르면 교착한다 - 이벤트 추가도
+// 같은 전역 잠금을 잡으므로(event.go), 자기가 쥔 잠금을 잠금 대기 상한까지 기다리다 죽는다(두 엔진 다).
 // 롤백돼도 남는다 — 실패한 시도가 원장에서 사라지면 그 실패를 나중에 셀 수 없다.
 func (t *Tx) LogEvent(kind, project, sessionID string, payload any) {
 	t.deferred = append(t.deferred, pendingEvent{kind, project, sessionID, payload})
@@ -221,9 +244,23 @@ func Open(path string) (*Store, error) {
 }
 
 // OpenWithLogger 는 Open 에 로거를 주입한다.
+//
+// path 가 Postgres 접속 URL(postgres://…)이면 Postgres 원장에 붙고 판이 이 바이너리와 같은지만 잰다
+// (checkPGVersion). 아니면 SQLite 파일이다.
 func OpenWithLogger(path string, log *slog.Logger) (*Store, error) {
 	if log == nil {
 		log = slog.Default()
+	}
+	if engineOf(path) == enginePG {
+		s, err := openPG(path, log, lockTimeout)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.checkPGVersion(context.Background()); err != nil {
+			s.Close()
+			return nil, err
+		}
+		return s, nil
 	}
 	// ★ **재기가 sql.Open 보다 앞에 선다.** sql.Open 은 없는 파일을 **만들기** 때문에,
 	//   뒤에 두면 빈 DB 를 하나 만들어 놓고 "빈 DB 다" 라고 거절하게 되고 그 파일이 다음
@@ -249,6 +286,8 @@ func OpenWithLogger(path string, log *slog.Logger) (*Store, error) {
 //
 // ★ **패키지 밖으로 내보내지 않는다.** 이 문은 관문을 지나지 않으므로, 밖에서 부를 수 있으면
 // 적용을 기동에서 분리한 의미가 없어진다 — 누구든 이것으로 열고 스키마를 만질 수 있다.
+//
+// SQLite 파일만 연다. Postgres 는 OpenWithLogger 가 openPG 로 가르고, MigrateTo 는 Postgres 를 거절한다.
 func openRaw(path string, log *slog.Logger) (*Store, error) {
 	if log == nil {
 		log = slog.Default()
@@ -267,7 +306,7 @@ func openRaw(path string, log *slog.Logger) (*Store, error) {
 		return nil, fmt.Errorf("sqlite 접속 실패(path=%q): %w", path, err)
 	}
 
-	s := &Store{db: db, path: path, log: log}
+	s := &Store{db: &conn{raw: db, eng: engineSQLite}, path: path, log: log}
 
 	// ★ DSN pragma 가 실제로 먹었는지 되읽어 확인한다.
 	//   드라이버는 **모르는 pragma 이름을 조용히 무시한다**(실물로 확인: `_pragma=nonsense(1)` 이
@@ -303,20 +342,23 @@ func openRefusal(plan MigrationPlan, path string) error {
 
 // dsn 은 접속 문자열을 만든다.
 //
-// busy_timeout 은 스키마 주석(§2 의 `busy_timeout=5000`)과 같은 값이고,
+// busy_timeout 은 잠금 대기 상한(lockTimeout, 스키마 주석 §2 의 `busy_timeout=5000`)이고,
 // _txlock=immediate 는 Tx 주석의 실측 근거로 건다.
 func dsn(path string) string {
 	q := url.Values{}
-	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "busy_timeout("+busyTimeoutMS+")")
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Set("_txlock", "immediate")
 	return "file:" + path + "?" + q.Encode()
 }
 
+// busyTimeoutMS 는 SQLite 의 busy_timeout pragma 값(밀리초)이다. Postgres 의 lock_timeout 과 같은 상한이다.
+var busyTimeoutMS = strconv.FormatInt(lockTimeout.Milliseconds(), 10)
+
 // wantPragmas 는 기본 DSN(dsn)이 요청한 pragma 와 기대값이다.
 var wantPragmas = map[string]string{
-	"busy_timeout": "5000",
+	"busy_timeout": busyTimeoutMS,
 	"foreign_keys": "1",
 	"journal_mode": "wal",
 }
@@ -332,7 +374,7 @@ var wantPragmas = map[string]string{
 // 이 갈래가 없던 동안은 ProbeMigration 이 두 줄 위에서 파일을 WAL 로 바꿔 준 덕에
 // 이 요구가 **우연히** 통과하고 있었다. 그 우연이 곧 결함이었다.
 var ledgerWantPragmas = map[string]string{
-	"busy_timeout": "5000",
+	"busy_timeout": busyTimeoutMS,
 	"foreign_keys": "1",
 }
 
@@ -369,7 +411,7 @@ func CheckPragmasAgainst(want, got map[string]string) error {
 // ★ Open 경로(마이그레이션 적용)와 검증 경로(ProbeMigration 읽기 전용)가 **같은 탐지를 쓴다**.
 // 두 벌로 두면 한쪽만 고쳐져 실제 열기와 검증이 갈린다 — 낡은 탐지로 재기동을 승인하면
 // 새 바이너리·새 DB 스키마가 실행 도중 맞지 않는 조용한 사고가 난다.
-func readMigrationState(ctx context.Context, db *sql.DB) (hasTable bool, dbVersion, objects int, err error) {
+func readMigrationState(ctx context.Context, db Reader) (hasTable bool, dbVersion, objects int, err error) {
 	// schema_version 테이블 존재 확인
 	var n int
 	if err := db.QueryRowContext(ctx,
@@ -424,19 +466,42 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) Path() string { return s.path }
 
 // DB 는 저수준 핸들이다. **시험과 진단 전용** — 일반 경로는 이걸 쓰지 않는다.
-func (s *Store) DB() *sql.DB { return s.db }
+// 자리표시 감싸개를 안 지나므로 Postgres 에서는 `?` 질의가 안 돈다.
+func (s *Store) DB() *sql.DB { return s.db.raw }
 
-// Tx 는 fn 을 한 트랜잭션 안에서 돌린다. fn 이 오류를 내면 롤백하고 그 오류를 그대로 올린다.
+// ─────────────────────────────────────────────────────────────────────────────
+// 트랜잭션 종류는 넷이다: Tx · ObsTx(runTx) · ReadTx · 증분 적용(applySteps). 여는 자리는 engine.go 의
+// begin 하나다(engine_test.go 가 소스로 잠근다).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Tx 는 fn 을 한 쓰기 트랜잭션 안에서 돌린다(전역 잠금). fn 이 오류를 내면 롤백하고 그 오류를 그대로 올린다.
+func (s *Store) Tx(ctx context.Context, fn func(*Tx) error) error {
+	return s.runTx(ctx, txSpec{kind: txWrite}, fn)
+}
+
+// ObsTx 는 관측 적재 트랜잭션이다. 전역 잠금이 아니라 (기기, 저장소) 잠금을 잡는다 - 관측은 기기 × 저장소마다
+// 잦게 오고, 관측 표 사이에는 선점 · 레인 같은 배타 불변식이 없어 업무 쓰기와 한 줄로 설 까닭이 없다.
+// 같은 (기기, 저장소) 끼리만 한 줄로 선다. SQLite 에서는 Tx 와 같다(BEGIN IMMEDIATE 가 전역이다).
+//
+// ★ 클로저 안에서 업무 표를 쓰지 마라. 업무 표의 직렬성은 전역 잠금이 지킨다.
+func (s *Store) ObsTx(ctx context.Context, device, repo string, fn func(*Tx) error) error {
+	return s.runTx(ctx, txSpec{kind: txObs, device: device, repo: repo}, fn)
+}
+
+// runTx 는 쓰기 트랜잭션 하나를 끝까지 돌린다(Tx · ObsTx 의 본체).
 //
 // 롤백 실패는 삼키지 않고 원래 오류에 합쳐 올린다 — 롤백이 실패하면 커넥션이 이상한 상태로
 // 풀에 돌아가므로, 그 사실이 안 남으면 뒤따르는 무관한 실패의 원인을 영영 못 찾는다.
-func (s *Store) Tx(ctx context.Context, fn func(*Tx) error) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+//
+// 끝에서 오류를 한 번 옮긴다(asFault): 잠금 대기 초과 · 교착 · 버려진 트랜잭션은 *TxFault 로 나간다.
+func (s *Store) runTx(ctx context.Context, sp txSpec, fn func(*Tx) error) error {
+	tx, err := s.begin(ctx, sp)
 	if err != nil {
-		return fmt.Errorf("트랜잭션 시작 실패: %w", err)
+		return asFault(fmt.Errorf("트랜잭션 시작 실패: %w", err))
 	}
 	t := &Tx{tx: tx, ctx: ctx, s: s}
 	if err := fn(t); err != nil {
+		err = asFault(err)
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 			// 예약 이벤트는 롤백 뒤에도 흘린다 — 실패한 시도가 원장에 남는 것이 목적이다.
 			t.flushDeferred(false)
@@ -448,12 +513,29 @@ func (s *Store) Tx(ctx context.Context, fn func(*Tx) error) error {
 	if err := tx.Commit(); err != nil {
 		// ★ 커밋 실패도 롤백이다. 여기를 true 로 두면 아무것도 안 쓴 트랜잭션이 원장에서
 		//   "썼다"고 말한다 — 롤백 갈래보다 되짚기 어려운 거짓이다(여기는 fn 이 오류를
-		//   안 냈으므로 service 쪽 실패 로그조차 안 남는다).
+		//   안 냈으므로 service 쪽 실패 로그조차 안 남는다). Postgres 에서 클로저가 문장 오류를
+		//   삼키고 끝까지 가면 커밋이 ROLLBACK 으로 끝나 이 갈래로 온다(FaultAborted).
 		t.flushDeferred(false)
-		return fmt.Errorf("커밋 실패: %w", err)
+		return asFault(fmt.Errorf("커밋 실패: %w", err))
 	}
 	t.flushDeferred(true)
 	return nil
+}
+
+// ReadTx 는 fn 의 질의들을 한 스냅숏에서 돌린다. 잠그지 않는다 - 쓰기를 막지도, 쓰기에 막히지도 않는다.
+//
+// ★ 여러 질의가 같은 시점을 봐야 하는 읽기의 자리다. 단발 조회(s.db)는 문장마다 새 시점이라, 질의 사이에
+// 닫힌 세션이 목록에는 있고 축에는 없는 카드가 나온다. Postgres 는 REPEATABLE READ READ ONLY 로 연다
+// (읽기 전용 RR 은 직렬화 실패가 없다), SQLite 는 읽기 전용 BEGIN(WAL 스냅숏)이다.
+//
+// 읽기만 하므로 언제나 롤백으로 끝낸다. 커밋할 것이 없다.
+func (s *Store) ReadTx(ctx context.Context, fn func(Reader) error) error {
+	tx, err := s.begin(ctx, txSpec{kind: txRead})
+	if err != nil {
+		return asFault(fmt.Errorf("읽기 트랜잭션 시작 실패: %w", err))
+	}
+	defer func() { _ = tx.Rollback() }()
+	return asFault(fn(tx))
 }
 
 // DeferredFlushBudget 는 flushDeferred 가 예약 이벤트 **전부**를 흘리는 데 쓰는 상한이다.
@@ -603,6 +685,11 @@ func Migrate(ctx context.Context, path string, log *slog.Logger) error {
 
 // MigrateTo 는 target 까지만 올린다. `fd migrate --to N` 의 본체다.
 func MigrateTo(ctx context.Context, path string, target int, log *slog.Logger) error {
+	if engineOf(path) == enginePG {
+		// 판 재기(readMigrationState)와 스키마 적용이 SQLite 판뿐이다. 없는 표를 물어 엉뚱한 오류로 죽기 전에 거절한다.
+		return fmt.Errorf("Postgres 원장의 판 적용은 Postgres 이전 실행기가 맡는다 - 이 명령은 아직 SQLite 파일만 올린다(%s)",
+			redactDSN(path))
+	}
 	s, err := openRaw(path, log)
 	if err != nil {
 		return err
@@ -766,9 +853,18 @@ func (s *Store) applyUpgrades(ctx context.Context, from, target int) error {
 			"path", s.path, "db_version", from, "code_version", target, "error", err.Error())
 		return fmt.Errorf("스키마 거절: %w", err)
 	}
+	return s.applySteps(ctx, steps)
+}
+
+// applySteps 는 고른 증분을 한 단에 한 트랜잭션으로 얹는다.
+//
+// ★ **증분 트랜잭션은 업무 쓰기와 같은 전역 잠금을 잡는다**(txWrite). 잠금이 다르면 DDL 도중에 업무 쓰기가
+// 끼어 반쯤 바뀐 스키마 위에서 커밋할 수 있다. 같은 잠금이면 적용이 도는 동안 들어온 쓰기는 적용이 끝날
+// 때까지 기다린다(pg_tx_test.go 의 DDL 중 쓰기 시험). SQLite 는 BEGIN IMMEDIATE 라 원래 그렇다.
+func (s *Store) applySteps(ctx context.Context, steps []Migration) error {
 	for _, m := range steps {
 		start := time.Now()
-		tx, err := s.db.BeginTx(ctx, nil)
+		tx, err := s.begin(ctx, txSpec{kind: txWrite})
 		if err != nil {
 			return fmt.Errorf("증분 %d(%s) 트랜잭션 시작 실패(path=%q): %w", m.To, m.Name, s.path, err)
 		}

@@ -185,24 +185,27 @@ func ledgerInsert(name, cols string) string {
 // 되읽기가 FK 로 죽는다. 트랜잭션 원자성은 DB 상태를 보장하지 서로 다른 시점의 두 읽기를
 // 보장하지 않는다 — 동시 세션이 스물이 넘는 이 저장소에서 실제로 열리는 창이다.
 //
-// ★ 왜 Store.Tx 를 안 쓰는가. 그 함수는 DSN 의 _txlock=immediate 때문에 BEGIN IMMEDIATE 라
-// 읽기만 해도 쓰기 잠금을 잡는다(Tx 주석이 그 대가를 적어 뒀다). 전량 읽기가 도는 동안
-// 서버의 모든 쓰기가 busy_timeout 안에서 줄을 선다. 여기서는 BeginTx 를 직접 부르고,
-// 백업 전용 열기(OpenLedger)가 DSN 을 deferred 로 준다. 기본 DSN 으로 열린 Store 에서
-// 불러도 정확성은 같고(스냅숏 일관성은 유지된다) 잠금만 세진다.
+// ★ 왜 Store.Tx 를 안 쓰는가. 그 함수는 쓰기 트랜잭션이라 전역 쓰기 잠금을 잡는다(Tx 주석이
+// 그 대가를 적어 뒀다). 전량 읽기가 도는 동안 서버의 모든 쓰기가 잠금 대기 상한 안에서 줄을 선다.
+// 여기서는 읽기 트랜잭션(ReadTx)을 연다 - 잠그지 않고 한 스냅숏을 본다.
 //
 // ★ 상한이 없다. ListJudgmentsByKind 는 limit<=0 을 50 으로 바꾸고, legacy 되쓰기는
 // 100000 이라는 수를 손으로 넣는다 — 상한에 걸려 조용히 잘리면 산출물이 원본보다
 // 적어지고 그 차이는 세어 보기 전에는 안 보인다. 원장은 전량이 목적이라 WHERE 절도 없다.
 func (s *Store) ReadLedger(ctx context.Context) (LedgerDump, error) {
 	var d LedgerDump
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return d, fmt.Errorf("원장 읽기 트랜잭션 시작 실패: %w", err)
-	}
-	// 읽기만 하므로 언제나 롤백으로 끝낸다. 커밋할 것이 없다.
-	defer func() { _ = tx.Rollback() }()
+	err := s.ReadTx(ctx, func(tx Reader) error {
+		var err error
+		d, err = readLedger(ctx, tx)
+		return err
+	})
+	return d, err
+}
 
+// readLedger 는 ReadLedger 의 본체다. 읽기 트랜잭션 하나(ReadTx) 안에서 돈다.
+func readLedger(ctx context.Context, tx Reader) (LedgerDump, error) {
+	var d LedgerDump
+	var err error
 	if d.Machines, err = readLedgerMachines(ctx, tx); err != nil {
 		return d, err
 	}
@@ -226,7 +229,7 @@ func (s *Store) ReadLedger(ctx context.Context) (LedgerDump, error) {
 
 // readLedgerJudgments 는 판단 전량을 id 순으로 읽는다.
 // id 는 ULID 라 정렬이 곧 생성순이고, 같은 DB 면 같은 바이트가 나오는 근거가 이것이다.
-func readLedgerJudgments(ctx context.Context, q dbtx) ([]LedgerJudgment, error) {
+func readLedgerJudgments(ctx context.Context, q Reader) ([]LedgerJudgment, error) {
 	rows, err := q.QueryContext(ctx, `SELECT `+judgmentCols+` FROM judgment ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("원장 판단 조회 실패: %w", err)
@@ -252,7 +255,7 @@ func readLedgerJudgments(ctx context.Context, q dbtx) ([]LedgerJudgment, error) 
 
 // readLedgerLinks 는 링크 전량을 읽는다.
 // 정렬 셋은 PK 와 같은 순서다 — 재현성을 위해 완전 순서여야 한다.
-func readLedgerLinks(ctx context.Context, q dbtx) ([]LedgerLink, error) {
+func readLedgerLinks(ctx context.Context, q Reader) ([]LedgerLink, error) {
 	rows, err := q.QueryContext(ctx, `
 		SELECT `+linkCols+` FROM judgment_link
 		ORDER BY judgment_id, target_kind, target_id`)
@@ -276,7 +279,7 @@ func readLedgerLinks(ctx context.Context, q dbtx) ([]LedgerLink, error) {
 }
 
 // readLedgerSnapshots 는 스냅숏 전량을 읽는다. PK 와 같은 (project, key) 순이다.
-func readLedgerSnapshots(ctx context.Context, q dbtx) ([]LedgerSnapshot, error) {
+func readLedgerSnapshots(ctx context.Context, q Reader) ([]LedgerSnapshot, error) {
 	rows, err := q.QueryContext(ctx,
 		`SELECT `+snapshotCols+` FROM snapshot ORDER BY project, key`)
 	if err != nil {
@@ -302,7 +305,7 @@ func readLedgerSnapshots(ctx context.Context, q dbtx) ([]LedgerSnapshot, error) 
 }
 
 // readLedgerMachines 는 머신 전량을 id 순으로 읽는다.
-func readLedgerMachines(ctx context.Context, q dbtx) ([]LedgerMachine, error) {
+func readLedgerMachines(ctx context.Context, q Reader) ([]LedgerMachine, error) {
 	rows, err := q.QueryContext(ctx, `SELECT `+machineCols+` FROM machine ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("원장 머신 조회 실패: %w", err)
@@ -324,7 +327,7 @@ func readLedgerMachines(ctx context.Context, q dbtx) ([]LedgerMachine, error) {
 }
 
 // readLedgerProjects 는 프로젝트 전량을 id 순으로 읽는다.
-func readLedgerProjects(ctx context.Context, q dbtx) ([]LedgerProject, error) {
+func readLedgerProjects(ctx context.Context, q Reader) ([]LedgerProject, error) {
 	rows, err := q.QueryContext(ctx, `SELECT `+projectCols+` FROM project ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("원장 프로젝트 조회 실패: %w", err)
@@ -350,7 +353,7 @@ func readLedgerProjects(ctx context.Context, q dbtx) ([]LedgerProject, error) {
 }
 
 // readLedgerSessions 는 세션 전량을 id 순으로 읽는다.
-func readLedgerSessions(ctx context.Context, q dbtx) ([]LedgerSession, error) {
+func readLedgerSessions(ctx context.Context, q Reader) ([]LedgerSession, error) {
 	rows, err := q.QueryContext(ctx, `SELECT `+sessionCols+` FROM session ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("원장 세션 조회 실패: %w", err)
@@ -546,7 +549,7 @@ func OpenLedger(ctx context.Context, path string, log *slog.Logger) (*Store, err
 		return nil, fmt.Errorf("원장용 sqlite 접속 실패(path=%q): %w", clip(path, 200), err)
 	}
 
-	s := &Store{db: db, path: path, log: log}
+	s := &Store{db: &conn{raw: db, eng: engineSQLite}, path: path, log: log}
 	// DSN pragma 가 실제로 걸렸는지 되읽어 확인한다 — 드라이버는 모르는 pragma 를 조용히 무시한다.
 	// ledgerDSN 이 요청한 것만 본다. journal_mode 는 요청하지 않았으므로 요구하지도 않는다.
 	if err := s.verifyPragmas(ctx, ledgerWantPragmas); err != nil {

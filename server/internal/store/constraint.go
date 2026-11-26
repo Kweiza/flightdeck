@@ -3,7 +3,11 @@ package store
 import (
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	sqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -24,8 +28,12 @@ import (
 // 대신 드라이버가 실제로 노출하는 것에 기댄다 — modernc.org/sqlite 는 확장 결과 코드를
 // 켜고(conn.extendedResultCodes(true)) 오류를 *sqlite.Error 로 올리며 Code() 로 그 값을 준다.
 // 실물로 확인한 값: PK 중복 1555 · UNIQUE 2067 · FK 787 · CHECK 275 · 트리거 ABORT 1811.
+// Postgres(pgx)는 *pgconn.PgError 로 올리고 SQLSTATE 를 준다: 유니크 23505 · FK 23503 · CHECK 23514 ·
+// NOT NULL 23502 · 추가 전용 트리거 23000(제약 이름 자리에 트리거 이름).
 //
-// 판정 자체는 순수 함수(JudgeConstraintCode)에 있고 시험이 그 함수를 직접 부른다.
+// ★ 엔진이 갈리는 오류 번역은 이 파일 한 자리다. 호출부는 JudgeError · conflictOf · asFault 만 부른다.
+//
+// 판정 자체는 순수 함수(JudgeConstraintCode · JudgeSQLState)에 있고 시험이 그 함수를 직접 부른다.
 // 다중 조건이라 불리언이 아니라 **사유**를 돌려준다 — 사유가 없으면 "접지 않기로 했다"와
 // "이 축을 아예 안 본다"가 구분되지 않는다.
 
@@ -101,13 +109,17 @@ type ConflictError struct {
 	// 호출부가 자기 표의 FK 목록을 정적으로 적어 넘긴다.
 	RefHint string
 	Code    int    // SQLite 확장 결과 코드. 로그·진단용
-	Reason  string // JudgeConstraintCode 가 낸 사유 전문
-	Err     error  // 드라이버 원문
+	State   string // Postgres SQLSTATE. 로그·진단용
+	// Constraint 는 Postgres 가 알려 준 제약 이름이다(트리거가 거절했으면 트리거 이름). 로그·진단용
+	Constraint string
+	Reason     string // JudgeConstraintCode · JudgeSQLState 가 낸 사유 전문
+	Err        error  // 드라이버 원문
 }
 
 func (e *ConflictError) Error() string {
-	return fmt.Sprintf("%s 제약 위반(%s, project=%q id=%q, code=%d): %s: %v",
-		e.Target, e.Kind, clip(e.Project, 64), clip(e.ID, 64), e.Code, e.Reason, e.Err)
+	return fmt.Sprintf("%s 제약 위반(%s, project=%q id=%q, code=%s): %s: %v",
+		e.Target, e.Kind, clip(e.Project, 64), clip(e.ID, 64),
+		driverCode{sqlite: e.Code, state: e.State, constraint: e.Constraint}, e.Reason, e.Err)
 }
 
 func (e *ConflictError) Unwrap() error { return e.Err }
@@ -115,9 +127,44 @@ func (e *ConflictError) Unwrap() error { return e.Err }
 // ConstraintVerdict 는 결과 코드 하나의 판정이다. Reason 은 **항상** 채운다.
 type ConstraintVerdict struct {
 	// Kind 가 비면 접지 않는다 — 그 오류는 500 으로 남아야 한다.
-	Kind   ConflictKind
+	Kind ConflictKind
+	// Fault 가 차면 제약 위반이 아니라 트랜잭션 실패다(TxFault). Kind 와 함께 차는 일은 없다.
+	Fault  FaultKind
 	Reason string
 }
+
+// FaultKind 는 제약 위반이 아닌 트랜잭션 실패의 종류다. **처방이 다르므로 뭉개지 않는다.**
+type FaultKind string
+
+const (
+	// FaultLockTimeout 은 잠금 대기가 상한(lockTimeout)을 넘은 것이다(Postgres 55P03 · SQLite BUSY).
+	// 처방: 같은 요청을 다시 보내라. 잦으면 잠금 대기 지표(/metrics)를 봐라.
+	FaultLockTimeout FaultKind = "lock_timeout"
+	// FaultDeadlock 은 교착이다(40P01). 잠금 공간이 둘이고 한 트랜잭션이 둘을 함께 잡지 않으므로
+	// 나면 서버 결함이다.
+	FaultDeadlock FaultKind = "deadlock"
+	// FaultAborted 는 앞 문장의 오류 뒤에 같은 트랜잭션에서 이어 간 것이다(25P02, 그리고 그렇게 버려진
+	// 트랜잭션의 COMMIT 이 ROLLBACK 으로 끝난 것). SQLite 는 실패한 문장만 되돌리지만 Postgres 는 트랜잭션
+	// 전체를 버린다. 서버 결함이다 - 오류를 받고 이어 가야 하는 자리는 Savepoint 로 감싼다.
+	FaultAborted FaultKind = "aborted"
+)
+
+// TxFault 는 제약 위반이 아닌 트랜잭션 실패 하나다. 원인 전문은 Err 에 그대로 물린다.
+//
+// ★ 타입으로 따로 내는 까닭: 드라이버 원문만 올리면 「잠금을 오래 기다렸다」와 「앞 오류를 삼키고 이어
+// 갔다」가 같은 500 으로 보인다. 앞쪽은 다시 하면 되고 뒤쪽은 코드를 고쳐야 한다.
+type TxFault struct {
+	Kind   FaultKind
+	Code   string // SQLSTATE 또는 SQLite 결과 코드. 로그·진단용
+	Reason string
+	Err    error
+}
+
+func (e *TxFault) Error() string {
+	return fmt.Sprintf("트랜잭션 실패(%s, code=%s): %s: %v", e.Kind, e.Code, e.Reason, e.Err)
+}
+
+func (e *TxFault) Unwrap() error { return e.Err }
 
 // JudgeConstraintCode 는 SQLite 확장 결과 코드를 도메인 축으로 옮긴다. 순수 함수다.
 //
@@ -153,11 +200,114 @@ func JudgeConstraintCode(code int) ConstraintVerdict {
 		return ConstraintVerdict{
 			Reason: fmt.Sprintf("아는 축이 아닌 제약 위반이다(코드 %d) — 접지 않고 서버 결함으로 남긴다", code)}
 	}
+	if code&0xff == sqlite3.SQLITE_BUSY {
+		return ConstraintVerdict{Fault: FaultLockTimeout,
+			Reason: fmt.Sprintf("제약 위반이 아니다 - 쓰기 잠금 대기가 busy_timeout 을 넘었다(코드 %d)", code)}
+	}
 	return ConstraintVerdict{
 		Reason: fmt.Sprintf("제약 위반이 아니다(코드 %d, 기본 코드 %d)", code, code&0xff)}
 }
 
+// JudgeSQLState 는 Postgres SQLSTATE 를 도메인 축으로 옮긴다. 순수 함수다.
+//
+// 접는 축은 SQLite 판(JudgeConstraintCode)과 같다: 유니크 · FK 만 접고, CHECK · NOT NULL · 트리거
+// 거절(추가 전용 23000)은 **일부러 안 접는다**(1차 방어를 지나 DB 까지 닿았다는 뜻이라 서버 결함이다).
+// 살아 있는 선점을 덮는 upsert 는 트리거 claim_one_live_holder 가 23505 로 거절한다 - 유니크 위반과 같은
+// 처방(「이미 남이 쥐었다」)이라 같은 축으로 접는다.
+func JudgeSQLState(state string) ConstraintVerdict {
+	switch state {
+	case "":
+		return ConstraintVerdict{Reason: "드라이버 SQLSTATE 가 없다 - 제약 위반이 아니다"}
+	case "23505":
+		return ConstraintVerdict{Kind: ConflictDuplicate,
+			Reason: "같은 좌표가 이미 있다(SQLSTATE 23505) - 오타·재등록에서 흔한 정상적인 거절이다"}
+	case "23503":
+		return ConstraintVerdict{Kind: ConflictMissingRef,
+			Reason: "가리키는 좌표가 등록돼 있지 않다(SQLSTATE 23503) - 먼저 등록해야 하는 것이 있다"}
+	case "23514", "23502", "23000":
+		return ConstraintVerdict{
+			Reason: fmt.Sprintf("불변식 위반이다(SQLSTATE %s) - 1차 방어를 지나 DB 까지 닿았다는 뜻이라 "+
+				"호출자가 고칠 거리가 아니다. 서버 결함으로 남긴다", state)}
+	case "55P03":
+		return ConstraintVerdict{Fault: FaultLockTimeout,
+			Reason: "제약 위반이 아니다 - 잠금 대기가 lock_timeout 을 넘었다(SQLSTATE 55P03, SQLite 의 busy_timeout 자리)"}
+	case "40P01":
+		return ConstraintVerdict{Fault: FaultDeadlock,
+			Reason: "교착이다(SQLSTATE 40P01) - 잠금 공간이 둘이고 한 트랜잭션이 둘을 함께 잡지 않으므로 나면 서버 결함이다"}
+	case "25P02":
+		return ConstraintVerdict{Fault: FaultAborted,
+			Reason: "앞 문장의 오류 뒤에 같은 트랜잭션에서 이어 갔다(SQLSTATE 25P02) - Postgres 는 그 트랜잭션 " +
+				"전체를 버린다. 오류를 받고 이어 가야 하는 자리는 Savepoint 로 감싸라"}
+	}
+	if strings.HasPrefix(state, "23") {
+		return ConstraintVerdict{
+			Reason: fmt.Sprintf("아는 축이 아닌 제약 위반이다(SQLSTATE %s) - 접지 않고 서버 결함으로 남긴다", state)}
+	}
+	return ConstraintVerdict{Reason: fmt.Sprintf("제약 위반이 아니다(SQLSTATE %s)", state)}
+}
+
+// driverCode 는 오류 사슬에서 꺼낸 드라이버의 코드다. 엔진마다 둘 중 하나만 찬다.
+type driverCode struct {
+	sqlite     int    // SQLite 확장 결과 코드
+	state      string // Postgres SQLSTATE
+	constraint string // Postgres 의 제약(또는 거절한 트리거) 이름
+}
+
+func (c driverCode) String() string {
+	switch {
+	case c.state != "" && c.constraint != "":
+		return c.state + "/" + c.constraint
+	case c.state != "":
+		return c.state
+	}
+	return strconv.Itoa(c.sqlite)
+}
+
+func (c driverCode) judge() ConstraintVerdict {
+	if c.state != "" {
+		return JudgeSQLState(c.state)
+	}
+	return JudgeConstraintCode(c.sqlite)
+}
+
+// driverCodeOf 는 오류 사슬에서 드라이버 코드를 꺼낸다. errors.As 로 찾으므로 감싼 오류 안에서도 찾는다.
+//
+// ★ 버려진(25P02) 트랜잭션의 COMMIT 은 오류 없이 ROLLBACK 으로 끝나고, pgx 가 그것을 ErrTxCommitRollback 으로
+// 올린다. SQLSTATE 는 없지만 뜻이 25P02 와 같아(오류를 삼키고 끝까지 간 클로저) 같은 코드로 읽는다.
+func driverCodeOf(err error) driverCode {
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) {
+		return driverCode{state: pe.Code, constraint: pe.ConstraintName}
+	}
+	if errors.Is(err, pgx.ErrTxCommitRollback) {
+		return driverCode{state: "25P02"}
+	}
+	return driverCode{sqlite: ConstraintCode(err)}
+}
+
+// JudgeError 는 오류 하나를 엔진과 무관하게 판정한다. 드라이버 오류가 없으면 「제약 위반이 아니다」다.
+func JudgeError(err error) ConstraintVerdict { return driverCodeOf(err).judge() }
+
+// asFault 는 트랜잭션 실패(잠금 대기 초과 · 교착 · 버려진 트랜잭션)를 *TxFault 로 감싼다. 아니면 그대로 낸다.
+// 트랜잭션의 끝(runTx · ReadTx)이 부른다 - 어느 문장에서 났든 거기서 한 번 옮긴다.
+func asFault(err error) error {
+	if err == nil {
+		return nil
+	}
+	var f *TxFault
+	if errors.As(err, &f) {
+		return err
+	}
+	c := driverCodeOf(err)
+	v := c.judge()
+	if v.Fault == "" {
+		return err
+	}
+	return &TxFault{Kind: v.Fault, Code: c.String(), Reason: v.Reason, Err: err}
+}
+
 // ConstraintCode 는 오류 사슬에서 SQLite 확장 결과 코드를 꺼낸다. 없으면 0 이다.
+// 엔진과 무관하게 판정하려면 JudgeError 를 쓴다.
 //
 // errors.As 로 찾으므로 **감싼 오류 안에서도** 찾아낸다 — 저장 계층이 fmt.Errorf 로
 // 문맥을 덧붙인 뒤에도 이 축이 살아 있어야 한다.
@@ -172,14 +322,14 @@ func ConstraintCode(err error) int {
 // conflictOf 는 쓰기 오류가 접을 수 있는 제약 위반이면 타입 있는 오류로 옮긴다.
 // 아니면 nil 이다(호출부가 원래 오류를 그대로 감싸 올린다).
 func conflictOf(err error, t ConflictTarget, project, id, refHint string) *ConflictError {
-	code := ConstraintCode(err)
-	v := JudgeConstraintCode(code)
+	c := driverCodeOf(err)
+	v := c.judge()
 	if v.Kind == "" {
 		return nil
 	}
 	return &ConflictError{
 		Kind: v.Kind, Target: t, Project: project, ID: id, RefHint: refHint,
-		Code: code, Reason: v.Reason, Err: err,
+		Code: c.sqlite, State: c.state, Constraint: c.constraint, Reason: v.Reason, Err: err,
 	}
 }
 

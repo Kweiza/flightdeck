@@ -255,6 +255,13 @@ func TestRenderMetrics(t *testing.T) {
 		Unauthorized:  3,
 		RateLimited:   4,
 		SSESubs:       2,
+		DB: store.DBStats{
+			Locks: map[store.LockSpace]store.LockWait{
+				// 칸은 누적이 아닌 건수로 오고 문서는 누적으로 쓴다: 0.001 칸 1, 0.2 칸 2, 5초 넘음 1.
+				store.LockGlobal: {Buckets: lockBuckets(map[int]uint64{0: 1, 6: 2}), Count: 4, Sum: 6.5, Timeouts: 3},
+			},
+			PoolWaits: 7, PoolWaitSeconds: 1.25,
+		},
 	})
 	for _, want := range []string{
 		`flightdeck_requests_total{route="POST /api/v1/items",status="201"} 2`,
@@ -264,6 +271,20 @@ func TestRenderMetrics(t *testing.T) {
 		"flightdeck_rate_limited_total 4",
 		"flightdeck_sse_subscribers 2",
 		"# TYPE flightdeck_requests_total counter",
+		"# TYPE flightdeck_tx_lock_wait_seconds histogram",
+		`flightdeck_tx_lock_wait_seconds_bucket{lock="global",le="0.001"} 1`,
+		`flightdeck_tx_lock_wait_seconds_bucket{lock="global",le="0.1"} 1`,
+		`flightdeck_tx_lock_wait_seconds_bucket{lock="global",le="0.2"} 3`,
+		`flightdeck_tx_lock_wait_seconds_bucket{lock="global",le="5"} 3`,
+		`flightdeck_tx_lock_wait_seconds_bucket{lock="global",le="+Inf"} 4`,
+		`flightdeck_tx_lock_wait_seconds_sum{lock="global"} 6.500000`,
+		`flightdeck_tx_lock_wait_seconds_count{lock="global"} 4`,
+		// 안 쓴 공간도 0 으로 나온다(0 과 「안 잰다」를 가른다)
+		`flightdeck_tx_lock_wait_seconds_bucket{lock="obs",le="+Inf"} 0`,
+		`flightdeck_tx_lock_timeouts_total{lock="global"} 3`,
+		`flightdeck_tx_lock_timeouts_total{lock="obs"} 0`,
+		"flightdeck_db_pool_waits_total 7",
+		"flightdeck_db_pool_wait_seconds_total 1.250000",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("지표 문서에 %q 가 없다:\n%s", want, out)
@@ -285,6 +306,14 @@ func TestRenderMetrics(t *testing.T) {
 			t.Fatal("같은 상태에서 서로 다른 지표 문서가 나왔다 — 순서가 고정되지 않았다")
 		}
 	}
+}
+
+// lockBuckets 는 칸 번호 → 건수로 store.LockWait 의 칸 배열을 만든다.
+func lockBuckets(at map[int]uint64) (out [len(store.LockWaitBuckets)]uint64) {
+	for i, n := range at {
+		out[i] = n
+	}
+	return out
 }
 
 func TestEscapeLabel(t *testing.T) {

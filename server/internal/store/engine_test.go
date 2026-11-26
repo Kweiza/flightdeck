@@ -1,0 +1,450 @@
+package store
+
+import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 자리표시 감싸개 - 순수 함수
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestBindDollar(t *testing.T) {
+	for _, c := range []struct{ name, in, want string }{
+		{"번호는 나온 순서", `SELECT a FROM t WHERE x = ? AND y = ?`, `SELECT a FROM t WHERE x = $1 AND y = $2`},
+		{"IN 목록", `WHERE id IN (?,?,?)`, `WHERE id IN ($1,$2,$3)`},
+		{"자리표시가 없으면 그대로", `SELECT 1`, `SELECT 1`},
+		{"위치 매개변수는 건드리지 않는다", `SELECT $1`, `SELECT $1`},
+		{"문자열 안의 ?", `WHERE note = 'why?' AND id = ?`, `WHERE note = 'why?' AND id = $1`},
+		{"따옴표 두 개는 글자 하나", `SELECT 'it''s ?', ?`, `SELECT 'it''s ?', $1`},
+		{"표준 문자열의 역슬래시는 글자다", `SELECT 'x\', ?`, `SELECT 'x\', $1`},
+		{"E 문자열의 역슬래시는 따옴표를 품는다", `SELECT E'\'?', ?`, `SELECT E'\'?', $1`},
+		{"이름 끝의 e 는 E 문자열이 아니다", `SELECT type'?\', ?`, `SELECT type'?\', $1`},
+		{"큰따옴표 식별자", `SELECT "col?" FROM t WHERE a = ?`, `SELECT "col?" FROM t WHERE a = $1`},
+		{"줄 주석", "-- 판단?\nSELECT ?", "-- 판단?\nSELECT $1"},
+		{"겹친 블록 주석", `/* a ? /* b ? */ c ? */ SELECT ?`, `/* a ? /* b ? */ c ? */ SELECT $1`},
+		{"달러 따옴표", `DO $$ SELECT '?' $$; SELECT ?`, `DO $$ SELECT '?' $$; SELECT $1`},
+		{"꼬리표 달린 달러 따옴표", `SELECT $fn$ ? $fn$, ?`, `SELECT $fn$ ? $fn$, $1`},
+		{"이름 속의 $ 는 따옴표가 아니다", `SELECT a$b, ?`, `SELECT a$b, $1`},
+		{"뒤에 이름 글자가 붙으면 띄운다", `WHERE a=?AND b=?`, `WHERE a=$1 AND b=$2`},
+		{"닫히지 않은 문자열은 끝까지 문자열", `SELECT '?`, `SELECT '?`},
+		{"여러 문장", `UPDATE t SET a = ?; SELECT ?`, `UPDATE t SET a = $1; SELECT $2`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := bindDollar(c.in); got != c.want {
+				t.Fatalf("bindDollar(%q)\n 얻음 %q\n 기대 %q", c.in, got, c.want)
+			}
+		})
+	}
+	// 열 자리를 넘는 번호(두 자리 수)도 그대로 센다.
+	q := strings.Repeat("?,", 11) + "?"
+	if got := bindDollar(q); !strings.HasSuffix(got, ",$12") || !strings.HasPrefix(got, "$1,$2,") {
+		t.Fatalf("12개 자리표시의 번호가 다르다: %q", got)
+	}
+}
+
+func TestBindIsIdentityOnSQLite(t *testing.T) {
+	q := `SELECT ? FROM t WHERE a = '?'`
+	if got := engineSQLite.bind(q); got != q {
+		t.Fatalf("SQLite 는 ? 그대로여야 한다: %q", got)
+	}
+	if got := enginePG.bind(q); got != `SELECT $1 FROM t WHERE a = '?'` {
+		t.Fatalf("Postgres 는 $n 으로 옮겨야 한다: %q", got)
+	}
+}
+
+func TestEngineOf(t *testing.T) {
+	for in, want := range map[string]engine{
+		"postgres://fd@db:5432/fd":      enginePG,
+		"postgresql://fd@db/fd":         enginePG,
+		"POSTGRES://fd@db/fd":           enginePG,
+		"/var/lib/flightdeck/fd.db":     engineSQLite,
+		"fd.db":                         engineSQLite,
+		"file:fd.db?mode=ro":            engineSQLite,
+		"./postgres://-looking-file.db": engineSQLite,
+	} {
+		if got := engineOf(in); got != want {
+			t.Errorf("engineOf(%q) = %s, 기대 %s", in, got, want)
+		}
+	}
+}
+
+func TestRedactDSNHidesPasswords(t *testing.T) {
+	for _, in := range []string{
+		"postgres://fd:hunter2@db:5432/fd?sslmode=disable",
+		"postgres://fd@db:5432/fd?password=hunter2&sslmode=disable",
+	} {
+		got := redactDSN(in)
+		if strings.Contains(got, "hunter2") {
+			t.Errorf("비밀번호가 샜다: %q → %q", in, got)
+		}
+		if !strings.Contains(got, "db:5432/fd") {
+			t.Errorf("가린 주소가 어디를 가리키는지 잃었다: %q", got)
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 소스 잠금 - 무엇이 어느 자리에서만 일어나는가
+// ─────────────────────────────────────────────────────────────────────────────
+
+// storeSource 는 이 패키지의 시험 아닌 Go 파일들이다(하위 패키지 제외).
+type storeSource struct {
+	fset  *token.FileSet
+	files map[string]*ast.File // 파일 이름 → 구문 나무
+}
+
+func parseStoreSource(t *testing.T) storeSource {
+	t.Helper()
+	names, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := storeSource{fset: token.NewFileSet(), files: map[string]*ast.File{}}
+	for _, n := range names {
+		if strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(src.fset, n, nil, 0)
+		if err != nil {
+			t.Fatalf("%s 해석 실패: %v", n, err)
+		}
+		src.files[n] = f
+	}
+	// 빈 목록이면 아래 잠금이 다 초록이 된다 - 수를 먼저 잰다.
+	if len(src.files) < 20 {
+		t.Fatalf("store 의 시험 아닌 파일이 %d개뿐이다 - 이 시험의 좌표(작업 디렉토리)가 틀렸다", len(src.files))
+	}
+	return src
+}
+
+// site 는 소스의 한 자리(파일, 감싼 함수)다.
+type site struct{ file, fn string }
+
+func (s site) String() string { return s.file + ":" + s.fn }
+
+// each 는 모든 함수 선언 안의 노드마다 f 를 부른다. 함수 밖(전역 선언)은 fn 이 "" 이다.
+func (src storeSource) each(f func(at site, n ast.Node)) {
+	names := make([]string, 0, len(src.files))
+	for n := range src.files {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		for _, d := range src.files[name].Decls {
+			fn := ""
+			if fd, ok := d.(*ast.FuncDecl); ok {
+				fn = fd.Name.Name
+			}
+			ast.Inspect(d, func(n ast.Node) bool {
+				if n != nil {
+					f(site{name, fn}, n)
+				}
+				return true
+			})
+		}
+	}
+}
+
+// isDBField 는 e 가 `<x>.db`(Store 의 단발 핸들)인가다.
+func isDBField(e ast.Expr) bool {
+	sel, ok := e.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "db"
+}
+
+// TestRawHandlesStayInEngine 은 날 database/sql 핸들이 engine.go 밖에서 안 쓰이는지 잠근다.
+//
+// ★ 이것이 「모든 실행 자리가 자리표시 감싸개를 탄다」의 근거다. store 의 질의는 s.db(conn) · t.tx(txConn) ·
+// ReadTx 의 Reader 로만 나가고, 그 셋의 메서드가 감싸개다. 날 *sql.DB · *sql.Tx 에 손이 닿는 자리가 생기면
+// 그 자리의 `?` 는 Postgres 에서 그대로 나간다. 남은 예외는 SQLite 전용 길이라 Postgres 로 옮긴 뒤 빠진다.
+func TestRawHandlesStayInEngine(t *testing.T) {
+	src := parseStoreSource(t)
+	allowed := map[site]string{
+		{"store.go", "DB"}:                "시험 · 진단 전용 접근자(감싸개를 안 지난다고 주석에 적었다)",
+		{"store.go", "openRaw"}:           "SQLite 파일 열기",
+		{"probe.go", "probeMigrationVia"}: "SQLite 파일의 판 재기",
+		{"backup.go", "OpenLedger"}:       "SQLite 원장 내보내기 전용 열기",
+	}
+	raw := map[string]bool{"DB": true, "Tx": true, "Conn": true, "Stmt": true, "Open": true, "OpenDB": true, "TxOptions": true}
+	var bad []string
+	seen := map[site]bool{}
+	src.each(func(at site, n ast.Node) {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return
+		}
+		isRawType := false
+		if x, ok := sel.X.(*ast.Ident); ok && x.Name == "sql" && raw[sel.Sel.Name] {
+			isRawType = true
+		}
+		if !isRawType && sel.Sel.Name != "raw" {
+			return
+		}
+		if at.file == "engine.go" {
+			return
+		}
+		if _, ok := allowed[at]; ok {
+			seen[at] = true
+			return
+		}
+		bad = append(bad, at.String()+" 의 "+src.fset.Position(sel.Pos()).String())
+	})
+	if len(bad) > 0 {
+		t.Errorf("날 database/sql 핸들이 engine.go 밖에서 쓰였다 - 그 자리는 자리표시 감싸개를 안 지난다:\n  %s",
+			strings.Join(bad, "\n  "))
+	}
+	for at, why := range allowed {
+		if !seen[at] {
+			t.Errorf("예외 목록이 낡았다: %s(%s)에 날 핸들이 더는 없다 - 목록에서 지워라", at, why)
+		}
+	}
+}
+
+// TestTxKindsAreFour 는 트랜잭션을 여는 자리를 잠근다: BeginTx 는 begin 한 곳, begin 을 부르는 것은
+// runTx(Tx · ObsTx) · ReadTx · applySteps(증분 적용) 셋뿐이다.
+//
+// ★ 직렬성 규칙(격리 수준 · 전역 잠금)은 begin 에만 산다. 다른 자리에서 트랜잭션을 열면 그 트랜잭션은
+// 잠금도 격리 수준도 없이 돈다 - Postgres 에서 조용히 깨지는 바로 그 모양이다.
+func TestTxKindsAreFour(t *testing.T) {
+	src := parseStoreSource(t)
+	calls := map[string]map[site]bool{"BeginTx": {}, "begin": {}, "runTx": {}}
+	src.each(func(at site, n ast.Node) {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return
+		}
+		if m, ok := calls[sel.Sel.Name]; ok {
+			m[at] = true
+		}
+	})
+	for name, want := range map[string][]site{
+		"BeginTx": {{"engine.go", "begin"}},
+		"begin":   {{"store.go", "ReadTx"}, {"store.go", "applySteps"}, {"store.go", "runTx"}},
+		"runTx":   {{"store.go", "ObsTx"}, {"store.go", "Tx"}},
+	} {
+		var got []site
+		for at := range calls[name] {
+			got = append(got, at)
+		}
+		sort.Slice(got, func(i, j int) bool { return got[i].String() < got[j].String() })
+		if !slices.Equal(got, want) {
+			t.Errorf("%s 를 부르는 자리가 다르다\n 얻음 %v\n 기대 %v", name, got, want)
+		}
+	}
+}
+
+// TestWritesOutsideTxAreListed 는 트랜잭션 밖 쓰기(s.db 로 곧장 쓰기)를 목록으로 잠근다.
+//
+// ★ 트랜잭션 밖 쓰기는 전역 잠금을 안 잡는다. 이벤트 추가가 여기 있으면 event.id 순서가 커밋 순서와
+// 어긋난다(Postgres) - 그래서 이벤트 추가는 목록에 없고 자기 Tx 로 간다(event.go 의 TryLogEvent).
+// 쓰기를 숨기는 길 셋을 다 본다: s.db.Exec*, s.db.Query* 로 INSERT/UPDATE/DELETE, 쓰는 도우미에 s.db 넘기기.
+func TestWritesOutsideTxAreListed(t *testing.T) {
+	src := parseStoreSource(t)
+	allowed := map[site]string{
+		{"store.go", "migrateTo"}: "SQLite schema.sql 적용 - PRAGMA 가 있어 트랜잭션 밖이어야 한다",
+		{"store.go", "backup"}:    "SQLite 판올림 전 VACUUM INTO",
+		{"inbox.go", "DropInbox"}: "받는 곳 지우기 - 알림이 서버 DB 로 옮기면 없어진다",
+	}
+
+	// 쓰는 도우미에 s.db 를 넘기는 길. 지금 dbtx 도우미는 다 읽기라 실제 소스에선 0건이 정상이다 -
+	// 그래서 탐지 자체를 합성 소스로 따로 잰다(빈 탐지가 초록으로 숨지 않게).
+	writers := dbtxWriters(src.files)
+	probe, err := parser.ParseFile(token.NewFileSet(), "probe.go", `package p
+func put(ctx context.Context, q dbtx, id string) error { _, err := q.ExecContext(ctx, "x", id); return err }
+func get(ctx context.Context, a int, q dbtx) error { return q.QueryRowContext(ctx, "x").Scan() }`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dbtxWriters(map[string]*ast.File{"probe.go": probe}); len(got) != 1 || got["put"] != 1 {
+		t.Fatalf("쓰는 도우미 탐지가 죽었다: 합성 소스에서 %v(기대 put 의 1번 자리)", got)
+	}
+
+	seen := map[site]bool{}
+	var bad []string
+	src.each(func(at site, n ast.Node) {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		pos := src.fset.Position(call.Pos()).String()
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && isDBField(sel.X) {
+			switch sel.Sel.Name {
+			case "ExecContext", "Exec":
+				if _, ok := allowed[at]; ok {
+					seen[at] = true
+					return
+				}
+				bad = append(bad, at.String()+" 가 s.db 로 곧장 쓴다("+pos+")")
+			case "QueryContext", "QueryRowContext", "Query", "QueryRow":
+				if q := leadingSQL(call); looksLikeWrite(q) {
+					bad = append(bad, at.String()+" 가 s.db 의 질의로 쓴다("+pos+"): "+clip(q, 60))
+				}
+			}
+			return
+		}
+		if fn, ok := call.Fun.(*ast.Ident); ok {
+			if i, ok := writers[fn.Name]; ok && i < len(call.Args) && isDBField(call.Args[i]) {
+				bad = append(bad, at.String()+" 가 쓰는 도우미 "+fn.Name+" 에 s.db 를 넘긴다("+pos+")")
+			}
+		}
+	})
+	if len(bad) > 0 {
+		t.Errorf("트랜잭션 밖 쓰기가 목록 밖에 있다 - 전역 잠금을 안 잡는다:\n  %s", strings.Join(bad, "\n  "))
+	}
+	for at, why := range allowed {
+		if !seen[at] {
+			t.Errorf("목록이 낡았다: %s(%s)에 트랜잭션 밖 쓰기가 더는 없다 - 목록에서 지워라", at, why)
+		}
+	}
+}
+
+// dbtxWriters 는 dbtx 매개변수로 ExecContext 하는 함수 이름 → 그 매개변수 자리다.
+func dbtxWriters(files map[string]*ast.File) map[string]int {
+	out := map[string]int{}
+	for _, f := range files {
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Recv != nil || fd.Body == nil {
+				continue
+			}
+			idx := 0
+			for _, p := range fd.Type.Params.List {
+				typ, _ := p.Type.(*ast.Ident)
+				names := len(p.Names)
+				for _, name := range p.Names {
+					if typ != nil && typ.Name == "dbtx" && execsOn(fd.Body, name.Name) {
+						out[fd.Name.Name] = idx
+					}
+					idx++
+				}
+				if names == 0 {
+					idx++
+				}
+			}
+		}
+	}
+	return out
+}
+
+// execsOn 은 body 안에 `<name>.ExecContext(` 호출이 있는가다.
+func execsOn(body ast.Node, name string) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "ExecContext" {
+				if x, ok := sel.X.(*ast.Ident); ok && x.Name == name {
+					found = true
+				}
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// leadingSQL 은 질의 호출의 SQL 인자가 문자열 글자(또는 글자로 시작하는 이어 붙이기)면 그 글자를 낸다.
+func leadingSQL(call *ast.CallExpr) string {
+	for _, a := range call.Args {
+		for {
+			b, ok := a.(*ast.BinaryExpr)
+			if !ok {
+				break
+			}
+			a = b.X
+		}
+		if lit, ok := a.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+			s, err := strconv.Unquote(lit.Value)
+			if err == nil {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func looksLikeWrite(q string) bool {
+	u := strings.ToUpper(strings.TrimSpace(q))
+	for _, w := range []string{"INSERT", "UPDATE", "DELETE", "WITH"} {
+		if strings.HasPrefix(u, w) {
+			return w != "WITH" || strings.Contains(u, "INSERT") || strings.Contains(u, "UPDATE") || strings.Contains(u, "DELETE")
+		}
+	}
+	return strings.Contains(u, "RETURNING")
+}
+
+// TestStoreSQLHasNoJSONBQuestionOperators 는 jsonb 의 `?` · `?|` · `?&` 연산자가 store 의 SQL 에 없는지 잠근다.
+//
+// ★ 감싸개는 따옴표 밖의 `?` 를 전부 자리표시로 본다(bindDollar). jsonb 연산자는 자리표시와 글자가 같아
+// 실행 때 못 가른다 - 그래서 소스에서 막는다. 자리표시 바로 뒤에 `|` · `&` 가 붙거나, 다음 글자가 문자열
+// 따옴표나 또 다른 `?` 면(값 둘이 연산자 없이 붙을 수 없으니) 연산자 자리다. 키를 물을 일이 생기면
+// `jsonb_exists(…)` 처럼 함수로 쓴다.
+func TestStoreSQLHasNoJSONBQuestionOperators(t *testing.T) {
+	src := parseStoreSource(t)
+	marks := 0
+	var bad []string
+	src.each(func(at site, n ast.Node) {
+		lit, ok := n.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return
+		}
+		s, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			return
+		}
+		for _, p := range placeholders(s) {
+			marks++
+			if reason := questionOperatorAt(s, p); reason != "" {
+				bad = append(bad, at.String()+" "+src.fset.Position(lit.Pos()).String()+": "+reason+" - "+clip(s, 80))
+			}
+		}
+	})
+	// 자리표시를 하나도 못 세면 아래 단정이 그냥 초록이다. 지금 store 의 SQL 은 자리표시가 수백 개다.
+	if marks < 200 {
+		t.Fatalf("store 의 SQL 에서 자리표시를 %d개만 셌다 - 이 시험의 탐지가 죽었다", marks)
+	}
+	if len(bad) > 0 {
+		t.Errorf("jsonb 의 ? 연산자로 보이는 자리가 있다 - 감싸개가 자리표시로 바꿔 버린다:\n  %s", strings.Join(bad, "\n  "))
+	}
+	// 탐지 자체도 잰다(위가 늘 초록이면 이것이 빨개야 한다).
+	for _, q := range []string{`payload::jsonb ?| array['a']`, `payload::jsonb ?& ?`, `payload::jsonb ? 'item'`, `payload::jsonb ? ?`} {
+		hit := false
+		for _, p := range placeholders(q) {
+			if questionOperatorAt(q, p) != "" {
+				hit = true
+			}
+		}
+		if !hit {
+			t.Errorf("탐지가 jsonb 연산자를 못 잡는다: %q", q)
+		}
+	}
+	for _, q := range []string{`WHERE a = ? AND b IN (?, ?)`, `VALUES (?, ?)`, `(payload::jsonb ->> 'item') = ?`} {
+		for _, p := range placeholders(q) {
+			if r := questionOperatorAt(q, p); r != "" {
+				t.Errorf("탐지가 자리표시를 연산자로 잘못 본다: %q (%s)", q, r)
+			}
+		}
+	}
+}
+
+// questionOperatorAt 은 q[p] 의 `?` 가 jsonb 연산자 자리로 보이면 그 사유를 낸다.
+func questionOperatorAt(q string, p int) string {
+	if p+1 < len(q) && (q[p+1] == '|' || q[p+1] == '&') {
+		return "?" + string(q[p+1]) + " 연산자"
+	}
+	rest := strings.TrimLeft(q[p+1:], " \t\r\n")
+	if rest != "" && (rest[0] == '\'' || rest[0] == '?') {
+		return "? 다음에 값이 곧장 온다(키 존재 연산자)"
+	}
+	return ""
+}

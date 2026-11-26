@@ -590,7 +590,7 @@ func (s *Store) RemoveProject(ctx context.Context, id string) error {
 // 그 경로를 실제로 재현한다). 그때도 "FOREIGN KEY constraint failed" 원문만 올리면
 // 무엇이 막았는지 아무도 모른다 — 그래서 번역한다.
 func removalFKMessage(project, tbl string, err error) *RemovalBlockedError {
-	if JudgeConstraintCode(ConstraintCode(err)).Kind != ConflictMissingRef {
+	if JudgeError(err).Kind != ConflictMissingRef {
 		return nil
 	}
 	return &RemovalBlockedError{

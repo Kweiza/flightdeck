@@ -186,7 +186,7 @@ func TestMigrateUpgradesVersion1Database(t *testing.T) {
 		t.Errorf("업그레이드 뒤 버전이 %d 다 — %d 를 기대했다", v, SchemaVersion)
 	}
 	for _, table := range []string{"idempotency", "landing_queue"} {
-		if !hasTableIn(t, s.db, table) {
+		if !hasTableIn(t, s.DB(), table) {
 			t.Errorf("업그레이드했는데 %s 표가 없다", table)
 		}
 	}

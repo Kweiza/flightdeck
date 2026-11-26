@@ -3,8 +3,11 @@ package api
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/kweiza/flightdeck/internal/store"
 )
 
 // /metrics — 프로메테우스 텍스트 포맷을 직접 쓴다(의존성 0).
@@ -44,6 +47,11 @@ type MetricsSnapshot struct {
 	DeriveRuns    uint64
 	DeriveCards   uint64
 	DeriveSeconds float64
+
+	// DB 는 저장 계층의 잠금 대기 · 연결 풀 대기다. 쓰기가 전역 잠금 하나에서 한 줄로 서므로, 느려질 때
+	// 「잠금 줄이 길다」와 「연결이 모자라다」를 가르는 축이 이것이다(SQLite 때 BUSY 횟수의 자리).
+	// 영값이면(조립에 store 가 없는 시험) 0 으로 그린다.
+	DB store.DBStats
 }
 
 // RenderMetrics 는 스냅숏을 프로메테우스 텍스트 포맷으로 옮긴다. 순수 함수다.
@@ -111,11 +119,44 @@ func RenderMetrics(s MetricsSnapshot) string {
 	b.WriteString("# TYPE flightdeck_session_card_derive_seconds_total counter\n")
 	fmt.Fprintf(&b, "flightdeck_session_card_derive_seconds_total %.6f\n", s.DeriveSeconds)
 
+	renderDBStats(&b, s.DB)
+
 	b.WriteString("# HELP flightdeck_sse_subscribers 지금 붙어 있는 SSE 구독자 수\n")
 	b.WriteString("# TYPE flightdeck_sse_subscribers gauge\n")
 	fmt.Fprintf(&b, "flightdeck_sse_subscribers %d\n", s.SSESubs)
 
 	return b.String()
+}
+
+// renderDBStats 는 잠금 대기 히스토그램(공간별) · 잠금 대기 초과 · 연결 풀 대기를 쓴다.
+// 공간은 store.LockSpaces 전부를 늘 쓴다 - 안 쓴 공간이 빠지면 0 과 「안 잰다」가 섞인다.
+func renderDBStats(b *strings.Builder, d store.DBStats) {
+	spaces := store.LockSpaces()
+	b.WriteString("# HELP flightdeck_tx_lock_wait_seconds 쓰기 트랜잭션이 잠금을 받기까지 기다린 시간(잠금 공간별)\n")
+	b.WriteString("# TYPE flightdeck_tx_lock_wait_seconds histogram\n")
+	for _, sp := range spaces {
+		w := d.Locks[sp]
+		var cum uint64
+		for i, le := range store.LockWaitBuckets {
+			cum += w.Buckets[i]
+			fmt.Fprintf(b, "flightdeck_tx_lock_wait_seconds_bucket{lock=\"%s\",le=\"%s\"} %d\n",
+				escapeLabel(string(sp)), strconv.FormatFloat(le, 'g', -1, 64), cum)
+		}
+		fmt.Fprintf(b, "flightdeck_tx_lock_wait_seconds_bucket{lock=\"%s\",le=\"+Inf\"} %d\n", escapeLabel(string(sp)), w.Count)
+		fmt.Fprintf(b, "flightdeck_tx_lock_wait_seconds_sum{lock=\"%s\"} %.6f\n", escapeLabel(string(sp)), w.Sum)
+		fmt.Fprintf(b, "flightdeck_tx_lock_wait_seconds_count{lock=\"%s\"} %d\n", escapeLabel(string(sp)), w.Count)
+	}
+	b.WriteString("# HELP flightdeck_tx_lock_timeouts_total 잠금 대기가 상한을 넘어 실패한 쓰기 트랜잭션 수(잠금 공간별)\n")
+	b.WriteString("# TYPE flightdeck_tx_lock_timeouts_total counter\n")
+	for _, sp := range spaces {
+		fmt.Fprintf(b, "flightdeck_tx_lock_timeouts_total{lock=\"%s\"} %d\n", escapeLabel(string(sp)), d.Locks[sp].Timeouts)
+	}
+	b.WriteString("# HELP flightdeck_db_pool_waits_total 연결 풀에서 연결을 기다린 횟수\n")
+	b.WriteString("# TYPE flightdeck_db_pool_waits_total counter\n")
+	fmt.Fprintf(b, "flightdeck_db_pool_waits_total %d\n", d.PoolWaits)
+	b.WriteString("# HELP flightdeck_db_pool_wait_seconds_total 연결 풀에서 연결을 기다린 시간 합\n")
+	b.WriteString("# TYPE flightdeck_db_pool_wait_seconds_total counter\n")
+	fmt.Fprintf(b, "flightdeck_db_pool_wait_seconds_total %.6f\n", d.PoolWaitSeconds)
 }
 
 // escapeLabel 은 라벨 값을 노출 포맷 규칙대로 이스케이프한다. 순수 함수다.

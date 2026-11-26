@@ -3,9 +3,13 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kweiza/flightdeck/internal/model"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -82,6 +86,71 @@ func TestJudgeConstraintCodeAlwaysGivesReason(t *testing.T) {
 func TestConstraintCodeFindsWrappedDriverError(t *testing.T) {
 	if got := ConstraintCode(errors.New("드라이버와 무관한 오류")); got != 0 {
 		t.Fatalf("드라이버 오류가 아닌데 코드 %d 를 냈다", got)
+	}
+}
+
+// JudgeSQLState 는 Postgres 의 SQLSTATE 를 SQLite 와 **같은 축**으로 판정한다(실물은 pg_tx_test.go).
+func TestJudgeSQLState(t *testing.T) {
+	for _, c := range []struct {
+		name, state  string
+		wantKind     ConflictKind
+		wantFault    FaultKind
+		wantInReason string
+	}{
+		{"PK · UNIQUE 중복", "23505", ConflictDuplicate, "", "이미 있다"},
+		{"FK", "23503", ConflictMissingRef, "", "등록돼 있지 않다"},
+		{"CHECK 는 안 접는다", "23514", "", "", "1차 방어"},
+		{"NOT NULL 은 안 접는다", "23502", "", "", "1차 방어"},
+		{"추가 전용 트리거는 안 접는다", "23000", "", "", "1차 방어"},
+		{"모르는 제약 축", "23P01", "", "", "아는 축이 아닌"},
+		{"잠금 대기 초과", "55P03", "", FaultLockTimeout, "lock_timeout"},
+		{"교착", "40P01", "", FaultDeadlock, "교착"},
+		{"버려진 트랜잭션", "25P02", "", FaultAborted, "Savepoint"},
+		{"제약이 아님", "42601", "", "", "제약 위반이 아니다"},
+		{"코드 없음", "", "", "", "SQLSTATE 가 없다"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := JudgeSQLState(c.state)
+			if got.Kind != c.wantKind || got.Fault != c.wantFault {
+				t.Errorf("(Kind, Fault) = (%q, %q), want (%q, %q) (사유: %s)", got.Kind, got.Fault, c.wantKind, c.wantFault, got.Reason)
+			}
+			if !strings.Contains(got.Reason, c.wantInReason) {
+				t.Errorf("사유에 %q 가 없다: %q", c.wantInReason, got.Reason)
+			}
+		})
+	}
+}
+
+// asFault 는 트랜잭션 실패만 *TxFault 로 옮기고, 감싼 오류 안에서도 찾고, 두 번 감싸지 않는다.
+func TestAsFaultWrapsOnlyTxFaults(t *testing.T) {
+	if asFault(nil) != nil {
+		t.Fatal("nil 을 오류로 바꿨다")
+	}
+	plain := errors.New("드라이버와 무관한 오류")
+	if got := asFault(plain); got != plain {
+		t.Fatalf("트랜잭션 실패가 아닌 오류를 바꿨다: %v", got)
+	}
+	dup := fmt.Errorf("쓰기: %w", &pgconn.PgError{Code: "23505", ConstraintName: "project_pkey"})
+	if got := asFault(dup); got != dup {
+		t.Fatalf("제약 위반을 트랜잭션 실패로 옮겼다: %v", got)
+	}
+	for _, c := range []struct {
+		err  error
+		kind FaultKind
+		code string
+	}{
+		{fmt.Errorf("문맥: %w", &pgconn.PgError{Code: "55P03"}), FaultLockTimeout, "55P03"},
+		{fmt.Errorf("문맥: %w", &pgconn.PgError{Code: "40P01"}), FaultDeadlock, "40P01"},
+		{fmt.Errorf("커밋 실패: %w", pgx.ErrTxCommitRollback), FaultAborted, "25P02"},
+	} {
+		got := asFault(c.err)
+		var f *TxFault
+		if !errors.As(got, &f) || f.Kind != c.kind || f.Code != c.code || !errors.Is(got, c.err) {
+			t.Fatalf("%v → %v(기대 TxFault %s/%s, 원문 사슬 유지)", c.err, got, c.kind, c.code)
+		}
+		if again := asFault(got); again != got {
+			t.Fatalf("두 번 감쌌다: %v", again)
+		}
 	}
 }
 
