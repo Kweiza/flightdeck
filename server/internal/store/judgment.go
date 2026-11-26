@@ -1,10 +1,12 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -289,37 +291,54 @@ func (s *Store) fillLinks(ctx context.Context, js []model.Judgment) ([]model.Jud
 // 그것이 필요해지면 **인자를 하나 늘려** 원문 통과 경로를 여는 것이 맞다 —
 // 지금 문법을 반쯤 허용하면 어느 문자가 살아 있는지 아무도 모르는 상태가 된다.
 //
-// ★ NUL 은 구절 안의 빈칸으로 바꾼다. FTS5 의 질의 해석기는 NUL 을 글의 끝으로 읽어 따옴표가 안 닫힌 질의가 되고
-// (unterminated string) 검색이 오류로 죽는다. unicode61 에서 NUL 은 가름표라 빈칸으로 바꿔도 구절의 뜻이 같다.
+// ★ NUL 과 깨진 UTF-8 바이트는 구절 안의 빈칸으로 바꾼다(cleanSearchText). 둘 다 그대로 두면 Postgres 판과 다른
+// 낱말을 본다:
+//   - NUL: FTS5 의 질의 해석기는 NUL 을 글의 끝으로 읽어 따옴표가 안 닫힌 질의가 되고(unterminated string) 검색이
+//     오류로 죽는다.
+//   - 깨진 바이트: unicode61 은 홀로 선 이어짐 바이트를 그 값의 코드포인트로 읽는다. `%AA` 만 친 검색이 `ª`(U+00AA)
+//     낱말을 찾고, 조각 나누기(SearchTerms)가 그 바이트를 가름표로 두는 Postgres 판은 0건이다.
+//
+// unicode61 에서 빈칸은 가름표라, 바꾼 뒤의 낱말이 SearchTerms 의 조각과 같다.
 func FTSQuery(raw string) string {
 	var toks []string
 	for _, f := range strings.Fields(raw) {
-		f = strings.ReplaceAll(f, "\x00", " ")
+		f = cleanSearchText(f)
 		toks = append(toks, `"`+strings.ReplaceAll(f, `"`, `""`)+`"`)
 	}
 	return strings.Join(toks, " ")
 }
 
+// cleanSearchText 는 검색어에서 두 엔진이 글로 받지 못하는 것(NUL · 깨진 UTF-8 바이트)을 빈칸으로 바꾼다. 순수 함수다.
+// 나머지 글자는 그대로 둔다. SQLite 판은 FTS5 구절(FTSQuery)에, Postgres 판은 순위의 유사도 인자(trgmSearch)에 쓴다.
+// 두 자리 모두 빈칸이 가름표라 NUL · 깨진 바이트를 가름표로 두는 SearchTerms 와 낱말 경계가 같다.
+func cleanSearchText(s string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(s, " "), "\x00", " ")
+}
+
 // SearchTerms 는 사람이 친 검색어를 판단 검색의 조각으로 나눈다. 순수 함수다. Postgres 판(trgmSearch)은 조각마다 부분
-// 일치(ILIKE)를 AND 로 걸고, 두 판 모두 조각 수로 검색어를 거른다(SearchJudgments).
+// 일치(ILIKE)를 AND 로 건다. 조각 수에 상한은 없다(trgmSearch 의 ★).
 //
 // 가름표는 FTS5 의 unicode61 과 코드포인트 하나까지 같다(unicode61.go 의 표, SQLite 에 물어 지었고 시험이 SQLite 와
 // 견준다). Go 의 범주로 가르지 않는 까닭은 unicode61 의 표가 Unicode 6.1 에 멈춰 있어서다 - 그 뒤에 생긴 이모지 `🦊` 는
 // unicode61 에서 낱말 글자다. 결합 기호 중 unicode61 이 떼어 내는 것(remove_diacritics)도 가름표다: unicode61 은 기호를
 // 떼고 앞뒤를 한 낱말로 잇지만(`cafe` + U+0301 + `bar` 는 `cafebar`) Postgres 는 기호를 떼지 못하므로, 이어 붙인 조각은
 // 원문에 없는 글자열이 되고 갈라 두면 조각마다 원문 안에 그대로 있다. 깨진 UTF-8 바이트도 가름표다 - 조각을 Postgres 에
-// 넘길 때 22021(인코딩 오류)로 질의가 통째로 거절되지 않게.
+// 넘길 때 22021(인코딩 오류)로 질의가 통째로 거절되지 않게. SQLite 판도 그 바이트를 가름표로 본다(FTSQuery 가 빈칸으로
+// 바꾼다).
 //
 // ★ 왜 공백만이 아니라 가름표로도 나누나. SQLite 판(FTSQuery)은 공백 토큰 하나를 **구절**로 넘기고 unicode61 이 그것을
 // 구두점에서 낱말로 가른다 - 그래서 `fd-update` 는 구절 「fd update」 라 `fd update` · `fd, update` 에도 맞는다.
 // `ILIKE '%fd-update%'` 는 거기에 안 맞는다. 조각으로 나누면 FTS5 가 맞힌 판단은 조각을 다 품으므로 이쪽도 맞힌다
 // (낱말 단위 검색의 상위집합). 거꾸로는 아니다 - `판단` 이 `판단을` 에 맞는 것처럼 더 맞힌다.
 //
-// ★ 상위집합이 깨지는 자리는 글자 접기 둘이다(Postgres 의 ILIKE 는 양쪽을 lower() 로 견주고, FTS5 는 제 접기 표로
-// 견준다. 코드포인트 전부를 두 엔진에서 접어 견준 결과다):
+// ★ 상위집합이 깨지는 자리는 셋이고 셋 다 받아들인 예외다. 앞의 둘은 글자 접기다(Postgres 의 ILIKE 는 양쪽을 lower() 로
+// 견주고, FTS5 는 제 접기 표로 견준다. 코드포인트 전부를 두 엔진에서 접어 견준 결과다):
 //   - 발음 구별 기호 접기: FTS5 는 `é` · `É` · `e` + U+0301 을 `e` 로 접는다. `cafe` 로 친 검색은 `café` 에 안 맞는다.
 //   - 대소문자 특수 접기 11자: `ſ` `ẛ`(→s) · `µ`(→μ) · `ς`(→σ) · `ϐ` `ϵ` `ϑ` `ϰ` `ϖ` `ϱ` `ϕ`(그리스 기호꼴). lower() 는
 //     이 글자들을 그대로 둔다. `ΛΟΓΟΣ` 로 친 검색은 `λογος` 에 안 맞는다.
+//   - 32,768 바이트를 넘는 낱말 하나: FTS5 는 낱말을 그 길이에서 자른다(fts5Int.h 의 FTS5_MAX_TOKEN_SIZE, 색인과 질의
+//     둘 다). 앞 32,768 바이트가 같고 뒤가 다른 검색어도 SQLite 판은 맞히고 Postgres 판은 못 맞힌다. 판단 본문에 그런
+//     낱말이 없어 고치지 않는다.
 //
 // 6.1 이후에 생긴 글자는 예외가 아니다 - 가름표는 표로 맞췄고, 접기는 FTS5 가 그 글자를 안 접어 Postgres 쪽이 더 맞힌다.
 //
@@ -338,24 +357,6 @@ func unicode61Separator(r rune) bool {
 	t := unicode61Separators[:]
 	i := sort.Search(len(t), func(i int) bool { return t[i].hi >= r })
 	return i < len(t) && t[i].lo <= r
-}
-
-// maxSearchTerms 는 검색어 하나가 가질 수 있는 조각(SearchTerms) 수의 상한이다.
-//
-// ★ 왜 두나. Postgres 판은 조각마다 ILIKE 하나와 바인드 하나가 붙는다. 바인드는 문장 하나에 65,535 개가 한도라 조각이
-// 수만 개인 검색어는 질의를 못 짓고, 그 전에도 조각마다 판단 글을 한 번 더 훑어 비용이 조각 수에 비례한다. 사람이 치는
-// 검색어는 낱말 몇 개이고 문장 하나를 통째로 붙여 넣어도 32개를 넘기 어렵다. 넘으면 질의를 돌리지 않고 입력 오류로
-// 돌려준다 - 두 엔진이 같은 규칙으로 거절하도록 엔진을 고르기 전에 잰다.
-const maxSearchTerms = 32
-
-// SearchQueryError 는 검색어가 받을 수 없는 꼴이라 질의를 돌리지 않았다는 오류다. 입력 오류다(표면은 400 으로 낸다).
-type SearchQueryError struct {
-	Query  string // 원문
-	Reason string // 왜, 무엇을 고치면 되나
-}
-
-func (e *SearchQueryError) Error() string {
-	return fmt.Sprintf("판단 검색어를 받을 수 없다(원문 %q): %s", clip(e.Query, 64), e.Reason)
 }
 
 // likeEscaper 는 LIKE 무늬의 특수 글자(`%` · `_` 와 이스케이프 글자 `\`)를 글자 그대로 찾게 막는다.
@@ -401,21 +402,56 @@ func ftsSearch(project, raw string, limit int) searchQuery {
 // 검색은 그대로 맞지만 매번 표 전체를 훑는다 - 결과로는 안 보이는 결함이라 시험이 실행 계획으로 잠근다.
 const judgmentText = `(coalesce(j.title, '') || ' ' || j.body)`
 
-// trgmSearch 는 Postgres 판의 검색이다(pg_trgm 부분 일치). 조각(SearchTerms)마다 ILIKE 를 AND 로 걸고, 순위는 조각을
-// 이은 글과의 trigram 유사도 내림차순, 같으면 최신 먼저다. 조각이 없으면 빈 질의다.
+// indexedTerms 는 Postgres 판 검색이 식 인덱스의 조건으로 거는 조각 수의 상한이다. 넘는 조각은 행 거르기로 맞춘다
+// (trgmSearch 의 ★). 검색어의 조각 수 상한이 아니다 - 조각 수에는 상한이 없다.
+const indexedTerms = 32
+
+// trgmSearch 는 Postgres 판의 검색이다(pg_trgm 부분 일치). 조각(SearchTerms)을 모두 AND 로 부분 일치시키고, 순위는
+// 원문과의 trigram 유사도 내림차순, 같으면 최신 먼저다. 조각이 없으면 빈 질의다.
 //
-// ★ 유사도에 원문이 아니라 조각을 이은 글을 넘긴다. 원문에는 NUL 이나 깨진 UTF-8 이 들 수 있고 Postgres 는 그런 글자열
-// 인자를 22021 로 거절해 질의가 통째로 죽는다. 조각에는 둘 다 없다(SearchTerms).
-func trgmSearch(project string, terms []string, limit int) searchQuery {
+// ★ 조각 수에 상한이 없다(SQLite 판도 없다). 조각을 두 갈래로 건다:
+//   - 긴 조각부터 indexedTerms 개는 조각마다 `식 ILIKE ?` 다. 식 인덱스의 조건이 되어 한 번의 인덱스 훑기에 함께 든다
+//     (시험이 실행 계획으로 잠근다). 긴 조각이 trigram 이 많아 더 좁힌다.
+//   - 나머지는 무늬 배열 바인드 하나(text[])로 넘겨 행 거르기 `lower(식) LIKE ALL(소문자 무늬)` 로 맞춘다. Postgres 의
+//     ILIKE 는 양쪽을 lower() 로 접어 LIKE 로 견주므로 뜻이 같다.
+//
+// 그래서 바인드는 많아야 indexedTerms + 5 개이고 문장 하나의 바인드 한도(65,535)에 닿지 않는다. 쓰지 않는 꼴과 까닭:
+//   - 조각마다 바인드 하나: 조각이 수만 개면 한도를 넘어 질의를 못 짓고, 조각마다 행을 다시 확인하며 본문을 접는다.
+//   - 인덱스 조건을 `식 ILIKE ALL(배열)` 로: 플래너가 ALL 꼴을 인덱스 조건으로 받지 않아 매번 표 전체를 훑는다.
+//   - 배열 하나를 조각마다 `식 ILIKE 배열[k]` 로 집기: 인덱스는 타지만, 플래너가 값을 아는 계획에서 조건마다 배열
+//     전체를 복사해 계획 메모리가 조각 수의 제곱이다(조각 수천 개에 GB, 수만 개면 백엔드가 메모리 부족으로 죽는다).
+//   - 거르기를 `식 ILIKE ALL(배열)` 로: ILIKE 는 무늬 하나마다 본문을 새로 접어(lower) 행 하나의 메모리가 조각 수 x
+//     본문 길이다. `lower(식)` 을 왼쪽에 두면 행마다 한 번만 접는다. 소문자 무늬는 부분질의가 질의마다 한 번 짓는다.
+//
+// ★ 유사도에는 원문에서 NUL · 깨진 UTF-8 만 빈칸으로 바꾼 글(cleanSearchText)을 넘긴다. Postgres 는 그 둘이 든 글자열
+// 인자를 22021 로 거절해 질의가 통째로 죽는다. 조각을 이은 글을 넘기면 가름표가 빈칸으로 접혀 `xⓐy` 로 친 검색에서
+// 원문과 똑같은 판단보다 `x y` 판단이 먼저 온다.
+func trgmSearch(project, raw string, limit int) searchQuery {
+	terms := SearchTerms(raw)
 	if len(terms) == 0 {
 		return searchQuery{}
 	}
-	joined := strings.Join(terms, " ")
+	byLen := slices.Clone(terms)
+	slices.SortStableFunc(byLen, func(a, b string) int {
+		return cmp.Compare(utf8.RuneCountInString(b), utf8.RuneCountInString(a))
+	})
+	indexed, rest := byLen, []string(nil)
+	if len(byLen) > indexedTerms {
+		indexed, rest = byLen[:indexedTerms], byLen[indexedTerms:]
+	}
 	args := []any{project, project}
 	var match strings.Builder
-	for _, t := range terms {
+	for _, t := range indexed {
 		match.WriteString(` AND ` + judgmentText + ` ILIKE ?`)
 		args = append(args, likeContains(t))
+	}
+	if len(rest) > 0 {
+		pats := make([]string, len(rest))
+		for i, t := range rest {
+			pats[i] = likeContains(t)
+		}
+		match.WriteString(` AND lower(` + judgmentText + `) LIKE ALL(ARRAY(SELECT lower(p) FROM unnest(?::text[]) p))`)
+		args = append(args, pats)
 	}
 	return searchQuery{
 		sql: `SELECT ` + searchCols + `
@@ -423,8 +459,8 @@ func trgmSearch(project string, terms []string, limit int) searchQuery {
 		WHERE (? = '' OR j.project = ?)` + match.String() + `
 		ORDER BY similarity(` + judgmentText + `, ?) DESC, j.at DESC, j.id DESC
 		LIMIT ?`,
-		args:  append(args, joined, limit),
-		shown: joined,
+		args:  append(args, cleanSearchText(raw), limit),
+		shown: strings.Join(terms, " "),
 	}
 }
 
@@ -432,26 +468,20 @@ func trgmSearch(project string, terms []string, limit int) searchQuery {
 //
 // project 가 비어 있으면 전 프로젝트를 본다. 결과는 관련도 높은 순이다. 무엇으로 찾고 어떻게 줄 세우는지는 엔진마다
 // 다르다(engine.judgmentSearch): SQLite 판은 FTS5 의 낱말 구절 검색과 rank, Postgres 판은 부분 일치와 trigram 유사도.
-// Postgres 판이 맞히는 집합은 글자 접기 예외(SearchTerms 의 ★)를 빼면 SQLite 판의 상위집합이다. 순위는 같지 않으므로
-// 상한(limit)에 잘린 목록끼리는 상위집합이 안 선다.
+// Postgres 판이 맞히는 집합은 받아들인 예외 셋(SearchTerms 의 ★: 발음 구별 기호 접기 · 대소문자 특수 접기 11자 ·
+// 32,768 바이트를 넘는 낱말)을 빼면 SQLite 판의 상위집합이다. 순위는 같지 않으므로 상한(limit)에 잘린 목록끼리는
+// 상위집합이 안 선다. 검색어의 낱말 수에는 두 엔진 모두 상한이 없다.
 // 판단이 쌓이면 grep 이 유일한 도달 경로가 되는 것을 막는 자리다.
-//
-// 받을 수 없는 검색어(비었거나 조각이 maxSearchTerms 를 넘는다)는 두 엔진 모두 *SearchQueryError 다.
 func (s *Store) SearchJudgments(ctx context.Context, project, query string, limit int) ([]model.Judgment, error) {
 	if strings.TrimSpace(query) == "" {
 		// 빈 결과와 구분되는 오류로 거절한다 - 「찾았는데 없다」와 「찾을 것이 없다」는 다르다(빈 질의를 MATCH 에
-		// 넘기면 구문 오류로 죽기도 한다).
-		return nil, &SearchQueryError{Query: query, Reason: "검색어가 비었다"}
-	}
-	terms := SearchTerms(query)
-	if len(terms) > maxSearchTerms {
-		return nil, &SearchQueryError{Query: query, Reason: fmt.Sprintf(
-			"낱말이 %d개다(상한 %d) - 찾을 낱말 몇 개로 줄여라", len(terms), maxSearchTerms)}
+		// 넘기면 구문 오류로 죽기도 한다). 표면은 이 자리에 닿기 전에 빈 검색어를 거절한다(api 의 requireQuery).
+		return nil, fmt.Errorf("검색어가 비었다(원문 %q)", clip(query, 64))
 	}
 	if limit <= 0 {
 		limit = 50
 	}
-	sq := s.db.dialect().judgmentSearch(project, query, terms, limit)
+	sq := s.db.dialect().judgmentSearch(project, query, limit)
 	if sq.sql == "" {
 		return nil, nil
 	}

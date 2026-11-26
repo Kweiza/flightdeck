@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kweiza/flightdeck/internal/model"
 )
 
 // 소비자 좌표계 시험 — 실제 HTTP 응답과 구조화 로그 실물 한 줄로만 단정한다.
@@ -528,26 +530,28 @@ func TestQueueRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSearchJudgmentsTooManyTermsIs400 은 낱말이 상한을 넘는 검색어가 500 이 아니라 400 bad_search_query 로 나가는지
-// HTTP 에서 잰다. ClassifyError 는 화이트리스트라 갈래가 빠지면 같은 오류가 조용히 500 이 된다.
-func TestSearchJudgmentsTooManyTermsIs400(t *testing.T) {
+// TestSearchJudgmentsTakesManyTerms 는 낱말이 많은 검색어도 표면에서 거절되지 않고 판단을 찾는지 HTTP 에서 잰다.
+// 앞 판은 조각 33개부터 400 으로 거절해, 예전 판이 찾던 검색이 깨졌다. 낱말 수에는 상한이 없다.
+func TestSearchJudgmentsTakesManyTerms(t *testing.T) {
 	e := newEnv(t, nil)
-	words := make([]string, 33)
+	if err := e.st.UpsertProject(t.Context(), model.Project{ID: testProject, Path: e.repo}); err != nil {
+		t.Fatal(err)
+	}
+	words := make([]string, 40)
 	for i := range words {
 		words[i] = fmt.Sprintf("w%d", i)
 	}
+	if _, err := e.st.AddJudgment(t.Context(), model.Judgment{Project: testProject, Kind: model.JudgmentDecision,
+		Body: strings.Join(words, " ")}); err != nil {
+		t.Fatal(err)
+	}
 	w := e.do(http.MethodGet, "/api/v1/judgments?"+url.Values{
 		"project": {testProject}, "q": {strings.Join(words, " ")}}.Encode(), nil)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("낱말 33개 검색이 %d 로 나갔다(400 을 기대): %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("낱말 %d개 검색이 %d 로 나갔다(200 을 기대): %s", len(words), w.Code, w.Body.String())
 	}
-	if ce := errorOf(t, w); ce["code"] != "bad_search_query" || !strings.Contains(fmt.Sprint(ce["message"]), "33") {
-		t.Fatalf("오류 절이 다르다: %v", ce)
-	}
-	ok := e.do(http.MethodGet, "/api/v1/judgments?"+url.Values{
-		"project": {testProject}, "q": {strings.Join(words[:32], " ")}}.Encode(), nil)
-	if ok.Code != http.StatusOK {
-		t.Fatalf("낱말 32개 검색은 받아야 한다: %d %s", ok.Code, ok.Body.String())
+	if n, _ := decodeBody(t, w)["count"].(float64); n != 1 {
+		t.Fatalf("낱말 %d개 검색이 판단을 못 찾았다: %s", len(words), w.Body.String())
 	}
 }
 

@@ -565,6 +565,9 @@ func TestLikeContainsMatchesLiterally(t *testing.T) {
 func TestSearchJudgmentsPGCoversFTS(t *testing.T) {
 	ctx := context.Background()
 	lite, pg := newStore(t), newPGStore(t, lockTimeout)
+	// FTS5 는 낱말을 32,768 바이트에서 자른다(fts5Int.h 의 FTS5_MAX_TOKEN_SIZE). 그 길이를 넘는 낱말 둘은 뒤가 달라도
+	// SQLite 판에서 같은 낱말이다.
+	long := strings.Repeat("z", 32768)
 	docs := []struct{ id, title, body string }{
 		{"d1", "배포 절차", "fd-update 로 판을 올린다"},
 		{"d2", "", "fd update 를 먼저 돌린다"},
@@ -580,6 +583,10 @@ func TestSearchJudgmentsPGCoversFTS(t *testing.T) {
 		{"d12", "", "🦊"},
 		{"d13", "", "λογος"},
 		{"d14", "", "ſun"},
+		{"d15", "", "ª 서수 표시"},
+		{"f1", "", "ẛqz1"}, {"f2", "", "µqz2"}, {"f3", "", "ϐqz3"}, {"f4", "", "ϵqz4"}, {"f5", "", "ϑqz5"},
+		{"f6", "", "ϰqz6"}, {"f7", "", "ϖqz7"}, {"f8", "", "ϱqz8"}, {"f9", "", "ϕqz9"},
+		{"g1", "", long + "b"},
 	}
 	for _, s := range []*Store{lite, pg} {
 		seed(t, s, "p")
@@ -593,7 +600,7 @@ func TestSearchJudgmentsPGCoversFTS(t *testing.T) {
 		t.Helper()
 		js, err := s.SearchJudgments(ctx, "", q, 1000)
 		if err != nil {
-			t.Fatalf("SearchJudgments(%q, %s): %v", q, s.db.eng, err)
+			t.Fatalf("SearchJudgments(%q, %s): %v", clip(q, 40), s.db.eng, err)
 		}
 		ids := strings.Split(judgmentIDs(js), ",")
 		if len(js) == 0 {
@@ -603,7 +610,8 @@ func TestSearchJudgmentsPGCoversFTS(t *testing.T) {
 		return ids
 	}
 	for _, q := range []string{"fd-update", "fd update", "FD", "update", "판단", "판단을", "sync_mode", "ωmega", "école",
-		`"unbalanced`, "-not", "*", "(", "OR OR", "a AND", "없는낱말", "---", "🦊", "판단을\x00남긴다\xff"} {
+		`"unbalanced`, "-not", "*", "(", "OR OR", "a AND", "없는낱말", "---", "🦊", "판단을\x00남긴다\xff",
+		"ª", "\xaa", "\x00\xaa", "ª\xaa서수"} {
 		l, p := search(lite, q), search(pg, q)
 		for _, id := range l {
 			if !slices.Contains(p, id) {
@@ -621,42 +629,112 @@ func TestSearchJudgmentsPGCoversFTS(t *testing.T) {
 		{"fd update", []string{"d1", "d2", "d3", "d4", "d6"}, []string{"d1", "d2", "d3", "d4", "d6"}, "조각은 AND 다(d10 · d11 은 하나만 품는다)"},
 		{"🦊", []string{"d12"}, []string{"d12"}, "6.1 이후 이모지도 두 판에서 낱말이다"},
 		{"판단을\x00남긴다\xff", []string{"d5"}, []string{"d5"}, "NUL · 깨진 바이트가 든 검색도 두 판에서 돈다"},
+		{"ª", []string{"d15"}, []string{"d15"}, "대조: 온전한 ª(U+00AA) 는 두 판에서 낱말이다"},
+		{"\xaa", nil, nil, "깨진 바이트 0xAA 는 두 판에서 가름표다(SQLite 판이 U+00AA 로 읽어 ª 를 찾으면 안 된다)"},
+		{"\x00\xaa", nil, nil, "NUL 뒤의 깨진 바이트도 두 판에서 가름표다"},
+		{"ª\xaa서수", []string{"d15"}, []string{"d15"}, "깨진 바이트가 구절 가운데에 있어도 두 판이 같은 낱말을 본다"},
 		{"판단", nil, []string{"d5"}, "낱말 단위와 부분 일치"},
 		{"ωmega", []string{"d8"}, []string{"d8"}, "한글 밖 대소문자 접기"},
 		{"cafe", []string{"d9"}, nil, "받아들인 예외: 발음 구별 기호 접기는 FTS5 에만 있다"},
 		{"ΛΟΓΟΣ", []string{"d13"}, nil, "받아들인 예외: 대소문자 특수 접기(ς→σ)는 FTS5 에만 있다"},
 		{"sun", []string{"d14"}, nil, "받아들인 예외: 대소문자 특수 접기(ſ→s)는 FTS5 에만 있다"},
+		{"sqz1", []string{"f1"}, nil, "받아들인 예외: 대소문자 특수 접기(ẛ→s)"},
+		{"μqz2", []string{"f2"}, nil, "받아들인 예외: 대소문자 특수 접기(µ→μ)"},
+		{"βqz3", []string{"f3"}, nil, "받아들인 예외: 대소문자 특수 접기(ϐ→β)"},
+		{"εqz4", []string{"f4"}, nil, "받아들인 예외: 대소문자 특수 접기(ϵ→ε)"},
+		{"θqz5", []string{"f5"}, nil, "받아들인 예외: 대소문자 특수 접기(ϑ→θ)"},
+		{"κqz6", []string{"f6"}, nil, "받아들인 예외: 대소문자 특수 접기(ϰ→κ)"},
+		{"πqz7", []string{"f7"}, nil, "받아들인 예외: 대소문자 특수 접기(ϖ→π)"},
+		{"ρqz8", []string{"f8"}, nil, "받아들인 예외: 대소문자 특수 접기(ϱ→ρ)"},
+		{"φqz9", []string{"f9"}, nil, "받아들인 예외: 대소문자 특수 접기(ϕ→φ)"},
+		{long + "c", []string{"g1"}, nil, "받아들인 예외: FTS5 는 32,768 바이트를 넘는 낱말을 잘라 뒤가 달라도 맞힌다"},
+		{long + "b", []string{"g1"}, []string{"g1"}, "대조: 긴 낱말도 똑같으면 두 판이 맞힌다"},
 		{"---", nil, nil, "가름표만 친 검색은 맞을 판단이 없다(조각 없는 검색이 전부를 내면 안 된다)"},
 	} {
 		if l, p := search(lite, c.q), search(pg, c.q); !slices.Equal(l, c.lite) || !slices.Equal(p, c.pg) {
-			t.Errorf("%q(%s): SQLite %v(기대 %v), Postgres %v(기대 %v)", c.q, c.why, l, c.lite, p, c.pg)
+			t.Errorf("%q(%s): SQLite %v(기대 %v), Postgres %v(기대 %v)", clip(c.q, 40), c.why, l, c.lite, p, c.pg)
 		}
 	}
 }
 
-// TestSearchJudgmentsRejectsTooManyTerms 는 조각이 상한을 넘는 검색어와 빈 검색어를 두 엔진이 같은 입력 오류
-// (*SearchQueryError)로 거절하는지 잰다. 표면은 이 타입을 400 으로 낸다(api 의 TestSearchJudgmentsTooManyTermsIs400).
-func TestSearchJudgmentsRejectsTooManyTerms(t *testing.T) {
-	bothEngines(t, func(t *testing.T, s *Store) {
-		ctx := context.Background()
+// TestSearchJudgmentsHasNoTermLimit 는 검색어의 조각 수에 상한이 없는지 두 엔진에서 잰다. 앞 판은 조각 33개부터
+// 두 엔진 모두 입력 오류로 거절해, 예전 SQLite 판이 찾던 검색(`w0` 부터 `w32` 까지)이 깨졌다.
+//
+// 33개 · 100개 검색이 두 엔진에서 같은 판단을 찾는지 본다(빈칸이 없어도 조각으로 센다). Postgres 판은 앞 32개 조각만
+// 인덱스 조건이고 나머지는 배열 하나로 넘긴 행 거르기라(trgmSearch 의 ★), 빠진 조각이 그 거르기 쪽에 있는 판단(head ·
+// most)이 안 맞는지(AND), 대문자로 적은 판단(upper)이 맞는지(대소문자 무시) 본다. 낱말 길이를 같게 둬 부분 일치가
+// 다른 낱말 안에서 맞는 일이 없게 한다(w005 는 w050 안에 없다).
+func TestSearchJudgmentsHasNoTermLimit(t *testing.T) {
+	ctx := context.Background()
+	words := make([]string, 100)
+	for i := range words {
+		words[i] = fmt.Sprintf("w%03d", i)
+	}
+	without := func(i int) []string { return slices.Delete(slices.Clone(words), i, i+1) }
+	upper := slices.Clone(words)
+	upper[90] = "W090"
+	lite, pg := newStore(t), newPGStore(t, lockTimeout)
+	for _, s := range []*Store{lite, pg} {
 		seed(t, s, "p")
-		words := make([]string, maxSearchTerms+1)
-		for i := range words {
-			words[i] = fmt.Sprintf("w%d", i)
-		}
-		if _, err := s.SearchJudgments(ctx, "", strings.Join(words[:maxSearchTerms], " "), 0); err != nil {
-			t.Fatalf("조각 %d개는 받아야 한다: %v", maxSearchTerms, err)
-		}
-		var qe *SearchQueryError
-		for _, q := range []string{strings.Join(words, " "), strings.Join(words, "-")} { // 빈칸이 없어도 조각으로 센다
-			if _, err := s.SearchJudgments(ctx, "", q, 0); !errors.As(err, &qe) || !strings.Contains(err.Error(), fmt.Sprint(maxSearchTerms+1)) {
-				t.Fatalf("조각 %d개 검색이 입력 오류가 아니다: %v", maxSearchTerms+1, err)
+		for _, d := range []struct {
+			id    string
+			words []string
+		}{
+			{"all", words},
+			{"head", words[:32]},  // w032 부터 없다
+			{"most", without(90)}, // w090 만 없다
+			{"upper", upper},
+		} {
+			if _, err := s.AddJudgment(ctx, model.Judgment{ID: d.id, Project: "p", Kind: model.JudgmentDecision,
+				Body: strings.Join(d.words, " ")}); err != nil {
+				t.Fatal(err)
 			}
 		}
-		if _, err := s.SearchJudgments(ctx, "", " \t ", 0); !errors.As(err, &qe) {
-			t.Fatalf("빈 검색어가 입력 오류가 아니다: %v", err)
+	}
+	for _, c := range []struct {
+		q, want string
+	}{
+		{strings.Join(words[:32], " "), "all,head,most,upper"},
+		{strings.Join(words[:33], " "), "all,most,upper"},
+		{strings.Join(words[:33], "-"), "all,most,upper"},
+		{strings.Join(words, " "), "all,upper"},
+		{strings.Join(words, " ") + " 없는낱말", ""},
+	} {
+		for _, s := range []*Store{lite, pg} {
+			js, err := s.SearchJudgments(ctx, "", c.q, 0)
+			ids := strings.Split(judgmentIDs(js), ",")
+			slices.Sort(ids)
+			if got := strings.Join(ids, ","); err != nil || got != c.want {
+				t.Errorf("조각 %d개 검색(%s): %q %v, 기대 %q", len(SearchTerms(c.q)), s.db.eng, got, err, c.want)
+			}
 		}
-	})
+	}
+}
+
+// TestTrgmSearchBindCountIsBounded 는 Postgres 판 검색의 바인드 수가 조각 수와 상관없이 indexedTerms + 5 개를 넘지
+// 않는지 잰다. 조각마다 바인드를 붙이면 조각이 수만 개인 검색어가 문장 하나의 바인드 한도(65,535)를 넘어 질의를 못
+// 짓는다. 한도를 넘는 조각 수로 Postgres 에서 실제로 돌려, 드라이버가 []string 을 text[] 로 넘기는지와 질의가 메모리를
+// 조각 수의 제곱으로 쓰지 않는지(그 꼴은 이 조각 수에서 Postgres 백엔드가 메모리 부족으로 죽는다)까지 본다. 조각은
+// 모두 같은 낱말이다 - 서로 다른 낱말 7만 개를 품은 본문은 부분 일치에 행마다 수십 초가 걸린다. SQLite 판은 돌리지
+// 않는다(FTS5 가 구절 7만 개에 십여 초를 쓴다). 두 엔진의 같은 결과는 TestSearchJudgmentsHasNoTermLimit 가 잰다.
+func TestTrgmSearchBindCountIsBounded(t *testing.T) {
+	ctx := context.Background()
+	const n = 70000
+	raw := strings.TrimSpace(strings.Repeat("낱말 ", n))
+	sq := trgmSearch("", raw, 10)
+	if pats, ok := sq.args[2+indexedTerms].([]string); len(sq.args) != indexedTerms+5 || !ok || len(pats) != n-indexedTerms {
+		t.Fatalf("바인드 %d개(기대 %d개), 무늬 배열 %T", len(sq.args), indexedTerms+5, sq.args[2+indexedTerms])
+	}
+	s := newPGStore(t, lockTimeout)
+	seed(t, s, "p")
+	for _, d := range []struct{ id, body string }{{"hit", "낱말"}, {"miss", "다른 글"}} {
+		if _, err := s.AddJudgment(ctx, model.Judgment{ID: d.id, Project: "p", Kind: model.JudgmentDecision, Body: d.body}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if js, err := s.SearchJudgments(ctx, "", raw, 0); err != nil || judgmentIDs(js) != "hit" {
+		t.Fatalf("조각 %d개 검색: %q %v", n, judgmentIDs(js), err)
+	}
 }
 
 // TestTrgmSearchRanksBySimilarityThenNewest 는 Postgres 판의 순위를 잰다: 원문과 비슷한 판단이 먼저, 같으면 최신 먼저.
@@ -685,15 +763,52 @@ func TestTrgmSearchRanksBySimilarityThenNewest(t *testing.T) {
 	}
 }
 
+// TestTrgmSearchRanksByRawQuery 는 Postgres 판의 순위가 조각을 이은 글이 아니라 원문과의 유사도인지 잰다. `xⓐy` 의
+// 조각은 x · y 라 둘 다 맞지만, 원문과 똑같은 판단이 먼저다. 조각을 빈칸으로 이어 유사도에 넘기면 `x y` 판단이 먼저
+// 온다. 똑같은 판단을 더 오래된 쪽에 둬 최신 먼저로 우연히 서지 않게 한다. NUL · 깨진 바이트가 든 원문도 순위를 짓는다
+// (그대로 넘기면 Postgres 가 22021 로 질의를 거절한다).
+func TestTrgmSearchRanksByRawQuery(t *testing.T) {
+	ctx := context.Background()
+	s := newPGStore(t, lockTimeout)
+	seed(t, s, "p")
+	t0 := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	for i, d := range []struct{ id, body string }{
+		{"exact", "xⓐy"},
+		{"split", "x y"},
+	} {
+		if _, err := s.AddJudgment(ctx, model.Judgment{ID: d.id, Project: "p", Kind: model.JudgmentDecision, Body: d.body,
+			At: t0.Add(time.Duration(i) * time.Minute)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, q := range []string{"xⓐy", "xⓐy\x00", "xⓐy\xff"} {
+		if js, err := s.SearchJudgments(ctx, "p", q, 0); err != nil || judgmentIDs(js) != "exact,split" {
+			t.Errorf("%q 순위: %s %v(기대 exact,split)", q, judgmentIDs(js), err)
+		}
+	}
+}
+
 // TestTrgmSearchUsesTheIndex 는 Postgres 판 검색이 기준선의 식 인덱스(judgment_text_trgm)를 탈 수 있는지 실행 계획으로 잰다.
 //
 // ★ 식이 인덱스와 한 글자라도 다르면 검색 결과는 같은데 매번 표 전체를 훑는다 - 결과 시험으로는 안 보인다. 순차 훑기를
 // 끈 연결에서 계획에 인덱스 이름이 없으면 그 식으로는 인덱스를 못 탄다는 뜻이다. 프로젝트를 비워(전 프로젝트 검색) 거르는
 // 조건을 본문 일치 하나로 둔다 - 프로젝트를 주면 빈 표에서는 플래너가 프로젝트 인덱스를 골라 이 잣대가 안 선다.
+//
+// ★ 조각이 인덱스 조건이 되는 수도 센다(trgmSearch 의 ★). 조각은 indexedTerms 를 넘게 두고, 짧은 조각(trigram 이
+// 없다)을 앞에 둔다: 긴 조각 indexedTerms 개가 모두 인덱스 조건의 ILIKE(`~~*`)이고, 짧은 조각은 행 거르기의 LIKE ALL
+// 이고, 행 거르기에 ILIKE 가 없어야 한다. `ILIKE ALL` 꼴은 인덱스를 아예 못 타고, 조각 일치가 행 거르기로 밀리면 인덱스로
+// 좁히지 못한다.
 func TestTrgmSearchUsesTheIndex(t *testing.T) {
 	ctx := context.Background()
 	s := newPGStore(t, lockTimeout)
-	sq := trgmSearch("", SearchTerms("판단을 남긴다"), 10)
+	var short, long []string
+	for i := range 8 {
+		short = append(short, fmt.Sprintf("x%d", i))
+	}
+	for i := range indexedTerms {
+		long = append(long, fmt.Sprintf("판단%02d", i))
+	}
+	sq := trgmSearch("", strings.Join(append(slices.Clone(short), long...), " "), 10)
 	q, err := bindDollar(sq.sql)
 	if err != nil {
 		t.Fatal(err)
@@ -722,7 +837,29 @@ func TestTrgmSearchUsesTheIndex(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(plan, "\n"), "judgment_text_trgm") {
-		t.Fatalf("검색이 식 인덱스 judgment_text_trgm 을 못 탄다:\n%s", strings.Join(plan, "\n"))
+	all := strings.Join(plan, "\n")
+	if !strings.Contains(all, "judgment_text_trgm") {
+		t.Fatalf("검색이 식 인덱스 judgment_text_trgm 을 못 탄다:\n%s", all)
+	}
+	var cond, filter string
+	for _, line := range plan {
+		switch l := strings.TrimSpace(line); {
+		case strings.HasPrefix(l, "Index Cond:"):
+			cond += l
+		case strings.HasPrefix(l, "Filter:"):
+			filter += l
+		}
+	}
+	if n := strings.Count(cond, "~~*"); n != indexedTerms || strings.Contains(filter, "~~*") {
+		t.Fatalf("인덱스 조건의 조각 일치 %d개(기대 %d개), 행 거르기의 ILIKE %v:\n%s",
+			n, indexedTerms, strings.Contains(filter, "~~*"), all)
+	}
+	for _, w := range long {
+		if !strings.Contains(cond, likeContains(w)) {
+			t.Fatalf("긴 조각 %s 가 인덱스 조건에 없다:\n%s", w, all)
+		}
+	}
+	if !strings.Contains(filter, "~~ ALL") {
+		t.Fatalf("인덱스 조건에 못 든 짧은 조각이 행 거르기(LIKE ALL)에 없다:\n%s", all)
 	}
 }

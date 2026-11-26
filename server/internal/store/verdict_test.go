@@ -403,6 +403,9 @@ func TestFTSQuery(t *testing.T) {
 		{"OR 도 리터럴이 된다", "a OR b", `"a" "OR" "b"`},
 		// NUL 은 FTS5 해석기에서 글의 끝이다. 구절 안의 빈칸(같은 가름표)으로 바꾼다.
 		{"NUL 은 구절 안의 빈칸", "판단\x00남긴다 x", `"판단 남긴다" "x"`},
+		// 깨진 UTF-8 바이트도 구절 안의 빈칸이다. 그대로 두면 unicode61 이 홀로 선 0xAA 를 ª(U+00AA) 낱말로 읽는다.
+		{"깨진 바이트는 구절 안의 빈칸", "ª\xaa서수 \xff", `"ª 서수" " "`},
+		{"NUL 과 깨진 바이트", "\x00\xaa", `"  "`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
