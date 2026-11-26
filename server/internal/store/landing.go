@@ -141,9 +141,14 @@ func ValidateResourceName(name string) error {
 // 새로 넣지 않고 그것을 그대로 돌려준다.
 //
 // ★ 먼저 조회해 판정하지 않는다(AcquireResource 와 같은 이유). 그냥 넣고 **부분 유니크
-// 인덱스의 위반을 받아** 이미 있는 행을 조회한다. 재진입을 앱 판정으로 두면 조회와 삽입
+// 인덱스에 막히면** 이미 있는 행을 조회한다. 재진입을 앱 판정으로 두면 조회와 삽입
 // 사이에 같은 세션의 다른 호출이 끼어들 수 있고, 그때 한 세션이 줄을 두 자리 차지해
 // 순번 자체가 거짓이 된다.
+//
+// ★ 막힘은 `ON CONFLICT DO NOTHING RETURNING` 으로 「행이 안 돌아왔다」로 받는다(AcquireResource 와 같은 선택과 까닭:
+// 흡수할 것이 이 문장의 유니크 충돌 하나뿐이다). 앞 판은 삽입 오류를 받고 같은 트랜잭션에서 살아 있는 행을
+// 읽어 **성공으로** 돌려줬다 - Postgres 에서는 그 읽기가 25P02 로 죽고, 살아남았더라도 버려진 트랜잭션이라
+// 뒤의 자원 획득과 커밋이 다 실패했다. 순번(id)도 RETURNING 으로 받는다.
 //
 // Store 짝을 두지 않는다 — 이 호출은 항상 service 가 다른 쓰기와 묶어 부르는 것이
 // 설계 의도다(레인이 비어 있으면 곧바로 AcquireResource 를 같은 트랜잭션에서 잇는다).
@@ -172,33 +177,29 @@ func (t *Tx) EnqueueLanding(project, sessionID string, resources []string, at ti
 		}
 	}
 	at = atStamp(at)
-	res, err := t.tx.ExecContext(t.ctx, `
+	id, inserted, err := t.insertUnlessTaken(`
 		INSERT INTO landing_queue(project, session_id, enqueued_at, left_at, left_kind, left_detail)
 		VALUES (?, ?, ?, NULL, NULL, NULL)`,
 		project, sessionID, fmtTime(at))
-	if err != nil {
+	if err == nil && !inserted {
+		// 이미 서 있다. **자원 집합까지 채워** 그대로 낸다(liveLandingRow 가
+		// attachResources 를 이미 거친다) — 요청 집합과 다른지의 판정(거절)은
+		// service 몫이다. 여기서 거절하면 재진입 안전이 깨진다.
 		row, qErr := liveLandingRow(t.ctx, t.tx, project, sessionID)
-		if qErr == nil {
-			// 이미 서 있다. **자원 집합까지 채워** 그대로 낸다(liveLandingRow 가
-			// attachResources 를 이미 거친다) — 요청 집합과 다른지의 판정(거절)은
-			// service 몫이다. 여기서 거절하면 재진입 안전이 깨진다.
-			return row, nil
-		}
-		if !errors.Is(qErr, ErrNotFound) {
+		if qErr != nil {
+			// 충돌했는데 살아 있는 행이 없다면 재진입 인덱스가 아닌 유니크 제약에 걸린 것이다(지금 스키마에는 없다).
 			return model.LandingRow{}, fmt.Errorf(
-				"랜딩 줄 서기 실패(project=%q session=%q): %w (살아 있는 줄 행 조회도 실패: %v)",
-				clip(project, 64), clip(sessionID, 64), err, qErr)
+				"랜딩 줄 서기가 유니크 충돌로 막혔는데 살아 있는 줄 행을 못 읽었다(project=%q session=%q): %w",
+				clip(project, 64), clip(sessionID, 64), qErr)
 		}
-		// 살아 있는 행이 없는데 삽입이 실패했다 = 재진입이 아닌 다른 오류(FK·CHECK 등).
+		return row, nil
+	}
+	if err != nil {
+		// 유니크 충돌이 아닌 오류(FK · CHECK 등).
 		return model.LandingRow{}, writeErr(err, writeTarget{
 			Target: TargetLandingQueue, Project: project, ID: sessionID,
 			RefHint: fmt.Sprintf("프로젝트 %s · 세션 %s", clip(project, 64), clip(sessionID, 64)),
 		}, "랜딩 줄 서기 실패(project=%q session=%q)", clip(project, 64), clip(sessionID, 64))
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return model.LandingRow{}, fmt.Errorf("랜딩 줄 순번 확인 실패(project=%q session=%q): %w",
-			clip(project, 64), clip(sessionID, 64), err)
 	}
 	for _, r := range sorted {
 		if _, err := t.tx.ExecContext(t.ctx,

@@ -152,7 +152,8 @@ const (
 	FaultDeadlock FaultKind = "deadlock"
 	// FaultAborted 는 앞 문장의 오류 뒤에 같은 트랜잭션에서 이어 간 것이다(25P02, 그리고 그렇게 버려진
 	// 트랜잭션의 COMMIT 이 ROLLBACK 으로 끝난 것). SQLite 는 실패한 문장만 되돌리지만 Postgres 는 트랜잭션
-	// 전체를 버린다. 서버 결함이다 - 오류를 받고 이어 가야 하는 자리는 Savepoint 로 감싼다.
+	// 전체를 버린다. 서버 결함이다 - 오류를 받고 이어 가야 하는 자리는 Tx.Savepoint 로 감싸거나
+	// ON CONFLICT DO NOTHING 으로 오류 자체를 안 만든다(Tx 주석의 「오류의 뜻」, savepoint_guard_test.go 가 소스로 잠근다).
 	FaultAborted FaultKind = "aborted"
 )
 
@@ -263,7 +264,8 @@ func JudgeSQLState(state string) ConstraintVerdict {
 	case "25P02":
 		return ConstraintVerdict{Fault: FaultAborted,
 			Reason: "앞 문장의 오류 뒤에 같은 트랜잭션에서 이어 갔다(SQLSTATE 25P02) - Postgres 는 그 트랜잭션 " +
-				"전체를 버린다. 오류를 받고 이어 가야 하는 자리는 Savepoint 로 감싸라"}
+				"전체를 버린다. 오류를 받고 이어 가야 하는 자리는 Tx.Savepoint 로 감싸거나 ON CONFLICT DO NOTHING 으로 " +
+				"오류를 안 만들어라"}
 	}
 	if strings.HasPrefix(state, "23") {
 		return ConstraintVerdict{

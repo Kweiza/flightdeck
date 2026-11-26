@@ -182,6 +182,9 @@ type Store struct {
 // ★ **오류의 뜻은 엔진마다 다르다.** SQLite 는 실패한 문장만 되돌리고 트랜잭션은 산다. Postgres 는 한 문장이
 // 실패하면 트랜잭션 전체를 버리고(25P02) 뒤 문장과 커밋이 다 실패한다. 클로저 안에서 DB 오류를 받고 이어 가면
 // Postgres 에서 그 트랜잭션은 커밋되지 않는다 - runTx 가 그것을 TxFault(FaultAborted)로 낸다.
+// 오류를 받고 이어 가야 하는 자리는 둘 중 하나로 쓴다(savepoint_guard_test.go 가 소스로 잠근다):
+//   - 오류 자체를 안 만든다: 흡수할 것이 그 문장의 유니크 충돌 하나뿐이면 `INSERT … ON CONFLICT DO NOTHING RETURNING`(insertUnlessTaken).
+//   - 오류를 저장점 안에 가둔다: 흡수할 오류가 남의 메서드 안에서 나거나 종류를 가려 받아야 하면 Savepoint.
 //
 // 이 아래는 SQLite 판의 근거다.
 //
@@ -199,11 +202,14 @@ type Store struct {
 // 그래서 **읽기는 Tx 를 안 거치고** Store 의 조회 메서드가 s.db 로 바로 질의한다(WAL 이라 안 막힌다).
 // 여러 질의가 한 시점을 봐야 하는 읽기는 ReadTx 다.
 //
-// 중첩 트랜잭션은 지원하지 않는다(SAVEPOINT 를 쓰지 않는다).
+// 중첩 트랜잭션은 지원하지 않는다. 트랜잭션 안의 저장점(Savepoint)은 오류를 가두는 데만 쓴다.
 type Tx struct {
 	tx  *txConn
 	ctx context.Context
 	s   *Store
+
+	// savepoints 는 이 트랜잭션이 연 저장점 수다. 저장점 이름의 번호가 된다(Savepoint).
+	savepoints int
 
 	// deferred 는 이 트랜잭션 안에서 남기려 한 계측 이벤트다.
 	//
@@ -235,6 +241,75 @@ type pendingEvent struct {
 // 롤백돼도 남는다 — 실패한 시도가 원장에서 사라지면 그 실패를 나중에 셀 수 없다.
 func (t *Tx) LogEvent(kind, project, sessionID string, payload any) {
 	t.deferred = append(t.deferred, pendingEvent{kind, project, sessionID, payload})
+}
+
+// Savepoint 는 fn 을 이 트랜잭션 안의 저장점에서 돌린다. fn 이 오류를 내면 저장점까지 되돌리고 그 오류를 그대로
+// 낸다 - 트랜잭션은 살아 있어 뒤 문장과 커밋이 그대로 돈다. fn 이 성공하면 저장점을 풀고 쓴 것은 남긴다.
+//
+// ★ Tx 안에서 DB 오류를 받고 같은 Tx 로 이어 가는 자리는 반드시 이 안에서 부른다(Tx 주석의 「오류의 뜻」).
+// Postgres 는 문장 하나가 실패하면 트랜잭션 전체를 버린다(25P02) - 저장점 없이 오류를 삼키면 앞서 쓴 것까지
+// 커밋되지 않는다. SQLite 도 SAVEPOINT 를 같은 뜻으로 지원하므로 엔진 분기가 없다.
+//
+// ★ 되돌리기는 fn 전체다. fn 이 문장 둘을 쓰고 둘째에서 실패하면 첫째도 되돌아간다 - 반쯤 쓴 것을 남기지 않는다.
+// 예약 이벤트(t.LogEvent)는 되돌리지 않는다 - 시도의 기록이라 트랜잭션 버퍼에 그대로 남는다.
+//
+// fn 은 같은 *Tx 를 받는다. 저장점은 중첩해도 된다(이름에 번호가 붙고, 되돌리기 · 풀기는 늘 가장 안쪽부터다).
+func (t *Tx) Savepoint(fn func(*Tx) error) error {
+	t.savepoints++
+	name := "fd_sp_" + strconv.Itoa(t.savepoints)
+	if _, err := t.tx.ExecContext(t.ctx, "SAVEPOINT "+name); err != nil {
+		return fmt.Errorf("저장점 %s 만들기 실패: %w", name, err)
+	}
+	if err := fn(t); err != nil {
+		// 되돌린 뒤 풀어 둔다 - ROLLBACK TO 는 저장점을 남기므로, 안 풀면 같은 트랜잭션 안에 저장점이 쌓인다.
+		if _, rbErr := t.tx.ExecContext(t.ctx, "ROLLBACK TO SAVEPOINT "+name); rbErr != nil {
+			return fmt.Errorf("%w (저장점 %s 되돌리기도 실패: %v)", err, name, rbErr)
+		}
+		if relErr := t.releaseSavepoint(name); relErr != nil {
+			return fmt.Errorf("%w (%v)", err, relErr)
+		}
+		return err
+	}
+	return t.releaseSavepoint(name)
+}
+
+// SavepointValue 는 값을 돌려주는 fn 을 저장점 안에서 부르는 Savepoint 다(읽기를 저장점에 가둘 때의 꼴).
+// fn 이 오류를 내면 값은 영값이다.
+func SavepointValue[T any](t *Tx, fn func(*Tx) (T, error)) (T, error) {
+	var v T
+	err := t.Savepoint(func(sp *Tx) error {
+		var err error
+		v, err = fn(sp)
+		return err
+	})
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return v, nil
+}
+
+func (t *Tx) releaseSavepoint(name string) error {
+	if _, err := t.tx.ExecContext(t.ctx, "RELEASE SAVEPOINT "+name); err != nil {
+		return fmt.Errorf("저장점 %s 풀기 실패: %w", name, err)
+	}
+	return nil
+}
+
+// insertUnlessTaken 은 `INSERT …` 한 문장에 `ON CONFLICT DO NOTHING RETURNING id` 를 붙여 돌린다.
+// 유니크 충돌로 안 들어갔으면 inserted 가 거짓이고 오류는 없다 - 트랜잭션은 멀쩡하다(Tx 주석의 「오류의 뜻」).
+// 유니크 충돌이 아닌 위반(FK · CHECK · NOT NULL)은 그대로 오류로 온다.
+//
+// ★ 충돌 대상을 적지 않는다: 그 표의 유니크 제약 · 인덱스 전부(부분 유니크 인덱스 포함)가 대상이다. 그래서 이것을
+// 쓰는 표는 「막혔다」가 곧 「살아 있는 것이 이미 있다」인 표여야 한다(resource_hold · landing_queue).
+func (t *Tx) insertUnlessTaken(insert string, args ...any) (id int64, inserted bool, err error) {
+	err = t.tx.QueryRowContext(t.ctx, insert+`
+		ON CONFLICT DO NOTHING
+		RETURNING id`, args...).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	return id, err == nil, err
 }
 
 // Open 은 DB 를 연다. **마이그레이션을 적용하지 않는다**(설계 §7 처방 ①).

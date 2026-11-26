@@ -77,12 +77,14 @@ func (e *ResourceHeldError) Error() string {
 // AcquireResource 는 자원을 배타 점유한다.
 //
 // ★ 먼저 조회해 판정하지 않는다. 조회와 삽입 사이에 남이 잡을 수 있기 때문이다.
-// 그냥 넣고 **부분 유니크 인덱스(resource_one_holder)의 위반을 받아** 점유자를 담은 오류로 바꾼다.
+// 그냥 넣고 **부분 유니크 인덱스(resource_one_holder)에 막히면** 점유자를 담은 오류로 바꾼다.
 // 배타를 애플리케이션 판정이 아니라 DB 제약으로 두면 우회할 코드 자체가 없다.
 //
-// 위반 판별을 드라이버의 오류 코드로 하지 않는 이유: 삽입이 실패한 뒤 **살아 있는 점유자를
-// 실제로 조회해** 있으면 ResourceHeldError, 없으면 원래 오류를 그대로 올린다.
-// 어느 쪽이든 점유자를 조회해야 오류에 실을 수 있으므로 드라이버 내부에 기대는 대가가 순이익이 아니다.
+// ★ 막힘을 오류가 아니라 「행이 안 돌아왔다」로 받는다(`ON CONFLICT DO NOTHING RETURNING`).
+// 고른 까닭: 흡수할 것이 이 문장의 유니크 충돌 하나뿐이라 저장점(Savepoint) 없이 오류 자체를 안 만들 수 있다.
+// 앞 판은 삽입 오류를 받은 뒤 같은 트랜잭션에서 점유자를 조회했는데, Postgres 는 실패한 문장 뒤의 트랜잭션을
+// 통째로 버려(25P02) 그 조회가 죽고 ResourceHeldError 대신 일반 오류가 나갔다. FK · CHECK 위반은 유니크 충돌이
+// 아니라 그대로 오류로 와서 writeErr 가 옮긴다. id 도 RETURNING 으로 받는다(Postgres 드라이버에 LastInsertId 가 없다).
 //
 // ★ 획득 시각을 **받는다**(Beat·Touch·EnqueueLanding 과 같은 문법 — 영값이면 지금. atStamp).
 // 이 값이 곧 레인 절의 **획득 경과**이고, 스스로 실시계를 찍으면 주입된 시계로 그리는
@@ -97,38 +99,34 @@ func (t *Tx) AcquireResource(project, resource string, h Holder, at time.Time) (
 		return model.ResourceHold{}, err
 	}
 	at = atStamp(at)
-	res, err := t.tx.ExecContext(t.ctx, `
+	id, inserted, err := t.insertUnlessTaken(`
 		INSERT INTO resource_hold(project, resource, session_id, job_id, acquired_at, released_at, force_reason)
 		VALUES (?, ?, ?, ?, ?, NULL, NULL)`,
 		project, resource, nullStr(h.SessionID), nullStr(h.JobID), fmtTime(at))
-	if err != nil {
+	if err == nil && !inserted {
+		// 유니크 충돌로 안 들어갔다 - 트랜잭션은 멀쩡하니 점유자를 읽어 담는다.
 		held, qErr := heldBy(t.ctx, t.tx, project, resource)
-		if qErr == nil {
-			return model.ResourceHold{}, &ResourceHeldError{
-				Project:    project,
-				Resource:   resource,
-				Holder:     Holder{SessionID: held.SessionID, JobID: held.JobID},
-				AcquiredAt: held.AcquiredAt,
-			}
-		}
-		if !errors.Is(qErr, ErrNotFound) {
-			// 점유자 조회까지 실패했다. 둘 다 남긴다 — 원인이 인덱스 위반이 아닐 수도 있다.
+		if qErr != nil {
+			// 충돌했는데 살아 있는 점유자가 없다면 배타 인덱스가 아닌 유니크 제약에 걸린 것이다(지금 스키마에는 없다).
 			return model.ResourceHold{}, fmt.Errorf(
-				"자원 획득 실패(project=%q resource=%q holder=%s): %w (점유자 조회도 실패: %v)",
-				clip(project, 64), clip(resource, 64), h, err, qErr)
+				"자원 획득이 유니크 충돌로 막혔는데 점유자를 못 읽었다(project=%q resource=%q holder=%s): %w",
+				clip(project, 64), clip(resource, 64), h, qErr)
 		}
-		// 살아 있는 점유자가 없는데 삽입이 실패했다 = 배타 위반이 아닌 다른 오류(FK·CHECK 등).
-		// 등록 안 된 프로젝트·세션으로 잡으면 여기로 오고, 그것은 호출자가 고칠 거리다.
+		return model.ResourceHold{}, &ResourceHeldError{
+			Project:    project,
+			Resource:   resource,
+			Holder:     Holder{SessionID: held.SessionID, JobID: held.JobID},
+			AcquiredAt: held.AcquiredAt,
+		}
+	}
+	if err != nil {
+		// 유니크 충돌이 아닌 오류(FK · CHECK 등). 등록 안 된 프로젝트 · 세션으로 잡으면 여기로 오고,
+		// 그것은 호출자가 고칠 거리다.
 		return model.ResourceHold{}, writeErr(err, writeTarget{
 			Target: TargetResourceHold, Project: project, ID: resource,
 			RefHint: fmt.Sprintf("프로젝트 %s · %s", clip(project, 64), h),
 		}, "자원 획득 실패(project=%q resource=%q holder=%s)",
 			clip(project, 64), clip(resource, 64), h)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return model.ResourceHold{}, fmt.Errorf("자원 점유 id 확인 실패(project=%q resource=%q): %w",
-			clip(project, 64), clip(resource, 64), err)
 	}
 	return model.ResourceHold{
 		ID: id, Project: project, Resource: resource,

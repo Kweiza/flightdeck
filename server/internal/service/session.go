@@ -237,8 +237,13 @@ func (s *Service) OpenSession(ctx context.Context, in OpenSessionInput) (Session
 			// 무는 자리라 거절하면 세션이 안 열리고, 그 대가로 얻는 것이 없다(잘못된 것은
 			// 클라이언트가 보낸 이름이지 이 세션의 정체가 아니다). 대신 **관측을 남긴다** —
 			// 지금까지 이 자리에 아무 흔적이 없던 것이 이 항목이 늦게 발견된 이유다.
-			if prior, perr := t.FindSession(in.MachineID, in.Worktree, in.CCSessionID); perr == nil &&
-				prior.Project != "" && prior.Project != in.Project {
+			//
+			// ★ 이 조회의 실패는 관측을 건너뛸 뿐 등록을 막지 않는다. 그래서 저장점 안에서 읽는다 - 아니면
+			//   Postgres 에서 읽기 실패가 트랜잭션을 버려(25P02) 등록까지 커밋되지 않는다(store.Tx 의 「오류의 뜻」).
+			prior, perr := store.SavepointValue(t, func(sp *store.Tx) (model.Session, error) {
+				return sp.FindSession(in.MachineID, in.Worktree, in.CCSessionID)
+			})
+			if perr == nil && prior.Project != "" && prior.Project != in.Project {
 
 				// ★ I-2(최종 리뷰): 이 이벤트를 무조건 남기면 안 된다. 이 갈래는 3중키가
 				// 살아 있는 한 OpenSession 이 불릴 때마다(훅 진입점 넷~다섯 자리, 그것도
@@ -327,7 +332,11 @@ func (s *Service) OpenSession(ctx context.Context, in OpenSessionInput) (Session
 		// (세션, 들어온 machine) 조합당 정확히 한 번이 된다. 건별로 남기면 원장이
 		// 프롬프트마다 4배로 증폭된다.
 		if created {
-			others, derr := t.DivergentSessions(in.CCSessionID, in.Project, in.MachineID)
+			// ★ 저장점 안에서 읽는다 - 아래 「관측 실패가 등록을 죽이면 안 된다」가 Postgres 에서도 서려면
+			//   실패한 읽기가 트랜잭션을 버리지(25P02) 않아야 한다.
+			others, derr := store.SavepointValue(t, func(sp *store.Tx) ([]model.Session, error) {
+				return sp.DivergentSessions(in.CCSessionID, in.Project, in.MachineID)
+			})
 			if derr != nil {
 				// 관측 실패가 세션 등록을 죽이면 안 된다 — 조정이 관측 때문에 멈추면
 				// 이 도구의 존재 이유가 사라진다. 삼키지 않고 사유만 남긴다.

@@ -342,13 +342,22 @@ func (s *Service) Finish(ctx context.Context, in FinishInput) (FinishResult, err
 		//
 		// ★ **여기서는 거절하지 않는다.** 오류를 올리면 ① 의 판단이 함께 롤백된다.
 		//   어긋난 것은 건너뛰고 원장에 남긴다 — 자격 거절은 tx 진입 전에 이미 끝났다.
+		//
+		// ★ 그래서 이 절에서 DB 오류를 받고 이어 가는 자리(아래 읽기 둘 · 후속 등록)는 전부 t.Savepoint 안이다.
+		//   Postgres 는 문장 하나가 실패하면 트랜잭션을 통째로 버려(25P02) 판단까지 커밋되지 않는다.
+		//   ON CONFLICT 로 오류를 안 만드는 길을 안 고른 까닭: 읽기 오류는 충돌이 아니고, 후속 등록은
+		//   중복이 거절이어야 하는 다른 호출자(add)와 같은 store 메서드다.
 		creates := make([]model.Item, 0, len(plan.Create))
 		for _, c := range plan.Create {
 			// ★ **c.Project 로 본다 — in.Project 가 아니다.** 후속이 멤버 레포로 갈 수
 			//   있고(증분 015), 여기서 요청 프로젝트로 존재를 물으면 «남의 레포에 같은
 			//   id 가 있나»를 엉뚱한 곳에서 묻게 된다. 그러면 이미 있는 항목 위에 덮어
 			//   쓰려다 아래 AddItem 의 중복 갈래로 빠지고, 그 이벤트는 원인을 틀리게 적는다.
-			if _, err := t.GetItem(c.Project, c.Item.ID); err == nil {
+			//
+			// 못 읽은 것(ErrNotFound 밖의 오류)은 「없다」와 같이 만들기로 간다 - 실제로 있으면 아래 중복 갈래가 받는다.
+			if _, err := store.SavepointValue(t, func(sp *store.Tx) (model.Item, error) {
+				return sp.GetItem(c.Project, c.Item.ID)
+			}); err == nil {
 				out.SkippedFollowups = append(out.SkippedFollowups, c.Item.ID)
 				t.LogEvent("item.followup_skipped", c.Project, in.SessionID, map[string]any{
 					"item": c.Item.ID,
@@ -364,7 +373,9 @@ func (s *Service) Finish(ctx context.Context, in FinishInput) (FinishResult, err
 		}
 		linked := make([]string, 0, len(plan.Link))
 		for _, id := range plan.Link {
-			it, err := t.GetItem(in.Project, id)
+			it, err := store.SavepointValue(t, func(sp *store.Tx) (model.Item, error) {
+				return sp.GetItem(in.Project, id)
+			})
 			// ★ **사유를 셋으로 가른다.** judgment·event 는 추가 전용이라 여기 적은 원인이
 			//   영구히 남는다 — "사라졌거나 닫혔다" 한 문구로 접으면 DB 를 못 읽었을 뿐인 것이
 			//   "닫혔다"로 굳고, 그 거짓은 나중에 되짚을 방법이 없다. 같은 파일의 itemExists 가
@@ -433,12 +444,14 @@ func (s *Service) Finish(ctx context.Context, in FinishInput) (FinishResult, err
 		//   그 거절이 미래에 느슨해질 수 있다), 무엇보다 여기서 오류를 올리면 ① 의 판단이
 		//   함께 죽는다. lane.release_skipped 갈래와 같은 성격의 최후 방어다.
 		//
-		// ★ 이 갈래도 **시험이 결정론적으로는 못 밟는다.** 바로 위 t.GetItem 선검사와
-		//   BEGIN IMMEDIATE(store/store.go:211)의 쓰기 직렬화 때문이다. 경합 시험이
-		//   전체 suite 부하에서 여기 닿을 때만 산출이 관측되고, 그 시험은 그 사실을
-		//   조건부로 단정한다(갈래를 못 고르기 때문이다).
+		// ★ 이 갈래는 바로 위 t.GetItem 선검사와 쓰기 직렬화(전역 잠금) 때문에 운영에서는 거의 안 밟힌다.
+		//   시험은 판단을 넣는 순간 같은 id 의 항목을 만드는 트리거로 갈래를 결정론적으로 고른다
+		//   (finish_savepoint_test.go, 두 엔진).
+		//
+		// ★ 저장점 안에서 부른다. 저장점이 없으면 Postgres 에서 이 중복 흡수가 트랜잭션을 버려 ① 의 판단까지
+		//   사라지고, SQLite 에서도 AddItem 이 선행 행을 쓰다 실패하면 반쯤 만든 항목이 남는다.
 		for _, it := range creates {
-			if err := t.AddItem(it); err != nil {
+			if err := t.Savepoint(func(sp *store.Tx) error { return sp.AddItem(it) }); err != nil {
 				var conflict *store.ConflictError
 				if errors.As(err, &conflict) && conflict.Kind == store.ConflictDuplicate {
 					out.SkippedFollowups = append(out.SkippedFollowups, it.ID)
