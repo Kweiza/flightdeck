@@ -75,9 +75,9 @@ func TestJudgeBusyFamily(t *testing.T) {
 		inReason  string
 		notReason string
 	}{
-		{"잠금 못 얻음", sqlite3.SQLITE_BUSY, FaultLockTimeout, "교착 회피 즉시 반환", "busy_timeout 을 넘었다"},
+		{"잠금 못 얻음", sqlite3.SQLITE_BUSY, FaultLockUnavailable, "교착 회피 즉시 반환", "busy_timeout 을 넘었다"},
 		{"낡은 스냅숏", sqlite3.SQLITE_BUSY_SNAPSHOT, FaultSerialization, "BUSY_SNAPSHOT", "넘었다"},
-		{"복구 중", sqlite3.SQLITE_BUSY_RECOVERY, FaultLockTimeout, "단정하지 않는다", "넘었다"},
+		{"복구 중", sqlite3.SQLITE_BUSY_RECOVERY, FaultLockUnavailable, "단정하지 않는다", "넘었다"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			v := JudgeConstraintCode(c.code)
@@ -129,7 +129,7 @@ func TestJudgeSQLState(t *testing.T) {
 		{"NOT NULL 은 안 접는다", "23502", "", "", "1차 방어"},
 		{"추가 전용 트리거는 안 접는다", "23000", "", "", "1차 방어"},
 		{"모르는 제약 축", "23P01", "", "", "아는 축이 아닌"},
-		{"잠금 대기 초과", "55P03", "", FaultLockTimeout, "lock_timeout"},
+		{"잠금 대기 초과", "55P03", "", FaultLockUnavailable, "lock_timeout"},
 		{"직렬화 실패", "40001", "", FaultSerialization, "트랜잭션 전체"},
 		{"교착", "40P01", "", FaultDeadlock, "엇갈리면"},
 		{"버려진 트랜잭션", "25P02", "", FaultAborted, "Savepoint"},
@@ -166,7 +166,7 @@ func TestAsFaultWrapsOnlyTxFaults(t *testing.T) {
 		kind FaultKind
 		code string
 	}{
-		{fmt.Errorf("문맥: %w", &pgconn.PgError{Code: "55P03"}), FaultLockTimeout, "55P03"},
+		{fmt.Errorf("문맥: %w", &pgconn.PgError{Code: "55P03"}), FaultLockUnavailable, "55P03"},
 		{fmt.Errorf("문맥: %w", &pgconn.PgError{Code: "40P01"}), FaultDeadlock, "40P01"},
 		{fmt.Errorf("문맥: %w", &pgconn.PgError{Code: "40001"}), FaultSerialization, "40001"},
 		{fmt.Errorf("커밋 실패: %w", pgx.ErrTxCommitRollback), FaultAborted, "25P02"},

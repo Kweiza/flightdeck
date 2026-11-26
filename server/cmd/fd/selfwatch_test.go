@@ -542,27 +542,38 @@ func TestNewSelfWatcherNamesTheBranchItCannotCover(t *testing.T) {
 	}
 }
 
-// TestVerifyWithSelfcheckPassesDBByEnvNotArgv 는 감시기가 원장 자리를 자식 argv 가 아니라 환경(FD_DB)으로 넘기는지
-// 잰다. 원장 자리가 접속 URL 이면 비밀번호를 품고, 프로세스 인자는 같은 기기의 다른 사용자도 읽는다(ps).
+// TestVerifyWithSelfcheckPassesDBByEngine 은 감시기가 원장 자리를 자식에게 넘기는 꼴을 엔진별로 잰다.
+//   - Postgres 접속 URL: 환경(FD_DB)으로만 넘긴다. 비밀번호를 품고, 프로세스 인자는 같은 기기의 다른 사용자도 읽는다(ps).
+//   - SQLite 파일: 환경과 함께 예전 계약대로 `--db <경로>` 도 넘긴다. FD_DB 를 안 읽는 옛 판 바이너리가 자식이어도
+//     정상 원장을 거절하지 않게.
+//
 // 부모 환경에 다른 FD_DB 가 있어도 넘긴 값이 이겨야 한다.
-func TestVerifyWithSelfcheckPassesDBByEnvNotArgv(t *testing.T) {
+func TestVerifyWithSelfcheckPassesDBByEngine(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("자식을 셸 스크립트로 흉내 낸다")
 	}
-	const dsn = "postgres://fd:hunter2@db/fd"
-	exe := filepath.Join(t.TempDir(), "fd")
-	script := "#!/bin/sh\n" +
-		"[ \"$FD_DB\" = '" + dsn + "' ] || { echo \"FD_DB 가 안 왔다\"; exit 1; }\n" +
-		"echo \"fd selfcheck ok build=argv[$*]\"\n"
-	if err := os.WriteFile(exe, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("FD_DB", "/somewhere/else.db")
-	got, err := verifyWithSelfcheck(context.Background(), exe, dsn)
-	if err != nil {
-		t.Fatalf("자식이 거절했다: %v", err)
-	}
-	if got != "argv[selfcheck]" {
-		t.Fatalf("자식 argv 가 %q 다 - selfcheck 하나여야 한다(원장 자리를 argv 에 싣지 않는다)", got)
+	for _, c := range []struct {
+		name, db, argv string
+	}{
+		{"Postgres 는 환경만", "postgres://fd:hunter2@db/fd", "selfcheck"},
+		{"SQLite 는 --db 도", "/srv/flightdeck/fd.db", "selfcheck --db /srv/flightdeck/fd.db"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			exe := filepath.Join(t.TempDir(), "fd")
+			script := "#!/bin/sh\n" +
+				"[ \"$FD_DB\" = '" + c.db + "' ] || { echo \"FD_DB 가 안 왔다\"; exit 1; }\n" +
+				"echo \"fd selfcheck ok build=argv[$*]\"\n"
+			if err := os.WriteFile(exe, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("FD_DB", "/somewhere/else.db")
+			got, err := verifyWithSelfcheck(context.Background(), exe, c.db)
+			if err != nil {
+				t.Fatalf("자식이 거절했다: %v", err)
+			}
+			if want := "argv[" + c.argv + "]"; got != want {
+				t.Fatalf("자식 argv 가 %q 다 - 기대 %q", got, want)
+			}
+		})
 	}
 }

@@ -258,7 +258,7 @@ func TestRenderMetrics(t *testing.T) {
 		DB: store.DBStats{
 			Locks: map[store.LockSpace]store.LockWait{
 				// 칸은 누적이 아닌 건수로 오고 문서는 누적으로 쓴다: 0.001 칸 1, 0.2 칸 2, 5초 넘음 1.
-				store.LockGlobal: {Buckets: lockBuckets(map[int]uint64{0: 1, 6: 2}), Count: 4, Sum: 6.5, Timeouts: 3},
+				store.LockGlobal: {Buckets: lockBuckets(map[int]uint64{0: 1, 6: 2}), Count: 4, Sum: 6.5, NotAcquired: 3},
 			},
 			PoolWaits: 7, PoolWaitSeconds: 1.25,
 		},
@@ -281,8 +281,9 @@ func TestRenderMetrics(t *testing.T) {
 		`flightdeck_tx_lock_wait_seconds_count{lock="global"} 4`,
 		// 안 쓴 공간도 0 으로 나온다(0 과 「안 잰다」를 가른다)
 		`flightdeck_tx_lock_wait_seconds_bucket{lock="obs",le="+Inf"} 0`,
-		`flightdeck_tx_lock_timeouts_total{lock="global"} 3`,
-		`flightdeck_tx_lock_timeouts_total{lock="obs"} 0`,
+		"# HELP flightdeck_tx_lock_not_acquired_total 잠금을 못 얻고 실패한",
+		`flightdeck_tx_lock_not_acquired_total{lock="global"} 3`,
+		`flightdeck_tx_lock_not_acquired_total{lock="obs"} 0`,
 		"flightdeck_db_pool_waits_total 7",
 		"flightdeck_db_pool_wait_seconds_total 1.250000",
 	} {
@@ -393,6 +394,16 @@ func TestAuthNoticeAndHealthzScrub(t *testing.T) {
 	}
 	if body.DBError == "" {
 		t.Fatal("DB 가 죽었는데 그 사실이 응답에 없다 — 침묵하면 배너가 정상으로 읽힌다")
+	}
+}
+
+// TestHealthzKeepsRemoteDiskReason 은 Postgres 원장이라 디스크를 재지 않은 사유(service.DiskRemote)를 /healthz 가
+// 「측정 실패 · 로그를 보라」로 바꾸지 않고 그대로 내는지 잰다. 그 갈래는 정상이라 서버 로그에 남는 것이 없다.
+func TestHealthzKeepsRemoteDiskReason(t *testing.T) {
+	body := HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true, DiskFreePct: -1, DiskError: service.DiskRemote},
+		true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
+	if body.DiskKnown || body.DiskError != service.DiskRemote {
+		t.Fatalf("원격 DB 의 디스크 항목이 (%v, %q)다 - 기대 (false, %q)", body.DiskKnown, body.DiskError, service.DiskRemote)
 	}
 }
 

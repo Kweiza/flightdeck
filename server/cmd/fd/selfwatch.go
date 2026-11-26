@@ -13,6 +13,7 @@ import (
 
 	"github.com/kweiza/flightdeck/internal/api"
 	"github.com/kweiza/flightdeck/internal/buildinfo"
+	"github.com/kweiza/flightdeck/internal/store"
 )
 
 // ExeID 는 실행 파일 하나의 정체다. 순수 값이다.
@@ -686,14 +687,13 @@ func (w *selfWatcher) step(ctx context.Context, drain func()) Action {
 
 // verifyWithSelfcheck 는 새 바이너리를 자식으로 한 번 돌린다.
 //
-// ★ 검사할 원장은 argv 가 아니라 환경(FD_DB)으로 넘긴다. 원장 자리가 접속 URL 이면 비밀번호를 품고, 프로세스
-// 인자는 같은 기기의 다른 사용자도 읽는다(ps). 부모 환경에 FD_DB 가 따로 있어도 뒤에 붙인 값이 이긴다
-// (exec.Cmd.Env 는 겹친 키의 마지막 값을 쓴다). 자식의 출력은 표시값만 싣는다(runSelfcheck) - 그 출력이 아래
-// 오류 본문으로 감시기의 로그 · 화면에 간다.
+// ★ 검사할 원장은 늘 환경(FD_DB)으로 넘기고, argv(--db)에는 SQLite 파일일 때만 싣는다(selfcheckArgs).
+// 부모 환경에 FD_DB 가 따로 있어도 뒤에 붙인 값이 이긴다(exec.Cmd.Env 는 겹친 키의 마지막 값을 쓴다).
+// 자식의 출력은 표시값만 싣는다(runSelfcheck) - 그 출력이 아래 오류 본문으로 감시기의 로그 · 화면에 간다.
 //
 // ★ Postgres 원장이면 자식이 「판 재기는 아직 없다」로 거절해 자가 갱신이 여기서 선다. 받아들인 한계다.
 func verifyWithSelfcheck(ctx context.Context, exe, db string) (string, error) {
-	cmd := exec.CommandContext(ctx, exe, "selfcheck")
+	cmd := exec.CommandContext(ctx, exe, selfcheckArgs(db)...)
 	cmd.Env = append(os.Environ(), dbEnv+"="+db)
 	out, err := cmd.CombinedOutput()
 	line := firstOutputLine(string(out))
@@ -705,6 +705,22 @@ func verifyWithSelfcheck(ctx context.Context, exe, db string) (string, error) {
 		return strings.TrimSpace(b), nil
 	}
 	return "", fmt.Errorf("selfcheck 가 계약된 첫 줄을 안 냈다: %s", clip(line, 200))
+}
+
+// selfcheckArgs 는 자식 selfcheck 의 argv 다. 순수 함수다.
+//
+// ★ 갈래가 둘인 까닭이 서로 다르다.
+//   - Postgres 접속 URL 은 argv 에 싣지 않는다. 비밀번호를 품고, 프로세스 인자는 같은 기기의 다른 사용자도 읽는다(ps).
+//   - SQLite 파일 경로는 예전 계약대로 `--db <경로>` 로도 싣는다. 감시기는 **새** 바이너리를 자식으로 부르는데, 그것이
+//     FD_DB 를 안 읽던 옛 판일 수 있다(되돌리기 배포). 환경만 넘기면 옛 판은 정상 원장도 「--db 가 없다」로 거절하고
+//     자가 갱신이 선다. 파일 경로는 비밀이 아니라 argv 에 실어도 잃을 것이 없다.
+//
+// Postgres 원장은 어느 판의 selfcheck 도 거절하므로(판 재기가 아직 없다) 옛 판과의 호환이 걸리지 않는다.
+func selfcheckArgs(db string) []string {
+	if store.ParseTarget(db).Postgres() {
+		return []string{"selfcheck"}
+	}
+	return []string{"selfcheck", "--db", db}
 }
 
 // firstOutputLine 은 자식 프로세스 출력의 첫 줄을 뽑는다.

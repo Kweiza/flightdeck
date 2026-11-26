@@ -90,6 +90,43 @@ func New(tb testing.TB) string {
 	return fd.clone(tb)
 }
 
+// CutConnections 는 New 가 준 DB 가 새 연결을 받지 않게 하고(ALLOW_CONNECTIONS false) 지금 붙은 연결을 모두 끊는다.
+// 서버가 다시 떴거나 연결이 끊긴 뒤 연결 풀의 재접속이 실패하는 자리를 흉내 낸다. 끊긴 연결이 다 빠질 때까지 기다린다 -
+// 안 기다리면 아직 안 죽은 연결이 다음 질의를 받아 재접속 길을 안 탄다. 지우는 것은 New 의 정리가 한다
+// (DROP DATABASE 는 그 DB 에 붙지 않는다).
+func CutConnections(tb testing.TB, dsn string) {
+	tb.Helper()
+	_, admin, err := server()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	name := strings.TrimPrefix(u.Path, "/")
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+	if _, err := admin.ExecContext(ctx, "ALTER DATABASE "+ident(name)+" WITH ALLOW_CONNECTIONS false"); err != nil {
+		tb.Fatalf("시험 DB 접속 막기 실패(%s): %v", name, err)
+	}
+	for {
+		var left int
+		if err := admin.QueryRowContext(ctx, `WITH k AS (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1)
+			SELECT count(*) FROM k`, name).Scan(&left); err != nil {
+			tb.Fatalf("시험 DB 연결 끊기 실패(%s): %v", name, err)
+		}
+		if left == 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			tb.Fatalf("시험 DB 연결이 %s 안에 안 빠졌다(%s, 남은 %d)", opTimeout, name, left)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 // opTimeout 은 DB 하나를 만들거나 지우는 한 번의 상한이다. 평소에는 1초도 안 걸린다 — 이것은 서버가
 // 응답하지 않을 때 시험이 영영 서지 않게 하는 상한일 뿐이다.
 const opTimeout = time.Minute

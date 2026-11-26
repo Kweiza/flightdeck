@@ -163,7 +163,7 @@ type dbtx interface {
 // Store 는 열린 DB 하나다.
 type Store struct {
 	db *conn
-	// path 는 SQLite 파일 경로다. Postgres 면 비밀번호를 가린 접속 URL 이다(로그 · 오류에 실린다).
+	// path 는 SQLite 파일 경로다. Postgres 면 접속 세부 없는 표시값(Target.Shown)이다(로그 · 오류에 실린다).
 	path  string
 	log   *slog.Logger
 	locks lockMeter
@@ -463,7 +463,7 @@ func (s *Store) verifyPragmas(ctx context.Context, want map[string]string) error
 // Close 는 DB 를 닫는다.
 func (s *Store) Close() error { return s.db.Close() }
 
-// Path 는 로그 · 출력에 실을 원장 자리다. SQLite 면 파일 경로, Postgres 면 가린 접속 URL(Target.Shown)이다.
+// Path 는 로그 · 출력에 실을 원장 자리다. SQLite 면 파일 경로, Postgres 면 접속 세부 없는 표시값(Target.Shown)이다.
 func (s *Store) Path() string { return s.path }
 
 // Postgres 는 이 원장이 Postgres 인가다. 참이면 Path 는 파일 경로가 아니다 - 파일 API(statfs · stat)에 넘기지 마라.
@@ -471,8 +471,8 @@ func (s *Store) Postgres() bool { return s.db.eng == enginePG }
 
 // DB 는 저수준 핸들이다. 자리표시 감싸개를 안 지나므로 Postgres 에서는 `?` 질의가 안 돈다.
 //
-// ★ 지금 쓰는 자리는 시험 · 진단(service 의 doctor Ping)과 web 의 날 질의 넷(engine.go 머리말)이다.
-// 그 넷이 store 안으로 옮기면 시험 · 진단 전용이 된다. 새 질의를 여기에 걸지 마라.
+// ★ 지금 쓰는 자리는 시험과 web 의 날 질의 넷(engine.go 머리말)이다. 그 넷이 store 안으로 옮기면 시험 전용이 된다.
+// 새 질의를 여기에 걸지 마라. 접속 확인은 Ping 이다(날 핸들의 오류는 접속 문자열의 조각을 싣는다).
 func (s *Store) DB() *sql.DB { return s.db.raw }
 
 // ─────────────────────────────────────────────────────────────────────────────

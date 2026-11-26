@@ -41,15 +41,17 @@ func (s *Service) Health(ctx context.Context) Health {
 		return h
 	}
 	h.DBPath = s.st.Path()
-	if err := s.st.DB().PingContext(ctx); err != nil {
+	// ★ 날 핸들(DB())이 아니라 store 의 Ping 이다. Postgres 의 재접속 실패 본문은 접속 문자열의 조각(사용자 · DB 이름)을
+	//   다시 싣는데, 아래는 그 본문을 로그 · DBError(대시보드의 헬스 줄)에 그대로 싣는다. Ping 이 경계에서 옮긴다.
+	if err := s.st.Ping(ctx); err != nil {
 		h.DBError = clip(err.Error(), 400)
 		s.log.ErrorContext(ctx, "DB 접속 확인 실패", "path", clip(h.DBPath, 200), "error", err.Error())
 	} else {
 		h.DBOK = true
 	}
 
-	// ★ Postgres 원장이면 재지 않는다. DBPath 는 가린 접속 URL 이라 그 「상위 디렉토리」를 statfs 하면 현재 폴더나
-	//   없는 경로를 재게 되고, 원장이 사는 디스크는 이 프로세스의 것이 아니다.
+	// ★ Postgres 원장이면 재지 않는다. DBPath 는 파일 경로가 아닌 표시값이라 그 「상위 디렉토리」를 statfs 하면 현재
+	//   폴더를 재게 되고, 원장이 사는 디스크는 이 프로세스의 것이 아니다.
 	if s.st.Postgres() {
 		h.DiskError = DiskRemote
 	} else if pct, err := diskFreePct(dirOf(h.DBPath)); err != nil {

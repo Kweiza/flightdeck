@@ -128,7 +128,7 @@ func RenderMetrics(s MetricsSnapshot) string {
 	return b.String()
 }
 
-// renderDBStats 는 잠금 대기 히스토그램(공간별) · 잠금 대기 초과 · 연결 풀 대기를 쓴다.
+// renderDBStats 는 잠금 대기 히스토그램(공간별) · 잠금 못 얻음 · 연결 풀 대기를 쓴다.
 // 공간은 store.LockSpaces 전부를 늘 쓴다 - 안 쓴 공간이 빠지면 0 과 「안 잰다」가 섞인다.
 func renderDBStats(b *strings.Builder, d store.DBStats) {
 	spaces := store.LockSpaces()
@@ -146,10 +146,11 @@ func renderDBStats(b *strings.Builder, d store.DBStats) {
 		fmt.Fprintf(b, "flightdeck_tx_lock_wait_seconds_sum{lock=\"%s\"} %.6f\n", escapeLabel(string(sp)), w.Sum)
 		fmt.Fprintf(b, "flightdeck_tx_lock_wait_seconds_count{lock=\"%s\"} %d\n", escapeLabel(string(sp)), w.Count)
 	}
-	b.WriteString("# HELP flightdeck_tx_lock_timeouts_total 잠금 대기가 상한을 넘어 실패한 쓰기 트랜잭션 수(잠금 공간별)\n")
-	b.WriteString("# TYPE flightdeck_tx_lock_timeouts_total counter\n")
+	b.WriteString("# HELP flightdeck_tx_lock_not_acquired_total 잠금을 못 얻고 실패한 쓰기 트랜잭션 수(잠금 공간별). " +
+		"대기 상한 초과와 SQLite 의 교착 회피 즉시 반환을 함께 센다\n")
+	b.WriteString("# TYPE flightdeck_tx_lock_not_acquired_total counter\n")
 	for _, sp := range spaces {
-		fmt.Fprintf(b, "flightdeck_tx_lock_timeouts_total{lock=\"%s\"} %d\n", escapeLabel(string(sp)), d.Locks[sp].Timeouts)
+		fmt.Fprintf(b, "flightdeck_tx_lock_not_acquired_total{lock=\"%s\"} %d\n", escapeLabel(string(sp)), d.Locks[sp].NotAcquired)
 	}
 	b.WriteString("# HELP flightdeck_db_pool_waits_total 연결 풀에서 연결을 기다린 횟수\n")
 	b.WriteString("# TYPE flightdeck_db_pool_waits_total counter\n")

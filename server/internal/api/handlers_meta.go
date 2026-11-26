@@ -249,7 +249,13 @@ func HealthzOf(h service.Health, tokenSet bool, reach LoopbackReach, build build
 	if h.DBError != "" {
 		b.DBError = "DB 에 접속할 수 없다 — 원인 전문은 서버 로그에 있다"
 	}
-	if h.DiskError != "" {
+	// ★ 원격 DB 라 재지 않은 것은 측정 실패가 아니다 - 그 갈래는 서버 로그도 안 남기므로 「로그를 보라」는 헛걸음이다.
+	//   그 사유는 고정 문구라 경로가 없고, 그대로 낸다.
+	switch h.DiskError {
+	case "":
+	case service.DiskRemote:
+		b.DiskError = h.DiskError
+	default:
 		b.DiskError = "디스크 여유를 재지 못했다 — 원인 전문은 서버 로그에 있다"
 	}
 	return b

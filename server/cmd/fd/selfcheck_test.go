@@ -79,8 +79,8 @@ func TestSelfcheckRequiresDBFlag(t *testing.T) {
 
 func noSelfcheckEnv(string) (string, bool) { return "", false }
 
-// TestSelfcheckReadsFDDBWhenFlagIsEmpty 는 --db 가 비면 FD_DB 를 재는지 잰다. 감시기는 원장 자리를 argv 가 아니라
-// 이 환경 변수로 넘긴다(verifyWithSelfcheck).
+// TestSelfcheckReadsFDDBWhenFlagIsEmpty 는 --db 가 비면 FD_DB 를 재는지 잰다. 감시기는 원장 자리를 늘 이 환경
+// 변수로 넘기고, Postgres 접속 URL 은 argv 에 싣지 않는다(selfcheckArgs).
 func TestSelfcheckReadsFDDBWhenFlagIsEmpty(t *testing.T) {
 	path := selfcheckDB(t)
 	env := func(k string) (string, bool) { return path, k == "FD_DB" }
@@ -112,10 +112,12 @@ func TestSelfcheckRefusesPostgresWithoutLeaking(t *testing.T) {
 				t.Fatalf("Postgres 원장인데 종료코드 %d - %s", code, out.String())
 			}
 			got := out.String()
-			if strings.Contains(got, "hunter2") {
-				t.Fatalf("출력에 비밀이 샜다: %s", got)
+			for _, piece := range []string{"hunter2", "127.0.0.1", "fd@"} {
+				if strings.Contains(got, piece) {
+					t.Fatalf("출력에 접속 문자열의 조각(%s)이 실렸다: %s", piece, got)
+				}
 			}
-			if !strings.Contains(got, "판 재기는 아직 없다") || !strings.Contains(got, "postgres://fd@127.0.0.1:1/fd") {
+			if !strings.Contains(got, "판 재기는 아직 없다") || !strings.Contains(got, "원장(postgres)") {
 				t.Fatalf("Postgres 거절 사유를 표시값과 함께 안 냈다: %s", got)
 			}
 		})

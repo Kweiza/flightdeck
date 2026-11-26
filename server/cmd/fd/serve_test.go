@@ -465,28 +465,26 @@ func TestResolveDBPathKeepsFlagAsGiven(t *testing.T) {
 // 오류에 원문을 실었고, --db 는 Postgres 로 갔지만 그 전에 MkdirAll 이 비밀이 이름에 든 디렉토리를 만들었다.
 // 닿을 수 없는 주소(포트 1)라 열기에서 곧장 실패해 감시기 · 리스너는 안 뜬다.
 //
-// ★ 표시 함수만 재서는 모자란다. 경계가 모호한 URL 은 표시값을 통째로 가려도 드라이버의 접속 실패 본문이 원문의
-// 조각을 다시 싣는다(`127.0.0.1:1/hunter2@db/fd` 는 pgx 에게 DB 이름이 `hunter2@db/fd` 다). 그래서 기록 전체를 본다.
+// ★ 표시 함수만 재서는 모자란다. 경계가 모호한 URL 은 드라이버의 접속 실패 본문이 원문의 조각을 다시 싣는다
+// (`127.0.0.1:1/hunter2@db/fd` 는 pgx 에게 DB 이름이 `hunter2@db/fd` 다). 그래서 기록 전체를 본다.
 func TestServeKeepsPostgresURLOutOfFilesAndLogs(t *testing.T) {
 	const secret = "hunter2"
 	dsn := "postgres://fd:" + secret + "@127.0.0.1:1/fd?sslpassword=" + secret
-	const clean = "postgres://fd@127.0.0.1:1/fd"
 	for _, c := range []struct {
 		name    string
 		raw     string
 		viaFlag bool
-		shown   string // 비면 「세부를 가렸다」(표시값에 호스트가 없다)를 단정한다
 		secrets []string
 	}{
-		{"플래그", dsn, true, clean, []string{secret}},
-		{"환경변수", dsn, false, clean, []string{secret}},
-		{"앞뒤 공백", "  " + dsn + " ", true, clean, []string{secret}},
-		// 비밀번호가 숫자로 시작하고 `/` 가 들었다. 사용자 127.0.0.1 · 비밀번호 `1/hunter2` 로 적었지만 두 해석기 모두
+		{"플래그", dsn, true, []string{secret}},
+		{"환경변수", dsn, false, []string{secret}},
+		{"앞뒤 공백", "  " + dsn + " ", true, []string{secret}},
+		// 비밀번호가 숫자로 시작하고 `/` 가 들었다. 사용자 127.0.0.1 · 비밀번호 `1/hunter2` 로 적었지만 pgx 는
 		// 호스트 127.0.0.1 · 포트 1 · DB 이름 `hunter2@db/fd` 로 읽는다.
-		{"모호한 `/`", "postgres://127.0.0.1:1/" + secret + "@db/fd", true, "", []string{secret}},
+		{"모호한 `/`", "postgres://127.0.0.1:1/" + secret + "@db/fd", true, []string{secret}},
 		// 비밀번호가 숫자로 시작하고 인코딩 안 한 `?` 가 들었다. pgx 는 비밀번호 `8642097531?hunter2` 로, net/url 은
 		// 포트 8642097531 로 읽는다.
-		{"모호한 `?`", "postgres://fd:8642097531?" + secret + "@127.0.0.1:1/fd", false, "", []string{secret, "8642097531"}},
+		{"모호한 `?`", "postgres://fd:8642097531?" + secret + "@127.0.0.1:1/fd", false, []string{secret, "8642097531"}},
 	} {
 		args := []string{"--addr", "127.0.0.1:0"}
 		fdDB := c.raw
@@ -519,12 +517,9 @@ func TestServeKeepsPostgresURLOutOfFilesAndLogs(t *testing.T) {
 			if !strings.Contains(out, "Postgres 접속 실패") || !strings.Contains(out, "연결 거부") {
 				t.Fatalf("Postgres 길로 가서 연결 거부로 실패하지 않았다: %s", out)
 			}
-			shown := store.ParseTarget(c.raw).Shown()
-			if !strings.Contains(out, shown) {
-				t.Fatalf("표시값 %q 로 실패하지 않았다: %s", shown, out)
-			}
-			if (c.shown == "") == strings.Contains(shown, "127.0.0.1") || (c.shown != "" && shown != c.shown) {
-				t.Fatalf("표시값이 %q 다(기대 %q, 비면 세부 가림)", shown, c.shown)
+			// 원장 자리는 접속 세부 없는 표시값 하나로만 실린다.
+			if !strings.Contains(out, `"db_path":"postgres"`) {
+				t.Fatalf("원장 자리가 고정 표시값(postgres)으로 실리지 않았다: %s", out)
 			}
 			entries, err := os.ReadDir(dir)
 			if err != nil {

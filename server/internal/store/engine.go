@@ -3,11 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -26,10 +26,10 @@ import (
 //
 // 엔진이 갈리는 자리는 이 파일(열기 · 트랜잭션 시작 · 자리표시)과 constraint.go(오류 번역) 둘뿐이다.
 // 질의를 쓰는 자리(item.go 등)는 엔진을 모른다 - `?` 자리표시로 쓰고 conn · txConn 을 지난다.
-// 날 *sql.DB · *sql.Tx 는 이 파일 밖으로 안 나간다. 예외는 DB() 하나이고, 시험 · 진단(service 의 doctor
-// Ping)만이 아니라 web 의 날 질의 넷(query.go 의 pickEvals · closedItems · unackedJobs, page.go 의
-// claimHolders)이 아직 그것으로 질의한다. 그 넷은 감싸개를 안 지나 Postgres 에서는 안 돈다 - 이전의
-// 뒤 단계가 store 안으로 옮긴다. engine_test.go 가 store 안의 경계를 소스로 잠근다.
+// 날 *sql.DB · *sql.Tx 는 이 파일 밖으로 안 나간다. 예외는 DB() 하나이고, 시험만이 아니라 web 의 날 질의 넷
+// (query.go 의 pickEvals · closedItems · unackedJobs, page.go 의 claimHolders)이 아직 그것으로 질의한다.
+// 그 넷은 감싸개를 안 지나 Postgres 에서는 안 돈다 - 이전의 뒤 단계가 store 안으로 옮긴다.
+// engine_test.go 가 store 안의 경계를 소스로 잠근다.
 //
 // ★ 두 엔진이 함께 있는 것은 옮기는 동안뿐이다. Postgres 로 옮긴 뒤 SQLite 실행 경로는 빠진다.
 
@@ -84,10 +84,18 @@ func hasPGScheme(s string) bool {
 // Postgres 는 접속 URL 인가다.
 func (t Target) Postgres() bool { return t.eng == enginePG }
 
-// Shown 은 로그 · 오류 · 출력에 실을 꼴이다. 파일 경로는 그대로, 접속 URL 은 redactDSN 이다.
+// pgShown 은 Postgres 원장의 표시값이다. 접속 문자열에서 아무것도 꺼내지 않은 고정 문자열이다.
+//
+// ★ 접속 URL 에서 좌표(사용자 · 호스트 · 포트 · DB 이름)를 골라 싣던 앞 판은 해석기 둘(net/url · pgx)을 맞대도
+// 세 번 연달아 틈이 났다 - 인코딩 안 한 `/ ? @` 가 든 비밀번호는 두 해석기 모두에게, 또는 한쪽에게 포트 · DB 이름으로
+// 읽혔다. 게다가 pgx 해석은 비밀번호 파일 · 인증서 파일을 실제로 읽어, 응답 없는 FIFO 앞에서 표시가 멈췄다.
+// 그래서 표시 경로는 해석하지 않는다. 무엇에 붙었는지는 붙은 **뒤에** 서버가 말한 값으로 기동 로그에 남긴다(openPG).
+const pgShown = "postgres"
+
+// Shown 은 로그 · 오류 · 출력에 실을 꼴이다. 파일 경로는 그대로, 접속 URL 은 원문과 무관한 pgShown 이다.
 func (t Target) Shown() string {
 	if t.eng == enginePG {
-		return redactDSN(t.open)
+		return pgShown
 	}
 	return t.open
 }
@@ -179,7 +187,30 @@ func openPG(t Target, log *slog.Logger, wait time.Duration) (*Store, error) {
 				"- 연결 중개기가 시작 인자를 버리는지 확인하라", p.name, shown, got, p.ms)
 		}
 	}
+	logPGServer(ctx, s, log)
 	return s, nil
+}
+
+// logPGServer 는 붙은 서버가 스스로 말한 좌표(DB 이름 · 포트 · 판)를 기동 로그에 한 줄 남긴다. 포트는 서버 쪽에서 본
+// 값이다(포트 넘기기 뒤라면 접속한 포트와 다르다).
+//
+// ★ 표시값(pgShown)이 접속 세부를 안 싣는 대신의 진단이다. 접속 문자열을 해석해 꺼내지 않고 **붙은 뒤에** 서버에게
+// 묻는다 - 그 값은 실제로 붙은 자리라, 해석기가 비밀번호 조각을 좌표로 잘못 읽을 길이 없다. 사용자 이름은 싣지 않는다.
+// 못 읽어도 열기는 실패시키지 않는다(진단일 뿐이다). 그 오류도 pgFault 로만 싣는다.
+func logPGServer(ctx context.Context, s *Store, log *slog.Logger) {
+	var db, version string
+	var port sql.NullInt64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT current_database(), inet_server_port(), current_setting('server_version')`).Scan(&db, &port, &version)
+	if err != nil {
+		log.Warn("Postgres 원장에 붙었지만 서버 좌표를 읽지 못했다", "error", pgFault(err))
+		return
+	}
+	where := "unix 소켓"
+	if port.Valid {
+		where = strconv.FormatInt(port.Int64, 10)
+	}
+	log.Info("Postgres 원장에 붙었다", "database", db, "port", where, "server_version", version)
 }
 
 // pgFault 는 열기 경계에서 난 드라이버 오류를 종류와 SQLSTATE 만으로 옮긴다. 순수 함수다.
@@ -189,9 +220,14 @@ func openPG(t Target, log *slog.Logger, wait time.Duration) (*Store, error) {
 // 비밀번호 조각이 들어간다 - `postgres://fd:12/hunter2@db/fd` 는 pgx 에게 호스트 fd · 포트 12 · DB 이름
 // `hunter2@db/fd` 다. 표시값을 통째로 가려도 오류 본문이 그 조각을 다시 싣는다.
 //
-// ★ 열기가 성공한 뒤의 업무 오류는 이것을 안 지난다. 열렸다는 것은 그 좌표(사용자 · DB 이름 · 주소)로 실제 서버에
-// 붙었다는 뜻이라, 뒤에 다시 붙다 난 오류가 그 이름을 실어도 비밀번호 조각이 아니다.
+// ★ 열기 뒤에도 같은 문구가 난다. 연결 풀은 끊긴 연결을 버리고 **처음 받은 접속 문자열로** 새로 맺으므로, 재접속
+// 실패의 ConnectError 도 그 사용자 · DB 이름을 다시 싣는다. 그래서 열기 뒤의 접속 오류도 store 경계에서 이것으로
+// 옮긴다(Store.Ping · engine.connFault). 업무 오류(제약 · 잠금 SQLSTATE)는 옮기지 않는다 - JudgeError 가 읽는다.
 func pgFault(err error) string {
+	var ce *connError
+	if errors.As(err, &ce) {
+		return ce.fault // 이미 옮긴 것이다(감싸개를 지난 질의가 열기 경계 안에서 난 때)
+	}
 	var pe *pgconn.PgError
 	if errors.As(err, &pe) {
 		return "서버가 거절했다(SQLSTATE " + pe.Code + ")"
@@ -201,6 +237,9 @@ func pgFault(err error) string {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
 		return "시간 초과"
+	case errors.Is(err, driver.ErrBadConn):
+		// database/sql 의 Ping 은 풀에서 꺼낸 연결이 이미 끊겨 있으면 다시 붙지 않고 이것을 낸다(그 연결은 버린다).
+		return "연결이 끊겨 있었다(풀이 그 연결을 버렸다 - 다음 확인에서 새로 붙는다)"
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return "연결 거부(그 주소에서 듣는 서버가 없다)"
 	case errors.As(err, &dns):
@@ -213,6 +252,42 @@ func pgFault(err error) string {
 		inner = u
 	}
 	return fmt.Sprintf("분류하지 못한 드라이버 오류(%T)", inner)
+}
+
+// connFault 는 연결 풀이 새 연결을 맺다 난 오류(pgconn.ConnectError)를 pgFault 로 옮긴다. 그 밖의 오류는 그대로 낸다.
+//
+// ★ 감싸개(conn · row · begin)가 풀에서 연결을 받는 자리마다 부른다. 거기가 재접속이 일어나는 자리다 - 서버가
+// 다시 떴거나 연결이 끊긴 뒤 첫 질의가 새 연결을 맺고, 그 실패 본문이 접속 문자열의 조각을 싣는다(pgFault 의 ★).
+// 원래 오류는 품지 않는다(connError 는 Unwrap 이 없다). 품으면 errors.As 로 그 본문을 다시 꺼내 싣는 자리가 생긴다.
+func (e engine) connFault(err error) error {
+	if e != enginePG || err == nil {
+		return err
+	}
+	var ce *pgconn.ConnectError
+	if !errors.As(err, &ce) {
+		return err
+	}
+	return &connError{fault: pgFault(err)}
+}
+
+// connError 는 store 경계에서 옮긴 Postgres 접속 오류다. 종류 · SQLSTATE(pgFault)만 든다.
+type connError struct{ fault string }
+
+func (e *connError) Error() string {
+	return "Postgres 에 붙지 못했다(" + pgShown + "): " + e.fault
+}
+
+// Ping 은 원장에 지금 붙을 수 있는가다(service 의 Health).
+//
+// ★ Postgres 면 오류를 종류 · SQLSTATE 로만 낸다(connError). 풀이 끊긴 연결을 버리고 새로 맺다 난 실패는 처음 받은
+// 접속 문자열의 사용자 · DB 이름을 다시 싣고(pgFault 의 ★), Health 는 그 본문을 로그 · DBError · 대시보드에 싣는다.
+// SQLite 의 오류는 파일 경로를 싣고, 그것은 이미 표시값(Path)이다.
+func (s *Store) Ping(ctx context.Context) error {
+	err := s.db.raw.PingContext(ctx)
+	if err == nil || s.db.eng != enginePG {
+		return err
+	}
+	return &connError{fault: pgFault(err)}
 }
 
 // pgParam 은 연결 시작 인자 하나다. ms 는 밀리초 정수 문자열이다(pg_settings 의 setting 이 같은 단위로 되읽힌다).
@@ -261,94 +336,6 @@ func (s *Store) checkPGVersion(ctx context.Context) error {
 	return nil
 }
 
-// hiddenDSN 은 세부를 실을 수 없는 접속 URL 의 표시값이다. 엔진 말고는 아무것도 안 싣는다.
-const hiddenDSN = "postgres://<세부 가림: 모호하거나 깨진 접속 문자열>"
-
-// redactDSN 은 로그 · 오류에 실을 접속 URL 이다. dsn 은 ParseTarget 이 다듬은 값이다(Target.Shown 만 부른다).
-//
-// ★ 가리지 않고 **허용한 것만 조립한다**: 호스트 · 포트 · DB 이름 · 사용자(사용자 정보 자리와, 같은 뜻의 질의 인자
-// host · port · dbname · user). 비밀을 하나씩 골라 가리면 목록에 없는 비밀(sslpassword, 앞으로 생길 인자)이 그대로
-// 샌다 - 앞 판이 password 만 가려 sslpassword 를 흘렸다. 그 밖의 질의 인자(sslmode 같은 것)도 싣지 않는다.
-//
-// ★ **두 해석기가 같은 좌표를 읽을 때만** 세부를 싣는다. 표시값은 net/url 로 조립하지만 실제로 붙는 것은 pgx 이고,
-// 둘은 사용자 정보의 끝을 다르게 읽는다: pgx(libpq 와 같다)는 `/` 앞의 첫 `@` 까지를, net/url 은 `/ ? #` 앞의
-// 마지막 `@` 까지를 사용자 정보로 본다. 그래서 인코딩 안 한 `?` 가 든 비밀번호(`fd:123?x@db/fd`)는 pgx 에게
-// 비밀번호 `123?x` 이고 net/url 에게 호스트 fd · 포트 123 이다 - 비밀번호 조각이 포트 자리로 표시값에 실린다.
-// 표시값에 싣는 좌표가 하나라도 pgx 와 어긋나거나 둘 중 하나가 못 읽으면 세부 없이(hiddenDSN) 낸다. 비운 좌표는
-// 맞대지 않는다 - pgx 가 환경 · 기본값으로 채우는 자리이고, 싣지 않으니 샐 것도 없다.
-//
-// ★ 두 해석기가 같게 읽어도 표시 조각에 `@` 가 있으면 비밀번호의 `/` 가 경계를 앞당긴 것이다
-// (`fd:12/hunter2@db/fd` 는 둘 다 DB 이름을 `hunter2@db/fd` 로 읽는다). 그것도 세부 없이 낸다.
-//
-// ★ 순수 함수가 아니다. pgx 해석은 PG* 환경 변수와 ~/.pgpass 를 읽는다. 그 값은 맞대기에만 쓰고 싣지 않는다.
-func redactDSN(dsn string) string {
-	u, err := url.Parse(dsn)
-	if err != nil {
-		return hiddenDSN
-	}
-	cfg, err := pgconn.ParseConfig(dsn)
-	if err != nil {
-		return hiddenDSN
-	}
-	shown, ok := urlCoords(u)
-	if !ok {
-		return hiddenDSN
-	}
-	byPGX := pgCoords{user: cfg.User, host: cfg.Host, port: strconv.Itoa(int(cfg.Port)), db: cfg.Database}
-	for _, c := range [][2]string{{shown.user, byPGX.user}, {shown.host, byPGX.host}, {shown.port, byPGX.port}, {shown.db, byPGX.db}} {
-		if c[0] != "" && c[0] != c[1] {
-			return hiddenDSN
-		}
-	}
-	out := url.URL{Scheme: strings.ToLower(u.Scheme), Host: u.Host, Path: u.Path}
-	if u.User != nil {
-		out.User = url.User(u.User.Username())
-	}
-	q, keep := u.Query(), url.Values{}
-	for _, k := range []string{"host", "port", "dbname", "user"} {
-		if v, ok := q[k]; ok {
-			keep[k] = v
-		}
-	}
-	out.RawQuery = keep.Encode()
-	if strings.Contains(out.User.String()+out.Host+out.Path+out.RawQuery, "@") {
-		return hiddenDSN
-	}
-	return out.String()
-}
-
-// pgCoords 는 접속 좌표 넷이다(비면 그 해석기가 그 자리를 안 읽었다).
-type pgCoords struct{ user, host, port, db string }
-
-// urlCoords 는 net/url 이 읽어 표시값에 싣는 좌표다. 사용자 정보 · 호스트 · 경로 자리와 같은 뜻의 질의 인자를 합친다.
-// 같은 좌표가 두 자리에 다 있거나 질의 인자가 겹치면 ok=false 다 - 어느 쪽이 이기는지를 두 해석기가 같게 정한다고
-// 기대할 근거가 없다.
-func urlCoords(u *url.URL) (pgCoords, bool) {
-	q := u.Query()
-	ok := true
-	pick := func(inPlace, key string) string {
-		vs, inQuery := q[key]
-		if !inQuery {
-			return inPlace
-		}
-		if inPlace != "" || len(vs) != 1 {
-			ok = false
-		}
-		return vs[0]
-	}
-	var user string
-	if u.User != nil {
-		user = u.User.Username()
-	}
-	c := pgCoords{
-		user: pick(user, "user"),
-		host: pick(u.Hostname(), "host"),
-		port: pick(u.Port(), "port"),
-		db:   pick(strings.TrimPrefix(u.Path, "/"), "dbname"),
-	}
-	return c, ok
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // 감싸개 - 모든 실행 자리가 지난다
 // ─────────────────────────────────────────────────────────────────────────────
@@ -359,12 +346,14 @@ type conn struct {
 	eng engine
 }
 
+// conn 의 세 실행은 풀에서 연결을 받는다 - 재접속 오류를 connFault 로 옮긴다.
 func (c *conn) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
 	b, err := c.eng.bind(q)
 	if err != nil {
 		return nil, err
 	}
-	return c.raw.ExecContext(ctx, b, args...)
+	res, err := c.raw.ExecContext(ctx, b, args...)
+	return res, c.eng.connFault(err)
 }
 
 func (c *conn) QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
@@ -372,7 +361,8 @@ func (c *conn) QueryContext(ctx context.Context, q string, args ...any) (*sql.Ro
 	if err != nil {
 		return nil, err
 	}
-	return c.raw.QueryContext(ctx, b, args...)
+	rows, err := c.raw.QueryContext(ctx, b, args...)
+	return rows, c.eng.connFault(err)
 }
 
 func (c *conn) QueryRowContext(ctx context.Context, q string, args ...any) *row {
@@ -380,7 +370,7 @@ func (c *conn) QueryRowContext(ctx context.Context, q string, args ...any) *row 
 	if err != nil {
 		return &row{err: err}
 	}
-	return &row{r: c.raw.QueryRowContext(ctx, b, args...)}
+	return &row{r: c.raw.QueryRowContext(ctx, b, args...), eng: c.eng}
 }
 
 // Exec · Query · QueryRow 는 시험이 쓰는 꼴(ctx 없음)이다. 같은 감싸개를 지난다.
@@ -400,8 +390,11 @@ func (c *conn) Close() error { return c.raw.Close() }
 
 // row 는 한 행 질의의 결과다. 자리표시 옮기기(bind)가 거절한 문장이면 그 오류를 Scan 이 낸다 -
 // *sql.Row 는 패키지 밖에서 오류를 실어 만들 수 없어서 감싼다. 쓰는 쪽은 *sql.Row 처럼 Scan 만 부른다.
+//
+// 연결 오류는 Scan · Err 에서 드러난다(*sql.Row 가 미룬다). 그래서 거기서 connFault 로 옮긴다.
 type row struct {
 	r   *sql.Row
+	eng engine
 	err error
 }
 
@@ -409,14 +402,14 @@ func (r *row) Scan(dest ...any) error {
 	if r.err != nil {
 		return r.err
 	}
-	return r.r.Scan(dest...)
+	return r.eng.connFault(r.r.Scan(dest...))
 }
 
 func (r *row) Err() error {
 	if r.err != nil {
 		return r.err
 	}
-	return r.r.Err()
+	return r.eng.connFault(r.r.Err())
 }
 
 // txConn 은 진행 중인 트랜잭션의 핸들이다. begin 만 만든다.
@@ -446,7 +439,7 @@ func (t *txConn) QueryRowContext(ctx context.Context, q string, args ...any) *ro
 	if err != nil {
 		return &row{err: err}
 	}
-	return &row{r: t.raw.QueryRowContext(ctx, b, args...)}
+	return &row{r: t.raw.QueryRowContext(ctx, b, args...), eng: t.eng}
 }
 
 func (t *txConn) Commit() error   { return t.raw.Commit() }
@@ -695,6 +688,7 @@ func (s *Store) begin(ctx context.Context, sp txSpec) (*txConn, error) {
 	eng := s.db.eng
 	start := time.Now()
 	raw, err := s.db.raw.BeginTx(ctx, eng.txOptions(sp.kind))
+	err = eng.connFault(err)
 	if err == nil {
 		if q, args := eng.lockStmt(sp); q != "" {
 			start = time.Now()
@@ -745,14 +739,16 @@ func (e engine) lockSpace(k txKind) LockSpace {
 // 잠금을 좁히는 것을 검토한다」는 문턱을 그대로 읽게 하려고 둔다. 마지막 칸은 lockTimeout 이다.
 var LockWaitBuckets = [...]float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1, 2.5, 5}
 
-// LockWait 는 잠금 공간 하나의 대기 기록이다. 잠금을 받은 것만 칸에 들고, 대기 상한을 넘은 것은 Timeouts 다.
+// LockWait 는 잠금 공간 하나의 대기 기록이다. 잠금을 받은 것만 칸에 들고, 잠금을 못 얻은 것은 NotAcquired 다.
 type LockWait struct {
 	// Buckets[i] 는 대기가 (LockWaitBuckets[i-1], LockWaitBuckets[i]] 에 든 건수다(누적이 아니다).
 	// 마지막 칸을 넘은 것은 어느 칸에도 없고 Count 에만 있다.
-	Buckets  [len(LockWaitBuckets)]uint64
-	Count    uint64
-	Sum      float64
-	Timeouts uint64
+	Buckets [len(LockWaitBuckets)]uint64
+	Count   uint64
+	Sum     float64
+	// NotAcquired 는 잠금을 못 얻고 실패한 건수다(FaultLockUnavailable). 대기 상한을 넘은 것만이 아니다 - SQLite 의
+	// BUSY 는 교착을 피하려고 기다리지 않고 곧장 나기도 하고, 코드로는 그 둘이 안 갈린다. 그래서 「시간 초과」라 부르지 않는다.
+	NotAcquired uint64
 }
 
 // DBStats 는 /metrics 에 실을 저장 계층 계측이다.
@@ -771,8 +767,8 @@ type lockMeter struct {
 }
 
 func (l *lockMeter) observe(space LockSpace, d time.Duration, err error) {
-	timeout := err != nil && JudgeError(err).Fault == FaultLockTimeout
-	if err != nil && !timeout {
+	refused := err != nil && JudgeError(err).Fault == FaultLockUnavailable
+	if err != nil && !refused {
 		return // 잠금과 무관한 실패(취소 등)는 대기 축이 아니다
 	}
 	l.mu.Lock()
@@ -785,8 +781,8 @@ func (l *lockMeter) observe(space LockSpace, d time.Duration, err error) {
 		w = &LockWait{}
 		l.m[space] = w
 	}
-	if timeout {
-		w.Timeouts++
+	if refused {
+		w.NotAcquired++
 		return
 	}
 	sec := d.Seconds()

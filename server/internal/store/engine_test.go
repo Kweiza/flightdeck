@@ -134,57 +134,51 @@ func TestParseTargetClassifiesTrimmedButOpensFilesAsGiven(t *testing.T) {
 	}
 }
 
-// TestTargetShowsOnlyAllowedFields 는 표시값이 허용한 필드(호스트 · 포트 · DB 이름 · 사용자)만 싣는지 잰다.
-// 비밀을 골라 가리는 방식은 목록 밖 비밀(sslpassword)을 흘렸다 - 그래서 비밀 쪽이 아니라 허용 쪽을 단정한다.
+// TestPostgresShownCarriesNoURLPiece 는 Postgres 원장의 표시값이 어떤 접속 문자열에서도 고정 문자열 하나인지 잰다.
 //
-// ★ 경계가 모호한 입력(비밀번호가 숫자로 시작하고 인코딩 안 한 `?` · `/` · `@` 가 든 것)은 pgx 와 net/url 이 다르게
-// 읽는다. pgx 가 비밀번호로 읽는 숫자를 net/url 은 포트로 읽어, 맞대지 않으면 그 숫자가 표시값에 실린다.
-func TestTargetShowsOnlyAllowedFields(t *testing.T) {
-	for in, want := range map[string]string{
-		"postgres://fd:hunter2@db:5432/fd?sslmode=disable":                                 "postgres://fd@db:5432/fd",
-		"postgres://fd@db:5432/fd?password=hunter2&sslpassword=hunter2&application_name=x": "postgres://fd@db:5432/fd",
-		"POSTGRESQL://fd:hunter2@db/fd":                                                    "postgresql://fd@db/fd",
-		"  postgres://fd:hunter2@db/fd ":                                                   "postgres://fd@db/fd",
-		"postgres:///fd?host=/run/pg&port=5433&user=fd&password=hunter2&x=hunter2":         "postgres:///fd?host=%2Frun%2Fpg&port=5433&user=fd",
-		// pgx 가 못 읽는다(sslkey 만 있고 sslcert 가 없다) - 맞댈 수 없으니 세부를 안 싣는다.
-		"postgres://fd:hunter2@db/fd?sslkey=k": hiddenDSN,
-		// 같은 좌표가 두 자리에 있다 - 어느 쪽이 이기는지 맞대지 않는다.
-		"postgres://fd:hunter2@db/fd?host=other": hiddenDSN,
-		// 깨진 퍼센트 인코딩.
-		"postgres://fd:%zz@db/fd": hiddenDSN,
-		// `/`: 두 해석기 모두 호스트 fd · 포트 12 · DB 이름 `hunter2@db/fd` 로 읽는다(표시 조각의 `@`).
-		"postgres://fd:12/hunter2@db/fd": hiddenDSN,
-		"postgres://fd:hun/ter2@db/fd":   hiddenDSN,
-		// `?`: pgx 는 비밀번호 `8642097531?hunter2` · 호스트 db, net/url 은 호스트 fd · 포트 8642097531 이다.
-		"postgres://fd:8642097531?hunter2@db/fd": hiddenDSN,
-		// `@`: pgx 는 첫 `@` 에서(비밀번호 8642097531, 호스트 `hunter2@db`), net/url 은 마지막 `@` 에서 끊는다.
-		"postgres://fd:8642097531@hunter2@db/fd": hiddenDSN,
-		// 셋이 섞였다: pgx 는 `/` 를 먼저 만나 사용자 정보가 없고 질의 꼴이 깨져 못 읽는다.
-		"postgres://fd:8642097531?x/hun@ter2@db/fd": hiddenDSN,
-		// `@` 다음 `/`: 둘 다 DB 이름을 `hunter2@db/fd` 로 읽는다.
-		"postgres://fd:8642097531@x/hunter2@db/fd": hiddenDSN,
-	} {
-		got := ParseTarget(in).Shown()
-		for _, secret := range []string{"hunter2", "ter2", "8642097531"} {
-			if strings.Contains(got, secret) {
-				t.Errorf("비밀이 샜다: %q → %q", in, got)
-			}
+// ★ 앞 판은 net/url 과 pgx 를 맞대 좌표(사용자 · 호스트 · 포트 · DB 이름)를 골라 실었고, 인코딩 안 한 `/ ? @` 가 든
+// 비밀번호에서 세 번 연달아 틈이 났다. 그래서 「허용한 조각만」이 아니라 「조각이 하나도 없다」를 단정한다.
+// 아래 입력은 그 틈들을 냈던 꼴과, pgx 해석이 파일을 읽게 하는 인자(passfile · sslkey)를 든 것이다.
+func TestPostgresShownCarriesNoURLPiece(t *testing.T) {
+	inputs := []string{
+		"postgres://fd:hunter2@db:5432/fd?sslmode=disable",
+		"postgres://fd@db:5432/fd?password=hunter2&sslpassword=hunter2&application_name=x",
+		"POSTGRESQL://fd:hunter2@db/fd",
+		"  postgres://fd:hunter2@db/fd ",
+		"postgres:///fd?host=/run/pg&port=5433&user=fd&password=hunter2&x=hunter2",
+		"postgres://fd:hunter2@db/fd?sslkey=k",
+		"postgres://fd:hunter2@db/fd?host=other",
+		"postgres://fd:%zz@db/fd",
+		"postgres://fd:12/hunter2@db/fd",
+		"postgres://fd:hun/ter2@db/fd",
+		"postgres://fd:8642097531?hunter2@db/fd",
+		"postgres://fd:8642097531@hunter2@db/fd",
+		"postgres://fd:8642097531?x/hun@ter2@db/fd",
+		"postgres://fd:8642097531@x/hunter2@db/fd",
+		"postgres://fd:1/hunter2@db/fd?application_name=x@y",
+		"postgres://fd@db/fd?passfile=/dev/stdin&sslcert=/dev/stdin&sslkey=/dev/stdin",
+		"postgres://",
+	}
+	for _, in := range inputs {
+		tg := ParseTarget(in)
+		if !tg.Postgres() {
+			t.Fatalf("시험 전제가 깨졌다: %q 를 Postgres 로 가르지 않았다", in)
 		}
-		if got != want {
-			t.Errorf("ParseTarget(%q).Shown() = %q, 기대 %q", in, got, want)
+		if got := tg.Shown(); got != "postgres" {
+			t.Errorf("ParseTarget(%q).Shown() = %q - 접속 문자열의 조각 없이 \"postgres\" 여야 한다", in, got)
 		}
-		if fmt.Sprint(ParseTarget(in)) != got {
-			t.Errorf("Target 을 그대로 찍으면 표시값이 아니다: %q", in)
+		if got := fmt.Sprint(tg); got != "postgres" {
+			t.Errorf("Target 을 그대로 찍으면 %q 다(%q) - 표시값이어야 한다", got, in)
 		}
 	}
 }
 
-// TestShowSeparatesFilesFromURLs 는 파일 경로는 그대로, 접속 URL 은 가린 꼴로 내는지 잰다.
+// TestShowSeparatesFilesFromURLs 는 파일 경로는 받은 그대로, 접속 URL 은 고정 표시값으로 내는지 잰다.
 func TestShowSeparatesFilesFromURLs(t *testing.T) {
 	for in, want := range map[string]string{
 		"/data/fd.db": "/data/fd.db",
 		"fd.db ":      "fd.db ",
-		"postgres://fd:hunter2@db:5432/fd?sslpassword=hunter2": "postgres://fd@db:5432/fd",
+		"postgres://fd:hunter2@db:5432/fd?sslpassword=hunter2": "postgres",
 	} {
 		if got := ParseTarget(in).Shown(); got != want {
 			t.Errorf("ParseTarget(%q).Shown() = %q, 기대 %q", in, got, want)
@@ -193,7 +187,7 @@ func TestShowSeparatesFilesFromURLs(t *testing.T) {
 }
 
 // TestSQLiteOnlyPathsRefusePostgresURLs 는 SQLite 파일만 다루는 길이 접속 URL 을 파일 API 에 넘기지 않고
-// 가린 표시값으로 거절하는지 잰다. 넘기면 「파일이 없다」 오류에 원문(비밀번호)이 실린다. 앞에 공백이 붙은 URL 도
+// 표시값으로 거절하는지 잰다. 넘기면 「파일이 없다」 오류에 원문(비밀번호)이 실린다. 앞에 공백이 붙은 URL 도
 // 같은 길이어야 한다(분류는 다듬은 값으로 한다).
 func TestSQLiteOnlyPathsRefusePostgresURLs(t *testing.T) {
 	for _, dsn := range []string{
@@ -328,7 +322,7 @@ func isDBField(e ast.Expr) bool {
 func TestRawHandlesStayInEngine(t *testing.T) {
 	src := parseStoreSource(t)
 	allowed := map[site]string{
-		{"store.go", "DB"}:                "저수준 접근자 - 시험 · 진단과 web 의 날 질의 넷(store 안으로 옮길 차례다)",
+		{"store.go", "DB"}:                "저수준 접근자 - 시험과 web 의 날 질의 넷(store 안으로 옮길 차례다)",
 		{"store.go", "openRaw"}:           "SQLite 파일 열기",
 		{"probe.go", "probeMigrationVia"}: "SQLite 파일의 판 재기",
 		{"backup.go", "OpenLedger"}:       "SQLite 원장 내보내기 전용 열기",

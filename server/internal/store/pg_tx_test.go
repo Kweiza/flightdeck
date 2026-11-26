@@ -1,11 +1,14 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -201,8 +204,8 @@ func TestPGTxSerializesReadThenWrite(t *testing.T) {
 	if got := pgCount(t, s, `SELECT value FROM counter WHERE project = 'p' AND name = 'n'`); got != n {
 		t.Fatalf("갱신을 잃었다: %d(기대 %d) - 읽고 쓰기가 전역 잠금 아래에서 한 줄로 서지 않았다", got, n)
 	}
-	if w := s.DBStats().Locks[LockGlobal]; w.Count != n || w.Timeouts != 0 {
-		t.Fatalf("잠금 대기 계측이 다르다: %+v(기대 Count %d, Timeouts 0)", w, n)
+	if w := s.DBStats().Locks[LockGlobal]; w.Count != n || w.NotAcquired != 0 {
+		t.Fatalf("잠금 대기 계측이 다르다: %+v(기대 Count %d, NotAcquired 0)", w, n)
 	}
 }
 
@@ -527,8 +530,8 @@ func TestPGLockTimeoutIsATxFault(t *testing.T) {
 		err := c.run()
 		took := time.Since(start)
 		var f *TxFault
-		if !errors.As(err, &f) || f.Kind != FaultLockTimeout || f.Code != "55P03" {
-			t.Fatalf("%s: 잠금 대기 초과가 TxFault(lock_timeout, 55P03)로 오지 않았다: %v", c.name, err)
+		if !errors.As(err, &f) || f.Kind != FaultLockUnavailable || f.Code != "55P03" {
+			t.Fatalf("%s: 잠금 대기 초과가 TxFault(lock_not_available, 55P03)로 오지 않았다: %v", c.name, err)
 		}
 		if took < wait {
 			t.Fatalf("%s: lock_timeout(%s) 전에 포기했다: %s", c.name, wait, took)
@@ -537,8 +540,8 @@ func TestPGLockTimeoutIsATxFault(t *testing.T) {
 	a.finish(t)
 
 	w := s.DBStats().Locks[LockGlobal]
-	if w.Timeouts != 2 || w.Count != 1 {
-		t.Fatalf("잠금 계측: %+v(기대 Timeouts 2 - 넘긴 둘, Count 1 - 쥔 것)", w)
+	if w.NotAcquired != 2 || w.Count != 1 {
+		t.Fatalf("잠금 계측: %+v(기대 NotAcquired 2 - 못 얻은 둘, Count 1 - 쥔 것)", w)
 	}
 }
 
@@ -657,7 +660,7 @@ func TestPGObsTxLocksPerDeviceRepo(t *testing.T) {
 		}
 	}
 	var f *TxFault
-	if err := s.ObsTx(ctx, "d1", "r1", obsNoop); !errors.As(err, &f) || f.Kind != FaultLockTimeout {
+	if err := s.ObsTx(ctx, "d1", "r1", obsNoop); !errors.As(err, &f) || f.Kind != FaultLockUnavailable {
 		t.Fatalf("같은 (기기, 저장소)가 한 줄로 서지 않았다: %v", err)
 	}
 	a.finish(t)
@@ -669,7 +672,7 @@ func TestPGObsTxLocksPerDeviceRepo(t *testing.T) {
 	g.finish(t)
 
 	locks := s.DBStats().Locks
-	if locks[LockObs].Timeouts != 1 || locks[LockGlobal].Timeouts != 0 {
+	if locks[LockObs].NotAcquired != 1 || locks[LockGlobal].NotAcquired != 0 {
 		t.Fatalf("잠금 공간별 계측이 섞였다: %+v", locks)
 	}
 }
@@ -759,4 +762,96 @@ func TestPGOpenRefusesUnstampedOrForeignVersion(t *testing.T) {
 		t.Fatalf("엔진 %q", got)
 	}
 	_ = s.Close()
+}
+
+// TestPGOpenLogsServerCoordsWithoutUser 는 열기가 붙은 **뒤에** 서버가 말한 좌표(DB 이름 · 포트 · 판)를 기동 로그에 한 줄
+// 남기는지 잰다. 표시값(postgres)이 접속 세부를 안 싣는 대신의 진단이다. 사용자 이름은 안 싣는다.
+func TestPGOpenLogsServerCoordsWithoutUser(t *testing.T) {
+	dsn := storetest.New(t)
+	var logs bytes.Buffer
+	s, err := openPG(ParseTarget(dsn), slog.New(slog.NewJSONHandler(&logs, nil)), lockTimeout)
+	if err != nil {
+		t.Fatalf("openPG: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var line map[string]any
+	for _, raw := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(raw), &rec) == nil && rec["msg"] == "Postgres 원장에 붙었다" {
+			line = rec
+		}
+	}
+	if line == nil {
+		t.Fatalf("기동 진단 줄이 없다: %s", logs.String())
+	}
+	// 포트는 서버 쪽에서 본 값이라 접속 URL 의 포트와 다를 수 있다(컨테이너의 포트 넘기기). 찼는지만 본다.
+	if line["database"] != strings.TrimPrefix(u.Path, "/") || line["port"] == "" || line["server_version"] == "" {
+		t.Fatalf("서버가 말한 좌표가 접속한 자리와 다르거나 비었다(기대 DB %s): %v", u.Path, line)
+	}
+	for k := range line {
+		if strings.Contains(k, "user") {
+			t.Fatalf("사용자 이름을 실었다(%s): %v", k, line)
+		}
+	}
+}
+
+// TestPGReconnectFailureCarriesNoDSNPiece 는 열기 **뒤** 연결 풀이 다시 붙다 실패한 오류가 접속 문자열의 조각
+// (사용자 · DB 이름)을 싣지 않는지 잰다. 드라이버의 ConnectError 는 `user=… database=…` 를 본문에 넣고, 그 DB 이름은
+// 처음 받은 접속 문자열에서 읽은 값이다 - 경계가 모호한 문자열이면 비밀번호 조각이다. 풀에서 연결을 받는 자리
+// (Ping · 단발 질의 · 트랜잭션 시작)가 다 store 경계에서 종류 · SQLSTATE 로 옮겨야 한다.
+func TestPGReconnectFailureCarriesNoDSNPiece(t *testing.T) {
+	dsn := storetest.New(t)
+	s, err := openPG(ParseTarget(dsn), quietLog(), lockTimeout)
+	if err != nil {
+		t.Fatalf("openPG: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := strings.TrimPrefix(u.Path, "/")
+	storetest.CutConnections(t, dsn)
+
+	ctx := context.Background()
+	var one int
+	for _, c := range []struct {
+		where string
+		run   func() error
+	}{
+		{"Ping", func() error { return s.Ping(ctx) }},
+		{"단발 질의", func() error { return s.db.QueryRowContext(ctx, `SELECT 1`).Scan(&one) }},
+		{"단발 실행", func() error { _, err := s.db.ExecContext(ctx, `SELECT 1`); return err }},
+		{"여러 행 질의", func() error {
+			rows, err := s.db.QueryContext(ctx, `SELECT 1`)
+			if err == nil {
+				rows.Close()
+			}
+			return err
+		}},
+		{"트랜잭션 시작", func() error { return s.ReadTx(ctx, func(Reader) error { return nil }) }},
+	} {
+		// database/sql 의 Ping 은 풀에 남은 끊긴 연결을 꺼내면 다시 붙지 않고 「끊겼다」만 낸다(그 연결은 버린다).
+		// 그래서 재접속 거절(55000)에 닿을 때까지 몇 번 부르고, 그 사이의 오류도 전부 잰다.
+		var msg string
+		for try := 0; try < 3 && !strings.Contains(msg, "SQLSTATE 55000"); try++ {
+			err := c.run()
+			if err == nil {
+				t.Fatalf("%s: 접속을 막았는데 성공했다", c.where)
+			}
+			msg = err.Error()
+			for _, piece := range []string{name, "user=", "failed to connect"} {
+				if strings.Contains(msg, piece) {
+					t.Fatalf("%s: 재접속 오류에 접속 문자열의 조각(%s)이 실렸다: %s", c.where, piece, msg)
+				}
+			}
+		}
+		if !strings.Contains(msg, "SQLSTATE 55000") {
+			t.Fatalf("%s: 재접속 거절을 종류 · SQLSTATE 로 옮기지 않았다: %s", c.where, msg)
+		}
+	}
 }
