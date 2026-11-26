@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kweiza/flightdeck/internal/store"
 	"github.com/kweiza/flightdeck/internal/store/storetest"
@@ -317,5 +319,48 @@ func TestResolveBackupDir(t *testing.T) {
 		if got := resolveBackupDir(envOf(c.env), c.flag); got != c.want {
 			t.Errorf("resolveBackupDir(%v, %q) = %q, 기대 %q", c.env, c.flag, got, c.want)
 		}
+	}
+}
+
+// FD_DUMP_TIMEOUT 은 Go 시간 표기의 양수만 받는다. 비면 0(store 의 기본값)이다. 못 읽는 값 · 0 이하는 거절한다 - 기본값으로
+// 물러서면 늘렸다고 믿은 기한이 기본값에서 끊기고, 0 은 「기한 없음」이 아니다.
+func TestResolveDumpTimeout(t *testing.T) {
+	for _, c := range []struct {
+		env  map[string]string
+		want time.Duration
+		ok   bool
+	}{
+		{nil, 0, true},
+		{map[string]string{dumpTimeoutEnv: "  "}, 0, true},
+		{map[string]string{dumpTimeoutEnv: "45m"}, 45 * time.Minute, true},
+		{map[string]string{dumpTimeoutEnv: " 2h "}, 2 * time.Hour, true},
+		{map[string]string{dumpTimeoutEnv: "30"}, 0, false},
+		{map[string]string{dumpTimeoutEnv: "0"}, 0, false},
+		{map[string]string{dumpTimeoutEnv: "-5m"}, 0, false},
+	} {
+		got, err := resolveDumpTimeout(envOf(c.env))
+		if (err == nil) != c.ok || got != c.want {
+			t.Errorf("resolveDumpTimeout(%v) = %s, %v (기대 %s, 받음 %v)", c.env, got, err, c.want, c.ok)
+		}
+		if err != nil && !strings.Contains(err.Error(), dumpTimeoutEnv) {
+			t.Errorf("resolveDumpTimeout(%v) 의 거절이 변수 이름을 안 말한다: %v", c.env, err)
+		}
+	}
+}
+
+// 못 읽는 FD_DUMP_TIMEOUT 이면 `fd migrate` 는 원장을 건드리지 않고 거절한다 - 판이 이미 맞는 날에도 그렇다.
+func TestMigrateRefusesAnUnreadableDumpTimeout(t *testing.T) {
+	h := newHarness(t)
+	fresh := filepath.Join(t.TempDir(), "new.db")
+	env := map[string]string{dumpTimeoutEnv: "half an hour"}
+	for k, v := range h.env {
+		env[k] = v
+	}
+	rc, out := h.runEnv(env, "", "migrate", "--db", fresh)
+	if rc != 2 || !strings.Contains(out, dumpTimeoutEnv) {
+		t.Fatalf("못 읽는 덤프 기한(rc=%d): %s", rc, out)
+	}
+	if _, err := os.Stat(fresh); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("거절했는데 원장을 만들었다: %v", err)
 	}
 }

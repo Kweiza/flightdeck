@@ -937,6 +937,9 @@ type MigrateOptions struct {
 	// BackupDir 은 Postgres 원장의 판올림 전 덤프(pg_dump -Fc) 자리다. 기존 데이터 위에 증분을 얹는데 비어 있으면
 	// 거절한다 - 덤프 없이 판을 올리지 않는다(dumpPG). SQLite 는 안 쓴다(사본이 원장 옆에 뜬다).
 	BackupDir string
+	// DumpTimeout 은 Postgres 판올림 전 덤프 한 번의 기한이다(FD_DUMP_TIMEOUT). 0 이면 DefaultDumpTimeout 이다. 같은 값이
+	// 스냅숏 트랜잭션의 서버 상한과 pg_dump 자식의 문맥에 걸린다(snapshotTxLimits · backupPG). SQLite 는 안 쓴다.
+	DumpTimeout time.Duration
 }
 
 // MigrateWith 는 원장을 opt 대로 올린다. 엔진은 path 로 가른다(ParseTarget).
@@ -964,13 +967,17 @@ func openMigrator(path string, opt MigrateOptions, log *slog.Logger) (*Store, mi
 	}
 	t := ParseTarget(path)
 	if t.Postgres() {
+		limit, err := opt.dumpTimeout()
+		if err != nil {
+			return nil, run, err
+		}
 		s, err := openPG(t, log, lockTimeout)
 		if err != nil {
 			return nil, run, err
 		}
 		run.steps = pgMigrations
 		run.backup = func(ctx context.Context, sess *migrateSession, from int) (string, error) {
-			return s.backupPG(ctx, t, sess, opt.BackupDir, from)
+			return s.backupPG(ctx, t, sess, from, opt.BackupDir, limit)
 		}
 		return s, run, nil
 	}

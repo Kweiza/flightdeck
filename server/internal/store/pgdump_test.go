@@ -384,6 +384,7 @@ func TestPGDumpFaultNeverEchoesStderr(t *testing.T) {
 		{"없는 실행 파일", exec.ErrNotFound, "", "pg_dump 를 찾지 못했다"},
 		{"없는 경로", &os.PathError{Op: "stat", Path: "/x/pg_dump", Err: os.ErrNotExist}, "", "pg_dump 를 찾지 못했다"},
 		{"문맥 끝", context.DeadlineExceeded, "", "문맥이 끝났다"},
+		{"덤프 기한", dumpDeadline{2 * time.Second}, "", "pg_dump 를 멈췄다: 덤프 기한(2s, FD_DUMP_TIMEOUT)을 넘었다"},
 		{"큰 판 낮음", exitErr, "pg_dump: error: aborting because of server version mismatch\npg_dump: detail: server version: 17.2; pg_dump version: 16.4", "큰 판이 서버보다 낮다"},
 		{"인증", exitErr, `pg_dump: error: connection to server at "10.1.2.3", port 5432 failed: FATAL:  password authentication failed for user "fduser"`, "인증에 실패했다"},
 		{"권한", exitErr, `pg_dump: error: query failed: ERROR:  permission denied for table fd_secret_tbl`, "읽을 권한이 없는 객체"},
@@ -413,6 +414,51 @@ func TestPGDumpFaultNeverEchoesStderr(t *testing.T) {
 				t.Errorf("%s: stderr 조각 %q 가 샜다: %q", c.name, leak, got)
 			}
 		}
+	}
+}
+
+// TestDumpTimeoutRange 는 덤프 기한의 기본값과 범위를 잰다. 1초 아래는 밀리초로 0 이 될 수 있고 Postgres 는 0 을 「상한
+// 없음」으로 읽는다. 밀리초 int 의 최댓값 위는 SET 이 실패한다.
+func TestDumpTimeoutRange(t *testing.T) {
+	for _, c := range []struct {
+		in   time.Duration
+		want time.Duration
+		ok   bool
+	}{
+		{0, DefaultDumpTimeout, true},
+		{time.Second, time.Second, true},
+		{45 * time.Minute, 45 * time.Minute, true},
+		{maxDumpTimeout, maxDumpTimeout, true},
+		{999 * time.Millisecond, 0, false},
+		{500 * time.Microsecond, 0, false},
+		{-time.Minute, 0, false},
+		{maxDumpTimeout + time.Millisecond, 0, false},
+	} {
+		got, err := MigrateOptions{DumpTimeout: c.in}.dumpTimeout()
+		if (err == nil) != c.ok || got != c.want {
+			t.Errorf("dumpTimeout(%s) = %s, %v (기대 %s, 받음 %v)", c.in, got, err, c.want, c.ok)
+		}
+		if err != nil && !strings.Contains(err.Error(), "FD_DUMP_TIMEOUT") {
+			t.Errorf("dumpTimeout(%s) 의 거절이 설정 이름을 안 말한다: %v", c.in, err)
+		}
+	}
+	if _, _, err := openMigrator("postgres://u@127.0.0.1:1/x", MigrateOptions{DumpTimeout: time.Millisecond}, quietLog()); err == nil ||
+		!strings.Contains(err.Error(), "덤프 기한") {
+		t.Fatalf("범위 밖 기한의 실행기를 열었다: %v", err)
+	}
+}
+
+// TestSnapshotTxLimitsRestartTheClock 은 스냅숏 트랜잭션에 거는 문장을 잰다: 두 상한이 덤프 기한이고, transaction_timeout 은
+// 끈 뒤에 다시 건다(이미 도는 시계는 값을 바꿔도 다시 서지 않는다 - 실제 서버에서는 TestPGLongDumpWithinTheDeadline).
+func TestSnapshotTxLimitsRestartTheClock(t *testing.T) {
+	got := snapshotTxLimits(90 * time.Second)
+	want := []string{
+		`SET LOCAL idle_in_transaction_session_timeout = 90000`,
+		`SET LOCAL transaction_timeout = 0`,
+		`SET LOCAL transaction_timeout = 90000`,
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("snapshotTxLimits = %q, 기대 %q", got, want)
 	}
 }
 
@@ -562,6 +608,58 @@ func TestDumpPGRunsTheToolWithoutSecretsInArgv(t *testing.T) {
 			t.Fatalf("먼저 게시된 덤프가 덮였다: %q", b)
 		}
 	})
+
+	// 덤프 창의 문맥(backupPG)이 기한으로 끝나면 끝나지 않는 자식을 죽이고 기한을 말한다. 가짜는 30초 뒤 스스로 끝난다.
+	t.Run("기한에 자식을 죽인다", func(t *testing.T) {
+		rec, dir := t.TempDir(), t.TempDir()
+		bin := fakePGDump(t, rec, `i=0; while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done; `+dumpHead(t, "ledger"))
+		const limit = 300 * time.Millisecond
+		dctx, cancel := context.WithTimeoutCause(ctx, limit, dumpDeadline{limit})
+		defer cancel()
+		start := time.Now()
+		_, err := dumpPG(dctx, tg, testJob(dir, bin), quietLog())
+		if err == nil || !strings.Contains(err.Error(), "pg_dump 를 멈췄다: 덤프 기한(300ms") {
+			t.Fatalf("기한을 넘긴 덤프: %v", err)
+		}
+		if took := time.Since(start); took > 10*time.Second {
+			t.Fatalf("기한 %s 의 덤프가 %s 걸렸다 - 자식을 기한에 죽이지 않았다", limit, took)
+		}
+		if names := dirNames(t, dir); len(names) != 0 {
+			t.Fatalf("기한을 넘긴 덤프가 남았다: %q", names)
+		}
+	})
+
+	// 다 뜬 뒤 봉인이 기한을 넘겨 실패하면(서버가 기한에 실행기 연결을 끊었다) 이름을 안 붙이고 기한을 말한다. 부른 쪽의
+	// 취소(기한이 아닌 끝)는 기한이라 말하지 않는다.
+	for _, c := range []struct {
+		name, want string
+		end        func(context.Context, context.CancelFunc)
+	}{
+		{"기한을 넘긴 봉인", "덤프에 최종 이름을 붙이지 않는다 - 덤프 기한(2s, FD_DUMP_TIMEOUT)을 넘었다",
+			func(ctx context.Context, _ context.CancelFunc) { <-ctx.Done() }},
+		{"취소된 봉인", "덤프에 최종 이름을 붙이지 않는다 - 이전 실행기 잠금을 다시 재지 못했다",
+			func(_ context.Context, cancel context.CancelFunc) { cancel() }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			rec, dir := t.TempDir(), t.TempDir()
+			bin := fakePGDump(t, rec, dumpHead(t, "ledger"))
+			const limit = 2 * time.Second // 가짜가 떠서 끝나기까지보다 넉넉하다 - 기한은 봉인하는 사이에 지나야 한다
+			dctx, cancel := context.WithTimeoutCause(ctx, limit, dumpDeadline{limit})
+			defer cancel()
+			j := testJob(dir, bin)
+			j.seal = func(ctx context.Context) error {
+				c.end(ctx, cancel)
+				return errors.New("이전 실행기 잠금을 다시 재지 못했다")
+			}
+			_, err := dumpPG(dctx, tg, j, quietLog())
+			if err == nil || !strings.Contains(err.Error(), c.want) || !strings.Contains(err.Error(), "잠금을 다시 재지 못했다") {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+			if names := dirNames(t, dir); len(names) != 0 {
+				t.Fatalf("봉인에 실패한 덤프가 남았다: %q", names)
+			}
+		})
+	}
 
 	t.Run("스냅숏 없이는 안 뜬다", func(t *testing.T) {
 		rec, dir := t.TempDir(), t.TempDir()

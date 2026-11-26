@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -468,14 +469,21 @@ var testStep = Migration{To: SchemaVersion + 1, Name: "시험 증분", SQL: `CRE
 
 // upgradeRun 은 dsn 의 원장을 판 하나 올리는 실행기다(덤프 자리 dir, 증분 testStep). 운영과 같은 길(openMigrator)로 연다.
 func upgradeRun(t *testing.T, dsn, dir string) (*Store, migrateRun) {
+	return upgradeRunOpts(t, dsn, MigrateOptions{BackupDir: dir})
+}
+
+// upgradeRunOpts 는 upgradeRun 이고 덤프 자리 · 기한을 opt 로 받는다(목표 판은 늘 하나 위다).
+func upgradeRunOpts(t *testing.T, dsn string, opt MigrateOptions) (*Store, migrateRun) {
 	t.Helper()
-	m, run := pgMigrator(t, dsn, MigrateOptions{Target: SchemaVersion + 1, BackupDir: dir})
+	opt.Target = SchemaVersion + 1
+	m, run := pgMigrator(t, dsn, opt)
 	run.steps = []Migration{testStep}
 	return m, run
 }
 
-// upgradeRunWith 는 upgradeRun 이고 연결 상한을 lim 으로 줄인 원장으로 연다. 덤프는 운영과 같은 backupPG 다.
-func upgradeRunWith(t *testing.T, dsn, dir string, lim pgLimits) (*Store, migrateRun) {
+// upgradeRunWith 는 upgradeRun 이고 연결 상한을 lim 으로 줄인 원장으로 연다. 덤프는 운영과 같은 backupPG 이고 기한은
+// dumpLimit 이다.
+func upgradeRunWith(t *testing.T, dsn, dir string, lim pgLimits, dumpLimit time.Duration) (*Store, migrateRun) {
 	t.Helper()
 	tg := ParseTarget(dsn)
 	m, err := openPGWith(tg, quietLog(), lim)
@@ -485,7 +493,7 @@ func upgradeRunWith(t *testing.T, dsn, dir string, lim pgLimits) (*Store, migrat
 	t.Cleanup(func() { _ = m.Close() })
 	return m, migrateRun{target: SchemaVersion + 1, steps: []Migration{testStep},
 		backup: func(ctx context.Context, sess *migrateSession, from int) (string, error) {
-			return m.backupPG(ctx, tg, sess, dir, from)
+			return m.backupPG(ctx, tg, sess, from, dir, dumpLimit)
 		}}
 }
 
@@ -973,7 +981,7 @@ func TestPGDumpSeesTheRunnersSnapshot(t *testing.T) {
 		t.Fatalf("실행기 세션: %v", err)
 	}
 	defer sess.release()
-	snap, err := s.exportSnapshot(ctx, sess)
+	snap, err := s.exportSnapshot(ctx, sess, DefaultDumpTimeout)
 	if err != nil {
 		t.Fatalf("스냅숏: %v", err)
 	}
@@ -1011,7 +1019,7 @@ func TestPGDumpSeesTheRunnersSnapshot(t *testing.T) {
 		t.Fatalf("다른 DB 의 실행기 세션: %v", err)
 	}
 	defer osess.release()
-	osnap, err := os2.exportSnapshot(ctx, osess)
+	osnap, err := os2.exportSnapshot(ctx, osess, DefaultDumpTimeout)
 	if err != nil {
 		t.Fatalf("다른 DB 의 스냅숏: %v", err)
 	}
@@ -1035,11 +1043,13 @@ func realJob(dir string, led ledgerFacts, snapshot string) dumpJob {
 	return dumpJob{dir: dir, bin: "pg_dump", ledger: led, from: SchemaVersion, snapshot: snapshot, lockWait: lockTimeout, seal: sealOK}
 }
 
-// TestPGDumpOutlivesTheTxLimits 는 덤프가 연결의 유휴 트랜잭션 상한(idle_in_transaction_session_timeout)과 서버 설정의
-// transaction_timeout 보다 오래 걸려도 판을 올리는지 잰다. 스냅숏을 내보낸 트랜잭션은 pg_dump 를 기다리는 동안 문장 없이
-// 열려 있다 - 상한이 그대로면 Postgres 가 실행기 연결을 끊어 두 잠금이 사라지고 봉인에서 실패한다. 두 상한을 1초로 줄이고
-// pg_dump 자리의 가짜가 그보다 오래 걸린다. 상한은 그 트랜잭션 안에서만 풀려야 한다 - 풀로 돌아간 연결은 다시 상한을 쥔다.
-func TestPGDumpOutlivesTheTxLimits(t *testing.T) {
+// TestPGLongDumpWithinTheDeadline 은 덤프 기한 안의 긴 덤프가 판을 올리는지 잰다: 연결의 유휴 트랜잭션 상한
+// (idle_in_transaction_session_timeout)과 서버 설정의 transaction_timeout 보다 오래 걸려도 기한 안이면 된다. 스냅숏을 내보낸
+// 트랜잭션은 pg_dump 를 기다리는 동안 문장 없이 열려 있다 - 두 상한이 그대로면 Postgres 가 실행기 연결을 끊어 두 잠금이
+// 사라지고 봉인에서 실패한다. 두 상한을 1초로 줄이고 pg_dump 자리의 가짜가 그보다 오래, 기한(10초)보다는 짧게 걸린다.
+// transaction_timeout 은 DB 설정이라 BEGIN 에서 이미 시계가 돈다 - 그 시계를 기한으로 다시 세우지 못하면 여기서 끊긴다.
+// 기한은 그 트랜잭션 안에서만 걸려야 한다 - 풀로 돌아간 연결은 다시 원래 상한을 쥔다.
+func TestPGLongDumpWithinTheDeadline(t *testing.T) {
 	ctx := context.Background()
 	dsn, s := pgMigrated(t)
 	const limit = time.Second
@@ -1047,11 +1057,11 @@ func TestPGDumpOutlivesTheTxLimits(t *testing.T) {
 	pgExec(t, s, `ALTER DATABASE `+pgx.Identifier{name}.Sanitize()+` SET transaction_timeout = `+millis(limit))
 	onPath(t, fakePGDump(t, t.TempDir(), `sleep 2.5; `+dumpHead(t, name)))
 	dir := t.TempDir()
-	m, run := upgradeRunWith(t, dsn, dir, pgLimits{lock: lockTimeout, idleInTx: limit})
+	m, run := upgradeRunWith(t, dsn, dir, pgLimits{lock: lockTimeout, idleInTx: limit}, 10*time.Second)
 	m.db.raw.SetMaxOpenConns(1) // 실행기 세션의 연결이 풀로 돌아와 아래 되읽기가 받는다
 	start := time.Now()
 	if err := m.migrateTo(ctx, run); err != nil {
-		t.Fatalf("상한보다 오래 걸린 덤프의 판올림: %v", err)
+		t.Fatalf("상한보다 길고 기한보다 짧은 덤프의 판올림: %v", err)
 	}
 	if d := time.Since(start); d < 2*limit {
 		t.Fatalf("판올림이 %s 만에 끝났다 - 덤프가 상한보다 오래 걸리지 않아 상한을 재지 못했다", d)
@@ -1068,8 +1078,182 @@ func TestPGDumpOutlivesTheTxLimits(t *testing.T) {
 			t.Fatal(err)
 		}
 		if got != want {
-			t.Errorf("판올림 뒤 실행기 연결의 %s = %s(기대 %s) - 상한을 트랜잭션 밖에서 풀었다", setting, got, want)
+			t.Errorf("판올림 뒤 실행기 연결의 %s = %s(기대 %s) - 기한을 트랜잭션 밖에 걸었다", setting, got, want)
 		}
+	}
+}
+
+// businessWrite 는 업무 쓰기 하나를 다른 연결에서 커밋한다(전역 잠금을 잡는다). 잠금 대기 상한은 운영과 같다.
+func businessWrite(t *testing.T, dsn, id string) error {
+	t.Helper()
+	w, err := openPG(ParseTarget(dsn), quietLog(), lockTimeout)
+	if err != nil {
+		t.Fatalf("업무 쓰기 연결: %v", err)
+	}
+	defer w.Close()
+	return w.Tx(context.Background(), func(x *Tx) error { return insertMachine(x, id) })
+}
+
+// TestPGDumpDeadlineStopsAHungDump 는 끝나지 않는 pg_dump 를 덤프 기한에 멈추는지 잰다. 실행기는 그 자식을 죽이고 기한을
+// 말하는 오류로 끝나며(닫힌 실패: 판도 덤프도 없다), 그 뒤 다른 연결의 업무 쓰기가 전역 잠금을 잡는다. 기한은 운영과 같은
+// 길(MigrateOptions.DumpTimeout → openMigrator)로 준다. 가짜는 60초 뒤 스스로 끝난다 - 기한이 안 걸려도 시험이 영영 서지 않게.
+func TestPGDumpDeadlineStopsAHungDump(t *testing.T) {
+	ctx := context.Background()
+	dsn, s := pgMigrated(t)
+	const limit = 2 * time.Second
+	rec := t.TempDir()
+	onPath(t, fakePGDump(t, rec, `: > "`+rec+`/started"
+i=0
+while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i+1)); done
+exit 3`))
+	dir := t.TempDir()
+	m, run := upgradeRunOpts(t, dsn, MigrateOptions{BackupDir: dir, DumpTimeout: limit})
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- m.migrateTo(ctx, run) }()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * limit):
+		t.Errorf("덤프 기한(%s)의 다섯 배가 지나도 실행기가 끝나지 않는다 - pg_dump 를 멈추지 않았다", limit)
+		err = <-done
+	}
+	took := time.Since(start)
+	if _, serr := os.Stat(filepath.Join(rec, "started")); serr != nil {
+		t.Fatalf("가짜 pg_dump 가 돌지 않았다: %v (판올림: %v)", serr, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "덤프 기한("+limit.String()) {
+		t.Fatalf("멈춘 덤프의 판올림: %v", err)
+	}
+	if took < limit {
+		t.Fatalf("판올림이 기한(%s) 전인 %s 에 끝났다 - 기한 말고 다른 것이 덤프를 멈췄다", limit, took)
+	}
+	if v := pgVersion(t, s); v != SchemaVersion || pgTableExists(t, s, "t_after") {
+		t.Fatalf("멈춘 덤프 뒤에 판이 올랐다: 판 %d, t_after %v", v, pgTableExists(t, s, "t_after"))
+	}
+	if names := dirNames(t, dir); len(names) != 0 {
+		t.Fatalf("멈춘 덤프가 남았다: %q", names)
+	}
+	if err := businessWrite(t, dsn, "m-after-hung-dump"); err != nil {
+		t.Fatalf("멈춘 덤프 뒤의 업무 쓰기: %v", err)
+	}
+}
+
+// TestPGServerAloneFreesTheRunnersLocks 는 실행기 쪽이 아무것도 닫지 않아도 덤프 기한이 지나면 **서버가 스스로** 실행기
+// 연결을 끊어 두 잠금을 푸는지 잰다. 실행기 프로세스가 통째로 서거나 서버와의 사이가 끊긴 자리다 - 그때 실행기 쪽 문맥은 아무
+// 일도 못 한다. 그래서 스냅숏 트랜잭션을 기한 없는 문맥으로 열고 붙든다(문맥이 끝나면 database/sql 이 그 트랜잭션을 되감다
+// 연결을 닫아 버려, 누가 풀었는지 가를 수 없다). 서버 상한이 덤프 기한이 아니면(0 이면) 잠금이 끝없이 남는다.
+func TestPGServerAloneFreesTheRunnersLocks(t *testing.T) {
+	ctx := context.Background()
+	dsn, s := pgMigrated(t)
+	const limit = 2 * time.Second
+	sess, err := s.openMigrateSession(ctx)
+	if err != nil {
+		t.Fatalf("실행기 세션: %v", err)
+	}
+	defer sess.release()
+	start := time.Now()
+	snap, err := s.exportSnapshot(ctx, sess, limit)
+	if err != nil {
+		t.Fatalf("스냅숏: %v", err)
+	}
+	defer func() { _ = snap.end() }()
+	waitUntil(t, "기한이 지나 서버가 실행기 연결을 끊고 두 잠금을 푼다", func() bool {
+		return advisoryHolders(t, s, migrateLockKey) == 0 && advisoryHolders(t, s, globalLockKey) == 0
+	})
+	if took := time.Since(start); took < limit {
+		t.Fatalf("잠금이 기한(%s) 전인 %s 에 풀렸다 - 기한 말고 다른 것이 풀었다", limit, took)
+	}
+	if err := businessWrite(t, dsn, "m-after-server-limit"); err != nil {
+		t.Fatalf("서버가 실행기를 끊은 뒤의 업무 쓰기: %v", err)
+	}
+	if err := snap.end(); err == nil {
+		t.Fatal("서버가 끊은 스냅숏 트랜잭션이 아무 일 없이 닫혔다")
+	}
+	if err := sealDump(ctx, sess, SchemaVersion); err == nil {
+		t.Fatal("서버가 끊은 실행기 세션이 봉인을 지났다")
+	}
+}
+
+// TestPGServerFreesTheLocksOfAStuckRunner 는 실행기가 파일 입출력에 서 있어도 덤프 기한에 두 잠금이 풀리고, 풀어 준 실행기가
+// 닫힌 실패로 끝나는지 잰다. 가짜 pg_dump 는 출력 자리를 FIFO 로 바꾸고 0 으로 끝난다. 실행기는 덤프 머리를 읽으려다
+// (checkDumpDatabase) 쓰는 쪽이 올 때까지 선다 - 응답을 멈춘 백업 볼륨에서 파일을 읽는 실행기와 같다. 서 있는 동안 잠금이
+// 풀리고 다른 연결의 업무 쓰기가 커밋해야 한다. 이 자리에서는 서버 상한과 실행기 쪽 문맥(끝나면 database/sql 이 스냅숏
+// 트랜잭션을 되감다 연결을 닫는다)이 같은 기한에 함께 움직여 누가 풀었는지 가르지 않는다 - 서버 혼자의 몫은
+// TestPGServerAloneFreesTheRunnersLocks 가 잰다. 풀어 주면 실행기는 판을 다시 재다 끊긴 연결을 만나 덤프에 이름을 안 붙이고
+// 기한을 말하며 실패한다.
+func TestPGServerFreesTheLocksOfAStuckRunner(t *testing.T) {
+	ctx := context.Background()
+	dsn, s := pgMigrated(t)
+	name := dsnDB(t, dsn)
+	const limit = 2 * time.Second
+	onPath(t, fakePGDump(t, t.TempDir(), `rm -f "$out" && mkfifo "$out"`))
+	dir := t.TempDir()
+	m, run := upgradeRunOpts(t, dsn, MigrateOptions{BackupDir: dir, DumpTimeout: limit})
+	done, ended := make(chan error, 1), make(chan struct{})
+	start := time.Now()
+	go func() { done <- m.migrateTo(ctx, run); close(ended) }()
+	var fifo string
+	waitUntil(t, "가짜 pg_dump 가 출력 자리를 FIFO 로 바꾼다", func() bool {
+		ps, _ := filepath.Glob(filepath.Join(dir, "*.part"))
+		if len(ps) != 1 {
+			return false
+		}
+		fi, err := os.Lstat(ps[0])
+		if err != nil || fi.Mode()&os.ModeNamedPipe == 0 {
+			return false
+		}
+		fifo = ps[0]
+		return true
+	})
+	// feed 는 서 있는 실행기에게 덤프 머리를 써 준다. 읽는 쪽이 없으면(이미 끝났다) 아무것도 안 한다.
+	feed := func() {
+		f, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			return
+		}
+		_, _ = f.WriteString(storetest.FakeDump(name, 16))
+		_ = f.Close()
+	}
+	t.Cleanup(func() { // 중간에 실패한 시험이 실행기를 붙들어 두지 않게
+		feed()
+		select {
+		case <-ended:
+		case <-time.After(10 * time.Second):
+		}
+	})
+
+	waitUntil(t, "기한이 지나 실행기 연결이 끊기고 두 잠금이 풀린다", func() bool {
+		return advisoryHolders(t, s, migrateLockKey) == 0 && advisoryHolders(t, s, globalLockKey) == 0
+	})
+	if took := time.Since(start); took < limit {
+		t.Fatalf("잠금이 기한(%s) 전인 %s 에 풀렸다 - 기한 말고 다른 것이 풀었다", limit, took)
+	}
+	if err := businessWrite(t, dsn, "m-while-runner-stuck"); err != nil {
+		t.Fatalf("실행기가 서 있는 동안의 업무 쓰기: %v", err)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("실행기가 서 있지 않았다 - 파일 입출력에 선 실행기를 재지 못했다(판올림: %v)", err)
+	default:
+	}
+
+	feed()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("풀어 준 실행기가 10초 안에 끝나지 않는다")
+	}
+	if err == nil || !strings.Contains(err.Error(), "덤프에 최종 이름을 붙이지 않는다") ||
+		!strings.Contains(err.Error(), "덤프 기한("+limit.String()) {
+		t.Fatalf("기한에 연결을 잃은 실행기: %v", err)
+	}
+	if v := pgVersion(t, s); v != SchemaVersion || pgTableExists(t, s, "t_after") {
+		t.Fatalf("연결을 잃은 실행기가 판을 올렸다: 판 %d, t_after %v", v, pgTableExists(t, s, "t_after"))
+	}
+	if names := dirNames(t, dir); len(names) != 0 {
+		t.Fatalf("연결을 잃은 실행기의 덤프가 남았다: %q", names)
 	}
 }
 
@@ -1171,7 +1355,7 @@ func TestPGDumpGivesUpOnATableLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	m, run := upgradeRunWith(t, dsn, dir, pgLimits{lock: 500 * time.Millisecond, idleInTx: idleInTxTimeout})
+	m, run := upgradeRunWith(t, dsn, dir, pgLimits{lock: 500 * time.Millisecond, idleInTx: idleInTxTimeout}, DefaultDumpTimeout)
 	done := make(chan error, 1)
 	start := time.Now()
 	go func() { done <- m.migrateTo(ctx, run) }()

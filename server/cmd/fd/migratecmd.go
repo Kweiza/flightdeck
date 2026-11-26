@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/kweiza/flightdeck/internal/store"
 )
@@ -29,6 +30,27 @@ func resolveBackupDir(env func(string) (string, bool), flag string) string {
 		return defaultBackupDir
 	}
 	return ""
+}
+
+// dumpTimeoutEnv 는 Postgres 원장의 판올림 전 덤프 기한을 주는 환경 변수다(Go 시간 표기, 예: 45m · 2h).
+const dumpTimeoutEnv = "FD_DUMP_TIMEOUT"
+
+// resolveDumpTimeout 은 덤프 기한을 읽는다. 비었으면 0 이고 store 가 기본값(store.DefaultDumpTimeout)을 쓴다. 범위는 store 가
+// 잰다(MigrateOptions.DumpTimeout).
+//
+// ★ 못 읽는 값과 0 이하는 거절한다. 기본값으로 물러서면 늘렸다고 믿은 기한이 기본값에서 끊기고, 0 은 「기한 없음」이 아니다 -
+// 기한 없는 덤프가 멈추면 업무 쓰기가 끝없이 막힌다.
+func resolveDumpTimeout(env func(string) (string, bool)) (time.Duration, error) {
+	v, ok := env(dumpTimeoutEnv)
+	if !ok || strings.TrimSpace(v) == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(v))
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("%s 를 읽지 못했다(%q) - 45m · 2h 같은 Go 시간 표기의 양수여야 한다(비우면 %s)",
+			dumpTimeoutEnv, clip(v, 40), store.DefaultDumpTimeout)
+	}
+	return d, nil
 }
 
 // `fd migrate` — 설계 §7 처방 ①·③(적용을 기동에서 분리 · 롤백 명령).
@@ -88,6 +110,12 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 	if *to != 0 {
 		target = *to
 	}
+	// 판이 맞아 아무것도 안 하는 날에도 잰다 - 설정이 틀린 것을 판올림 날에야 알면 늦다.
+	dumpTimeout, err := resolveDumpTimeout(a.env)
+	if err != nil {
+		fmt.Fprintln(out, err)
+		return 2
+	}
 
 	// ★ 이미 맞으면 **그렇다고 말하고 아무것도 안 한다.** 침묵하면 운영자가 두 번 돌았는지
 	//   아닌지 모르고, 그 모호함이 컨테이너의 one-shot 단계에서 재시작마다 되풀이된다.
@@ -97,7 +125,7 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 		return 0
 	}
 
-	if err := store.MigrateWith(ctx, path, store.MigrateOptions{Target: target, BackupDir: dumps}, a.log); err != nil {
+	if err := store.MigrateWith(ctx, path, store.MigrateOptions{Target: target, BackupDir: dumps, DumpTimeout: dumpTimeout}, a.log); err != nil {
 		a.log.Error("적용 실패", "path", shown, "target", target, "error", err.Error())
 		fmt.Fprintf(out, "적용 실패: %s\n", err)
 		return 1
