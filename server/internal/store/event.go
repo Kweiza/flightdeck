@@ -167,6 +167,8 @@ func payloadTopString(payload, key string) (string, bool, error) {
 		return "", false, err
 	}
 	dec := json.NewDecoder(strings.NewReader(payload))
+	// 최상위가 1e309 같은 수여도 표준 JSON 이고 「없음」이다. UseNumber 가 없으면 Token 이 float64 로 바꾸다 오류를 낸다.
+	dec.UseNumber()
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return "", false, err
 	}
@@ -318,6 +320,8 @@ func readReproPayload(payload string) (reproPayload, bool) {
 	if json.Unmarshal([]byte(payload), &p) != nil {
 		return reproPayload{}, false
 	}
+	// 결말은 자격 판정(PayloadCommitted)과 같은 판독기로 읽는다. 구조체 풀기는 중복 키의 끝 값을 써서 둘이 갈린다.
+	p.Tx = payloadTxOutcome(payload)
 	return p, true
 }
 

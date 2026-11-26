@@ -685,6 +685,8 @@ func TestPayloadTopStringReadsLikeJSONExtract(t *testing.T) {
 		{"최상위가 배열", `["fd-x"]`, "fd-x", miss, false},
 		{"최상위가 글", `"fd-x"`, "fd-x", miss, false},
 		{"최상위가 수", `3`, "fd-x", miss, false},
+		{"최상위가 float64 를 넘는 수", `1e309`, "fd-x", miss, false},
+		{"남의 칸이 float64 를 넘는 수", `{"big":1e309,"item":"fd-x"}`, "fd-x", hit, false},
 		{"최상위가 null", `null`, "fd-x", miss, false},
 		{"JSON 이 아니다", `not json`, "fd-x", fail, false},
 		{"닫히지 않았다", `{"item":"fd-x"`, "fd-x", fail, false},
@@ -717,5 +719,21 @@ func TestPayloadTopStringReadsLikeJSONExtract(t *testing.T) {
 		if sqlite.String != wantSQLite {
 			t.Errorf("%s: payload %s id %s - json_extract %s (기대 %s, err=%v)", c.why, c.payload, c.id, sqlite.String, wantSQLite, sqlErr)
 		}
+	}
+}
+
+// TestReproPayloadReadsOutcomeLikeEligibility 는 재생산 집계(readReproPayload)가 결말을 자격 판정(PayloadCommitted)과
+// 같은 판독기로 읽는가다. 구조체 풀기는 중복 키의 끝 값을 써서 둘이 한 행을 다르게 볼 수 있었다.
+func TestReproPayloadReadsOutcomeLikeEligibility(t *testing.T) {
+	const dup = `{"count":1,"tx":"committed","tx":"rolled_back"}`
+	p, read := readReproPayload(dup)
+	if !read || p.Count != 1 {
+		t.Fatalf("readReproPayload(%s) = %+v, %v", dup, p, read)
+	}
+	if got, want := p.Tx == TxRolledBack, !PayloadCommitted(dup); got != want {
+		t.Fatalf("중복 tx 에서 집계(롤백=%v)와 자격(커밋 아님=%v)이 갈린다", got, want)
+	}
+	if p.Tx != "committed" {
+		t.Fatalf("중복 tx 는 첫 값이어야 한다: %q", p.Tx)
 	}
 }
