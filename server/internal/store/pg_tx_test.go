@@ -3,11 +3,13 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/url"
 	"sort"
 	"strconv"
@@ -764,9 +766,10 @@ func TestPGOpenRefusesUnstampedOrForeignVersion(t *testing.T) {
 	_ = s.Close()
 }
 
-// TestPGOpenLogsServerCoordsWithoutUser 는 열기가 붙은 **뒤에** 서버가 말한 좌표(DB 이름 · 포트 · 판)를 기동 로그에 한 줄
-// 남기는지 잰다. 표시값(postgres)이 접속 세부를 안 싣는 대신의 진단이다. 사용자 이름은 안 싣는다.
-func TestPGOpenLogsServerCoordsWithoutUser(t *testing.T) {
+// TestPGOpenLogsServerCoordsWithoutNames 는 열기가 붙은 **뒤에** 서버가 말한 포트 · 판을 기동 로그에 한 줄 남기고, 이름
+// (DB · 사용자)은 어디에도 안 싣는지 잰다. 붙었다는 것은 그 이름이 맞았다는 뜻일 뿐이다 - 잘못 읽힌 비밀번호 조각이 실제
+// DB 이름과 같으면 그 조각으로 붙고, 서버가 current_database() 로 그 조각을 돌려준다(logPGServer 의 ★).
+func TestPGOpenLogsServerCoordsWithoutNames(t *testing.T) {
 	dsn := storetest.New(t)
 	var logs bytes.Buffer
 	s, err := openPG(ParseTarget(dsn), slog.New(slog.NewJSONHandler(&logs, nil)), lockTimeout)
@@ -789,13 +792,16 @@ func TestPGOpenLogsServerCoordsWithoutUser(t *testing.T) {
 		t.Fatalf("기동 진단 줄이 없다: %s", logs.String())
 	}
 	// 포트는 서버 쪽에서 본 값이라 접속 URL 의 포트와 다를 수 있다(컨테이너의 포트 넘기기). 찼는지만 본다.
-	if line["database"] != strings.TrimPrefix(u.Path, "/") || line["port"] == "" || line["server_version"] == "" {
-		t.Fatalf("서버가 말한 좌표가 접속한 자리와 다르거나 비었다(기대 DB %s): %v", u.Path, line)
+	if line["port"] == "" || line["server_version"] == "" {
+		t.Fatalf("서버가 말한 포트 · 판이 비었다: %v", line)
 	}
 	for k := range line {
-		if strings.Contains(k, "user") {
-			t.Fatalf("사용자 이름을 실었다(%s): %v", k, line)
+		if strings.Contains(k, "user") || strings.Contains(k, "database") {
+			t.Fatalf("이름 칸(%s)을 실었다: %v", k, line)
 		}
+	}
+	if name := strings.TrimPrefix(u.Path, "/"); strings.Contains(logs.String(), name) {
+		t.Fatalf("기동 로그에 DB 이름(%s)이 실렸다: %s", name, logs.String())
 	}
 }
 
@@ -854,4 +860,186 @@ func TestPGReconnectFailureCarriesNoDSNPiece(t *testing.T) {
 			t.Fatalf("%s: 재접속 거절을 종류 · SQLSTATE 로 옮기지 않았다: %s", c.where, msg)
 		}
 	}
+}
+
+// rstRelay 는 dsn 의 서버 앞에 TCP 중계를 세우고, 중계를 거치는 접속 URL 과 끊기(cut)를 낸다. cut 은 지금 중계 중인
+// 연결을 모두 RST 로 끊는다 - 서버가 마지막 말 없이 사라지는 자리(망 단절 · 서버 기계의 급사)다. 중계는 계속 들으므로
+// 연결 풀은 다시 붙는다.
+func rstRelay(t *testing.T, dsn string) (string, func()) {
+	t.Helper()
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := u.Host
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var live []net.Conn
+	cut := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range live {
+			if tc, ok := c.(*net.TCPConn); ok {
+				_ = tc.SetLinger(0) // 닫을 때 FIN 이 아니라 RST 를 보낸다
+			}
+			_ = c.Close()
+		}
+		live = nil
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			up, err := net.Dial("tcp", upstream)
+			if err != nil {
+				_ = c.Close()
+				continue
+			}
+			mu.Lock()
+			live = append(live, c, up)
+			mu.Unlock()
+			go func() { _, _ = io.Copy(up, c) }()
+			go func() { _, _ = io.Copy(c, up) }()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		cut()
+	})
+	u.Host = ln.Addr().String()
+	return u.String(), cut
+}
+
+// TestPGBrokenConnCarriesNoRemoteAddr 는 붙은 연결이 도중에 끊겼을 때 store 가 내는 오류에 원격 주소 · 포트가 없는지
+// 잰다. 드라이버는 그 자리의 네트워크 오류에 `tcp <내 주소>-><원격 주소>` 를 싣고, 그 본문이 문장 · 순회(rows.Err) ·
+// 커밋의 오류를 타고 API 오류 로그까지 간다. 재접속 실패(ConnectError)만 가리던 앞 판이 놓친 자리다.
+//
+// ★ 끊는 길이 둘이다. pg_terminate_backend 로 자기 연결을 끊으면 서버가 마지막 말(FATAL 57P01)을 먼저 보내고 드라이버는
+// 그것을 PgError 로 낸다 - 서버가 돌려준 SQLSTATE 라 그대로 지나야 하고, 그 뒤 문장은 「끊긴 연결」 종류로 와야 한다.
+// 주소를 싣는 네트워크 오류는 서버가 마지막 말 없이 사라질 때 난다 - 중계(rstRelay)를 RST 로 끊어 그 자리를 만든다.
+func TestPGBrokenConnCarriesNoRemoteAddr(t *testing.T) {
+	dsn, cut := rstRelay(t, storetest.New(t))
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	var one int
+	for _, c := range []struct {
+		name string
+		run  func(t *testing.T, s *Store) error
+	}{
+		{"자기 연결 끊기(pg_terminate_backend)", func(t *testing.T, s *Store) error {
+			return s.ReadTx(ctx, func(r Reader) error {
+				var ok bool
+				err := r.QueryRowContext(ctx, `SELECT pg_terminate_backend(pg_backend_pid())`).Scan(&ok)
+				var pe *pgconn.PgError
+				if !errors.As(err, &pe) || pe.Code != "57P01" {
+					t.Fatalf("서버가 돌려준 FATAL 57P01 이 PgError 로 지나지 않았다: %v", err)
+				}
+				return r.QueryRowContext(ctx, `SELECT 1`).Scan(&one)
+			})
+		}},
+		{"트랜잭션 안의 문장", func(t *testing.T, s *Store) error {
+			return s.ReadTx(ctx, func(r Reader) error {
+				if err := r.QueryRowContext(ctx, `SELECT 1`).Scan(&one); err != nil {
+					t.Fatalf("끊기 전 질의: %v", err)
+				}
+				cut()
+				return r.QueryRowContext(ctx, `SELECT 1`).Scan(&one)
+			})
+		}},
+		{"도중의 순회(rows.Err)", func(t *testing.T, s *Store) error {
+			// 첫 행(서버의 보내기 버퍼보다 커서 곧장 나간다)을 보낸 뒤 서버가 둘째 행에서 쉰다 - 그 사이에 끊는다.
+			// 쉬지 않고 흘리면 받는 쪽 창이 찬 채로 RST 를 맞아 커널이 그것을 버리고, 다음 탐침까지 십수 초를 선다.
+			// 쉬는 백엔드는 시험 DB 를 지울 때 FORCE 가 끝낸다.
+			return s.ReadTx(ctx, func(r Reader) error {
+				rows, err := r.QueryContext(ctx, `SELECT g, repeat('x', 20000),
+					CASE WHEN g = 2 THEN (SELECT 0 FROM pg_sleep(30)) ELSE 0 END FROM generate_series(1, 2) g`)
+				if err != nil {
+					t.Fatalf("끊기 전 질의: %v", err)
+				}
+				defer rows.Close()
+				if !rows.Next() {
+					t.Fatalf("첫 행이 없다: %v", rows.Err())
+				}
+				cut()
+				if rows.Next() {
+					t.Fatal("끊은 뒤 둘째 행을 받았다")
+				}
+				return rows.Err()
+			})
+		}},
+		{"커밋", func(t *testing.T, s *Store) error {
+			return s.Tx(ctx, func(x *Tx) error {
+				if err := insertMachine(x, "m"); err != nil {
+					t.Fatalf("끊기 전 쓰기: %v", err)
+				}
+				cut()
+				return nil
+			})
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := openPG(ParseTarget(dsn), quietLog(), lockTimeout)
+			if err != nil {
+				t.Fatalf("openPG: %v", err)
+			}
+			defer s.Close()
+			err = c.run(t, s)
+			if err == nil {
+				t.Fatal("끊었는데 성공했다")
+			}
+			msg := err.Error()
+			for _, piece := range []string{u.Host, ":" + u.Port(), "tcp ", "->"} {
+				if strings.Contains(msg, piece) {
+					t.Fatalf("오류에 원격 주소의 조각(%s)이 실렸다: %s", piece, msg)
+				}
+			}
+			if !strings.Contains(msg, "Postgres 와 주고받지 못했다") {
+				t.Fatalf("드라이버 오류를 종류로 옮기지 않았다: %s", msg)
+			}
+		})
+	}
+}
+
+// TestPGRowKeepsDatabaseSQLResults 는 드라이버 오류를 옮기는 감싸개가 database/sql 이 스스로 낸 결과는 그대로 두는지
+// 잰다. sql.ErrNoRows 는 부르는 쪽이 견주는 표지이고, 값 변환 오류(NULL 을 string 으로)는 드라이버 본문이 아니라 우리 쪽
+// 결함이라 가리면 고칠 거리가 사라진다. *sql.Row 를 감싸던 앞 판은 둘을 드라이버 오류와 한 반환값으로 받았다(row 의 ★).
+func TestPGRowKeepsDatabaseSQLResults(t *testing.T) {
+	s := newPGStore(t, lockTimeout)
+	ctx := context.Background()
+	check := func(t *testing.T, r Reader) {
+		t.Helper()
+		var n int
+		if err := r.QueryRowContext(ctx, `SELECT 1 WHERE false`).Scan(&n); err != sql.ErrNoRows {
+			t.Fatalf("빈 결과가 sql.ErrNoRows 그 자체로 오지 않았다: %v", err)
+		}
+		var str string
+		if err := r.QueryRowContext(ctx, `SELECT NULL::text`).Scan(&str); err == nil || !strings.Contains(err.Error(), "converting NULL to string") {
+			t.Fatalf("한 행 질의의 값 변환 오류가 본문을 잃었다: %v", err)
+		}
+		rows, err := r.QueryContext(ctx, `SELECT NULL::text`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		if !rows.Next() {
+			t.Fatalf("행이 없다: %v", rows.Err())
+		}
+		if err := rows.Scan(&str); err == nil || !strings.Contains(err.Error(), "converting NULL to string") {
+			t.Fatalf("여러 행 질의의 값 변환 오류가 본문을 잃었다: %v", err)
+		}
+	}
+	t.Run("단발", func(t *testing.T) { check(t, s.db) })
+	t.Run("트랜잭션", func(t *testing.T) {
+		if err := s.ReadTx(ctx, func(r Reader) error { check(t, r); return nil }); err != nil {
+			t.Fatal(err)
+		}
+	})
 }

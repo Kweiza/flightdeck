@@ -21,6 +21,7 @@ type Health struct {
 	DBOK        bool      `json:"db_ok"`
 	DBPath      string    `json:"db_path"`
 	DBError     string    `json:"db_error,omitempty"`
+	DBRemote    bool      `json:"db_remote"` // 원장이 Postgres 인가. 그러면 로그에도 종류 · SQLSTATE 만 남는다(/healthz 안내가 따른다)
 	DiskFreePct float64   `json:"disk_free_pct"`
 	DiskKnown   bool      `json:"disk_known"` // false 면 위 숫자는 값이 아니다. 0%와 "못 쟀다"를 가른다
 	DiskError   string    `json:"disk_error,omitempty"`
@@ -40,7 +41,7 @@ func (s *Service) Health(ctx context.Context) Health {
 		h.DBError = "저장 계층이 없다 — 서버가 DB 없이 기동했다"
 		return h
 	}
-	h.DBPath = s.st.Path()
+	h.DBPath, h.DBRemote = s.st.Path(), s.st.Postgres()
 	// ★ 날 핸들(DB())이 아니라 store 의 Ping 이다. Postgres 의 재접속 실패 본문은 접속 문자열의 조각(사용자 · DB 이름)을
 	//   다시 싣는데, 아래는 그 본문을 로그 · DBError(대시보드의 헬스 줄)에 그대로 싣는다. Ping 이 경계에서 옮긴다.
 	if err := s.st.Ping(ctx); err != nil {
@@ -52,7 +53,7 @@ func (s *Service) Health(ctx context.Context) Health {
 
 	// ★ Postgres 원장이면 재지 않는다. DBPath 는 파일 경로가 아닌 표시값이라 그 「상위 디렉토리」를 statfs 하면 현재
 	//   폴더를 재게 되고, 원장이 사는 디스크는 이 프로세스의 것이 아니다.
-	if s.st.Postgres() {
+	if h.DBRemote {
 		h.DiskError = DiskRemote
 	} else if pct, err := diskFreePct(dirOf(h.DBPath)); err != nil {
 		h.DiskError = clip(err.Error(), 400)

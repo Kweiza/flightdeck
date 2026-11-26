@@ -2,17 +2,25 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -224,6 +232,58 @@ func TestPGURLLowersOnlyTheScheme(t *testing.T) {
 		if got := pgURL(in); got != want {
 			t.Errorf("pgURL(%q) = %q, 기대 %q", in, got, want)
 		}
+	}
+}
+
+// TestConnFaultPassesOnlyServerErrors 는 store 경계의 통과 목록을 잠근다(connFault 의 ★): 서버가 돌려준 SQLSTATE 오류와
+// database/sql 의 표지 그 자체만 그대로 지나고, 나머지 드라이버 · 네트워크 오류는 종류만 남는다. 판정에 쓰는 표지(문맥의 끝 ·
+// 버려진 트랜잭션의 커밋)는 바뀐 뒤에도 읽혀야 하고, SQLite 의 오류는 손대지 않는다.
+func TestConnFaultPassesOnlyServerErrors(t *testing.T) {
+	const host, port = "10.1.2.3", "6543"
+	netErr := &net.OpError{Op: "read", Net: "tcp", Addr: &net.TCPAddr{IP: net.ParseIP(host), Port: 6543}, Err: syscall.ECONNRESET}
+	pgErr := &pgconn.PgError{Severity: "ERROR", Code: "23505", Message: "duplicate key"}
+	for _, c := range []struct {
+		name string
+		err  error
+		pass bool
+	}{
+		{"서버 오류", pgErr, true},
+		{"드라이버가 감싼 서버 오류", fmt.Errorf("prepare failed: %w", pgErr), true},
+		{"빈 결과 표지", sql.ErrNoRows, true},
+		{"끝난 트랜잭션 표지", sql.ErrTxDone, true},
+		{"문맥의 끝", context.Canceled, true},
+		{"네트워크 오류", netErr, false},
+		{"드라이버가 감싼 네트워크 오류", fmt.Errorf("failed to receive message: %w", netErr), false},
+		{"드라이버가 감싼 표지", fmt.Errorf("%s:%s: %w", host, port, sql.ErrNoRows), false},
+		{"끊긴 연결", driver.ErrBadConn, false},
+		{"드라이버 문구", errors.New("conn closed " + host + ":" + port), false},
+	} {
+		got := enginePG.connFault(c.err)
+		if c.pass {
+			if got != c.err {
+				t.Errorf("%s: 그대로 지나야 하는데 바뀌었다: %v", c.name, got)
+			}
+			continue
+		}
+		var ce *connError
+		if !errors.As(got, &ce) {
+			t.Errorf("%s: 종류로 옮기지 않았다: %v", c.name, got)
+			continue
+		}
+		if msg := got.Error(); strings.Contains(msg, host) || strings.Contains(msg, port) {
+			t.Errorf("%s: 옮긴 오류에 원격 주소가 남았다: %s", c.name, msg)
+		}
+	}
+
+	if got := enginePG.connFault(fmt.Errorf("timeout: %w", context.DeadlineExceeded)); !errors.Is(got, context.DeadlineExceeded) {
+		t.Errorf("옮긴 오류에서 문맥의 끝을 못 읽는다: %v", got)
+	}
+	var f *TxFault
+	if got := asFault(enginePG.connFault(pgx.ErrTxCommitRollback)); !errors.As(got, &f) || f.Kind != FaultAborted {
+		t.Errorf("버려진 트랜잭션의 커밋이 옮긴 뒤 TxFault(aborted)로 읽히지 않는다: %v", got)
+	}
+	if got := engineSQLite.connFault(netErr); got != netErr {
+		t.Errorf("SQLite 의 오류를 바꿨다: %v", got)
 	}
 }
 

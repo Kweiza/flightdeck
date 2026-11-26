@@ -506,7 +506,7 @@ func loadViews(ctx context.Context, tx Reader, filter string, args []any) ([]mod
 
 	ids := `SELECT s.id FROM session s WHERE ` + filter
 	if err := eachRow(ctx, tx, `SELECT session_id, kind, at FROM signal WHERE session_id IN (`+ids+`)`, args,
-		"신호", func(r *sql.Rows) error {
+		"신호", func(r *rowSet) error {
 			var id, kind, ts string
 			if err := r.Scan(&id, &kind, &ts); err != nil {
 				return err
@@ -523,7 +523,7 @@ func loadViews(ctx context.Context, tx Reader, filter string, args []any) ([]mod
 		return nil, err
 	}
 	if err := eachRow(ctx, tx, `SELECT DISTINCT session_id, path FROM footprint WHERE session_id IN (`+ids+`) ORDER BY session_id, path`, args,
-		"발자국 경로", func(r *sql.Rows) error {
+		"발자국 경로", func(r *rowSet) error {
 			var id, p string
 			if err := r.Scan(&id, &p); err != nil {
 				return err
@@ -536,7 +536,7 @@ func loadViews(ctx context.Context, tx Reader, filter string, args []any) ([]mod
 		return nil, err
 	}
 	if err := eachRow(ctx, tx, `SELECT session_id, item_id FROM claim WHERE released_at IS NULL AND session_id IN (`+ids+`) ORDER BY session_id, item_id`, args,
-		"선점 목록", func(r *sql.Rows) error {
+		"선점 목록", func(r *rowSet) error {
 			var id, item string
 			if err := r.Scan(&id, &item); err != nil {
 				return err
@@ -645,7 +645,7 @@ func summarizeOutside(ctx context.Context, tx Reader, project string, args []any
 }
 
 // eachRow 는 질의 하나의 행마다 fn 을 부른다. what 은 오류 문구의 대상 이름이다.
-func eachRow(ctx context.Context, db Reader, query string, args []any, what string, fn func(*sql.Rows) error) error {
+func eachRow(ctx context.Context, db Reader, query string, args []any, what string, fn func(*rowSet) error) error {
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("%s 조회 실패: %w", what, err)

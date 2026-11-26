@@ -49,6 +49,9 @@ func TestHealthDoesNotMeasureDiskForPostgres(t *testing.T) {
 	if !h.OK || !h.DBOK {
 		t.Fatalf("살아 있는 원장인데 헬스가 %+v 다", h)
 	}
+	if !h.DBRemote {
+		t.Fatal("Postgres 원장인데 DBRemote 가 거짓이다 - /healthz 가 로그에 전문이 있다고 잘못 안내한다")
+	}
 	if h.DiskKnown || h.DiskFreePct != -1 || h.DiskError != DiskRemote {
 		t.Fatalf("Postgres 원장의 디스크 항목이 (%v, %v, %q)다 - 기대 (false, -1, %q)",
 			h.DiskKnown, h.DiskFreePct, h.DiskError, DiskRemote)
@@ -67,8 +70,8 @@ func TestHealthCarriesNoDSNPieceAfterReconnectFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	name := strings.TrimPrefix(u.Path, "/")
+	// 로그는 비우지 않는다 - 열 때의 기동 진단 줄도 이름을 싣지 않아야 한다(store.logPGServer 의 ★).
 	storetest.CutConnections(t, dsn)
-	logs.Reset() // 열 때의 기동 진단 줄은 DB 이름을 일부러 싣는다(붙은 뒤 서버가 말한 값) - 여기서 재는 것이 아니다
 
 	// 첫 확인은 풀에 남은 끊긴 연결을 꺼내 「끊겼다」로 끝날 수 있다(database/sql 의 Ping 은 그때 다시 붙지 않는다).
 	// 재접속 거절(55000)에 닿을 때까지 몇 번 부르고, 그 사이의 DBError 도 전부 잰다.

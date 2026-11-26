@@ -407,6 +407,22 @@ func TestHealthzKeepsRemoteDiskReason(t *testing.T) {
 	}
 }
 
+// TestHealthzDBErrorPointsAtWhatTheLogHas 는 접속 실패 안내가 서버 로그에 실제로 남는 것을 가리키는지 잰다. Postgres 면
+// store 가 드라이버 문구를 걷어 로그에도 종류 · SQLSTATE 만 남는다 - 「원인 전문은 로그에」라고 하면 없는 것을 찾으러 간다.
+// SQLite 는 로그에 전문(파일 경로)이 있다.
+func TestHealthzDBErrorPointsAtWhatTheLogHas(t *testing.T) {
+	h := service.Health{APIVersion: "1", DBRemote: true,
+		DBError: "Postgres 와 주고받지 못했다(postgres): 서버가 거절했다(SQLSTATE 55000)"}
+	pg := HealthzOf(h, true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{}).DBError
+	if pg != dbErrorRemote || strings.Contains(pg, "전문") || !strings.Contains(pg, "SQLSTATE") {
+		t.Fatalf("Postgres 접속 실패 안내가 로그에 남는 것(종류 · SQLSTATE)과 다르다: %q", pg)
+	}
+	h.DBRemote = false
+	if lite := HealthzOf(h, true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{}).DBError; !strings.Contains(lite, "원인 전문은 서버 로그에") {
+		t.Fatalf("SQLite 접속 실패 안내가 바뀌었다: %q", lite)
+	}
+}
+
 // 루프백 문장은 **설정이 아니라 도달 가능성**을 말해야 한다.
 //
 // ★ 실물 사고가 이 시험의 근거다(2026-08-05). 서버를 컨테이너로 띄우면 호스트에서 온

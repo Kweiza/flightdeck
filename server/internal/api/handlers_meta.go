@@ -224,6 +224,10 @@ func UnauthorizedGuidance(reach LoopbackReach) string {
 	}
 }
 
+// dbErrorRemote 는 Postgres 원장에 붙지 못했을 때 /healthz 가 내는 안내다. 서버 로그에 실제로 남는 것(종류 · SQLSTATE)을
+// 가리킨다(HealthzOf 의 ★).
+const dbErrorRemote = "DB 에 접속할 수 없다 - 서버 로그에 종류 · SQLSTATE 가 있다(드라이버 문구는 접속 문자열의 조각을 품어 남기지 않는다)"
+
 // HealthzOf 는 내부 상태를 무인증으로 내보내도 되는 형태로 옮긴다. 순수 함수다.
 //
 // 오류 **전문**을 고정 문구로 갈아 끼운다. 그 문자열에는 DB 파일 경로와
@@ -246,7 +250,13 @@ func HealthzOf(h service.Health, tokenSet bool, reach LoopbackReach, build build
 			Notice:             AuthNotice(tokenSet, reach),
 		},
 	}
-	if h.DBError != "" {
+	// ★ Postgres 면 서버 로그에도 원인 전문이 없다 - store 가 드라이버 문구(접속 문자열의 조각 · 원격 주소를 품는다)를
+	//   걷고 종류 · SQLSTATE 만 남긴다. 「전문은 로그에」라고 하면 없는 것을 찾으러 간다.
+	switch {
+	case h.DBError == "":
+	case h.DBRemote:
+		b.DBError = dbErrorRemote
+	default:
 		b.DBError = "DB 에 접속할 수 없다 — 원인 전문은 서버 로그에 있다"
 	}
 	// ★ 원격 DB 라 재지 않은 것은 측정 실패가 아니다 - 그 갈래는 서버 로그도 안 남기므로 「로그를 보라」는 헛걸음이다.

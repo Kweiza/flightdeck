@@ -346,6 +346,7 @@ var catalog = [][2]string{
 	{"    사유: ", "    reason: "},
 	{"    DB 오류: ", "    DB error: "},
 	{"DB 에 접속할 수 없다 — 원인 전문은 서버 로그에 있다", "cannot connect to the DB — the full cause is in the server log"},
+	{"DB 에 접속할 수 없다 - 서버 로그에 종류 · SQLSTATE 가 있다(드라이버 문구는 접속 문자열의 조각을 품어 남기지 않는다)", "cannot connect to the DB - the server log has the kind and SQLSTATE (driver text is not kept, as it carries pieces of the connection string)"},
 	{"    디스크 여유 **못 쟀다**(0% 가 아니다): ", "    disk free **not measured** (it is not 0%): "},
 	{"디스크 여유를 재지 못했다 — 원인 전문은 서버 로그에 있다", "could not measure free disk — the full cause is in the server log"},
 	{"    디스크 여유 {$}", "    disk free {1}"},

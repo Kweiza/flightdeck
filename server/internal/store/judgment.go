@@ -243,7 +243,7 @@ func (s *Store) SupersededBy(ctx context.Context, project string) (map[string]st
 	return out, nil
 }
 
-func collectJudgments(rows *sql.Rows) ([]model.Judgment, error) {
+func collectJudgments(rows *rowSet) ([]model.Judgment, error) {
 	defer rows.Close()
 	var out []model.Judgment
 	for rows.Next() {
@@ -513,7 +513,7 @@ func (s *Store) ListSnapshots(ctx context.Context, project string) ([]model.Snap
 }
 
 // scanSnapshot 은 snapshotCols 순서의 한 행을 읽는다.
-// scanJudgment 과 같은 면(*sql.Row 와 *sql.Rows 둘 다)을 받는다.
+// scanJudgment 과 같은 면(row 와 rowSet 둘 다)을 받는다.
 func scanSnapshot(sc interface{ Scan(...any) error }) (model.Snapshot, error) {
 	var sn model.Snapshot
 	var evidence, digest sql.NullString

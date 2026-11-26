@@ -147,9 +147,9 @@ var ErrNotFound = errors.New("없다")
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Reader 는 읽기만 하는 면이다. ReadTx 의 클로저가 받는다 - 쓰기 문장(ExecContext)이 타입에 없다.
-// 한 행 질의의 결과(*row)는 *sql.Row 처럼 Scan 으로 읽는다(engine.go).
+// 결과(*rowSet · *row)는 *sql.Rows · *sql.Row 처럼 읽는다. 드라이버 오류를 store 경계에서 옮기는 감싸개다(engine.go).
 type Reader interface {
-	QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error)
+	QueryContext(ctx context.Context, q string, args ...any) (*rowSet, error)
 	QueryRowContext(ctx context.Context, q string, args ...any) *row
 }
 

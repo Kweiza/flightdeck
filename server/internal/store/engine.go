@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -191,17 +192,21 @@ func openPG(t Target, log *slog.Logger, wait time.Duration) (*Store, error) {
 	return s, nil
 }
 
-// logPGServer 는 붙은 서버가 스스로 말한 좌표(DB 이름 · 포트 · 판)를 기동 로그에 한 줄 남긴다. 포트는 서버 쪽에서 본
-// 값이다(포트 넘기기 뒤라면 접속한 포트와 다르다).
+// logPGServer 는 붙은 서버가 스스로 말한 포트 · 판을 기동 로그에 한 줄 남긴다. 포트는 서버 쪽에서 본 값이다
+// (포트 넘기기 뒤라면 접속한 포트와 다르다).
 //
 // ★ 표시값(pgShown)이 접속 세부를 안 싣는 대신의 진단이다. 접속 문자열을 해석해 꺼내지 않고 **붙은 뒤에** 서버에게
-// 묻는다 - 그 값은 실제로 붙은 자리라, 해석기가 비밀번호 조각을 좌표로 잘못 읽을 길이 없다. 사용자 이름은 싣지 않는다.
-// 못 읽어도 열기는 실패시키지 않는다(진단일 뿐이다). 그 오류도 pgFault 로만 싣는다.
+// 묻는다. 못 읽어도 열기는 실패시키지 않는다(진단일 뿐이다). 그 오류도 pgFault 로만 싣는다.
+//
+// ★ 이름(DB · 사용자)은 서버에게 물어도 싣지 않는다. 붙었다는 것은 그 이름이 맞았다는 뜻일 뿐, 비밀번호 조각이
+// 아니라는 뜻이 아니다 - `postgres://fd:12/hunter2@db/fd` 를 pgx 는 DB 이름 `hunter2@db/fd` 로 읽고, 그 이름의 DB 가
+// 실제로 있으면 붙는다. 그러면 current_database() 가 그 조각을 그대로 돌려준다. 포트 · 판은 숫자 · 서버 문자열이라
+// 접속 문자열에서 올 길이 없다.
 func logPGServer(ctx context.Context, s *Store, log *slog.Logger) {
-	var db, version string
+	var version string
 	var port sql.NullInt64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT current_database(), inet_server_port(), current_setting('server_version')`).Scan(&db, &port, &version)
+		`SELECT inet_server_port(), current_setting('server_version')`).Scan(&port, &version)
 	if err != nil {
 		log.Warn("Postgres 원장에 붙었지만 서버 좌표를 읽지 못했다", "error", pgFault(err))
 		return
@@ -210,19 +215,20 @@ func logPGServer(ctx context.Context, s *Store, log *slog.Logger) {
 	if port.Valid {
 		where = strconv.FormatInt(port.Int64, 10)
 	}
-	log.Info("Postgres 원장에 붙었다", "database", db, "port", where, "server_version", version)
+	log.Info("Postgres 원장에 붙었다", "port", where, "server_version", version)
 }
 
-// pgFault 는 열기 경계에서 난 드라이버 오류를 종류와 SQLSTATE 만으로 옮긴다. 순수 함수다.
+// pgFault 는 드라이버 오류를 종류와 SQLSTATE 만으로 옮긴다. 순수 함수다.
 //
 // ★ 드라이버 문구는 싣지 않는다. 접속 단계 오류(pgconn.ConnectError)는 본문에 `user=… database=…` 와 다이얼
-// 주소를 넣고, 서버 거절(PgError)의 문구도 DB · 사용자 이름을 인용한다. 경계가 모호한 접속 문자열에서는 그 자리에
+// 주소를 넣고, 접속 단계의 서버 거절(PgError)도 DB · 사용자 이름을 인용한다. 경계가 모호한 접속 문자열에서는 그 자리에
 // 비밀번호 조각이 들어간다 - `postgres://fd:12/hunter2@db/fd` 는 pgx 에게 호스트 fd · 포트 12 · DB 이름
-// `hunter2@db/fd` 다. 표시값을 통째로 가려도 오류 본문이 그 조각을 다시 싣는다.
+// `hunter2@db/fd` 다. 표시값을 통째로 가려도 오류 본문이 그 조각을 다시 싣는다. 붙은 뒤의 네트워크 오류(net.OpError)는
+// 원격 주소 · 포트를 싣는다.
 //
 // ★ 열기 뒤에도 같은 문구가 난다. 연결 풀은 끊긴 연결을 버리고 **처음 받은 접속 문자열로** 새로 맺으므로, 재접속
-// 실패의 ConnectError 도 그 사용자 · DB 이름을 다시 싣는다. 그래서 열기 뒤의 접속 오류도 store 경계에서 이것으로
-// 옮긴다(Store.Ping · engine.connFault). 업무 오류(제약 · 잠금 SQLSTATE)는 옮기지 않는다 - JudgeError 가 읽는다.
+// 실패의 ConnectError 도 그 사용자 · DB 이름을 다시 싣는다. 그래서 열기 뒤의 드라이버 오류도 store 경계에서
+// connFault 로 이것을 지난다.
 func pgFault(err error) string {
 	var ce *connError
 	if errors.As(err, &ce) {
@@ -237,15 +243,22 @@ func pgFault(err error) string {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
 		return "시간 초과"
+	case errors.Is(err, context.Canceled):
+		return "취소(부른 쪽의 문맥이 끝났다)"
+	case errors.Is(err, pgx.ErrTxCommitRollback):
+		return "커밋이 롤백으로 끝났다(앞 문장의 오류로 버려진 트랜잭션이다)"
 	case errors.Is(err, driver.ErrBadConn):
-		// database/sql 의 Ping 은 풀에서 꺼낸 연결이 이미 끊겨 있으면 다시 붙지 않고 이것을 낸다(그 연결은 버린다).
-		return "연결이 끊겨 있었다(풀이 그 연결을 버렸다 - 다음 확인에서 새로 붙는다)"
+		// database/sql 은 풀에서 꺼낸 연결이 이미 끊겨 있으면 이것을 낸다(그 연결은 버린다). 트랜잭션 안이면 그 트랜잭션이
+		// 묶인 연결이 죽은 것이다.
+		return "연결이 끊겨 있었다(풀이 그 연결을 버렸다 - 다음 요청이 새로 붙는다)"
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return "연결 거부(그 주소에서 듣는 서버가 없다)"
 	case errors.As(err, &dns):
 		return "호스트 이름을 풀지 못했다"
 	case errors.As(err, &op):
 		return "네트워크 오류(" + op.Op + ")"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "연결이 도중에 닫혔다(EOF)"
 	}
 	inner := err
 	for u := errors.Unwrap(inner); u != nil; u = errors.Unwrap(inner) {
@@ -254,40 +267,79 @@ func pgFault(err error) string {
 	return fmt.Sprintf("분류하지 못한 드라이버 오류(%T)", inner)
 }
 
-// connFault 는 연결 풀이 새 연결을 맺다 난 오류(pgconn.ConnectError)를 pgFault 로 옮긴다. 그 밖의 오류는 그대로 낸다.
+// connFault 는 Postgres 드라이버가 말하는 자리에서 받은 오류를 store 경계에서 옮긴다. SQLite 면 그대로 낸다.
 //
-// ★ 감싸개(conn · row · begin)가 풀에서 연결을 받는 자리마다 부른다. 거기가 재접속이 일어나는 자리다 - 서버가
-// 다시 떴거나 연결이 끊긴 뒤 첫 질의가 새 연결을 맺고, 그 실패 본문이 접속 문자열의 조각을 싣는다(pgFault 의 ★).
-// 원래 오류는 품지 않는다(connError 는 Unwrap 이 없다). 품으면 errors.As 로 그 본문을 다시 꺼내 싣는 자리가 생긴다.
+// ★ 원칙은 통과 목록이다: **서버가 돌려준 SQLSTATE 오류(*pgconn.PgError)만 그대로 낸다.** 그 밖의 드라이버 ·
+// 네트워크 오류는 전부 종류만 남긴 connError 로 바꾼다. 앞 판은 거꾸로 재접속 실패(ConnectError)만 골라 가렸고,
+// 붙은 연결이 질의 도중 끊기면 net.OpError 의 원격 주소 · 포트가 rows.Err() 를 타고 API 오류 로그까지 갔다.
+// 가릴 것을 고르는 목록은 드라이버가 새 꼴의 오류를 낼 때마다 한 자리씩 샌다. 통과시킬 것을 고르는 목록은 안 샌다.
+//
+// 그대로 내는 것은 둘이다.
+//   - *pgconn.PgError. 단 접속 단계(ConnectError) 안의 것은 아니다 - 그 거절 문구(3D000 · 28P01 등)는 접속 문자열의
+//     DB · 사용자 이름을 인용한다(pgFault 의 ★). 업무 오류(제약 · 잠금 SQLSTATE)는 JudgeError 가 이것을 읽는다.
+//   - database/sql 이 스스로 낸 표지 **그 자체**(sqlMarks). 고정 문구라 드라이버 본문이 없고, 부르는 쪽이 견준다
+//     (sql.ErrNoRows, 롤백의 sql.ErrTxDone). 감싼 것은 통과하지 않는다 - 감싼 쪽 문구는 드라이버가 썼다.
+//
+// ★ 바꾼 오류도 판정에 쓰는 표지(faultKinds)는 Unwrap 으로 남긴다. 표지 자체가 고정 문구라 본문을 다시 꺼낼 길이 없다.
+//
+// ★ 감싸개(conn · txConn · rowSet · row · begin · Ping)가 드라이버와 주고받는 자리마다 부른다. database/sql 의 값 변환
+// 오류(Scan 이 dest 로 옮기다 난 것)는 드라이버 본문이 아니라 우리 쪽 결함이라 여기를 지나지 않는다(rowSet.Scan).
 func (e engine) connFault(err error) error {
-	if e != enginePG || err == nil {
+	if e != enginePG || err == nil || passesBoundary(err) {
 		return err
+	}
+	c := &connError{fault: pgFault(err)}
+	for _, k := range faultKinds {
+		if errors.Is(err, k) {
+			c.kind = k
+			break
+		}
+	}
+	return c
+}
+
+// sqlMarks 는 database/sql 이 스스로 내는 표지와 부른 쪽 문맥의 끝이다. 모두 고정 문구다.
+var sqlMarks = []error{sql.ErrNoRows, sql.ErrTxDone, sql.ErrConnDone, context.Canceled, context.DeadlineExceeded}
+
+// faultKinds 는 connError 가 Unwrap 으로 남기는 표지다. 부르는 쪽이 errors.Is 로 읽는다 - 문맥의 끝, 그리고 버려진
+// 트랜잭션의 커밋(driverCodeOf 가 25P02 로 읽어 TxFault 로 낸다). 모두 고정 문구다.
+var faultKinds = []error{context.Canceled, context.DeadlineExceeded, pgx.ErrTxCommitRollback}
+
+// passesBoundary 는 connFault 가 그대로 내는 오류인가다(connFault 의 ★).
+func passesBoundary(err error) bool {
+	for _, m := range sqlMarks {
+		if err == m {
+			return true
+		}
 	}
 	var ce *pgconn.ConnectError
-	if !errors.As(err, &ce) {
-		return err
+	if errors.As(err, &ce) {
+		return false
 	}
-	return &connError{fault: pgFault(err)}
+	var pe *pgconn.PgError
+	return errors.As(err, &pe)
 }
 
-// connError 는 store 경계에서 옮긴 Postgres 접속 오류다. 종류 · SQLSTATE(pgFault)만 든다.
-type connError struct{ fault string }
+// connError 는 store 경계에서 옮긴 Postgres 드라이버 오류다. 종류 · SQLSTATE(pgFault)와 판정 표지(kind)만 든다.
+// 원래 오류는 품지 않는다 - 품으면 errors.As 로 그 본문을 다시 꺼내 싣는 자리가 생긴다.
+type connError struct {
+	fault string
+	kind  error // faultKinds 의 하나, 없으면 nil
+}
 
 func (e *connError) Error() string {
-	return "Postgres 에 붙지 못했다(" + pgShown + "): " + e.fault
+	return "Postgres 와 주고받지 못했다(" + pgShown + "): " + e.fault
 }
+
+func (e *connError) Unwrap() error { return e.kind }
 
 // Ping 은 원장에 지금 붙을 수 있는가다(service 의 Health).
 //
-// ★ Postgres 면 오류를 종류 · SQLSTATE 로만 낸다(connError). 풀이 끊긴 연결을 버리고 새로 맺다 난 실패는 처음 받은
-// 접속 문자열의 사용자 · DB 이름을 다시 싣고(pgFault 의 ★), Health 는 그 본문을 로그 · DBError · 대시보드에 싣는다.
+// ★ Postgres 면 오류를 connFault 로 옮긴다. 풀이 끊긴 연결을 버리고 새로 맺다 난 실패는 처음 받은 접속 문자열의
+// 사용자 · DB 이름을 다시 싣고(pgFault 의 ★), Health 는 그 본문을 로그 · DBError · 대시보드에 싣는다.
 // SQLite 의 오류는 파일 경로를 싣고, 그것은 이미 표시값(Path)이다.
 func (s *Store) Ping(ctx context.Context) error {
-	err := s.db.raw.PingContext(ctx)
-	if err == nil || s.db.eng != enginePG {
-		return err
-	}
-	return &connError{fault: pgFault(err)}
+	return s.db.eng.connFault(s.db.raw.PingContext(ctx))
 }
 
 // pgParam 은 연결 시작 인자 하나다. ms 는 밀리초 정수 문자열이다(pg_settings 의 setting 이 같은 단위로 되읽힌다).
@@ -340,37 +392,52 @@ func (s *Store) checkPGVersion(ctx context.Context) error {
 // 감싸개 - 모든 실행 자리가 지난다
 // ─────────────────────────────────────────────────────────────────────────────
 
+// rawHandle 은 날 *sql.DB · *sql.Tx 가 함께 만족하는 실행 면이다. conn · txConn 이 한 벌의 실행(exec · query)을 쓴다 -
+// 두 벌이면 한쪽만 connFault 를 지나는 표류가 난다(앞 판의 txConn 이 그랬다).
+type rawHandle interface {
+	ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error)
+}
+
+// exec 는 문장을 자리표시를 옮겨 실행하고 드라이버 오류를 connFault 로 옮긴다.
+func (e engine) exec(ctx context.Context, h rawHandle, q string, args []any) (sql.Result, error) {
+	b, err := e.bind(q)
+	if err != nil {
+		return nil, err
+	}
+	res, err := h.ExecContext(ctx, b, args...)
+	return res, e.connFault(err)
+}
+
+// query 는 질의를 자리표시를 옮겨 실행하고 결과를 rowSet 으로 감싼다.
+func (e engine) query(ctx context.Context, h rawHandle, q string, args []any) (*rowSet, error) {
+	b, err := e.bind(q)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := h.QueryContext(ctx, b, args...)
+	if err != nil {
+		return nil, e.connFault(err)
+	}
+	return &rowSet{raw: raw, eng: e}, nil
+}
+
 // conn 은 store 의 단발 질의가 지나는 DB 핸들이다(Store.db).
 type conn struct {
 	raw *sql.DB
 	eng engine
 }
 
-// conn 의 세 실행은 풀에서 연결을 받는다 - 재접속 오류를 connFault 로 옮긴다.
 func (c *conn) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
-	b, err := c.eng.bind(q)
-	if err != nil {
-		return nil, err
-	}
-	res, err := c.raw.ExecContext(ctx, b, args...)
-	return res, c.eng.connFault(err)
+	return c.eng.exec(ctx, c.raw, q, args)
 }
 
-func (c *conn) QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
-	b, err := c.eng.bind(q)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := c.raw.QueryContext(ctx, b, args...)
-	return rows, c.eng.connFault(err)
+func (c *conn) QueryContext(ctx context.Context, q string, args ...any) (*rowSet, error) {
+	return c.eng.query(ctx, c.raw, q, args)
 }
 
 func (c *conn) QueryRowContext(ctx context.Context, q string, args ...any) *row {
-	b, err := c.eng.bind(q)
-	if err != nil {
-		return &row{err: err}
-	}
-	return &row{r: c.raw.QueryRowContext(ctx, b, args...), eng: c.eng}
+	return rowOf(c.QueryContext(ctx, q, args...))
 }
 
 // Exec · Query · QueryRow 는 시험이 쓰는 꼴(ctx 없음)이다. 같은 감싸개를 지난다.
@@ -378,7 +445,7 @@ func (c *conn) Exec(q string, args ...any) (sql.Result, error) {
 	return c.ExecContext(context.Background(), q, args...)
 }
 
-func (c *conn) Query(q string, args ...any) (*sql.Rows, error) {
+func (c *conn) Query(q string, args ...any) (*rowSet, error) {
 	return c.QueryContext(context.Background(), q, args...)
 }
 
@@ -388,29 +455,64 @@ func (c *conn) QueryRow(q string, args ...any) *row {
 
 func (c *conn) Close() error { return c.raw.Close() }
 
-// row 는 한 행 질의의 결과다. 자리표시 옮기기(bind)가 거절한 문장이면 그 오류를 Scan 이 낸다 -
-// *sql.Row 는 패키지 밖에서 오류를 실어 만들 수 없어서 감싼다. 쓰는 쪽은 *sql.Row 처럼 Scan 만 부른다.
+// rowSet 은 여러 행 질의의 결과다. 쓰는 쪽은 *sql.Rows 처럼 Next · Scan · Err · Close 를 부른다.
 //
-// 연결 오류는 Scan · Err 에서 드러난다(*sql.Row 가 미룬다). 그래서 거기서 connFault 로 옮긴다.
-type row struct {
-	r   *sql.Row
+// ★ 날 *sql.Rows 를 내지 않는 까닭: 질의 도중 연결이 끊긴 오류는 질의를 연 자리가 아니라 Next 가 false 를 낸 뒤의
+// Err 로 드러난다(*sql.Rows 가 미룬다). 날 것을 내면 그 본문(원격 주소 · 포트)이 store 경계를 그대로 넘는다.
+type rowSet struct {
+	raw *sql.Rows
 	eng engine
+}
+
+func (r *rowSet) Next() bool { return r.raw.Next() }
+
+// Scan 의 오류는 두 갈래다. Next 가 드라이버에게서 받은 오류(그때 Err 가 같은 것을 낸다 - Next 가 false 를 낸 뒤 부른
+// 결함이다)와, 받은 값을 dest 로 옮기다 난 database/sql 의 변환 오류다. 앞쪽만 드라이버 본문을 싣는다 - 뒤쪽은 우리
+// 쪽 결함(열 수 · 타입)이라 그대로 내야 고칠 수 있다.
+func (r *rowSet) Scan(dest ...any) error {
+	err := r.raw.Scan(dest...)
+	if err != nil && r.raw.Err() != nil {
+		return r.Err()
+	}
+	return err
+}
+
+func (r *rowSet) Err() error   { return r.eng.connFault(r.raw.Err()) }
+func (r *rowSet) Close() error { return r.eng.connFault(r.raw.Close()) }
+
+// row 는 한 행 질의의 결과다. 쓰는 쪽은 *sql.Row 처럼 Scan 만 부른다.
+//
+// ★ *sql.Row 를 감싸지 않고 rowSet 위에 다시 세운다. *sql.Row.Scan 은 드라이버 오류(질의 · 도중 끊김 · 닫기)와 값
+// 변환 오류를 한 반환값에 섞어 내서, 드라이버 오류만 옮길 자리가 없다. 또 *sql.Row 는 패키지 밖에서 오류를 실어
+// 만들 수 없다 - 자리표시 옮기기(bind)가 거절한 문장의 오류는 err 에 실어 Scan 이 낸다.
+type row struct {
+	rs  *rowSet
 	err error
 }
 
+func rowOf(rs *rowSet, err error) *row { return &row{rs: rs, err: err} }
+
+// Scan 은 *sql.Row.Scan 과 같은 차례로 읽는다: 질의 오류, 첫 행이 없으면 순회 오류 또는 sql.ErrNoRows, 값 옮기기,
+// 닫기(남은 응답을 끝까지 받아 그 오류도 낸다).
 func (r *row) Scan(dest ...any) error {
 	if r.err != nil {
 		return r.err
 	}
-	return r.eng.connFault(r.r.Scan(dest...))
+	defer r.rs.Close()
+	if !r.rs.Next() {
+		if err := r.rs.Err(); err != nil {
+			return err
+		}
+		return sql.ErrNoRows
+	}
+	if err := r.rs.Scan(dest...); err != nil {
+		return err
+	}
+	return r.rs.Close()
 }
 
-func (r *row) Err() error {
-	if r.err != nil {
-		return r.err
-	}
-	return r.eng.connFault(r.r.Err())
-}
+// Err 는 질의 오류다(*sql.Row.Err 와 같다). 순회 · 닫기의 오류는 Scan 이 낸다.
+func (r *row) Err() error { return r.err }
 
 // txConn 은 진행 중인 트랜잭션의 핸들이다. begin 만 만든다.
 type txConn struct {
@@ -419,31 +521,21 @@ type txConn struct {
 }
 
 func (t *txConn) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
-	b, err := t.eng.bind(q)
-	if err != nil {
-		return nil, err
-	}
-	return t.raw.ExecContext(ctx, b, args...)
+	return t.eng.exec(ctx, t.raw, q, args)
 }
 
-func (t *txConn) QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
-	b, err := t.eng.bind(q)
-	if err != nil {
-		return nil, err
-	}
-	return t.raw.QueryContext(ctx, b, args...)
+func (t *txConn) QueryContext(ctx context.Context, q string, args ...any) (*rowSet, error) {
+	return t.eng.query(ctx, t.raw, q, args)
 }
 
 func (t *txConn) QueryRowContext(ctx context.Context, q string, args ...any) *row {
-	b, err := t.eng.bind(q)
-	if err != nil {
-		return &row{err: err}
-	}
-	return &row{r: t.raw.QueryRowContext(ctx, b, args...), eng: t.eng}
+	return rowOf(t.QueryContext(ctx, q, args...))
 }
 
-func (t *txConn) Commit() error   { return t.raw.Commit() }
-func (t *txConn) Rollback() error { return t.raw.Rollback() }
+// Commit · Rollback 도 드라이버와 주고받는다(연결이 그 사이 끊기면 네트워크 오류다). 버려진 트랜잭션의 커밋
+// (pgx.ErrTxCommitRollback)은 connError 의 표지로 남아 runTx 가 TxFault(aborted)로 낸다.
+func (t *txConn) Commit() error   { return t.eng.connFault(t.raw.Commit()) }
+func (t *txConn) Rollback() error { return t.eng.connFault(t.raw.Rollback()) }
 
 // bind 는 질의를 엔진의 자리표시로 옮긴다. SQLite 는 `?` 그대로다.
 func (e engine) bind(q string) (string, error) {
@@ -689,14 +781,13 @@ func (s *Store) begin(ctx context.Context, sp txSpec) (*txConn, error) {
 	start := time.Now()
 	raw, err := s.db.raw.BeginTx(ctx, eng.txOptions(sp.kind))
 	err = eng.connFault(err)
+	var tx *txConn
 	if err == nil {
+		tx = &txConn{raw: raw, eng: eng}
 		if q, args := eng.lockStmt(sp); q != "" {
 			start = time.Now()
-			if q, err = eng.bind(q); err == nil {
-				_, err = raw.ExecContext(ctx, q, args...)
-			}
-			if err != nil {
-				_ = raw.Rollback()
+			if _, err = tx.ExecContext(ctx, q, args...); err != nil {
+				_ = tx.Rollback()
 			}
 		}
 	}
@@ -706,7 +797,7 @@ func (s *Store) begin(ctx context.Context, sp txSpec) (*txConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &txConn{raw: raw, eng: eng}, nil
+	return tx, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
