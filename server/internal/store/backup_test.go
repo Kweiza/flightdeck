@@ -20,86 +20,179 @@ import (
 // 원장 읽기는 DB 전량이다 — 프로젝트로 안 거른다.
 // project 가 NULL 인 판단이 스키마상 가능하고, WHERE project = ? 는 그런 행을 절대 못 잡는다.
 func TestReadLedgerCoversAllProjectsAndNullProject(t *testing.T) {
-	s := newStore(t)
-	ctx := context.Background()
-	seed(t, s, "p1")
-	seed(t, s, "p2")
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p1")
+		seed(t, s, "p2")
 
-	linkJudgment(t, s, "p1", model.JudgmentDecision, "i1")
-	linkJudgment(t, s, "p2", model.JudgmentAsk, "i2")
-	// project 를 비우면 nullStr 이 NULL 로 넣는다. FK 를 아예 안 탄다.
-	if _, err := s.AddJudgment(ctx, model.Judgment{Kind: model.JudgmentNow, Body: "프로젝트 없는 판단"}); err != nil {
-		t.Fatalf("project 없는 판단 저장 실패: %v", err)
-	}
-
-	d, err := s.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("ReadLedger 실패: %v", err)
-	}
-	if len(d.Judgments) != 3 {
-		t.Fatalf("판단이 %d건이다 — 3건을 기대한다", len(d.Judgments))
-	}
-	var nullProject int
-	for _, j := range d.Judgments {
-		if j.Project == nil {
-			nullProject++
+		linkJudgment(t, s, "p1", model.JudgmentDecision, "i1")
+		linkJudgment(t, s, "p2", model.JudgmentAsk, "i2")
+		// project 를 비우면 nullStr 이 NULL 로 넣는다. FK 를 아예 안 탄다.
+		if _, err := s.AddJudgment(ctx, model.Judgment{Kind: model.JudgmentNow, Body: "프로젝트 없는 판단"}); err != nil {
+			t.Fatalf("project 없는 판단 저장 실패: %v", err)
 		}
-	}
-	if nullProject != 1 {
-		t.Errorf("project=NULL 판단이 %d건 — 1건을 기대한다. 포인터가 아니면 NULL 과 \"\" 가 안 갈린다", nullProject)
-	}
+
+		d, err := s.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("ReadLedger 실패: %v", err)
+		}
+		if len(d.Judgments) != 3 {
+			t.Fatalf("판단이 %d건이다 — 3건을 기대한다", len(d.Judgments))
+		}
+		var nullProject int
+		for _, j := range d.Judgments {
+			if j.Project == nil {
+				nullProject++
+			}
+		}
+		if nullProject != 1 {
+			t.Errorf("project=NULL 판단이 %d건 — 1건을 기대한다. 포인터가 아니면 NULL 과 \"\" 가 안 갈린다", nullProject)
+		}
+	})
 }
 
 // 판단 정렬은 id 순이다. ULID 라 생성순이고, 같은 DB 면 같은 바이트가 나와야 한다.
 func TestReadLedgerIsDeterministicallyOrdered(t *testing.T) {
-	s := newStore(t)
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p")
+		for i := 0; i < 5; i++ {
+			linkJudgment(t, s, "p", model.JudgmentDecision, "i1", "i2")
+		}
+
+		first, err := s.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("ReadLedger 실패: %v", err)
+		}
+		second, err := s.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("ReadLedger 재실행 실패: %v", err)
+		}
+		for i := range first.Judgments {
+			if first.Judgments[i].ID != second.Judgments[i].ID {
+				t.Fatalf("두 번 읽었더니 순서가 달라졌다: %d번째 %q vs %q",
+					i, first.Judgments[i].ID, second.Judgments[i].ID)
+			}
+			if i > 0 && first.Judgments[i-1].ID >= first.Judgments[i].ID {
+				t.Fatalf("id 오름차순이 아니다: %q >= %q", first.Judgments[i-1].ID, first.Judgments[i].ID)
+			}
+		}
+		for i := 1; i < len(first.Links); i++ {
+			p, c := first.Links[i-1], first.Links[i]
+			if p.JudgmentID > c.JudgmentID {
+				t.Fatalf("링크가 judgment_id 순이 아니다: %q > %q", p.JudgmentID, c.JudgmentID)
+			}
+		}
+	})
+}
+
+// TestPGReadLedgerReadsOneSnapshot 은 원장 여섯 표가 한 스냅숏에서 읽히는지 Postgres 에서 잰다(재설계 스펙 4.9.5: 매시간
+// 원장의 읽기 스냅숏은 ReadTx). 판단을 다 읽은 뒤 링크를 읽기 전에 다른 연결이 판단 X 와 그 링크를 커밋한다. 한 스냅숏이면
+// X 도 X 의 링크도 안 보이고, 표마다 따로 읽으면 판단 목록에 없는 판단을 가리키는 링크가 원장에 실린다 - 그 원장은
+// 되쓰기(WriteLedger)가 FK 로 거절하므로 백업이 복원 못 할 파일이 된다.
+//
+// ★ 끼어들 자리를 시각에 맡기지 않는다. 쓰는 쪽이 judgment_link 를 먼저 ACCESS EXCLUSIVE 로 잠가, 읽기가 판단까지 읽고
+// 링크 앞에서 서게 한다. 그 대기가 pg_locks 에 보인 뒤에 X 를 넣고 커밋한다.
+//
+// ★ 변이: ReadLedger 가 ReadTx 를 안 거치거나(s.db 로 바로) ReadTx 가 READ COMMITTED 로 열리면 빨갛다.
+// SQLite 는 이 갈래가 없다 - 쓰기가 BEGIN IMMEDIATE 로 한 줄이고, 읽기는 WAL 의 첫 읽기 스냅숏 하나다.
+func TestPGReadLedgerReadsOneSnapshot(t *testing.T) {
+	s := newPGStore(t, lockTimeout)
 	ctx := context.Background()
 	seed(t, s, "p")
-	for i := 0; i < 5; i++ {
-		linkJudgment(t, s, "p", model.JudgmentDecision, "i1", "i2")
+	before := linkJudgment(t, s, "p", model.JudgmentDecision, "i-before")
+
+	writer, err := s.DB().Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	wtx, err := writer.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = wtx.Rollback() }()
+	if _, err := wtx.ExecContext(ctx, `LOCK TABLE judgment_link IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatalf("링크 표 잠그기: %v", err)
 	}
 
-	first, err := s.ReadLedger(ctx)
+	type result struct {
+		d   LedgerDump
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		d, err := s.ReadLedger(ctx)
+		got <- result{d, err}
+	}()
+	waitUntil(t, "원장 읽기가 judgment_link 앞에서 선다", func() bool {
+		return pgCount(t, s, `SELECT count(*) FROM pg_locks
+			WHERE locktype = 'relation' AND relation = 'judgment_link'::regclass AND NOT granted`) == 1
+	})
+
+	const late = "01ZZZZZZZZZZZZZZZZZZZZZZZZ"
+	if _, err := wtx.ExecContext(ctx, `INSERT INTO judgment(id, project, at, kind, body) VALUES ($1, 'p', $2, 'decision', '늦게 온 판단')`,
+		late, fmtTime(time.Now().UTC())); err != nil {
+		t.Fatalf("늦게 온 판단 넣기: %v", err)
+	}
+	if _, err := wtx.ExecContext(ctx, `INSERT INTO judgment_link(judgment_id, target_kind, target_id) VALUES ($1, 'item', 'i-late')`, late); err != nil {
+		t.Fatalf("늦게 온 링크 넣기: %v", err)
+	}
+	if err := wtx.Commit(); err != nil {
+		t.Fatalf("쓰기 커밋: %v", err)
+	}
+
+	r := <-got
+	if r.err != nil {
+		t.Fatalf("ReadLedger: %v", r.err)
+	}
+	judged := map[string]bool{}
+	for _, j := range r.d.Judgments {
+		judged[j.ID] = true
+	}
+	if !judged[before] || judged[late] {
+		t.Fatalf("판단 목록이 읽기 시작 시점이 아니다(앞의 판단 %v · 늦게 온 판단 %v)", judged[before], judged[late])
+	}
+	if len(r.d.Links) == 0 {
+		t.Fatal("링크가 0건이다 - 앞의 판단의 링크는 보여야 한다(이 시험의 전제가 깨졌다)")
+	}
+	for _, l := range r.d.Links {
+		if !judged[l.JudgmentID] {
+			t.Fatalf("원장의 링크가 원장에 없는 판단 %q 를 가리킨다 - 표마다 다른 스냅숏에서 읽었다", l.JudgmentID)
+		}
+	}
+
+	// 전제: 그 쓰기는 실제로 커밋됐다. 새로 읽으면 보인다.
+	after, err := s.ReadLedger(ctx)
 	if err != nil {
-		t.Fatalf("ReadLedger 실패: %v", err)
+		t.Fatalf("다시 읽기: %v", err)
 	}
-	second, err := s.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("ReadLedger 재실행 실패: %v", err)
+	var seen bool
+	for _, j := range after.Judgments {
+		seen = seen || j.ID == late
 	}
-	for i := range first.Judgments {
-		if first.Judgments[i].ID != second.Judgments[i].ID {
-			t.Fatalf("두 번 읽었더니 순서가 달라졌다: %d번째 %q vs %q",
-				i, first.Judgments[i].ID, second.Judgments[i].ID)
-		}
-		if i > 0 && first.Judgments[i-1].ID >= first.Judgments[i].ID {
-			t.Fatalf("id 오름차순이 아니다: %q >= %q", first.Judgments[i-1].ID, first.Judgments[i].ID)
-		}
-	}
-	for i := 1; i < len(first.Links); i++ {
-		p, c := first.Links[i-1], first.Links[i]
-		if p.JudgmentID > c.JudgmentID {
-			t.Fatalf("링크가 judgment_id 순이 아니다: %q > %q", p.JudgmentID, c.JudgmentID)
-		}
+	if !seen {
+		t.Fatal("늦게 온 판단이 커밋 뒤에도 안 보인다 - 이 시험의 전제가 깨졌다")
 	}
 }
 
 // 시각은 DB 원문 문자열 그대로다. time.Time 으로 접으면 마셜이 후행 0을 지워
 // 폭이 흔들리고, 그러면 사전순 정렬이 시간순과 어긋난다(store.go 의 timeLayout 주석).
 func TestReadLedgerKeepsRawTimestampString(t *testing.T) {
-	s := newStore(t)
-	ctx := context.Background()
-	seed(t, s, "p")
-	linkJudgment(t, s, "p", model.JudgmentDecision, "i1")
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p")
+		linkJudgment(t, s, "p", model.JudgmentDecision, "i1")
 
-	d, err := s.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("ReadLedger 실패: %v", err)
-	}
-	at := d.Judgments[0].At
-	if len(at) != len("2006-01-02T15:04:05.000000Z") {
-		t.Fatalf("at 이 폭 고정이 아니다(%q, %d자) — DB 원문을 그대로 실어야 한다", at, len(at))
-	}
+		d, err := s.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("ReadLedger 실패: %v", err)
+		}
+		at := d.Judgments[0].At
+		if len(at) != len("2006-01-02T15:04:05.000000Z") {
+			t.Fatalf("at 이 폭 고정이 아니다(%q, %d자) — DB 원문을 그대로 실어야 한다", at, len(at))
+		}
+	})
 }
 
 // snapshotByKey 는 d.Snapshots 에서 key 로 하나를 찾는다. 없으면 시험을 즉시 실패시킨다.
@@ -122,141 +215,145 @@ func snapshotByKey(t *testing.T, d LedgerDump, key string) LedgerSnapshot {
 // 포인터로 나와야 한다. str() 을 썼다면 NULL 과 "" 가 똑같이 non-nil 빈 문자열
 // 포인터가 되어 이 시험이 못 잡는다 — ptrOf() 를 쓴 이유가 정확히 이것이다.
 func TestReadLedgerSnapshotsDistinguishNullFromValue(t *testing.T) {
-	s := newStore(t)
-	ctx := context.Background()
-	seed(t, s, "p")
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p")
 
-	if err := s.PutSnapshot(ctx, model.Snapshot{
-		Project: "p", Key: "manual-key", Value: "42",
-		Method: model.SnapshotManual, Evidence: "근거 문서", InputDigest: "deadbeef",
-	}); err != nil {
-		t.Fatalf("manual 스냅숏 저장 실패: %v", err)
-	}
-	if err := s.PutSnapshot(ctx, model.Snapshot{
-		Project: "p", Key: "command-key", Value: "7",
-		Method: model.SnapshotCommand,
-	}); err != nil {
-		t.Fatalf("command 스냅숏 저장 실패: %v", err)
-	}
+		if err := s.PutSnapshot(ctx, model.Snapshot{
+			Project: "p", Key: "manual-key", Value: "42",
+			Method: model.SnapshotManual, Evidence: "근거 문서", InputDigest: "deadbeef",
+		}); err != nil {
+			t.Fatalf("manual 스냅숏 저장 실패: %v", err)
+		}
+		if err := s.PutSnapshot(ctx, model.Snapshot{
+			Project: "p", Key: "command-key", Value: "7",
+			Method: model.SnapshotCommand,
+		}); err != nil {
+			t.Fatalf("command 스냅숏 저장 실패: %v", err)
+		}
 
-	d, err := s.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("ReadLedger 실패: %v", err)
-	}
+		d, err := s.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("ReadLedger 실패: %v", err)
+		}
 
-	manual := snapshotByKey(t, d, "manual-key")
-	if manual.Evidence == nil || *manual.Evidence != "근거 문서" {
-		t.Errorf("manual 스냅숏의 evidence 가 %v — \"근거 문서\" 를 가리키는 포인터를 기대한다", manual.Evidence)
-	}
-	if manual.InputDigest == nil || *manual.InputDigest != "deadbeef" {
-		t.Errorf("manual 스냅숏의 input_digest 가 %v — \"deadbeef\" 를 가리키는 포인터를 기대한다", manual.InputDigest)
-	}
+		manual := snapshotByKey(t, d, "manual-key")
+		if manual.Evidence == nil || *manual.Evidence != "근거 문서" {
+			t.Errorf("manual 스냅숏의 evidence 가 %v — \"근거 문서\" 를 가리키는 포인터를 기대한다", manual.Evidence)
+		}
+		if manual.InputDigest == nil || *manual.InputDigest != "deadbeef" {
+			t.Errorf("manual 스냅숏의 input_digest 가 %v — \"deadbeef\" 를 가리키는 포인터를 기대한다", manual.InputDigest)
+		}
 
-	cmd := snapshotByKey(t, d, "command-key")
-	if cmd.Evidence != nil {
-		t.Errorf("command 스냅숏의 evidence 가 nil 이어야 하는데 %q 를 가리킨다", *cmd.Evidence)
-	}
-	if cmd.InputDigest != nil {
-		t.Errorf("command 스냅숏의 input_digest 가 nil 이어야 하는데 %q 를 가리킨다", *cmd.InputDigest)
-	}
+		cmd := snapshotByKey(t, d, "command-key")
+		if cmd.Evidence != nil {
+			t.Errorf("command 스냅숏의 evidence 가 nil 이어야 하는데 %q 를 가리킨다", *cmd.Evidence)
+		}
+		if cmd.InputDigest != nil {
+			t.Errorf("command 스냅숏의 input_digest 가 nil 이어야 하는데 %q 를 가리킨다", *cmd.InputDigest)
+		}
+	})
 }
 
 // 일곱 컬럼을 전부 서로 다른 값으로 채워 SELECT 목록과 Scan 인자 순서가
 // 어긋나면 반드시 걸리게 한다 — 예컨대 value 와 key 에 같은 문자열을 주면
 // 그 둘이 뒤바뀌어도 시험이 통과하므로, 값을 겹치지 않게 고른다.
 func TestReadLedgerSnapshotsPreserveColumnOrder(t *testing.T) {
-	s := newStore(t)
-	ctx := context.Background()
-	seed(t, s, "ordp")
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "ordp")
 
-	if err := s.PutSnapshot(ctx, model.Snapshot{
-		Project: "ordp", Key: "ordkey", Value: "ordvalue",
-		Method: model.SnapshotManual, Evidence: "ordevidence", InputDigest: "orddigest",
-	}); err != nil {
-		t.Fatalf("스냅숏 저장 실패: %v", err)
-	}
+		if err := s.PutSnapshot(ctx, model.Snapshot{
+			Project: "ordp", Key: "ordkey", Value: "ordvalue",
+			Method: model.SnapshotManual, Evidence: "ordevidence", InputDigest: "orddigest",
+		}); err != nil {
+			t.Fatalf("스냅숏 저장 실패: %v", err)
+		}
 
-	d, err := s.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("ReadLedger 실패: %v", err)
-	}
-	sn := snapshotByKey(t, d, "ordkey")
+		d, err := s.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("ReadLedger 실패: %v", err)
+		}
+		sn := snapshotByKey(t, d, "ordkey")
 
-	switch {
-	case sn.Project != "ordp":
-		t.Errorf("project = %q, 기대 %q", sn.Project, "ordp")
-	case sn.Key != "ordkey":
-		t.Errorf("key = %q, 기대 %q", sn.Key, "ordkey")
-	case sn.Value != "ordvalue":
-		t.Errorf("value = %q, 기대 %q", sn.Value, "ordvalue")
-	case sn.Method != "manual":
-		t.Errorf("method = %q, 기대 %q", sn.Method, "manual")
-	case sn.Evidence == nil || *sn.Evidence != "ordevidence":
-		t.Errorf("evidence = %v, 기대 \"ordevidence\" 를 가리키는 포인터", sn.Evidence)
-	case sn.InputDigest == nil || *sn.InputDigest != "orddigest":
-		t.Errorf("input_digest = %v, 기대 \"orddigest\" 를 가리키는 포인터", sn.InputDigest)
-	}
+		switch {
+		case sn.Project != "ordp":
+			t.Errorf("project = %q, 기대 %q", sn.Project, "ordp")
+		case sn.Key != "ordkey":
+			t.Errorf("key = %q, 기대 %q", sn.Key, "ordkey")
+		case sn.Value != "ordvalue":
+			t.Errorf("value = %q, 기대 %q", sn.Value, "ordvalue")
+		case sn.Method != "manual":
+			t.Errorf("method = %q, 기대 %q", sn.Method, "manual")
+		case sn.Evidence == nil || *sn.Evidence != "ordevidence":
+			t.Errorf("evidence = %v, 기대 \"ordevidence\" 를 가리키는 포인터", sn.Evidence)
+		case sn.InputDigest == nil || *sn.InputDigest != "orddigest":
+			t.Errorf("input_digest = %v, 기대 \"orddigest\" 를 가리키는 포인터", sn.InputDigest)
+		}
+	})
 }
 
 // 정렬은 (project, key) 오름차순이다. 두 프로젝트에 키를 사전순 역순으로 넣어
 // 삽입 순서가 아니라 ORDER BY 가 결과를 정한다는 것을 확인한다.
 func TestReadLedgerSnapshotsOrderedByProjectThenKey(t *testing.T) {
-	s := newStore(t)
-	ctx := context.Background()
-	seed(t, s, "q1")
-	seed(t, s, "q2")
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "q1")
+		seed(t, s, "q2")
 
-	// 삽입은 일부러 기대 순서의 역순으로 한다.
-	for _, sn := range []model.Snapshot{
-		{Project: "q2", Key: "k2", Value: "v-q2-k2", Method: model.SnapshotCommand},
-		{Project: "q1", Key: "k2", Value: "v-q1-k2", Method: model.SnapshotCommand},
-		{Project: "q2", Key: "k1", Value: "v-q2-k1", Method: model.SnapshotCommand},
-		{Project: "q1", Key: "k1", Value: "v-q1-k1", Method: model.SnapshotCommand},
-	} {
-		if err := s.PutSnapshot(ctx, sn); err != nil {
-			t.Fatalf("스냅숏 저장 실패(%s/%s): %v", sn.Project, sn.Key, err)
+		// 삽입은 일부러 기대 순서의 역순으로 한다.
+		for _, sn := range []model.Snapshot{
+			{Project: "q2", Key: "k2", Value: "v-q2-k2", Method: model.SnapshotCommand},
+			{Project: "q1", Key: "k2", Value: "v-q1-k2", Method: model.SnapshotCommand},
+			{Project: "q2", Key: "k1", Value: "v-q2-k1", Method: model.SnapshotCommand},
+			{Project: "q1", Key: "k1", Value: "v-q1-k1", Method: model.SnapshotCommand},
+		} {
+			if err := s.PutSnapshot(ctx, sn); err != nil {
+				t.Fatalf("스냅숏 저장 실패(%s/%s): %v", sn.Project, sn.Key, err)
+			}
 		}
-	}
 
-	d, err := s.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("ReadLedger 실패: %v", err)
-	}
-
-	want := [][2]string{{"q1", "k1"}, {"q1", "k2"}, {"q2", "k1"}, {"q2", "k2"}}
-	if len(d.Snapshots) != len(want) {
-		t.Fatalf("스냅숏이 %d건 — %d건을 기대한다", len(d.Snapshots), len(want))
-	}
-	for i, w := range want {
-		got := d.Snapshots[i]
-		if got.Project != w[0] || got.Key != w[1] {
-			t.Fatalf("%d번째가 (%q,%q) — (%q,%q) 를 기대한다(정렬이 project,key 순이 아니다)",
-				i, got.Project, got.Key, w[0], w[1])
+		d, err := s.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("ReadLedger 실패: %v", err)
 		}
-	}
+
+		want := [][2]string{{"q1", "k1"}, {"q1", "k2"}, {"q2", "k1"}, {"q2", "k2"}}
+		if len(d.Snapshots) != len(want) {
+			t.Fatalf("스냅숏이 %d건 — %d건을 기대한다", len(d.Snapshots), len(want))
+		}
+		for i, w := range want {
+			got := d.Snapshots[i]
+			if got.Project != w[0] || got.Key != w[1] {
+				t.Fatalf("%d번째가 (%q,%q) — (%q,%q) 를 기대한다(정렬이 project,key 순이 아니다)",
+					i, got.Project, got.Key, w[0], w[1])
+			}
+		}
+	})
 }
 
 // computed_at 도 판단의 at 과 같은 이유로 DB 원문 폭 고정 문자열이어야 한다
 // (time.Time 으로 접으면 마셜이 후행 0을 지워 폭이 흔들린다).
 func TestReadLedgerSnapshotsKeepRawTimestampString(t *testing.T) {
-	s := newStore(t)
-	ctx := context.Background()
-	seed(t, s, "p")
-	if err := s.PutSnapshot(ctx, model.Snapshot{
-		Project: "p", Key: "k", Value: "v", Method: model.SnapshotCommand,
-	}); err != nil {
-		t.Fatalf("스냅숏 저장 실패: %v", err)
-	}
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p")
+		if err := s.PutSnapshot(ctx, model.Snapshot{
+			Project: "p", Key: "k", Value: "v", Method: model.SnapshotCommand,
+		}); err != nil {
+			t.Fatalf("스냅숏 저장 실패: %v", err)
+		}
 
-	d, err := s.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("ReadLedger 실패: %v", err)
-	}
-	sn := snapshotByKey(t, d, "k")
-	if len(sn.ComputedAt) != len("2006-01-02T15:04:05.000000Z") {
-		t.Fatalf("computed_at 이 폭 고정이 아니다(%q, %d자) — DB 원문을 그대로 실어야 한다",
-			sn.ComputedAt, len(sn.ComputedAt))
-	}
+		d, err := s.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("ReadLedger 실패: %v", err)
+		}
+		sn := snapshotByKey(t, d, "k")
+		if len(sn.ComputedAt) != len("2006-01-02T15:04:05.000000Z") {
+			t.Fatalf("computed_at 이 폭 고정이 아니다(%q, %d자) — DB 원문을 그대로 실어야 한다",
+				sn.ComputedAt, len(sn.ComputedAt))
+		}
+	})
 }
 
 // journalHeaderOf 는 SQLite 파일 헤더의 18·19번째 바이트다 — 1 이면 롤백저널, 2 면 WAL.
@@ -456,50 +553,52 @@ func TestOpenLedgerRejectsMissingFile(t *testing.T) {
 // 되쓰기는 원문을 그대로 되살린다 — id·at·NULL 까지.
 // AddJudgment 를 안 쓰는 이유가 이것이다(그것은 빈 ID/At 을 자기가 채운다).
 func TestWriteLedgerRestoresRowsVerbatim(t *testing.T) {
-	src := newStore(t)
-	ctx := context.Background()
-	seed(t, src, "p")
-	first := linkJudgment(t, src, "p", model.JudgmentDecision, "i1", "i2")
-	// supersedes 가 실제로 걸린 행을 만든다 — 자기참조 FK 라 삽입 순서 제약이 여기서 드러난다.
-	//
-	// ★ id 를 일부러 first 보다 사전순으로 앞세운다. ULID 는 생성 시각순이라, 자연 생성
-	// 그대로 두면(id 를 비워 NewID 가 채우게 하면) supersedes 행은 참조 대상보다 **나중에**
-	// 만들어지므로 항상 더 큰 id 를 받는다 — 그러면 ReadLedger 의 id 오름차순 정렬에서
-	// 참조 대상이 항상 먼저 나와, WriteLedger 가 defer_foreign_keys 없이도 우연히 통과한다.
-	// 삽입 순서 제약을 실제로 시험하려면 참조하는 쪽이 먼저 나와야 하므로, crockford 알파벳의
-	// 최소 문자('0')로만 된 26자 id 를 손으로 박는다 — 어떤 실제 ULID 보다도 사전순으로 작다.
-	if _, err := src.AddJudgment(ctx, model.Judgment{
-		ID:      "00000000000000000000000000",
-		Project: "p", Kind: model.JudgmentDecision, Title: "정정", Body: "앞 판단을 대체한다",
-		Supersedes: first,
-	}); err != nil {
-		t.Fatalf("supersedes 판단 저장 실패: %v", err)
-	}
-	if err := src.PutSnapshot(ctx, model.Snapshot{
-		Project: "p", Key: "k", Value: "1", Method: model.SnapshotCommand,
-	}); err != nil {
-		t.Fatalf("스냅숏 저장 실패: %v", err)
-	}
+	eachEngine(t, func(t *testing.T, open func(*testing.T) *Store) {
+		src := open(t)
+		ctx := context.Background()
+		seed(t, src, "p")
+		first := linkJudgment(t, src, "p", model.JudgmentDecision, "i1", "i2")
+		// supersedes 가 실제로 걸린 행을 만든다 — 자기참조 FK 라 삽입 순서 제약이 여기서 드러난다.
+		//
+		// ★ id 를 일부러 first 보다 사전순으로 앞세운다. ULID 는 생성 시각순이라, 자연 생성
+		// 그대로 두면(id 를 비워 NewID 가 채우게 하면) supersedes 행은 참조 대상보다 **나중에**
+		// 만들어지므로 항상 더 큰 id 를 받는다 — 그러면 ReadLedger 의 id 오름차순 정렬에서
+		// 참조 대상이 항상 먼저 나와, WriteLedger 가 defer_foreign_keys 없이도 우연히 통과한다.
+		// 삽입 순서 제약을 실제로 시험하려면 참조하는 쪽이 먼저 나와야 하므로, crockford 알파벳의
+		// 최소 문자('0')로만 된 26자 id 를 손으로 박는다 — 어떤 실제 ULID 보다도 사전순으로 작다.
+		if _, err := src.AddJudgment(ctx, model.Judgment{
+			ID:      "00000000000000000000000000",
+			Project: "p", Kind: model.JudgmentDecision, Title: "정정", Body: "앞 판단을 대체한다",
+			Supersedes: first,
+		}); err != nil {
+			t.Fatalf("supersedes 판단 저장 실패: %v", err)
+		}
+		if err := src.PutSnapshot(ctx, model.Snapshot{
+			Project: "p", Key: "k", Value: "1", Method: model.SnapshotCommand,
+		}); err != nil {
+			t.Fatalf("스냅숏 저장 실패: %v", err)
+		}
 
-	want, err := src.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("원본 읽기 실패: %v", err)
-	}
+		want, err := src.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("원본 읽기 실패: %v", err)
+		}
 
-	// 빈 DB 에 되쓴다. project·machine 도 원장에 실려 있으므로 미리 만들지 않는다
-	// (미리 만들면 WriteLedger 의 되쓰기와 id 가 겹쳐 UNIQUE 위반이 난다).
-	dst := newStore(t)
-	if err := dst.WriteLedger(ctx, want); err != nil {
-		t.Fatalf("WriteLedger 실패: %v", err)
-	}
+		// 빈 DB 에 되쓴다. project·machine 도 원장에 실려 있으므로 미리 만들지 않는다
+		// (미리 만들면 WriteLedger 의 되쓰기와 id 가 겹쳐 UNIQUE 위반이 난다).
+		dst := open(t)
+		if err := dst.WriteLedger(ctx, want); err != nil {
+			t.Fatalf("WriteLedger 실패: %v", err)
+		}
 
-	got, err := dst.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("복원본 읽기 실패: %v", err)
-	}
-	if !reflect.DeepEqual(want, got) {
-		t.Fatalf("원본과 복원본이 다르다:\n원본 %+v\n복원 %+v", want, got)
-	}
+		got, err := dst.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("복원본 읽기 실패: %v", err)
+		}
+		if !reflect.DeepEqual(want, got) {
+			t.Fatalf("원본과 복원본이 다르다:\n원본 %+v\n복원 %+v", want, got)
+		}
+	})
 }
 
 // supersedesLedger 는 프로젝트 하나와, 적힌 순서대로 되쓰일 판단들의 원장이다. 판단 i 는 parents[i] 를 정정한다(빈 값은 정정 없음).
@@ -577,32 +676,34 @@ func TestWriteLedgerRejectsMissingParentAtCommitOnBothEngines(t *testing.T) {
 // "판단 자체의 중복만" 격리해서 보려면 TestWriteLedgerRejectsDuplicateJudgmentEvenWhenClosureExists 를 봐라 —
 // 이 시험은 그보다 넓은 축("중복 되쓰기는 전부 거절되고 부분 적용이 없다")을 지킨다.
 func TestWriteLedgerRejectsDuplicateID(t *testing.T) {
-	src := newStore(t)
-	ctx := context.Background()
-	seed(t, src, "p")
-	linkJudgment(t, src, "p", model.JudgmentDecision, "i1")
-	d, err := src.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("원본 읽기 실패: %v", err)
-	}
+	eachEngine(t, func(t *testing.T, open func(*testing.T) *Store) {
+		src := open(t)
+		ctx := context.Background()
+		seed(t, src, "p")
+		linkJudgment(t, src, "p", model.JudgmentDecision, "i1")
+		d, err := src.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("원본 읽기 실패: %v", err)
+		}
 
-	// project·machine 도 원장에 실려 있으므로 미리 만들지 않는다(TestWriteLedgerRestoresRowsVerbatim 참고).
-	dst := newStore(t)
-	if err := dst.WriteLedger(ctx, d); err != nil {
-		t.Fatalf("첫 되쓰기 실패: %v", err)
-	}
-	if err := dst.WriteLedger(ctx, d); err == nil {
-		t.Fatal("같은 원장을 두 번 되썼는데 통과했다 — 판단은 추가 전용이라 되돌릴 수 없다")
-	}
+		// project·machine 도 원장에 실려 있으므로 미리 만들지 않는다(TestWriteLedgerRestoresRowsVerbatim 참고).
+		dst := open(t)
+		if err := dst.WriteLedger(ctx, d); err != nil {
+			t.Fatalf("첫 되쓰기 실패: %v", err)
+		}
+		if err := dst.WriteLedger(ctx, d); err == nil {
+			t.Fatal("같은 원장을 두 번 되썼는데 통과했다 — 판단은 추가 전용이라 되돌릴 수 없다")
+		}
 
-	// 실패한 되쓰기가 부분 적용으로 남지 않는지 본다.
-	after, err := dst.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("재확인 실패: %v", err)
-	}
-	if len(after.Judgments) != len(d.Judgments) {
-		t.Errorf("판단이 %d건으로 늘었다 — 한 트랜잭션이라 그대로여야 한다", len(after.Judgments))
-	}
+		// 실패한 되쓰기가 부분 적용으로 남지 않는지 본다.
+		after, err := dst.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("재확인 실패: %v", err)
+		}
+		if len(after.Judgments) != len(d.Judgments) {
+			t.Errorf("판단이 %d건으로 늘었다 — 한 트랜잭션이라 그대로여야 한다", len(after.Judgments))
+		}
+	})
 }
 
 // judgment 표 자체의 중복 거절을 격리해서 본다.
@@ -612,151 +713,158 @@ func TestWriteLedgerRejectsDuplicateID(t *testing.T) {
 // project·session)를 dst 에 먼저 정상 되쓴 뒤, **판단만 담은** LedgerDump 를 다시 넘긴다 —
 // 그러면 FK 는 이미 만족돼 있으므로 이번에는 judgment.id 의 PK 위반에서만 걸린다.
 func TestWriteLedgerRejectsDuplicateJudgmentEvenWhenClosureExists(t *testing.T) {
-	src := newStore(t)
-	ctx := context.Background()
-	seed(t, src, "p")
-	linkJudgment(t, src, "p", model.JudgmentDecision, "i1")
-	d, err := src.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("원본 읽기 실패: %v", err)
-	}
+	eachEngine(t, func(t *testing.T, open func(*testing.T) *Store) {
+		src := open(t)
+		ctx := context.Background()
+		seed(t, src, "p")
+		linkJudgment(t, src, "p", model.JudgmentDecision, "i1")
+		d, err := src.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("원본 읽기 실패: %v", err)
+		}
 
-	dst := newStore(t)
-	if err := dst.WriteLedger(ctx, d); err != nil {
-		t.Fatalf("첫 되쓰기 실패: %v", err)
-	}
+		dst := open(t)
+		if err := dst.WriteLedger(ctx, d); err != nil {
+			t.Fatalf("첫 되쓰기 실패: %v", err)
+		}
 
-	// 폐포는 이미 dst 에 있다 — 판단만 다시 넘겨 FK 를 건드리지 않고 judgment.id 만 겹치게 한다.
-	judgmentsOnly := LedgerDump{Judgments: d.Judgments}
-	err = dst.WriteLedger(ctx, judgmentsOnly)
-	if err == nil {
-		t.Fatal("같은 판단 id 를 두 번 되썼는데 통과했다 — judgment 는 UPDATE·DELETE 트리거로 금지돼 있어 되돌릴 수 없다")
-	}
-	if !strings.Contains(err.Error(), "judgment") {
-		t.Errorf("오류가 judgment 를 가리키지 않는다(격리가 안 됐다는 뜻) — %v", err)
-	}
+		// 폐포는 이미 dst 에 있다 — 판단만 다시 넘겨 FK 를 건드리지 않고 judgment.id 만 겹치게 한다.
+		judgmentsOnly := LedgerDump{Judgments: d.Judgments}
+		err = dst.WriteLedger(ctx, judgmentsOnly)
+		if err == nil {
+			t.Fatal("같은 판단 id 를 두 번 되썼는데 통과했다 — judgment 는 UPDATE·DELETE 트리거로 금지돼 있어 되돌릴 수 없다")
+		}
+		if !strings.Contains(err.Error(), "judgment") {
+			t.Errorf("오류가 judgment 를 가리키지 않는다(격리가 안 됐다는 뜻) — %v", err)
+		}
 
-	after, err := dst.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("재확인 실패: %v", err)
-	}
-	if len(after.Judgments) != len(d.Judgments) {
-		t.Errorf("판단이 %d건으로 늘었다 — 한 트랜잭션이라 그대로여야 한다", len(after.Judgments))
-	}
+		after, err := dst.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("재확인 실패: %v", err)
+		}
+		if len(after.Judgments) != len(d.Judgments) {
+			t.Errorf("판단이 %d건으로 늘었다 — 한 트랜잭션이라 그대로여야 한다", len(after.Judgments))
+		}
+	})
 }
 
 // 원장은 FK 폐포를 통째로 담는다. session.id 는 서버 발급 ULID 라 새 DB 에서 재현할 수 없고,
 // 그래서 세션을 안 담으면 세션 걸린 판단(실측 85%)이 FK 위반으로 전부 롤백된다.
 func TestReadLedgerCoversTheFullFKClosure(t *testing.T) {
-	s := newStore(t)
-	ctx := context.Background()
-	seed(t, s, "p1")
-	sess := mustSession(t, s, "p1", "cc-closure")
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p1")
+		sess := mustSession(t, s, "p1", "cc-closure")
 
-	if _, err := s.AddJudgment(ctx, model.Judgment{
-		Project: "p1", SessionID: sess.ID, Kind: model.JudgmentDecision, Body: "세션 걸린 판단",
-	}); err != nil {
-		t.Fatalf("판단 저장 실패: %v", err)
-	}
+		if _, err := s.AddJudgment(ctx, model.Judgment{
+			Project: "p1", SessionID: sess.ID, Kind: model.JudgmentDecision, Body: "세션 걸린 판단",
+		}); err != nil {
+			t.Fatalf("판단 저장 실패: %v", err)
+		}
 
-	d, err := s.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("ReadLedger 실패: %v", err)
-	}
-	if len(d.Machines) == 0 {
-		t.Error("machine 이 원장에 없다 — session.machine_id 가 가리킬 대상이 사라진다")
-	}
-	if len(d.Projects) == 0 {
-		t.Error("project 가 원장에 없다")
-	}
-	if len(d.Sessions) == 0 {
-		t.Fatal("session 이 원장에 없다 — 판단의 85%가 이것을 가리킨다")
-	}
-	var found bool
-	for _, x := range d.Sessions {
-		if x.ID == sess.ID {
-			found = true
-			if x.Project != "p1" || x.MachineID != "m1" {
-				t.Errorf("세션 필드가 틀리다: %+v", x)
+		d, err := s.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("ReadLedger 실패: %v", err)
+		}
+		if len(d.Machines) == 0 {
+			t.Error("machine 이 원장에 없다 — session.machine_id 가 가리킬 대상이 사라진다")
+		}
+		if len(d.Projects) == 0 {
+			t.Error("project 가 원장에 없다")
+		}
+		if len(d.Sessions) == 0 {
+			t.Fatal("session 이 원장에 없다 — 판단의 85%가 이것을 가리킨다")
+		}
+		var found bool
+		for _, x := range d.Sessions {
+			if x.ID == sess.ID {
+				found = true
+				if x.Project != "p1" || x.MachineID != "m1" {
+					t.Errorf("세션 필드가 틀리다: %+v", x)
+				}
 			}
 		}
-	}
-	if !found {
-		t.Errorf("판단이 가리키는 세션 %q 가 원장에 없다", sess.ID)
-	}
+		if !found {
+			t.Errorf("판단이 가리키는 세션 %q 가 원장에 없다", sess.ID)
+		}
+	})
 }
 
 // 빈 DB 에 되쓰면 폐포가 통째로 복원된다 — 미리 심어 둘 것이 하나도 없어야 한다.
 // 이것이 "무손실" 등급의 실제 의미다.
 func TestWriteLedgerRestoresIntoATrulyEmptyDB(t *testing.T) {
-	src := newStore(t)
-	ctx := context.Background()
-	seed(t, src, "p1")
-	sess := mustSession(t, src, "p1", "cc-restore")
+	eachEngine(t, func(t *testing.T, open func(*testing.T) *Store) {
+		src := open(t)
+		ctx := context.Background()
+		seed(t, src, "p1")
+		sess := mustSession(t, src, "p1", "cc-restore")
 
-	if _, err := src.AddJudgment(ctx, model.Judgment{
-		Project: "p1", SessionID: sess.ID, Kind: model.JudgmentAsk,
-		Title: "제목", Body: "세션 걸린 판단",
-	}); err != nil {
-		t.Fatalf("판단 저장 실패: %v", err)
-	}
-	if err := src.PutSnapshot(ctx, model.Snapshot{
-		Project: "p1", Key: "k", Value: "1", Method: model.SnapshotCommand,
-	}); err != nil {
-		t.Fatalf("스냅숏 저장 실패: %v", err)
-	}
+		if _, err := src.AddJudgment(ctx, model.Judgment{
+			Project: "p1", SessionID: sess.ID, Kind: model.JudgmentAsk,
+			Title: "제목", Body: "세션 걸린 판단",
+		}); err != nil {
+			t.Fatalf("판단 저장 실패: %v", err)
+		}
+		if err := src.PutSnapshot(ctx, model.Snapshot{
+			Project: "p1", Key: "k", Value: "1", Method: model.SnapshotCommand,
+		}); err != nil {
+			t.Fatalf("스냅숏 저장 실패: %v", err)
+		}
 
-	want, err := src.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("원본 읽기 실패: %v", err)
-	}
+		want, err := src.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("원본 읽기 실패: %v", err)
+		}
 
-	// ★ seed 를 부르지 않는다. 원장이 project·machine·session 을 다 갖고 와야 한다.
-	dst := newStore(t)
-	if err := dst.WriteLedger(ctx, want); err != nil {
-		t.Fatalf("빈 DB 되쓰기 실패 — 폐포가 안 닫혔다: %v", err)
-	}
-	got, err := dst.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("복원본 읽기 실패: %v", err)
-	}
-	if !reflect.DeepEqual(want, got) {
-		t.Fatalf("왕복에서 원장이 달라졌다:\n원본 %+v\n복원 %+v", want, got)
-	}
+		// ★ seed 를 부르지 않는다. 원장이 project·machine·session 을 다 갖고 와야 한다.
+		dst := open(t)
+		if err := dst.WriteLedger(ctx, want); err != nil {
+			t.Fatalf("빈 DB 되쓰기 실패 — 폐포가 안 닫혔다: %v", err)
+		}
+		got, err := dst.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("복원본 읽기 실패: %v", err)
+		}
+		if !reflect.DeepEqual(want, got) {
+			t.Fatalf("왕복에서 원장이 달라졌다:\n원본 %+v\n복원 %+v", want, got)
+		}
+	})
 }
 
 // state='blocked' 세션은 CHECK(state<>'blocked' OR blocked_why 가 비지 않음) 를 통과해야 한다.
 // 지금 실 DB 에 blocked 세션이 0건이라 이 축은 시험이 만들어야만 검증된다.
 func TestWriteLedgerRestoresBlockedSession(t *testing.T) {
-	src := newStore(t)
-	ctx := context.Background()
-	seed(t, src, "p1")
-	sess := mustSession(t, src, "p1", "cc-blocked")
-	if err := src.SetSessionState(ctx, sess.ID, model.SessionBlocked, "왜 막혔는지"); err != nil {
-		t.Fatalf("세션을 막힘으로 못 바꿨다: %v", err)
-	}
+	eachEngine(t, func(t *testing.T, open func(*testing.T) *Store) {
+		src := open(t)
+		ctx := context.Background()
+		seed(t, src, "p1")
+		sess := mustSession(t, src, "p1", "cc-blocked")
+		if err := src.SetSessionState(ctx, sess.ID, model.SessionBlocked, "왜 막혔는지"); err != nil {
+			t.Fatalf("세션을 막힘으로 못 바꿨다: %v", err)
+		}
 
-	want, err := src.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("원본 읽기 실패: %v", err)
-	}
-	var blocked bool
-	for _, x := range want.Sessions {
-		if x.State == "blocked" {
-			blocked = true
-			if x.BlockedWhy == nil || *x.BlockedWhy == "" {
-				t.Fatalf("blocked 세션인데 사유가 비었다: %+v", x)
+		want, err := src.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("원본 읽기 실패: %v", err)
+		}
+		var blocked bool
+		for _, x := range want.Sessions {
+			if x.State == "blocked" {
+				blocked = true
+				if x.BlockedWhy == nil || *x.BlockedWhy == "" {
+					t.Fatalf("blocked 세션인데 사유가 비었다: %+v", x)
+				}
 			}
 		}
-	}
-	if !blocked {
-		t.Fatal("전제가 깨졌다 — blocked 세션이 원장에 없다")
-	}
+		if !blocked {
+			t.Fatal("전제가 깨졌다 — blocked 세션이 원장에 없다")
+		}
 
-	dst := newStore(t)
-	if err := dst.WriteLedger(ctx, want); err != nil {
-		t.Fatalf("blocked 세션 되쓰기 실패(CHECK 위반?): %v", err)
-	}
+		dst := open(t)
+		if err := dst.WriteLedger(ctx, want); err != nil {
+			t.Fatalf("blocked 세션 되쓰기 실패(CHECK 위반?): %v", err)
+		}
+	})
 }
 
 // TestWriteLedgerRestoresProjectViewAxisInOrder 는 pinned_at 과 archived_at 이 원장
@@ -770,38 +878,40 @@ func TestWriteLedgerRestoresBlockedSession(t *testing.T) {
 // 로 넣은 **원래 값**과 dst.GetProject 가 돌려주는 값을 직접 견준다 — 자기 자신과 비교하지
 // 않는다.
 func TestWriteLedgerRestoresProjectViewAxisInOrder(t *testing.T) {
-	src := newStore(t)
-	ctx := context.Background()
-	seed(t, src, "p") // p·기본 머신을 만든다.
-	if err := src.UpsertProject(ctx, model.Project{ID: "q", Path: "/repo/q"}); err != nil {
-		t.Fatalf("프로젝트 q 등록 실패: %v", err)
-	}
-	pin := time.Date(2026, 8, 11, 1, 2, 3, 0, time.UTC)
-	arc := time.Date(2026, 8, 12, 4, 5, 6, 0, time.UTC)
-	if err := src.SetProjectView(ctx, "p", pin, arc); err != nil {
-		t.Fatalf("p 표시 축 설정 실패: %v", err)
-	}
+	eachEngine(t, func(t *testing.T, open func(*testing.T) *Store) {
+		src := open(t)
+		ctx := context.Background()
+		seed(t, src, "p") // p·기본 머신을 만든다.
+		if err := src.UpsertProject(ctx, model.Project{ID: "q", Path: "/repo/q"}); err != nil {
+			t.Fatalf("프로젝트 q 등록 실패: %v", err)
+		}
+		pin := time.Date(2026, 8, 11, 1, 2, 3, 0, time.UTC)
+		arc := time.Date(2026, 8, 12, 4, 5, 6, 0, time.UTC)
+		if err := src.SetProjectView(ctx, "p", pin, arc); err != nil {
+			t.Fatalf("p 표시 축 설정 실패: %v", err)
+		}
 
-	want, err := src.ReadLedger(ctx)
-	if err != nil {
-		t.Fatalf("원본 읽기 실패: %v", err)
-	}
+		want, err := src.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("원본 읽기 실패: %v", err)
+		}
 
-	dst := newStore(t)
-	if err := dst.WriteLedger(ctx, want); err != nil {
-		t.Fatalf("WriteLedger 실패: %v", err)
-	}
+		dst := open(t)
+		if err := dst.WriteLedger(ctx, want); err != nil {
+			t.Fatalf("WriteLedger 실패: %v", err)
+		}
 
-	got, err := dst.GetProject(ctx, "p")
-	if err != nil {
-		t.Fatalf("복원본 조회 실패: %v", err)
-	}
-	if !got.PinnedAt.Equal(pin) {
-		t.Errorf("복원된 PinnedAt 이 %v 다, want %v — ArchivedAt 과 뒤바뀌었을 수 있다", got.PinnedAt, pin)
-	}
-	if !got.ArchivedAt.Equal(arc) {
-		t.Errorf("복원된 ArchivedAt 이 %v 다, want %v — PinnedAt 과 뒤바뀌었을 수 있다", got.ArchivedAt, arc)
-	}
+		got, err := dst.GetProject(ctx, "p")
+		if err != nil {
+			t.Fatalf("복원본 조회 실패: %v", err)
+		}
+		if !got.PinnedAt.Equal(pin) {
+			t.Errorf("복원된 PinnedAt 이 %v 다, want %v — ArchivedAt 과 뒤바뀌었을 수 있다", got.PinnedAt, pin)
+		}
+		if !got.ArchivedAt.Equal(arc) {
+			t.Errorf("복원된 ArchivedAt 이 %v 다, want %v — PinnedAt 과 뒤바뀌었을 수 있다", got.ArchivedAt, arc)
+		}
+	})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -821,10 +931,10 @@ func TestWriteLedgerRestoresProjectViewAxisInOrder(t *testing.T) {
 //
 // ★ 그래서 목록은 표당 **하나**다(ledgerTables). 읽기와 쓰기가 각자 목록을 들면 관문이
 // 한쪽만 재게 되고, 재지 않은 쪽이 정확히 위의 조용한 손실 자리가 된다.
+//
+// 두 엔진의 스키마와 맞댄다. 목록 하나를 두 엔진이 같이 쓰므로, Postgres 기준선에만 칸이 하나 더 생겨도 여기서 빨갛다
+// (계산 칼럼은 원장이 실을 것이 아니라 도우미가 뺀다 - catalog_test.go 의 columnsQuery).
 func TestLedgerColumnListsMatchTheSchema(t *testing.T) {
-	s := newStore(t)
-	ctx := context.Background()
-
 	// 전제 — 폐포가 여섯 표라는 것 자체를 못박는다. 늘거나 줄면 사람이 판단해야 한다:
 	// 표가 늘면 ReadLedger·WriteLedger 가 그것을 실제로 담는지, 줄면 그 표의 행이
 	// 복원 후 어디서 오는지가 먼저 답해져야 한다.
@@ -837,44 +947,27 @@ func TestLedgerColumnListsMatchTheSchema(t *testing.T) {
 		t.Fatalf("원장 폐포의 표 집합이 달라졌다.\n  발견: %v\n  기대: %v", names, want)
 	}
 
-	for _, e := range ledgerTables {
-		rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info(?) ORDER BY cid`, e.name)
-		if err != nil {
-			t.Fatalf("%s 의 스키마를 못 읽었다: %v", e.name, err)
-		}
-		var schema []string
-		for rows.Next() {
-			var n string
-			if err := rows.Scan(&n); err != nil {
-				t.Fatalf("%s 의 컬럼 이름 스캔 실패: %v", e.name, err)
+	bothEngines(t, func(t *testing.T, s *Store) {
+		for _, e := range ledgerTables {
+			schema := liveColumns(t, s, e.name)
+			listed := ledgerColNames(e.cols)
+			// 순서가 아니라 **집합**으로 댄다. 목록 안의 순서는 질의 자신의 문제이고
+			// (SELECT 순서 = Scan 순서 · INSERT 순서 = 인자 순서), 스키마 순서와 같을
+			// 의무가 없다. 이 관문이 재는 것은 "빠뜨린 것이 있나"다.
+			missing := ledgerColsMinus(schema, listed)
+			extra := ledgerColsMinus(listed, schema)
+			if len(missing) > 0 {
+				t.Errorf("원장이 %s 의 컬럼 %v 를 안 담는다.\n"+
+					"백업은 그것을 버리고 복원도 버리는데, 왕복 시험은 양쪽이 다 ReadLedger "+
+					"산출물이라 원리적으로 못 본다 — 무손실을 표방하는 백업이 조용히 무손실이 "+
+					"아니게 된다. 목록에 더하고 DTO·Scan·INSERT 인자를 함께 맞춰라.", e.name, missing)
 			}
-			schema = append(schema, n)
+			if len(extra) > 0 {
+				t.Errorf("원장의 %s 목록에 스키마에 없는 컬럼 %v 가 있다 — "+
+					"질의가 런타임에 죽는다(그리고 이 목록이 다음 사람에게 거짓을 말한다).", e.name, extra)
+			}
 		}
-		if err := rows.Err(); err != nil {
-			t.Fatalf("%s 의 스키마 순회 실패: %v", e.name, err)
-		}
-		rows.Close()
-		if len(schema) == 0 {
-			t.Fatalf("%s 표가 스키마에 없다 — 이 관문의 좌표가 틀렸다(표 이름이 바뀌었나)", e.name)
-		}
-
-		listed := ledgerColNames(e.cols)
-		// 순서가 아니라 **집합**으로 댄다. 목록 안의 순서는 질의 자신의 문제이고
-		// (SELECT 순서 = Scan 순서 · INSERT 순서 = 인자 순서), 스키마 순서와 같을
-		// 의무가 없다. 이 관문이 재는 것은 "빠뜨린 것이 있나"다.
-		missing := ledgerColsMinus(schema, listed)
-		extra := ledgerColsMinus(listed, schema)
-		if len(missing) > 0 {
-			t.Errorf("원장이 %s 의 컬럼 %v 를 안 담는다.\n"+
-				"백업은 그것을 버리고 복원도 버리는데, 왕복 시험은 양쪽이 다 ReadLedger "+
-				"산출물이라 원리적으로 못 본다 — 무손실을 표방하는 백업이 조용히 무손실이 "+
-				"아니게 된다. 목록에 더하고 DTO·Scan·INSERT 인자를 함께 맞춰라.", e.name, missing)
-		}
-		if len(extra) > 0 {
-			t.Errorf("원장의 %s 목록에 스키마에 없는 컬럼 %v 가 있다 — "+
-				"질의가 런타임에 죽는다(그리고 이 목록이 다음 사람에게 거짓을 말한다).", e.name, extra)
-		}
-	}
+	})
 }
 
 // ledgerColsMinus 는 a 에는 있고 b 에는 없는 이름들이다(집합 차). 순수 함수다.

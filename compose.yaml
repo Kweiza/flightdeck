@@ -1,4 +1,6 @@
 # flightdeck — 서비스 2개(적용 one-shot + 서버), 러너 0, 시크릿 0(설계 §2 Tier A).
+#   Postgres 원장의 매일 덤프(db-backup)는 profile `postgres` 뒤에 있어 위 둘만 뜨는 기본 `up` 에는 안 낀다.
+#   맨 아래 db-backup 서비스의 머리말을 보라.
 #
 # ★ **두 단계인 이유**(2026-08-23, 설계 §7 처방 ①). 그전까지 스키마 적용은 store.Open() 안,
 #   곧 `fd serve` 기동 경로에 있었다. 그래서 나쁜 증분은 "서버가 안 뜬다"로 나타났고
@@ -160,3 +162,60 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  # ★ Postgres 원장의 매일 덤프(재설계 스펙의 백업 절: 매일 `pg_dump -Fc`, 14개 보관). 매시간 판단 원장(/ledger)과 다른
+  #   겹이다 - 그것은 여섯 표의 결정적 산출물이고, 이것은 원장 전체를 새 DB 로 되살리는 복원 수단이다.
+  #
+  # ★ **profile `postgres` 뒤에 있다.** 이 파일에는 아직 `db` 서비스가 없다(원장이 SQLite 파일이다). 기본 `up` 은 이
+  #   서비스를 안 띄우고, Postgres 로 넘어가는 단계가 `db` 를 더할 때 켠다(`docker compose --profile postgres up -d`).
+  #   `depends_on: db` 도 그때 붙는다 - 없는 서비스를 가리키면 기본 `up` 까지 설정 오류로 선다.
+  #
+  # ★ 이미지는 서버와 **같은 주판**의 postgres 다. pg_dump 는 자기보다 높은 서버를 거절한다. compose.test.yaml 의
+  #   pg-test 와 같은 이미지라 시험이 둘을 맞댄다(TestComposeDBBackupMatchesTheLedgerImage).
+  #
+  # ★ 비밀번호는 pgpass 파일 하나로만 받는다(아래 secrets). 환경 변수 · 명령줄에 안 싣는다 - `docker inspect` 와
+  #   `ps` 에 보인다. 파일 권한은 0600 이어야 한다(libpq 가 그보다 열린 파일을 무시한다). 줄의 꼴은
+  #   `db:5432:<DB>:<역할>:<비밀번호>` 다. 역할은 읽기만 하면 된다(pg_read_all_data 의 구성원).
+  #
+  # ★ 덤프 자리는 /backups/daily 다. /backups 바로 아래는 `fd migrate` 가 판을 올리기 전에 뜨는 덤프 자리라
+  #   (FD_BACKUP_DIR), 회전이 그것을 못 지우게 하위 자리를 쓴다. 되돌리기가 덤프를 고르는 훑기도 하위 자리를 안 본다.
+  #
+  # ★ 덤프는 원장 전체라 파일 권한을 0600 으로 쓴다(스크립트의 umask). 이름에는 시각만 있다.
+  db-backup:
+    profiles: ["postgres"]
+    image: postgres:17
+    restart: unless-stopped
+    # 호스트 사용자로 돈다. 다르면 쌓인 덤프를 호스트에서 못 지우고, 자리를 못 만든다.
+    user: "${FD_UID:-1000}:${FD_GID:-1000}"
+    # ★ 이미지의 진입점(postgres 를 띄우는 스크립트)을 안 탄다 - 이 컨테이너는 DB 를 띄우지 않는다.
+    entrypoint: ["sh", "/usr/local/bin/fd-db-backup"]
+    volumes:
+      - ./deploy/db-backup.sh:/usr/local/bin/fd-db-backup:ro
+      - ${FD_BACKUP_HOST:-${HOME}/.flightdeck-backups}:/backups
+    secrets:
+      - fd_pgpass
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: "${FD_PG_DATABASE:-flightdeck}"
+      PGUSER: "${FD_PG_BACKUP_USER:-fd_backup}"
+      PGPASSFILE: /run/secrets/fd_pgpass
+      FD_DB_BACKUP_DIR: /backups/daily
+      FD_DB_BACKUP_KEEP: "14"
+    # 가장 새 덤프가 이틀보다 낡으면 unhealthy 다 - 덤프가 조용히 멈춘 것이 `docker compose ps` 에 보인다.
+    healthcheck:
+      test: ["CMD", "sh", "/usr/local/bin/fd-db-backup", "check"]
+      interval: 10m
+      timeout: 10s
+      retries: 3
+      start_period: 1h
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+secrets:
+  # db-backup 의 pgpass 파일. 호스트 파일이 없으면 그 서비스만 기동에서 선다(기본 `up` 은 이것을 안 읽는다).
+  fd_pgpass:
+    file: ${FD_PGPASS_HOST:-${HOME}/.flightdeck-pgpass}

@@ -1844,6 +1844,7 @@ N-1 까지만 올려 두고 옛 바이너리로 계속 도는 선택지를 준�
 | DB 와 다른 볼륨 | 있음 | `compose.yaml` 이 `$FD_LEDGER:/ledger` 를 따로 붙인다. **기본값은 여전히 같은 디스크다**(`~/.flightdeck-ledger` 는 `~/.flightdeck` 의 형제다) — 이 줄이 사는 것은 *가를 수 있는 자리*이지 분리 그 자체가 아니다. 진짜 분리는 `FD_LEDGER_HOST` 를 다른 매체로 겨눠야 성립한다 |
 | bare 레포 커밋(`journal.git`) | 있음 | `$FD_LEDGER/journal.git` 에 회차마다 한 커밋. **가드를 안 건드렸다** — `JudgeOutTarget` 이 막는 것은 판단 본문이 남의 레포 **작업본**에 쌓이는 사고인데, bare 레포에는 작업 트리가 없어 그 관심사가 성립하지 않는다. 작업 트리 없이 `hash-object`→`mktree`→`commit-tree`→`update-ref` 로만 쌓는다. **디스크에 실린 바이트를 쌓지 갓 인코딩한 것을 쌓지 않는다** — 매니페스트의 `exported_at` 이 회차마다 달라 후자면 안 바뀐 회차도 커밋이 생긴다 |
 | 6시간 `VACUUM INTO` | **없음** | `VACUUM INTO` 는 있지만 마이그레이션 직전 1회다(`Store.backup`). 정기 작업이 아니다 |
+| 매일 덤프(Postgres 원장) | **자리만** | `compose.yaml` 의 `db-backup` 서비스(`deploy/db-backup.sh`)가 `pg_dump -Fc` 를 `$FD_BACKUP_HOST/daily` 에 하루 한 번 뜨고 새것 14개만 남긴다. `.part` 로 떠서 `pg_restore --list` 가 읽은 뒤에만 이름을 주고, 회전은 그 뒤에만 한다 - 접속이 끊긴 날이 이어져도 앞 덤프가 안 지워진다. 비밀번호는 pgpass 시크릿 파일로만 받는다. profile `postgres` 뒤에 있어 지금은 안 뜨고, Postgres 로 옮기는 단계가 `db` 서비스와 함께 켠다. 매시간 판단 원장은 두 엔진에서 같은 바이트다(Postgres 는 `ReadTx` 의 REPEATABLE READ READ ONLY 스냅숏 하나로 읽는다) |
 
 **실측 (2026-08-06 19:43 KST).** `judgment` 1,157행 · `judgment_link` 1,734행 · `snapshot` 12행 ·
 `session` 302행 · `project` 8행 · `machine` 8행이

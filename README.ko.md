@@ -172,6 +172,9 @@ codex                      # 한 번은 TUI 로 띄워 "Hooks need review" 를 �
 | `FD_LEDGER_HOST` | 서버 | 원장 백업 자리(기본 `~/.flightdeck-ledger`) |
 | `FD_BACKUP_DIR` | 서버 | `fd migrate` 가 Postgres 원장의 판을 올리기 전에 뜨는 덤프 자리(`--backup-dir` 가 먼저고, 둘 다 비면 `/backups` 가 있을 때 그곳). **배포마다 따로 둔다**: 물리 복제로 떠 온 시험 시스템은 원래 시스템과 원장 식별(클러스터 식별자 · DB 이름)이 같아서, 한 자리를 나눠 쓰면 되돌리기가 다른 배포의 덤프를 고를 수 있다 |
 | `FD_DUMP_TIMEOUT` | 서버 | `fd migrate` 가 Postgres 원장의 판을 올리기 전에 뜨는 덤프의 기한(Go 시간 표기, 기본 `30m`, 1초 이상). 덤프하는 동안 업무 쓰기가 기다리므로, 덤프가 멈추면(백업 볼륨이 응답을 멈추면) 이 기한이 쓰기가 막히는 가장 긴 시간이다. 기한이 지나면 pg_dump 를 멈추고 서버가 실행기 연결을 끊어 잠금을 풀며, 판은 올리지 않는다. 큰 원장에서 정상 덤프가 더 걸리면 늘린다 |
+| `FD_BACKUP_HOST` | 서버 | Postgres 원장의 매일 덤프 자리(기본 `~/.flightdeck-backups`). compose 의 `db-backup` 서비스가 그 안 `daily/` 에 `pg_dump -Fc` 를 하루 한 번 뜨고 새것 14개만 남긴다. 회전은 덤프가 성공한 뒤에만 한다. 서비스는 profile `postgres` 뒤에 있어 Postgres 로 옮기기 전에는 안 뜬다. 되살릴 때는 역할(`fd_owner` · `fd_app` 과 접속 계정)을 먼저 만들고(클러스터 전역이라 덤프에 없다) `pg_restore -d postgres --create --exit-on-error <덤프>` 로 DB 째 되살린다. `--create` 없이 미리 만든 DB 에 부으면 DB 단위 권한(PUBLIC 의 `TEMPORARY` 회수)이 빠진다 |
+| `FD_PGPASS_HOST` | 서버 | `db-backup` 이 읽는 pgpass 파일(기본 `~/.flightdeck-pgpass`, 권한 `0600`, 줄 `db:5432:<DB>:<역할>:<비밀번호>`). 비밀번호가 들어가는 유일한 자리다. 환경 변수와 명령줄에는 두지 않는다. 권한이 넓으면 libpq 가 파일을 안 읽는다 |
+| `FD_PG_DATABASE` · `FD_PG_BACKUP_USER` | 서버 | `db-backup` 이 붙는 DB 와 역할(기본 `flightdeck` · `fd_backup`). 역할에는 `pg_read_all_data` 가 있어야 한다 |
 | `FD_URL` | 세션 | 서버 주소(기본 `http://127.0.0.1:7420`) |
 | `FD_STATE_DIR` | 세션 | 상태 파일(아웃박스·캐시·머신 id)을 한 자리로 모은다 |
 | `FD_LANG` | 서버 · 세션 | 출력 언어. `en` 이면 영어로 낸다(기본 한국어). 서버 쪽은 대시보드, 세션 쪽은 CLI·훅·MCP 결과다 |

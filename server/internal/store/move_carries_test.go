@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"slices"
 	"sort"
 	"strings"
@@ -99,53 +98,38 @@ var itemKeyedNotMoved = map[string]string{}
 // 그래서 증분 016 이 item_revision 을 더했을 때 이동 목록도 시험도 같이 낡았고 아무도 몰랐다.
 // 이 시험은 목록을 적지 않는다. 적용이 끝난 스키마에서 `project`·`item_id` 칼럼을 함께 든 표를
 // 전부 찾아, 이동 목록(itemKeyedTables)이나 안 옮기는 목록(사유와 함께) 중 한 곳에 있기를 요구한다.
+//
+// 두 엔진에서 돈다. 이동 목록 하나를 두 엔진이 같이 쓰므로, 한 엔진에만 (project, item_id) 표가 생겨도 여기서 빨갛다.
 func TestMoveItemListCoversEveryTableKeyedToItem(t *testing.T) {
-	s := newStore(t)
-	ctx := context.Background()
-
-	var found []string
-	rows, err := s.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
-	if err != nil {
-		t.Fatalf("표 목록 조회 실패: %v", err)
-	}
-	var tables []string
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			t.Fatalf("표 이름 해석 실패: %v", err)
+	bothEngines(t, func(t *testing.T, s *Store) {
+		var found []string
+		for _, tbl := range liveTables(t, s) {
+			cols := liveColumnSet(t, s, tbl)
+			if cols["project"] && cols["item_id"] {
+				found = append(found, tbl)
+			}
 		}
-		tables = append(tables, n)
-	}
-	rows.Close()
-	if len(tables) == 0 {
-		t.Fatal("표를 하나도 못 찾았다 — 훑기가 눈이 먼 것이지 통과가 아니다")
-	}
-	for _, tbl := range tables {
-		cols := tableColumns(t, s.DB(), tbl)
-		if cols["project"] && cols["item_id"] {
-			found = append(found, tbl)
+		sort.Strings(found)
+		if len(found) == 0 {
+			t.Fatal("(project, item_id) 를 든 표가 0개다 — claim 은 있어야 한다. 훑기가 틀렸다")
 		}
-	}
-	sort.Strings(found)
-	if len(found) == 0 {
-		t.Fatal("(project, item_id) 를 든 표가 0개다 — claim 은 있어야 한다. 훑기가 틀렸다")
-	}
-	for _, tbl := range found {
-		if slices.Contains(itemKeyedTables, tbl) {
-			continue
+		for _, tbl := range found {
+			if slices.Contains(itemKeyedTables, tbl) {
+				continue
+			}
+			if why, ok := itemKeyedNotMoved[tbl]; ok && strings.TrimSpace(why) != "" {
+				continue
+			}
+			t.Errorf("표 %s 가 (project, item_id) 를 드는데 MoveItem 이 안 옮긴다.\n"+
+				"옮겨야 하면 itemKeyedTables 에 더하고, 일부러 안 옮기면 itemKeyedNotMoved 에 **사유와 함께** 올려라", tbl)
 		}
-		if why, ok := itemKeyedNotMoved[tbl]; ok && strings.TrimSpace(why) != "" {
-			continue
+		// 반대 방향: 목록에 있는데 스키마에 없는 표는 걷어라(011 이 item_dependents 를 걷은 것과 같은 규율).
+		for _, tbl := range itemKeyedTables {
+			if !slices.Contains(found, tbl) {
+				t.Errorf("itemKeyedTables 의 %s 가 스키마에 (project, item_id) 표로 없다 — 목록이 낡았다", tbl)
+			}
 		}
-		t.Errorf("표 %s 가 (project, item_id) 를 드는데 MoveItem 이 안 옮긴다.\n"+
-			"옮겨야 하면 itemKeyedTables 에 더하고, 일부러 안 옮기면 itemKeyedNotMoved 에 **사유와 함께** 올려라", tbl)
-	}
-	// 반대 방향: 목록에 있는데 스키마에 없는 표는 걷어라(011 이 item_dependents 를 걷은 것과 같은 규율).
-	for _, tbl := range itemKeyedTables {
-		if !slices.Contains(found, tbl) {
-			t.Errorf("itemKeyedTables 의 %s 가 스키마에 (project, item_id) 표로 없다 — 목록이 낡았다", tbl)
-		}
-	}
+	})
 }
 
 // 개정 이력은 여전히 **내용을 못 고치고 못 지운다.** 증분 017 이 연 것은 project 좌표 하나다.
@@ -170,23 +154,4 @@ func TestItemRevisionContentStaysAppendOnly(t *testing.T) {
 			t.Errorf("개정 이력의 내용이 바뀌었다(또는 다른 이유로 거절됐다) — %s: %v", q, err)
 		}
 	}
-}
-
-// tableColumns 는 표의 칼럼 이름 집합이다.
-func tableColumns(t *testing.T, db *sql.DB, table string) map[string]bool {
-	t.Helper()
-	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
-	if err != nil {
-		t.Fatalf("%s 칼럼 조회 실패: %v", table, err)
-	}
-	defer rows.Close()
-	out := map[string]bool{}
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			t.Fatalf("%s 칼럼 해석 실패: %v", table, err)
-		}
-		out[n] = true
-	}
-	return out
 }

@@ -187,7 +187,10 @@ func ledgerInsert(name, cols string) string {
 //
 // ★ 왜 Store.Tx 를 안 쓰는가. 그 함수는 쓰기 트랜잭션이라 전역 쓰기 잠금을 잡는다(Tx 주석이
 // 그 대가를 적어 뒀다). 전량 읽기가 도는 동안 서버의 모든 쓰기가 잠금 대기 상한 안에서 줄을 선다.
-// 여기서는 읽기 트랜잭션(ReadTx)을 연다 - 잠그지 않고 한 스냅숏을 본다.
+// 여기서는 읽기 트랜잭션(ReadTx)을 연다 - 잠그지 않고 한 스냅숏을 본다. 엔진 차이는 ReadTx 안에만 있다: SQLite 는
+// WAL 의 첫 읽기 스냅숏이고, Postgres 는 REPEATABLE READ READ ONLY 라 여섯 질의가 첫 질의의 스냅숏을 함께 본다(READ
+// COMMITTED 면 질의마다 새 스냅숏이라 위의 창이 그대로 열린다). Postgres 에서도 쓰기를 세우지 않는다 - 전역 잠금은
+// 쓰기 트랜잭션만 잡는다. 그 창이 닫힌 것은 backup_test.go 의 TestPGReadLedgerReadsOneSnapshot 이 잰다.
 //
 // ★ 상한이 없다. ListJudgmentsByKind 는 limit<=0 을 50 으로 바꾸고, legacy 되쓰기는
 // 100000 이라는 수를 손으로 넣는다 — 상한에 걸려 조용히 잘리면 산출물이 원본보다

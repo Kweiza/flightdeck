@@ -1,19 +1,13 @@
 package store
 
 import (
-	"context"
-	"database/sql"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
 
-	_ "github.com/jackc/pgx/v5/stdlib" // database/sql 드라이버 "pgx"
-
 	"github.com/kweiza/flightdeck/internal/store/pg"
-	"github.com/kweiza/flightdeck/internal/store/storetest"
 )
 
 // declaredTableRe 는 **사람이 선언한** 표를 찾는다.
@@ -197,35 +191,13 @@ var migrationsDropTables = []string{
 // "실제로 남은 것"을 센다. 둘이 갈리는 유일한 이유가 DROP 이고, 그 차이를 migrationsDropTables
 // 가 명시한다. 한쪽만 있으면 DROP 이 조용히 지나가거나(저쪽만) 선언의 계약이 사라진다(여기만).
 func TestLiveSchemaAfterAllMigrationsMatchesTheDeclaredList(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "fd.db")
-	mustMigrate(t, path)
-	s, err := OpenWithLogger(path, testLogger())
-	if err != nil {
-		t.Fatalf("올린 DB 를 못 열었다: %v", err)
-	}
-	defer s.Close()
-
-	// ★ 그림자 표는 우리가 정한 값이 아니다 — FTS5 가 judgment_fts 뒤에 만드는 넷과
-	//   AUTOINCREMENT 이 만드는 sqlite_sequence 다. fts5 옵션이나 SQLite 판이 바뀌면
-	//   조용히 달라지므로 세는 대상에서 뺀다(위 시험의 머리말과 같은 규율).
-	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT name FROM sqlite_master WHERE type='table'
-		   AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'judgment_fts_%'
-		 ORDER BY name`)
-	if err != nil {
-		t.Fatalf("sqlite_master 조회 실패: %v", err)
-	}
-	defer rows.Close()
+	// ★ 그림자 표는 우리가 정한 값이 아니다 — FTS5 가 judgment_fts 뒤에 만드는 넷이다(sqlite_sequence 는 liveTables 가
+	//   이미 뺀다). fts5 옵션이나 SQLite 판이 바뀌면 조용히 달라지므로 세는 대상에서 뺀다(위 시험의 머리말과 같은 규율).
 	var live []string
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			t.Fatalf("표 이름 해석 실패: %v", err)
+	for _, n := range liveTables(t, newStore(t)) {
+		if !strings.HasPrefix(n, "judgment_fts_") {
+			live = append(live, n)
 		}
-		live = append(live, n)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("순회 실패: %v", err)
 	}
 
 	dropped := make(map[string]bool, len(migrationsDropTables))
@@ -268,29 +240,7 @@ func TestLiveSchemaAfterAllMigrationsMatchesTheDeclaredList(t *testing.T) {
 // ★ 위 SQLite 짝과 같은 까닭이다: 선언 목록은 SQL 글자를 세고 여기는 DB 에 남은 것을 센다. PG 는 그림자 표를
 // 만들지 않으므로(pg_trgm 도 표를 안 만든다) 걸러 낼 것 없이 둘이 같아야 한다.
 func TestPGLiveSchemaMatchesTheDeclaredList(t *testing.T) {
-	db, err := sql.Open("pgx", storetest.New(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	rows, err := db.QueryContext(context.Background(),
-		`SELECT table_name FROM information_schema.tables
-		  WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name`)
-	if err != nil {
-		t.Fatalf("information_schema 조회 실패: %v", err)
-	}
-	defer rows.Close()
-	var live []string
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			t.Fatalf("표 이름 해석 실패: %v", err)
-		}
-		live = append(live, n)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("순회 실패: %v", err)
-	}
+	live := liveTables(t, newPGStore(t, lockTimeout))
 	if !slices.Equal(live, wantTables) {
 		t.Fatalf("기준선을 깐 PG DB 의 표가 %d개, 선언은 %d개다.\n실측(DB): %v\n기대(선언): %v",
 			len(live), len(wantTables), live, wantTables)

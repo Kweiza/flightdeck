@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +18,7 @@ import (
 	"github.com/kweiza/flightdeck/internal/ledger"
 	"github.com/kweiza/flightdeck/internal/model"
 	"github.com/kweiza/flightdeck/internal/store"
+	"github.com/kweiza/flightdeck/internal/store/storetest"
 )
 
 func quietLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -391,5 +396,149 @@ func TestLedgerBackupJobPushesToJournalEvenWhenFilesUnchanged(t *testing.T) {
 	j.tick(ctx, at.Add(time.Hour))
 	if s := ledgerBackupStatusOf(j.State()); s.Journal != "unchanged" {
 		t.Errorf("안 바뀐 회차의 저널이 %q 다: %+v", s.Journal, s)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 두 엔진의 원장이 같은 바이트다
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ledgerParityFixture 는 엔진 차이가 드러날 값만 모은 원장이다. 정렬 축(id · (judgment_id, target_kind, target_id) ·
+// (project, key))마다 대소문자 · 밑줄 · 공백 · 발음 구별 기호 · 한글을 섞었다 - 언어 규칙 정렬(en_US 등)이면 그 순서가
+// 코드포인트 순서와 갈린다. 글 칸에는 NULL 과 빈 글, 이모지 · 줄바꿈 · 탭 · 따옴표 · 역슬래시 · <>& 를 넣었다.
+// NUL 은 없다(Postgres text 가 거절하고, 이관 사전 검사가 막는 값이다). 넣는 순서는 일부러 정렬 순서가 아니다.
+func ledgerParityFixture() store.LedgerDump {
+	s := func(v string) *string { return &v }
+	const at = "2026-11-27T01:02:03.000004Z"
+	return store.LedgerDump{
+		Machines: []store.LedgerMachine{
+			{ID: "m-lower", Hostname: "호스트", FirstSeen: at, LastSeen: at},
+			{ID: "M-Upper", Hostname: "h\tq\"", FirstSeen: at, LastSeen: at},
+		},
+		Projects: []store.LedgerProject{
+			{ID: "proj-가", Path: "/repo/가", RemoteURL: s(""), DefaultBranch: "main", Config: s(`{"a":"<b>&\"\\n","가":[1,2]}`),
+				CreatedAt: at, PinnedAt: s(at)},
+			{ID: "Proj", Path: "/repo/P", DefaultBranch: "trunk", ConfigFromSHA: s("abc"), CreatedAt: at, ArchivedAt: s(at)},
+		},
+		Sessions: []store.LedgerSession{
+			{ID: "s_b", Project: "Proj", MachineID: "M-Upper", Worktree: "/w/b", CCSessionID: "cc", Label: s(""),
+				State: "blocked", BlockedWhy: s("막힘 🙂\n둘째 줄"), OpenedAt: at, Harness: s("codex")},
+			{ID: "S-a", Project: "proj-가", MachineID: "m-lower", Worktree: "/w/a", CCSessionID: "cc", State: "active", OpenedAt: at},
+		},
+		Judgments: []store.LedgerJudgment{
+			{ID: "가", Project: s("proj-가"), SessionID: s("S-a"), At: at, Kind: "decision", Title: s(""), Body: "한글 본문 🙂"},
+			{ID: "alpha", At: at, Kind: "now", Body: "프로젝트 없는 판단\r\n\t\"인용\" \\ <>&", Supersedes: s("Zeta")},
+			{ID: "ä", Project: s("Proj"), At: at, Kind: "ask", Title: s("ä 제목"), Body: "u+2028   u+2029  "},
+			{ID: "_x", Project: s("Proj"), SessionID: s("s_b"), At: at, Kind: "blocked", Body: "밑줄"},
+			{ID: "Zeta", Project: s("Proj"), At: at, Kind: "handoff", Title: s("대문자"), Body: "Z"},
+			{ID: "a b", Project: s("proj-가"), At: at, Kind: "verified", Body: "공백 id"},
+		},
+		Links: []store.LedgerLink{
+			{JudgmentID: "가", TargetKind: "item", TargetID: "i-b"},
+			{JudgmentID: "가", TargetKind: "item", TargetID: "I-a", TargetProject: s("Proj")},
+			{JudgmentID: "가", TargetKind: "commit", TargetID: "abc"},
+			{JudgmentID: "_x", TargetKind: "session", TargetID: "s_b", TargetProject: s("")},
+			{JudgmentID: "Zeta", TargetKind: "job", TargetID: "j"},
+		},
+		Snapshots: []store.LedgerSnapshot{
+			{Project: "proj-가", Key: "키", Value: "값", Method: "command", ComputedAt: at},
+			{Project: "Proj", Key: "k", Value: "1", Method: "manual", Evidence: s("근거 \"따옴표\""), InputDigest: s(""), ComputedAt: at},
+			{Project: "Proj", Key: "K", Value: "2", Method: "command", InputDigest: s("d"), ComputedAt: at},
+			{Project: "Proj", Key: "_k", Value: "3", Method: "command", ComputedAt: at},
+		},
+	}
+}
+
+// sortedLedger 는 원장을 ReadLedger 의 ORDER BY 축으로, 바이트(코드포인트) 순서로 정렬한 사본이다. Go 의 문자열 비교가
+// 바이트 비교이고, UTF-8 의 바이트 순서는 코드포인트 순서다.
+func sortedLedger(d store.LedgerDump) store.LedgerDump {
+	out := store.LedgerDump{
+		Machines: slices.Clone(d.Machines), Projects: slices.Clone(d.Projects), Sessions: slices.Clone(d.Sessions),
+		Judgments: slices.Clone(d.Judgments), Links: slices.Clone(d.Links), Snapshots: slices.Clone(d.Snapshots),
+	}
+	slices.SortFunc(out.Machines, func(a, b store.LedgerMachine) int { return strings.Compare(a.ID, b.ID) })
+	slices.SortFunc(out.Projects, func(a, b store.LedgerProject) int { return strings.Compare(a.ID, b.ID) })
+	slices.SortFunc(out.Sessions, func(a, b store.LedgerSession) int { return strings.Compare(a.ID, b.ID) })
+	slices.SortFunc(out.Judgments, func(a, b store.LedgerJudgment) int { return strings.Compare(a.ID, b.ID) })
+	slices.SortFunc(out.Links, func(a, b store.LedgerLink) int {
+		return cmp.Or(strings.Compare(a.JudgmentID, b.JudgmentID), strings.Compare(a.TargetKind, b.TargetKind),
+			strings.Compare(a.TargetID, b.TargetID))
+	})
+	slices.SortFunc(out.Snapshots, func(a, b store.LedgerSnapshot) int {
+		return cmp.Or(strings.Compare(a.Project, b.Project), strings.Compare(a.Key, b.Key))
+	})
+	return out
+}
+
+// openLedgerParityStores 는 같은 판의 빈 원장 둘(SQLite 파일 · Postgres 시험 DB)을 이전 실행기로 깔고 서버처럼 연다.
+func openLedgerParityStores(t *testing.T) map[string]*store.Store {
+	t.Helper()
+	ctx := context.Background()
+	out := map[string]*store.Store{}
+	for name, target := range map[string]string{
+		"sqlite":   filepath.Join(t.TempDir(), "fd.db"),
+		"postgres": storetest.NewBare(t, ""),
+	} {
+		if err := store.Migrate(ctx, target, quietLog()); err != nil {
+			t.Fatalf("%s 원장 깔기: %v", name, err)
+		}
+		st, err := store.OpenWithLogger(target, quietLog())
+		if err != nil {
+			t.Fatalf("%s 원장 열기: %v", name, err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		out[name] = st
+	}
+	return out
+}
+
+// TestLedgerBackupBytesMatchAcrossEngines 는 매시간 원장 백업의 산출물이 두 엔진에서 같은 바이트인지 잰다(재설계 스펙의
+// U-PG 성공 기준 「판단 원장 JSONL 내보내기 바이트가 SQLite 판과 같다」). 같은 원장을 두 엔진에 되쓰고 같은 시각으로 한
+// 회차씩 돌려, 매니페스트까지 파일마다 바이트를 맞댄다.
+//
+// ★ 두 엔진이 같은 것을 똑같이 잃어도 서로는 같다. 그래서 산출물을 원본(정렬한 픽스처)을 직접 인코딩한 것과도 맞댄다.
+// 정렬은 코드포인트 순서여야 한다 - Postgres 원장이 언어 규칙 정렬로 만들어지면 정렬 축에서 줄 순서가 갈린다(로케일 관문이
+// 기동에서 막는 그 축이다).
+func TestLedgerBackupBytesMatchAcrossEngines(t *testing.T) {
+	ctx := context.Background()
+	const at = "2026-11-27T05:00:00.000000Z"
+	fixture := ledgerParityFixture()
+	want, _, err := ledger.Encode(sortedLedger(fixture), store.SchemaVersion, at)
+	if err != nil {
+		t.Fatalf("원본 인코딩: %v", err)
+	}
+
+	got := map[string]map[string][]byte{}
+	for name, st := range openLedgerParityStores(t) {
+		if err := st.WriteLedger(ctx, fixture); err != nil {
+			t.Fatalf("%s 되쓰기: %v", name, err)
+		}
+		dir := filepath.Join(t.TempDir(), name)
+		if _, wrote, err := ledgerBackupOnce(ctx, st, dir, at); err != nil || !wrote {
+			t.Fatalf("%s 회차: wrote=%v err=%v", name, wrote, err)
+		}
+		files := map[string][]byte{}
+		for f := range want {
+			b, err := os.ReadFile(filepath.Join(dir, f))
+			if err != nil {
+				t.Fatalf("%s 산출물 %s 읽기: %v", name, f, err)
+			}
+			files[f] = b
+		}
+		got[name] = files
+	}
+
+	if len(want) < 7 {
+		t.Fatalf("원장 파일이 %d개다 - 여섯 표 + 매니페스트여야 한다: %v", len(want), slices.Sorted(maps.Keys(want)))
+	}
+	for _, f := range slices.Sorted(maps.Keys(want)) {
+		lite, pg := got["sqlite"][f], got["postgres"][f]
+		if !bytes.Equal(lite, pg) {
+			t.Errorf("%s 가 엔진마다 다르다.\n  sqlite:   %q\n  postgres: %q", f, lite, pg)
+		}
+		if !bytes.Equal(lite, want[f]) {
+			t.Errorf("%s 가 원본을 인코딩한 것과 다르다(두 엔진이 같은 것을 잃었거나 정렬이 코드포인트 순서가 아니다).\n"+
+				"  산출물: %q\n  원본:   %q", f, lite, want[f])
+		}
 	}
 }

@@ -83,8 +83,13 @@ func ledgerDataUnchanged(files map[string][]byte, dir string) bool {
 // ledgerBackupOnce 는 한 회차다. 실제로 썼으면 true 를 낸다.
 //
 // ★ store.Open 을 다시 안 부른다. 이 프로세스가 쥔 핸들을 그대로 쓴다 —
-// ReadLedger 는 살아 있는 DB 에서 부르도록 설계돼 있고(한 트랜잭션 안에서 여섯 표),
+// ReadLedger 는 살아 있는 DB 에서 부르도록 설계돼 있고(한 읽기 트랜잭션 안에서 여섯 표),
 // 여기서 OpenLedger 를 또 열면 같은 파일에 커넥션이 두 벌 생긴다.
+//
+// ★ 엔진을 가리지 않는다. 원장이 Postgres 여도 같은 회차다 - ReadLedger 의 ReadTx 가 한 스냅숏(REPEATABLE READ
+// READ ONLY)을 보고 쓰기를 세우지 않는다. 산출물 바이트가 두 엔진에서 같은 것은 TestLedgerBackupBytesMatchAcrossEngines
+// 가 잰다. 매일 덤프(pg_dump)는 이 잡이 아니라 compose 의 db-backup 서비스다 - 이 잡은 여섯 표의 결정적 산출물이고,
+// 덤프는 원장 전체의 복원 수단이다.
 func ledgerBackupOnce(ctx context.Context, st *store.Store, outDir, at string) (map[string][]byte, bool, error) {
 	dump, err := st.ReadLedger(ctx)
 	if err != nil {

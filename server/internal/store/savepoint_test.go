@@ -21,8 +21,17 @@ import (
 // bothEngines 는 run 을 SQLite 파일과 Postgres 시험 DB 에서 한 번씩 돈다.
 func bothEngines(t *testing.T, run func(t *testing.T, s *Store)) {
 	t.Helper()
-	t.Run("sqlite", func(t *testing.T) { run(t, newStore(t)) })
-	t.Run("postgres", func(t *testing.T) { run(t, newPGStore(t, lockTimeout)) })
+	eachEngine(t, func(t *testing.T, open func(*testing.T) *Store) { run(t, open(t)) })
+}
+
+// eachEngine 은 bothEngines 의 여는 쪽을 run 에 넘긴다. 같은 엔진의 DB 가 둘 이상 필요한 시험(원장을 한쪽에서 읽어
+// 다른 쪽에 되쓰는 왕복)이 쓴다. 엔진 목록은 여기 한 곳이다.
+func eachEngine(t *testing.T, run func(t *testing.T, open func(*testing.T) *Store)) {
+	t.Helper()
+	t.Run("sqlite", func(t *testing.T) { run(t, newStore) })
+	t.Run("postgres", func(t *testing.T) {
+		run(t, func(t *testing.T) *Store { return newPGStore(t, lockTimeout) })
+	})
 }
 
 func machineIDs(t *testing.T, s *Store) []string {

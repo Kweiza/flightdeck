@@ -12,8 +12,8 @@ import (
 
 // ★ 브리프(TestProjectRefTablesCoverSchema, schema.sql 를 정규식으로 훑는 시험)는 여기 없다.
 // 앞 태스크가 이미 더 나은 것을 커밋했다 — project_ref_counts_test.go 의
-// TestProjectRefTablesCoverEveryProjectColumn 이 **살아 있는 DB 의 스키마**(sqlite_master +
-// PRAGMA table_info)로 같은 대조를 하고, landing_queue 가 증분에만 있어서 정규식이 놓쳤던
+// TestProjectRefTablesCoverEveryProjectColumn 이 **살아 있는 DB 의 스키마**(두 엔진의 카탈로그,
+// catalog_test.go)로 같은 대조를 하고, landing_queue 가 증분에만 있어서 정규식이 놓쳤던
 // 바로 그 결함을 막는다. 중복해서 만들지 않는다.
 
 // TestRemoveProjectRefusesWithItems 는 항목이 있으면 안 지운다는 단정이다.

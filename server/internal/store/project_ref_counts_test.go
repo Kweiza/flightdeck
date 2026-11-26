@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"testing"
 	"time"
@@ -113,58 +112,19 @@ var knownProjectRefTables = map[string]string{
 // ★ schema.sql 을 정규식으로 읽지 않는다. landing_queue 가 이 목록에서 처음에 빠졌던
 // 결함이 정확히 "파일을 눈으로/정규식으로 훑는" 방식의 산물이었다 — 그 표는 증분
 // (internal/store/migrations/003_landing_queue.sql)에 있고 schema.sql 자체에는 없다.
-// sqlite_master + PRAGMA table_info 는 마이그레이션을 전부 적용한 뒤의 실제 스키마를
+// 카탈로그(liveTables · liveColumnSet)는 마이그레이션을 전부 적용한 뒤의 실제 스키마를
 // 보므로 증분에서 생긴 표도, 앞으로 생길 표도 자동으로 걸린다 — 사람이 목록을 손으로
 // 갱신하는 것을 잊어도 이 시험이 대신 빨개진다.
+//
+// 두 엔진에서 돈다. 목록 하나를 두 엔진이 같이 쓰므로, 한 엔진의 스키마에만 project 칸이 생겨도 여기서 빨갛다.
 func TestProjectRefTablesCoverEveryProjectColumn(t *testing.T) {
-	ctx := context.Background()
-	st := newStore(t) // OpenWithLogger 가 이미 schema.sql + 증분 전부를 적용한다
+	bothEngines(t, func(t *testing.T, st *Store) { projectRefTablesCoverEveryProjectColumn(t, st) })
+}
 
-	rows, err := st.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table'`)
-	if err != nil {
-		t.Fatalf("표 목록 조회 실패: %v", err)
-	}
-	var tables []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			rows.Close()
-			t.Fatalf("표 이름 스캔 실패: %v", err)
-		}
-		tables = append(tables, name)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("표 목록 순회 실패: %v", err)
-	}
-	rows.Close()
-
+func projectRefTablesCoverEveryProjectColumn(t *testing.T, st *Store) {
 	var withProject []string
-	for _, tbl := range tables {
-		// ★ PRAGMA 문은 자리표시자 바인딩을 지원하지 않는다 — 표 이름은 위에서 방금
-		// sqlite_master 가 낸 실제 표 이름이라 외부 입력이 아니다(project.go 의
-		// ProjectRefCounts 가 같은 근거로 문자열 결합을 쓰는 것과 같은 사정이다).
-		cols, err := st.db.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, tbl))
-		if err != nil {
-			t.Fatalf("%s 의 컬럼 조회 실패: %v", tbl, err)
-		}
-		has := false
-		for cols.Next() {
-			var cid, notnull, pk int
-			var name, ctype string
-			var dflt any
-			if err := cols.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-				cols.Close()
-				t.Fatalf("%s 의 컬럼 스캔 실패: %v", tbl, err)
-			}
-			if name == "project" {
-				has = true
-			}
-		}
-		if err := cols.Err(); err != nil {
-			t.Fatalf("%s 의 컬럼 순회 실패: %v", tbl, err)
-		}
-		cols.Close()
-		if has {
+	for _, tbl := range liveTables(t, st) {
+		if liveColumnSet(t, st, tbl)["project"] {
 			withProject = append(withProject, tbl)
 		}
 	}
