@@ -736,4 +736,9 @@ func TestReproPayloadReadsOutcomeLikeEligibility(t *testing.T) {
 	if p.Tx != "committed" {
 		t.Fatalf("중복 tx 는 첫 값이어야 한다: %q", p.Tx)
 	}
+	// 끝 tx 의 타입이 틀려도 행을 버리지 않는다(첫 값으로 커밋이다).
+	const badLast = `{"count":1,"tx":"committed","tx":7}`
+	if p, read := readReproPayload(badLast); !read || p.Count != 1 || p.Tx != "committed" || !PayloadCommitted(badLast) {
+		t.Fatalf("readReproPayload(%s) = %+v, %v", badLast, p, read)
+	}
 }

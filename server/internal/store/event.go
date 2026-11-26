@@ -308,7 +308,7 @@ type Reproduction struct {
 // 원래 모양이다.
 type reproPayload struct {
 	Count int    `json:"count"`
-	Tx    string `json:"tx"`
+	Tx    string `json:"-"` // 결말은 payloadTxOutcome 이 첫 값으로 읽는다(구조체 풀기는 끝 값이고, 끝 값의 타입이 틀리면 행 전체를 버린다)
 }
 
 // readReproPayload 는 payload 를 읽고 **읽혔는지**를 함께 낸다.
