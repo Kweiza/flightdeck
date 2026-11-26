@@ -37,6 +37,9 @@ import (
 // 없는 파일에는 오류를 낸다. sql.Open 은 파일을 **만들기** 때문에, 부재를 확인 안 하고
 // 열면 검증이 빈 DB 를 하나 만들어 놓고 "빈 DB 다"라고 답한다.
 func ProbeMigration(ctx context.Context, path string) (MigrationPlan, error) {
+	if err := sqliteOnly(path, "판 재기"); err != nil {
+		return MigrationPlan{}, err
+	}
 	return probeMigrationVia(ctx, path, ledgerDSN(path))
 }
 
@@ -52,8 +55,8 @@ func probeMigrationVia(ctx context.Context, path, connStr string) (MigrationPlan
 	defer db.Close()
 
 	// 판정 입력을 readMigrationState 로 읽는다. Open 경로(migrate)도 같은 함수를 쓴다 —
-	// 두 벌로 두면 한쪽만 고쳐져 탐지가 갈린다.
-	hasTable, dbVersion, objects, err := readMigrationState(ctx, db)
+	// 두 벌로 두면 한쪽만 고쳐져 탐지가 갈린다. 다른 질의처럼 감싸개(conn)를 지난다.
+	hasTable, dbVersion, objects, err := readMigrationState(ctx, &conn{raw: db, eng: engineSQLite})
 	if err != nil {
 		return MigrationPlan{}, err
 	}

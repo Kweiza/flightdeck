@@ -41,27 +41,42 @@ func resolveDBPath(env func(string) (string, bool), dbFlag string) string {
 	return path
 }
 
+// ensureDBDir 는 SQLite 파일의 부모 디렉토리를 만든다. Postgres 접속 URL 이면 아무것도 안 한다.
+//
+// ★ 접속 URL 을 파일 API 에 넘기지 않는 자리가 여기 하나다(serve · migrate · 이관이 나눠 쓴다). filepath.Dir 은
+// `postgres://사용자:비밀@호스트/db` 를 `postgres:/사용자:비밀@호스트` 로 접어, 비밀이 이름에 든 디렉토리를 현재
+// 폴더에 만든다.
+func ensureDBDir(path string) error {
+	if store.IsPostgresURL(path) {
+		return nil
+	}
+	return os.MkdirAll(filepath.Dir(path), 0o755)
+}
+
 // openDB 는 이관용으로 DB 를 연다. serve 와 같은 자리를 고른다.
 //
 // ★ migrate 인자로 **적용 여부를 부르는 쪽이 고른다.** 적용이 기동에서 분리된 뒤(설계 §7 ①)
 // Open 은 스키마가 안 맞는 DB 를 거절하는데, 이관은 갓 만든 **빈 파일**을 대상으로 하는 일이
 // 많아서 그대로 두면 되쓰기가 영영 못 들어간다. 반대로 내보내기는 **읽는 명령**이라 여기서
 // 적용하면 읽기가 스키마를 바꾸는 셈이 된다 — 그 둘을 한 값으로 접으면 한쪽이 반드시 틀린다.
+//
+// 둘째 반환값은 로그 · 출력에 실을 표시값(store.ShowTarget)이다. 원문은 store 에만 넘긴다.
 func openDB(env func(string) (string, bool), log *slog.Logger, dbFlag string, migrate bool) (*store.Store, string, error) {
 	path := resolveDBPath(env, dbFlag)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, path, fmt.Errorf("DB 디렉토리를 만들지 못했다(%q): %w", path, err)
+	shown := store.ShowTarget(path)
+	if err := ensureDBDir(path); err != nil {
+		return nil, shown, fmt.Errorf("DB 디렉토리를 만들지 못했다(%q): %w", shown, err)
 	}
 	if migrate {
 		if err := store.Migrate(context.Background(), path, log); err != nil {
-			return nil, path, fmt.Errorf("DB 적용에 실패했다(%q): %w", path, err)
+			return nil, shown, fmt.Errorf("DB 적용에 실패했다(%q): %w", shown, err)
 		}
 	}
 	st, err := store.OpenWithLogger(path, log)
 	if err != nil {
-		return nil, path, fmt.Errorf("DB 를 열지 못했다(%q): %w", path, err)
+		return nil, shown, fmt.Errorf("DB 를 열지 못했다(%q): %w", shown, err)
 	}
-	return st, path, nil
+	return st, shown, nil
 }
 
 // runImport 는 `fd import` 다.
@@ -308,14 +323,10 @@ func (a *App) runExport(ctx context.Context, args []string, out io.Writer) int {
 // migrate 가 돈다 — 낡은 DB 를 만나면 원장을 뜨기 전에 스키마를 바꾼다.
 // store.OpenLedger 는 ProbeMigration 으로 먼저 재고 이행이 필요하면 거절한다.
 func (a *App) exportJudgments(ctx context.Context, dbFlag, outDir string, out io.Writer) int {
-	path := strings.TrimSpace(dbFlag)
-	if path == "" {
-		home, _ := os.UserHomeDir()
-		_, derr := os.Stat("/data")
-		path = DefaultDBPath(a.env, home, derr == nil)
-	}
+	raw := resolveDBPath(a.env, dbFlag)
+	path := store.ShowTarget(raw) // 아래 로그 · 출력에는 이 표시값만 싣는다
 
-	st, err := store.OpenLedger(ctx, path, a.log)
+	st, err := store.OpenLedger(ctx, raw, a.log)
 	if err != nil {
 		a.log.Error("원장용 DB 를 열지 못했다", "db_path", path, "error", err.Error())
 		fmt.Fprintf(out, "%s\n", err)

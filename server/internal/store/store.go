@@ -147,9 +147,10 @@ var ErrNotFound = errors.New("없다")
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Reader 는 읽기만 하는 면이다. ReadTx 의 클로저가 받는다 - 쓰기 문장(ExecContext)이 타입에 없다.
+// 한 행 질의의 결과(*row)는 *sql.Row 처럼 Scan 으로 읽는다(engine.go).
 type Reader interface {
 	QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error)
-	QueryRowContext(ctx context.Context, q string, args ...any) *sql.Row
+	QueryRowContext(ctx context.Context, q string, args ...any) *row
 }
 
 // dbtx 는 단발 핸들(conn)과 트랜잭션(txConn)이 함께 만족하는 최소 면이다.
@@ -465,8 +466,10 @@ func (s *Store) Close() error { return s.db.Close() }
 // Path 는 DB 파일 경로다.
 func (s *Store) Path() string { return s.path }
 
-// DB 는 저수준 핸들이다. **시험과 진단 전용** — 일반 경로는 이걸 쓰지 않는다.
-// 자리표시 감싸개를 안 지나므로 Postgres 에서는 `?` 질의가 안 돈다.
+// DB 는 저수준 핸들이다. 자리표시 감싸개를 안 지나므로 Postgres 에서는 `?` 질의가 안 돈다.
+//
+// ★ 지금 쓰는 자리는 시험 · 진단(service 의 doctor Ping)과 web 의 날 질의 넷(engine.go 머리말)이다.
+// 그 넷이 store 안으로 옮기면 시험 · 진단 전용이 된다. 새 질의를 여기에 걸지 마라.
 func (s *Store) DB() *sql.DB { return s.db.raw }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -476,38 +479,66 @@ func (s *Store) DB() *sql.DB { return s.db.raw }
 
 // Tx 는 fn 을 한 쓰기 트랜잭션 안에서 돌린다(전역 잠금). fn 이 오류를 내면 롤백하고 그 오류를 그대로 올린다.
 func (s *Store) Tx(ctx context.Context, fn func(*Tx) error) error {
-	return s.runTx(ctx, txSpec{kind: txWrite}, fn)
+	t := &Tx{ctx: ctx, s: s}
+	return s.runTx(ctx, txSpec{kind: txWrite}, func(tx *txConn) error {
+		t.tx = tx
+		return fn(t)
+	}, t.flushDeferred)
 }
+
+// ObsTx 는 관측 적재 트랜잭션의 면이다. 클로저가 업무 *Tx 대신 이것을 받는다.
+//
+// ★ 타입으로 가르는 까닭: 관측 적재는 전역 잠금을 안 잡는다(Store.ObsTx). 업무 *Tx 를 넘기면 그 메서드
+// (선점 · 세션 닫기처럼 업무 표를 쓰거나 이벤트를 곧장 넣는 것)를 관측 잠금만 쥔 채 부를 수 있고, 그러면 업무
+// 표의 직렬성과 event.id 순서(= 커밋 순서)가 조용히 깨진다. ReadTx 가 Reader 를 받아 쓰기를 타입에서 빼는 것과
+// 같은 방식이다. 관측 표에 쓰는 메서드는 관측 적재가 들어올 때 이 타입에만 붙인다 - 업무 메서드 · 이벤트 기록을
+// 여기 붙이지 마라.
+type ObsTx struct {
+	tx  *txConn
+	ctx context.Context
+}
+
+// Ctx 는 이 트랜잭션이 물고 있는 컨텍스트다.
+func (o *ObsTx) Ctx() context.Context { return o.ctx }
 
 // ObsTx 는 관측 적재 트랜잭션이다. 전역 잠금이 아니라 (기기, 저장소) 잠금을 잡는다 - 관측은 기기 × 저장소마다
 // 잦게 오고, 관측 표 사이에는 선점 · 레인 같은 배타 불변식이 없어 업무 쓰기와 한 줄로 설 까닭이 없다.
 // 같은 (기기, 저장소) 끼리만 한 줄로 선다. SQLite 에서는 Tx 와 같다(BEGIN IMMEDIATE 가 전역이다).
-//
-// ★ 클로저 안에서 업무 표를 쓰지 마라. 업무 표의 직렬성은 전역 잠금이 지킨다.
-func (s *Store) ObsTx(ctx context.Context, device, repo string, fn func(*Tx) error) error {
-	return s.runTx(ctx, txSpec{kind: txObs, device: device, repo: repo}, fn)
+func (s *Store) ObsTx(ctx context.Context, device, repo string, fn func(*ObsTx) error) error {
+	return s.runTx(ctx, txSpec{kind: txObs, device: device, repo: repo}, func(tx *txConn) error {
+		return fn(&ObsTx{tx: tx, ctx: ctx})
+	}, nil)
 }
 
-// runTx 는 쓰기 트랜잭션 하나를 끝까지 돌린다(Tx · ObsTx 의 본체).
+// runTx 는 쓰기 트랜잭션 하나를 끝까지 돌린다(Tx · ObsTx 의 본체). body 가 트랜잭션 핸들을 받고,
+// after 는 커밋 · 롤백이 끝난 뒤 그 결말로 한 번 불린다(Tx 의 예약 이벤트 흘리기, 없으면 nil).
+// 시작이 실패하면 body 도 after 도 안 불린다.
 //
 // 롤백 실패는 삼키지 않고 원래 오류에 합쳐 올린다 — 롤백이 실패하면 커넥션이 이상한 상태로
 // 풀에 돌아가므로, 그 사실이 안 남으면 뒤따르는 무관한 실패의 원인을 영영 못 찾는다.
 //
-// 끝에서 오류를 한 번 옮긴다(asFault): 잠금 대기 초과 · 교착 · 버려진 트랜잭션은 *TxFault 로 나간다.
-func (s *Store) runTx(ctx context.Context, sp txSpec, fn func(*Tx) error) error {
+// 끝에서 오류를 한 번 옮긴다(asFault): 잠금 대기 초과 · 직렬화 실패 · 교착 · 버려진 트랜잭션은 *TxFault 로 나간다.
+func (s *Store) runTx(ctx context.Context, sp txSpec, body func(*txConn) error, after func(committed bool)) error {
 	tx, err := s.begin(ctx, sp)
 	if err != nil {
 		return asFault(fmt.Errorf("트랜잭션 시작 실패: %w", err))
 	}
-	t := &Tx{tx: tx, ctx: ctx, s: s}
-	if err := fn(t); err != nil {
+	// ★ 안전망: body 가 패닉하면 아래 커밋 · 롤백 어느 쪽에도 닿지 않는다. 그러면 연결과 잠금(Postgres 의
+	//   전역 · 관측 advisory 잠금, SQLite 의 쓰기 잠금)이 ctx 가 끝날 때까지 남고, 끝나지 않는 ctx 면 영영 남아
+	//   뒤 쓰기가 전부 잠금 대기 상한으로 죽는다. 이미 끝난 트랜잭션의 Rollback 은 sql.ErrTxDone 만 낸다.
+	//   예약 이벤트는 여기서 흘리지 않는다(flushDeferred 의 ★).
+	defer func() { _ = tx.Rollback() }()
+	if after == nil {
+		after = func(bool) {}
+	}
+	if err := body(tx); err != nil {
 		err = asFault(err)
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 			// 예약 이벤트는 롤백 뒤에도 흘린다 — 실패한 시도가 원장에 남는 것이 목적이다.
-			t.flushDeferred(false)
+			after(false)
 			return fmt.Errorf("%w (롤백도 실패: %v)", err, rbErr)
 		}
-		t.flushDeferred(false)
+		after(false)
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -515,10 +546,10 @@ func (s *Store) runTx(ctx context.Context, sp txSpec, fn func(*Tx) error) error 
 		//   "썼다"고 말한다 — 롤백 갈래보다 되짚기 어려운 거짓이다(여기는 fn 이 오류를
 		//   안 냈으므로 service 쪽 실패 로그조차 안 남는다). Postgres 에서 클로저가 문장 오류를
 		//   삼키고 끝까지 가면 커밋이 ROLLBACK 으로 끝나 이 갈래로 온다(FaultAborted).
-		t.flushDeferred(false)
+		after(false)
 		return asFault(fmt.Errorf("커밋 실패: %w", err))
 	}
-	t.flushDeferred(true)
+	after(true)
 	return nil
 }
 
@@ -597,8 +628,8 @@ func flushCtx(parent context.Context) (context.Context, context.CancelFunc) {
 // ★ 그래도 안 남는 갈래가 있다. BeginTx 가 실패하면 클로저를 아예 안 부르므로 예약 자체가
 // 없고(TestTxBeginFailureLeavesNothingReserved), 쓰기가 실패하면 LogEvent 가 WARN 으로
 // 삼키고, 프로세스가 여기 닿기 전에 죽으면 버퍼가 메모리째 사라진다. 클로저 안 패닉도
-// 마찬가지다 — 이 호출들이 defer 가 아닌 이유는 패닉 되감기 시점에는 롤백이 아직 안 돼
-// 쓰기 잠금이 살아 있고, 그때 별도 커넥션으로 쓰면 위 교착에 그대로 빠지기 때문이다.
+// 마찬가지다. runTx 의 안전망 defer 는 **롤백만** 한다. 그 목적은 잠금을 풀어 뒤 쓰기를 살리는
+// 것이고, 되감기 도중에 별도 커넥션으로 잠금을 다시 잡으며 쓰는 일까지 얹지는 않는다.
 // 그래서 이 수를 읽는 표면의 "하한이다" 단서는 이 수정 뒤에도 안 뗀다.
 //
 // ★ committed 를 받는다. 여기가 **트랜잭션의 결말을 아는 유일한 자리**다 — 호출자(service)는
@@ -685,10 +716,9 @@ func Migrate(ctx context.Context, path string, log *slog.Logger) error {
 
 // MigrateTo 는 target 까지만 올린다. `fd migrate --to N` 의 본체다.
 func MigrateTo(ctx context.Context, path string, target int, log *slog.Logger) error {
-	if engineOf(path) == enginePG {
-		// 판 재기(readMigrationState)와 스키마 적용이 SQLite 판뿐이다. 없는 표를 물어 엉뚱한 오류로 죽기 전에 거절한다.
-		return fmt.Errorf("Postgres 원장의 판 적용은 Postgres 이전 실행기가 맡는다 - 이 명령은 아직 SQLite 파일만 올린다(%s)",
-			redactDSN(path))
+	// 판 재기(readMigrationState)와 스키마 적용이 SQLite 판뿐이다. 없는 표를 물어 엉뚱한 오류로 죽기 전에 거절한다.
+	if err := sqliteOnly(path, "판 적용(fd migrate)"); err != nil {
+		return err
 	}
 	s, err := openRaw(path, log)
 	if err != nil {
@@ -861,7 +891,10 @@ func (s *Store) applyUpgrades(ctx context.Context, from, target int) error {
 // ★ **증분 트랜잭션은 업무 쓰기와 같은 전역 잠금을 잡는다**(txWrite). 잠금이 다르면 DDL 도중에 업무 쓰기가
 // 끼어 반쯤 바뀐 스키마 위에서 커밋할 수 있다. 같은 잠금이면 적용이 도는 동안 들어온 쓰기는 적용이 끝날
 // 때까지 기다린다(pg_tx_test.go 의 DDL 중 쓰기 시험). SQLite 는 BEGIN IMMEDIATE 라 원래 그렇다.
-func (s *Store) applySteps(ctx context.Context, steps []Migration) error {
+//
+// 끝에서 오류를 한 번 옮긴다(asFault) - 증분의 잠금 대기 초과(55P03)도 Tx 와 같은 *TxFault 로 나간다.
+func (s *Store) applySteps(ctx context.Context, steps []Migration) (err error) {
+	defer func() { err = asFault(err) }()
 	for _, m := range steps {
 		start := time.Now()
 		tx, err := s.begin(ctx, txSpec{kind: txWrite})

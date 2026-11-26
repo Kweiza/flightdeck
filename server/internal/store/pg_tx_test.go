@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -91,14 +92,15 @@ type holding struct {
 
 // hold 는 open 으로 트랜잭션을 열어 body 를 돌리고 쥔 채로 선다. 쥔 것이 확인돼야 돌아온다.
 // 시험이 중간에 실패해도 정리 때 놓는다(놓지 않으면 Store 닫기가 그 연결을 영영 기다린다).
-func hold(t *testing.T, open func(context.Context, func(*Tx) error) error, body func(*Tx) error) holding {
+// T 는 클로저가 받는 면이다(업무 *Tx 또는 관측 *ObsTx).
+func hold[T any](t *testing.T, open func(context.Context, func(T) error) error, body func(T) error) holding {
 	t.Helper()
 	held, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	var once sync.Once
 	rel := func() { once.Do(func() { close(release) }) }
 	t.Cleanup(rel)
 	go func() {
-		done <- open(context.Background(), func(x *Tx) error {
+		done <- open(context.Background(), func(x T) error {
 			if body != nil {
 				if err := body(x); err != nil {
 					return err
@@ -128,6 +130,26 @@ func (h holding) finish(t *testing.T) {
 }
 
 func noop(*Tx) error { return nil }
+
+func obsNoop(*ObsTx) error { return nil }
+
+// finishedOrWaiting 은 done 이 먼저 오면 그 결과를, 아니면 이 DB 에서 권고 잠금을 기다리는 백엔드가 생길 때까지
+// 기다린다. 「잠금을 쥔 동안 끝나지 않는다」를 재는 자리가 쓴다 - 끝났으면 (true, 결과) 다.
+func finishedOrWaiting(t *testing.T, what string, s *Store, done <-chan error) (bool, error) {
+	t.Helper()
+	var finished bool
+	var got error
+	waitUntil(t, what, func() bool {
+		select {
+		case got = <-done:
+			finished = true
+			return true
+		default:
+		}
+		return lockWaiters(t, s) >= 1
+	})
+	return finished, got
+}
 
 func insertMachine(x *Tx, id string) error {
 	_, err := x.tx.ExecContext(x.ctx,
@@ -357,6 +379,87 @@ func TestPGEventIDsFollowCommitOrder(t *testing.T) {
 	}
 }
 
+// TestPGEventInsertWaitsForBusinessTx 는 트랜잭션 밖 이벤트 추가(TryLogEvent)가 업무 Tx 와 **같은** 잠금에서
+// 기다리는지 잰다.
+//
+// ★ 업무 Tx 도 이벤트를 곧장 넣는 자리가 있다(세션 닫기처럼). 그 Tx 가 낮은 id 를 받은 채 커밋을 미루는 동안
+// TryLogEvent 가 먼저 커밋하면, 읽는 쪽이 본 max(id) 아래에 업무 Tx 의 행이 나중에 나타난다. 위 시험은
+// TryLogEvent 끼리만 겨뤄서, 이벤트 추가를 이벤트 전용 잠금으로 바꿔도 초록이다 - 그 빈칸을 이것이 잰다.
+func TestPGEventInsertWaitsForBusinessTx(t *testing.T) {
+	s := newPGStore(t, lockTimeout)
+	ctx := context.Background()
+	var heldID int64
+	a := hold(t, s.Tx, func(x *Tx) error {
+		return x.tx.QueryRowContext(x.ctx,
+			`INSERT INTO event(at, kind, payload) VALUES (?, 'probe.held', '{}') RETURNING id`, fmtTime(time.Now())).Scan(&heldID)
+	})
+	done := make(chan error, 1)
+	go func() { done <- s.TryLogEvent(ctx, "probe.after", "", "", nil) }()
+	if finished, err := finishedOrWaiting(t, "이벤트 추가가 끝나거나 잠금을 기다린다", s, done); finished {
+		t.Fatalf("업무 Tx 가 event id %d 를 받은 채 커밋을 미루는 동안 이벤트 추가가 끝났다(%v) - 같은 잠금에 서지 않는다",
+			heldID, err)
+	}
+	a.finish(t)
+	if err := <-done; err != nil {
+		t.Fatalf("이벤트 추가: %v", err)
+	}
+	if after := pgCount(t, s, `SELECT id FROM event WHERE kind = 'probe.after'`); after <= heldID {
+		t.Fatalf("나중에 커밋한 이벤트의 id(%d)가 앞 커밋의 id(%d) 이하다", after, heldID)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 트랜잭션 밖이던 쓰기 · 패닉 - 전역 잠금을 비켜 가지 않는다
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestPGDropInboxWaitsForTheGlobalLock 은 받는 곳 지우기가 전역 잠금을 쥔 쓰기가 끝날 때까지 기다리는지 잰다.
+// 트랜잭션 밖에서 곧장 지우면, 같은 행을 적으려고 잠금을 쥔 쓰기가 그 행을 만지기 전에 삭제가 먼저 커밋된다.
+func TestPGDropInboxWaitsForTheGlobalLock(t *testing.T) {
+	s := newPGStore(t, lockTimeout)
+	ctx := context.Background()
+	a := hold(t, s.Tx, nil)
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.DropInbox(ctx, "s1", "/s/1")
+		done <- err
+	}()
+	if finished, err := finishedOrWaiting(t, "지우기가 끝나거나 잠금을 기다린다", s, done); finished {
+		t.Fatalf("전역 잠금을 쥔 쓰기가 도는 동안 DropInbox 가 끝났다(%v) - 쓰기 줄을 비켜 간다", err)
+	}
+	a.finish(t)
+	if err := <-done; err != nil {
+		t.Fatalf("DropInbox: %v", err)
+	}
+}
+
+// TestPGPanicInTxReleasesTheLock 은 클로저가 패닉한 트랜잭션이 연결과 전역 잠금을 남기지 않는지 잰다.
+// 커밋도 롤백도 못 하고 빠지면, 끝나지 않는 ctx 에서는 잠금이 영영 남아 뒤 쓰기가 전부 lock_timeout 으로 죽는다.
+func TestPGPanicInTxReleasesTheLock(t *testing.T) {
+	s := newPGStore(t, 300*time.Millisecond)
+	// 재는 동안에는 끝나지 않는 ctx 다. 정리 때만 취소한다 - 안전망을 뺀 변이에서도 Store 닫기가 서지 않게.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("패닉이 올라오지 않았다 - 안전망이 패닉을 삼키면 안 된다")
+			}
+		}()
+		_ = s.Tx(ctx, func(x *Tx) error {
+			if err := insertMachine(x, "panicked"); err != nil {
+				return err
+			}
+			panic("클로저 패닉")
+		})
+	}()
+	if err := s.Tx(ctx, noop); err != nil {
+		t.Fatalf("패닉 뒤 다음 쓰기가 잠금을 못 얻었다: %v", err)
+	}
+	if got := pgCount(t, s, `SELECT count(*) FROM machine WHERE id = 'panicked'`); got != 0 {
+		t.Fatalf("패닉한 트랜잭션의 쓰기 %d행이 남았다", got)
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 증분 적용 - 업무 쓰기와 같은 잠금
 // ─────────────────────────────────────────────────────────────────────────────
@@ -404,26 +507,38 @@ func TestPGWriteWaitsForSchemaStep(t *testing.T) {
 // 실패의 옮기기 - lock_timeout · 버려진 트랜잭션 · 제약
 // ─────────────────────────────────────────────────────────────────────────────
 
+// TestPGLockTimeoutIsATxFault 는 전역 잠금의 대기 초과가 여는 자리와 무관하게 같은 TxFault 로 오는지 잰다.
+// 증분 적용(applySteps)이 asFault 를 안 지나면 같은 55P03 이 거기서만 드라이버 오류로 나간다.
 func TestPGLockTimeoutIsATxFault(t *testing.T) {
 	const wait = 200 * time.Millisecond
 	s := newPGStore(t, wait)
 	a := hold(t, s.Tx, nil)
 
-	start := time.Now()
-	err := s.Tx(context.Background(), noop)
-	took := time.Since(start)
-	var f *TxFault
-	if !errors.As(err, &f) || f.Kind != FaultLockTimeout || f.Code != "55P03" {
-		t.Fatalf("잠금 대기 초과가 TxFault(lock_timeout, 55P03)로 오지 않았다: %v", err)
-	}
-	if took < wait {
-		t.Fatalf("lock_timeout(%s) 전에 포기했다: %s", wait, took)
+	ctx := context.Background()
+	step := Migration{To: SchemaVersion + 1, Name: "시험 증분", SQL: `SELECT 1`}
+	for _, c := range []struct {
+		name string
+		run  func() error
+	}{
+		{"업무 쓰기", func() error { return s.Tx(ctx, noop) }},
+		{"증분 적용", func() error { return s.applySteps(ctx, []Migration{step}) }},
+	} {
+		start := time.Now()
+		err := c.run()
+		took := time.Since(start)
+		var f *TxFault
+		if !errors.As(err, &f) || f.Kind != FaultLockTimeout || f.Code != "55P03" {
+			t.Fatalf("%s: 잠금 대기 초과가 TxFault(lock_timeout, 55P03)로 오지 않았다: %v", c.name, err)
+		}
+		if took < wait {
+			t.Fatalf("%s: lock_timeout(%s) 전에 포기했다: %s", c.name, wait, took)
+		}
 	}
 	a.finish(t)
 
 	w := s.DBStats().Locks[LockGlobal]
-	if w.Timeouts != 1 || w.Count != 1 {
-		t.Fatalf("잠금 계측: %+v(기대 Timeouts 1 - 넘긴 것, Count 1 - 쥔 것)", w)
+	if w.Timeouts != 2 || w.Count != 1 {
+		t.Fatalf("잠금 계측: %+v(기대 Timeouts 2 - 넘긴 둘, Count 1 - 쥔 것)", w)
 	}
 }
 
@@ -524,8 +639,8 @@ func TestPGObsTxLocksPerDeviceRepo(t *testing.T) {
 	const wait = 300 * time.Millisecond
 	s := newPGStore(t, wait)
 	ctx := context.Background()
-	obs := func(device, repo string) func(context.Context, func(*Tx) error) error {
-		return func(ctx context.Context, fn func(*Tx) error) error { return s.ObsTx(ctx, device, repo, fn) }
+	obs := func(device, repo string) func(context.Context, func(*ObsTx) error) error {
+		return func(ctx context.Context, fn func(*ObsTx) error) error { return s.ObsTx(ctx, device, repo, fn) }
 	}
 
 	a := hold(t, obs("d1", "r1"), nil)
@@ -533,8 +648,8 @@ func TestPGObsTxLocksPerDeviceRepo(t *testing.T) {
 		name string
 		run  func() error
 	}{
-		{"같은 기기 다른 저장소", func() error { return s.ObsTx(ctx, "d1", "r2", noop) }},
-		{"다른 기기 같은 저장소", func() error { return s.ObsTx(ctx, "d2", "r1", noop) }},
+		{"같은 기기 다른 저장소", func() error { return s.ObsTx(ctx, "d1", "r2", obsNoop) }},
+		{"다른 기기 같은 저장소", func() error { return s.ObsTx(ctx, "d2", "r1", obsNoop) }},
 		{"업무 쓰기", func() error { return s.Tx(ctx, noop) }},
 	} {
 		if err := c.run(); err != nil {
@@ -542,13 +657,13 @@ func TestPGObsTxLocksPerDeviceRepo(t *testing.T) {
 		}
 	}
 	var f *TxFault
-	if err := s.ObsTx(ctx, "d1", "r1", noop); !errors.As(err, &f) || f.Kind != FaultLockTimeout {
+	if err := s.ObsTx(ctx, "d1", "r1", obsNoop); !errors.As(err, &f) || f.Kind != FaultLockTimeout {
 		t.Fatalf("같은 (기기, 저장소)가 한 줄로 서지 않았다: %v", err)
 	}
 	a.finish(t)
 
 	g := hold(t, s.Tx, nil)
-	if err := s.ObsTx(ctx, "d1", "r1", noop); err != nil {
+	if err := s.ObsTx(ctx, "d1", "r1", obsNoop); err != nil {
 		t.Fatalf("관측이 전역 잠금에 막혔다: %v", err)
 	}
 	g.finish(t)
@@ -562,6 +677,50 @@ func TestPGObsTxLocksPerDeviceRepo(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 열기 - 판이 안 맞으면 뜨지 않는다
 // ─────────────────────────────────────────────────────────────────────────────
+
+// TestPGOpenAcceptsUpperCaseScheme 은 판별(engineOf)이 Postgres 로 가른 대문자 스킴을 여는 경계도 여는지 잰다.
+// pgx 는 소문자 접두만 URL 로 읽어, 스킴을 안 맞추면 「Postgres 로 갈랐는데 못 연다」가 된다.
+func TestPGOpenAcceptsUpperCaseScheme(t *testing.T) {
+	dsn := storetest.New(t)
+	i := strings.Index(dsn, "://")
+	up := strings.ToUpper(dsn[:i]) + dsn[i:]
+	if up == dsn || engineOf(up) != enginePG {
+		t.Fatalf("전제가 깨졌다: 대문자 스킴 %q 가 Postgres 로 갈리지 않는다", up)
+	}
+	raw, err := openPG(up, quietLog(), lockTimeout)
+	if err != nil {
+		t.Fatalf("대문자 스킴을 못 열었다: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	stamp(t, raw, SchemaVersion)
+	s, err := OpenWithLogger(up, quietLog())
+	if err != nil {
+		t.Fatalf("OpenWithLogger 가 대문자 스킴을 못 열었다: %v", err)
+	}
+	_ = s.Close()
+}
+
+// TestPGSessionLimitsAreSet 은 연결마다 거는 상한 둘이 실제로 걸렸는지 잰다. idle_in_transaction_session_timeout 이
+// 빠지면 샌 트랜잭션이 전역 잠금을 영영 쥔다 - 걸려 있는지는 이 값으로만 보인다.
+func TestPGSessionLimitsAreSet(t *testing.T) {
+	const wait = 300 * time.Millisecond
+	s := newPGStore(t, wait)
+	if idleInTxTimeout <= lockTimeout {
+		t.Fatalf("idle_in_transaction 상한(%s)이 lock_timeout(%s)보다 넉넉하지 않다", idleInTxTimeout, lockTimeout)
+	}
+	for name, want := range map[string]time.Duration{
+		"lock_timeout":                        wait,
+		"idle_in_transaction_session_timeout": idleInTxTimeout,
+	} {
+		var got string
+		if err := s.db.QueryRowContext(context.Background(), `SELECT setting FROM pg_settings WHERE name = ?`, name).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != strconv.FormatInt(want.Milliseconds(), 10) {
+			t.Errorf("%s = %sms, 기대 %s", name, got, want)
+		}
+	}
+}
 
 func TestPGOpenRefusesUnstampedOrForeignVersion(t *testing.T) {
 	dsn := storetest.New(t)

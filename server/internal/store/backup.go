@@ -400,7 +400,7 @@ func ptrOf(ns sql.NullString) *string {
 //	                      요청하지도 않은 pragma 를 요구하면 롤백저널 DB 마다 거짓 진단이 난다.
 func ledgerDSN(path string) string {
 	q := url.Values{}
-	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "busy_timeout("+busyTimeoutMS+")")
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Set("_txlock", "deferred")
 	return "file:" + path + "?" + q.Encode()
@@ -526,6 +526,9 @@ func OpenLedger(ctx context.Context, path string, log *slog.Logger) (*Store, err
 	if log == nil {
 		log = slog.Default()
 	}
+	if err := sqliteOnly(path, "원장 내보내기(fd export --judgments)"); err != nil {
+		return nil, err
+	}
 	// ★ 이 재기는 대상 파일을 한 바이트도 안 바꾼다 — "거절한다"고 인쇄하는 실행조차
 	//   아카이브를 변조하던 것을 probe.go 가 DSN 에서 막는다(그 함수의 주석 참고).
 	plan, err := ProbeMigration(ctx, path)
@@ -573,6 +576,9 @@ func OpenLedger(ctx context.Context, path string, log *slog.Logger) (*Store, err
 func Rollback(ctx context.Context, path string, log *slog.Logger) (string, error) {
 	if log == nil {
 		log = slog.Default()
+	}
+	if err := sqliteOnly(path, "되돌리기(fd migrate --rollback)"); err != nil {
+		return "", err
 	}
 	backups, err := filepath.Glob(path + ".bak-*")
 	if err != nil {

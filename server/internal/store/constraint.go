@@ -140,8 +140,13 @@ const (
 	// FaultLockTimeout 은 잠금 대기가 상한(lockTimeout)을 넘은 것이다(Postgres 55P03 · SQLite BUSY).
 	// 처방: 같은 요청을 다시 보내라. 잦으면 잠금 대기 지표(/metrics)를 봐라.
 	FaultLockTimeout FaultKind = "lock_timeout"
-	// FaultDeadlock 은 교착이다(40P01). 잠금 공간이 둘이고 한 트랜잭션이 둘을 함께 잡지 않으므로
-	// 나면 서버 결함이다.
+	// FaultSerialization 은 트랜잭션이 본 스냅숏이 그새 낡아 끝낼 수 없다는 것이다(Postgres 40001 ·
+	// SQLite BUSY_SNAPSHOT). 기다린 것이 아니다 - 기다려도 안 풀린다.
+	// 처방: **트랜잭션 전체**를 처음부터 다시 하라. 실패한 문장 하나만 다시 하면 낡은 스냅숏 위에서 또 실패한다.
+	FaultSerialization FaultKind = "serialization"
+	// FaultDeadlock 은 교착이다(40P01). 같은 잠금 공간의 쓰기는 한 줄로 서지만, 잠금 공간이 다른 트랜잭션
+	// (업무 쓰기와 관측 적재처럼)이 같은 행에 행 잠금을 엇갈려 잡으면 날 수 있다. Postgres 가 한쪽을 버린다.
+	// 처방: 버려진 트랜잭션 전체를 다시 하라. 잦으면 두 공간이 함께 만지는 행을 찾아라.
 	FaultDeadlock FaultKind = "deadlock"
 	// FaultAborted 는 앞 문장의 오류 뒤에 같은 트랜잭션에서 이어 간 것이다(25P02, 그리고 그렇게 버려진
 	// 트랜잭션의 COMMIT 이 ROLLBACK 으로 끝난 것). SQLite 는 실패한 문장만 되돌리지만 Postgres 는 트랜잭션
@@ -200,9 +205,21 @@ func JudgeConstraintCode(code int) ConstraintVerdict {
 		return ConstraintVerdict{
 			Reason: fmt.Sprintf("아는 축이 아닌 제약 위반이다(코드 %d) — 접지 않고 서버 결함으로 남긴다", code)}
 	}
-	if code&0xff == sqlite3.SQLITE_BUSY {
+	// ★ BUSY 는 확장 코드를 먼저 가른다. 확장 없는 BUSY(5)만 「busy 처리기가 busy_timeout 을 다 기다리고 포기했다」이다.
+	//   BUSY_SNAPSHOT 은 기다린 것이 아니라 읽기 스냅숏이 낡아 쓰기로 못 올린다는 뜻이라(기다려도 안 풀린다)
+	//   대기 초과로 적으면 진단이 틀린다.
+	switch {
+	case code == sqlite3.SQLITE_BUSY:
 		return ConstraintVerdict{Fault: FaultLockTimeout,
 			Reason: fmt.Sprintf("제약 위반이 아니다 - 쓰기 잠금 대기가 busy_timeout 을 넘었다(코드 %d)", code)}
+	case code == sqlite3.SQLITE_BUSY_SNAPSHOT:
+		return ConstraintVerdict{Fault: FaultSerialization,
+			Reason: fmt.Sprintf("제약 위반이 아니다 - 읽기 스냅숏을 잡은 뒤 남이 커밋해 쓰기로 못 올린다(코드 %d, BUSY_SNAPSHOT). "+
+				"기다린 것이 아니다. 트랜잭션 전체를 다시 하라", code)}
+	case code&0xff == sqlite3.SQLITE_BUSY:
+		return ConstraintVerdict{Fault: FaultLockTimeout,
+			Reason: fmt.Sprintf("제약 위반이 아니다 - 잠금에 막혔다(확장 코드 %d). busy_timeout 을 다 기다렸는지는 이 코드로 "+
+				"단정하지 않는다", code)}
 	}
 	return ConstraintVerdict{
 		Reason: fmt.Sprintf("제약 위반이 아니다(코드 %d, 기본 코드 %d)", code, code&0xff)}
@@ -231,9 +248,14 @@ func JudgeSQLState(state string) ConstraintVerdict {
 	case "55P03":
 		return ConstraintVerdict{Fault: FaultLockTimeout,
 			Reason: "제약 위반이 아니다 - 잠금 대기가 lock_timeout 을 넘었다(SQLSTATE 55P03, SQLite 의 busy_timeout 자리)"}
+	case "40001":
+		return ConstraintVerdict{Fault: FaultSerialization,
+			Reason: "직렬화 실패다(SQLSTATE 40001) - 이 트랜잭션이 본 스냅숏이 그새 낡았다. 재시도 단위는 실패한 문장이 " +
+				"아니라 트랜잭션 전체다"}
 	case "40P01":
 		return ConstraintVerdict{Fault: FaultDeadlock,
-			Reason: "교착이다(SQLSTATE 40P01) - 잠금 공간이 둘이고 한 트랜잭션이 둘을 함께 잡지 않으므로 나면 서버 결함이다"}
+			Reason: "교착이다(SQLSTATE 40P01) - 같은 공간의 쓰기는 전역 잠금에서 한 줄로 서지만, 공간이 다른 트랜잭션끼리 " +
+				"행 잠금이 엇갈리면 난다. Postgres 가 이 트랜잭션을 버렸다 - 전체를 다시 하라"}
 	case "25P02":
 		return ConstraintVerdict{Fault: FaultAborted,
 			Reason: "앞 문장의 오류 뒤에 같은 트랜잭션에서 이어 갔다(SQLSTATE 25P02) - Postgres 는 그 트랜잭션 " +
@@ -288,8 +310,8 @@ func driverCodeOf(err error) driverCode {
 // JudgeError 는 오류 하나를 엔진과 무관하게 판정한다. 드라이버 오류가 없으면 「제약 위반이 아니다」다.
 func JudgeError(err error) ConstraintVerdict { return driverCodeOf(err).judge() }
 
-// asFault 는 트랜잭션 실패(잠금 대기 초과 · 교착 · 버려진 트랜잭션)를 *TxFault 로 감싼다. 아니면 그대로 낸다.
-// 트랜잭션의 끝(runTx · ReadTx)이 부른다 - 어느 문장에서 났든 거기서 한 번 옮긴다.
+// asFault 는 트랜잭션 실패(잠금 대기 초과 · 직렬화 실패 · 교착 · 버려진 트랜잭션)를 *TxFault 로 감싼다.
+// 아니면 그대로 낸다. 트랜잭션의 끝(runTx · ReadTx · applySteps)이 부른다 - 어느 문장에서 났든 거기서 한 번 옮긴다.
 func asFault(err error) error {
 	if err == nil {
 		return nil

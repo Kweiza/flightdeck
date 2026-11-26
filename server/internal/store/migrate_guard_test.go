@@ -564,7 +564,7 @@ func TestMigrationApplyIsSeparatedFromStartup(t *testing.T) {
 			return false, 0, 0, err
 		}
 		defer raw.Close()
-		return readMigrationState(context.Background(), raw)
+		return readMigrationState(context.Background(), &conn{raw: raw, eng: engineSQLite})
 	}()
 	if perr != nil {
 		t.Fatalf("전제 확인 실패: %v", perr)

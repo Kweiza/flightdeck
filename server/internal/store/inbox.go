@@ -65,12 +65,20 @@ func (s *Store) PutInbox(ctx context.Context, sessionID, socket, mode string, at
 
 // DropInbox 는 세션의 받는 곳을 지운다. **소켓이 같을 때만** 지운다: 보드가 죽은 소켓을 본 사이에
 // 훅이 새 소켓을 적었으면 그 새 값은 산다. 지운 행 수(0 또는 1)를 낸다.
+//
+// ★ 단발 트랜잭션(전역 잠금)으로 지운다. 트랜잭션 밖에서 곧장 지우면, 같은 세션의 받는 곳을 적는 쓰기가
+// 전역 잠금을 쥐고 아직 그 행을 안 만진 사이에 삭제가 먼저 커밋된다 - 쓰기를 한 줄로 세운 규칙의 구멍이다.
 func (s *Store) DropInbox(ctx context.Context, sessionID, socket string) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM session_inbox WHERE session_id = ? AND socket = ?`, sessionID, socket)
-	if err != nil {
-		return 0, fmt.Errorf("세션 받는 곳 지우기 실패(session_id=%q): %w", clip(sessionID, 64), err)
-	}
-	return res.RowsAffected()
+	var n int64
+	err := s.Tx(ctx, func(t *Tx) error {
+		res, err := t.tx.ExecContext(t.ctx, `DELETE FROM session_inbox WHERE session_id = ? AND socket = ?`, sessionID, socket)
+		if err != nil {
+			return fmt.Errorf("세션 받는 곳 지우기 실패(session_id=%q): %w", clip(sessionID, 64), err)
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	return n, err
 }
 
 // ListInbox 는 한 프로젝트 · 한 기계에서 받는 곳이 적힌 세션이다(닫힌 카드 done 은 뺀다).

@@ -1,9 +1,11 @@
 package store
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -38,25 +40,66 @@ func TestBindDollar(t *testing.T) {
 		{"여러 문장", `UPDATE t SET a = ?; SELECT ?`, `UPDATE t SET a = $1; SELECT $2`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			if got := bindDollar(c.in); got != c.want {
-				t.Fatalf("bindDollar(%q)\n 얻음 %q\n 기대 %q", c.in, got, c.want)
+			got, err := bindDollar(c.in)
+			if err != nil || got != c.want {
+				t.Fatalf("bindDollar(%q)\n 얻음 %q (%v)\n 기대 %q", c.in, got, err, c.want)
 			}
 		})
 	}
 	// 열 자리를 넘는 번호(두 자리 수)도 그대로 센다.
 	q := strings.Repeat("?,", 11) + "?"
-	if got := bindDollar(q); !strings.HasSuffix(got, ",$12") || !strings.HasPrefix(got, "$1,$2,") {
-		t.Fatalf("12개 자리표시의 번호가 다르다: %q", got)
+	if got, err := bindDollar(q); err != nil || !strings.HasSuffix(got, ",$12") || !strings.HasPrefix(got, "$1,$2,") {
+		t.Fatalf("12개 자리표시의 번호가 다르다: %q (%v)", got, err)
+	}
+}
+
+// TestBindDollarRefusesMixedPlaceholders 는 `?` 와 `$n` 을 섞은 문장을 거절하는지 잰다. 바꾸면 `SELECT $1, ?` 의
+// `?` 가 $1 이 되어 인자 하나가 두 자리에 조용히 들어간다. 따옴표 · 주석 · 달러 따옴표 안의 `$1` 은 섞은 것이 아니다.
+func TestBindDollarRefusesMixedPlaceholders(t *testing.T) {
+	for _, q := range []string{`SELECT $1, ?`, `WHERE a = ? AND b = $2`, `SELECT ?, ($1)`} {
+		if got, err := bindDollar(q); err == nil {
+			t.Errorf("섞은 문장을 받았다: %q → %q", q, got)
+		}
+	}
+	for q, want := range map[string]string{
+		`SELECT '$1', ?`:       `SELECT '$1', $1`,
+		"-- $1\nSELECT ?":      "-- $1\nSELECT $1",
+		`SELECT $f$ $1 $f$, ?`: `SELECT $f$ $1 $f$, $1`,
+		`SELECT a$1, ?`:        `SELECT a$1, $1`,
+		`SELECT $1, $2`:        `SELECT $1, $2`,
+	} {
+		if got, err := bindDollar(q); err != nil || got != want {
+			t.Errorf("bindDollar(%q) = %q (%v), 기대 %q", q, got, err, want)
+		}
 	}
 }
 
 func TestBindIsIdentityOnSQLite(t *testing.T) {
 	q := `SELECT ? FROM t WHERE a = '?'`
-	if got := engineSQLite.bind(q); got != q {
-		t.Fatalf("SQLite 는 ? 그대로여야 한다: %q", got)
+	if got, err := engineSQLite.bind(q); err != nil || got != q {
+		t.Fatalf("SQLite 는 ? 그대로여야 한다: %q (%v)", got, err)
 	}
-	if got := enginePG.bind(q); got != `SELECT $1 FROM t WHERE a = '?'` {
-		t.Fatalf("Postgres 는 $n 으로 옮겨야 한다: %q", got)
+	if got, err := enginePG.bind(q); err != nil || got != `SELECT $1 FROM t WHERE a = '?'` {
+		t.Fatalf("Postgres 는 $n 으로 옮겨야 한다: %q (%v)", got, err)
+	}
+}
+
+// TestBindRefusalReachesEveryCallShape 는 감싸개가 거절한 문장이 세 실행 꼴(Exec · Query · QueryRow) 모두에서
+// 오류로 나오는지 잰다. QueryRow 는 *sql.Row 에 오류를 못 실어 row 로 감싼다 - 그 길이 끊기면 거절이 조용히 사라진다.
+func TestBindRefusalReachesEveryCallShape(t *testing.T) {
+	c := &conn{eng: enginePG} // raw 가 없다 - 거절이 드라이버에 닿기 전에 나와야 한다
+	const q = `SELECT $1, ?`
+	ctx := context.Background()
+	if _, err := c.ExecContext(ctx, q); err == nil {
+		t.Error("Exec 가 섞은 문장을 받았다")
+	}
+	if _, err := c.QueryContext(ctx, q); err == nil {
+		t.Error("Query 가 섞은 문장을 받았다")
+	}
+	r := c.QueryRowContext(ctx, q)
+	var x int
+	if r.Scan(&x) == nil || r.Err() == nil {
+		t.Error("QueryRow 의 Scan · Err 가 거절을 안 냈다")
 	}
 }
 
@@ -76,17 +119,94 @@ func TestEngineOf(t *testing.T) {
 	}
 }
 
-func TestRedactDSNHidesPasswords(t *testing.T) {
-	for _, in := range []string{
-		"postgres://fd:hunter2@db:5432/fd?sslmode=disable",
-		"postgres://fd@db:5432/fd?password=hunter2&sslmode=disable",
+// TestRedactDSNShowsOnlyAllowedFields 는 표시값이 허용한 필드(호스트 · 포트 · DB 이름 · 사용자)만 싣는지 잰다.
+// 비밀을 골라 가리는 방식은 목록 밖 비밀(sslpassword)을 흘렸다 - 그래서 비밀 쪽이 아니라 허용 쪽을 단정한다.
+func TestRedactDSNShowsOnlyAllowedFields(t *testing.T) {
+	for in, want := range map[string]string{
+		"postgres://fd:hunter2@db:5432/fd?sslmode=disable":                         "postgres://fd@db:5432/fd",
+		"postgres://fd@db:5432/fd?password=hunter2&sslpassword=hunter2&sslkey=k":   "postgres://fd@db:5432/fd",
+		"POSTGRESQL://fd:hunter2@db/fd":                                            "postgresql://fd@db/fd",
+		"postgres:///fd?host=/run/pg&port=5433&user=fd&password=hunter2&x=hunter2": "postgres:///fd?host=%2Frun%2Fpg&port=5433&user=fd",
+		"postgres://fd:hun/ter2@db/fd":                                             "postgres://<해석 못 한 접속 문자열>",
+		"postgres://fd:12/hunter2@db/fd":                                           "postgres://<해석 못 한 접속 문자열>",
+		"postgres://fd:%zz@db/fd":                                                  "postgres://<해석 못 한 접속 문자열>",
 	} {
 		got := redactDSN(in)
-		if strings.Contains(got, "hunter2") {
-			t.Errorf("비밀번호가 샜다: %q → %q", in, got)
+		if strings.Contains(got, "hunter2") || strings.Contains(got, "ter2") {
+			t.Errorf("비밀이 샜다: %q → %q", in, got)
 		}
-		if !strings.Contains(got, "db:5432/fd") {
-			t.Errorf("가린 주소가 어디를 가리키는지 잃었다: %q", got)
+		if got != want {
+			t.Errorf("redactDSN(%q) = %q, 기대 %q", in, got, want)
+		}
+	}
+}
+
+// TestShowTargetSeparatesFilesFromURLs 는 파일 경로는 그대로, 접속 URL 은 가린 꼴로 내는지 잰다.
+func TestShowTargetSeparatesFilesFromURLs(t *testing.T) {
+	for in, want := range map[string]string{
+		"/data/fd.db": "/data/fd.db",
+		"postgres://fd:hunter2@db:5432/fd?sslpassword=hunter2": "postgres://fd@db:5432/fd",
+	} {
+		if got := ShowTarget(in); got != want {
+			t.Errorf("ShowTarget(%q) = %q, 기대 %q", in, got, want)
+		}
+	}
+	if !IsPostgresURL("Postgres://fd@db/fd") || IsPostgresURL("/data/fd.db") {
+		t.Error("IsPostgresURL 이 engineOf 와 다르게 가른다")
+	}
+}
+
+// TestSQLiteOnlyPathsRefusePostgresURLs 는 SQLite 파일만 다루는 길이 접속 URL 을 파일 API 에 넘기지 않고
+// 가린 표시값으로 거절하는지 잰다. 넘기면 「파일이 없다」 오류에 원문(비밀번호)이 실린다.
+func TestSQLiteOnlyPathsRefusePostgresURLs(t *testing.T) {
+	const dsn = "postgres://fd:hunter2@127.0.0.1:1/fd?sslpassword=hunter2"
+	ctx := context.Background()
+	_, probeErr := ProbeMigration(ctx, dsn)
+	_, rbErr := Rollback(ctx, dsn, nil)
+	_, ledgerErr := OpenLedger(ctx, dsn, nil)
+	for name, err := range map[string]error{
+		"ProbeMigration": probeErr,
+		"MigrateTo":      MigrateTo(ctx, dsn, SchemaVersion, nil),
+		"Rollback":       rbErr,
+		"OpenLedger":     ledgerErr,
+	} {
+		if err == nil || !strings.Contains(err.Error(), "SQLite 파일만") {
+			t.Errorf("%s 가 접속 URL 을 SQLite 거절로 안 막았다: %v", name, err)
+			continue
+		}
+		if strings.Contains(err.Error(), "hunter2") {
+			t.Errorf("%s 의 거절에 비밀이 샜다: %v", name, err)
+		}
+	}
+}
+
+func TestPGURLLowersOnlyTheScheme(t *testing.T) {
+	for in, want := range map[string]string{
+		"POSTGRES://Fd:PW@Db/Fd": "postgres://Fd:PW@Db/Fd",
+		"PostgreSQL://fd@db/fd":  "postgresql://fd@db/fd",
+		"postgres://fd@db/fd":    "postgres://fd@db/fd",
+	} {
+		if got := pgURL(in); got != want {
+			t.Errorf("pgURL(%q) = %q, 기대 %q", in, got, want)
+		}
+	}
+}
+
+// TestLockSpaceFollowsTheEngine 은 대기 계측의 잠금 공간 라벨이 실제로 잡는 잠금을 따르는지 잰다.
+// SQLite 의 ObsTx 는 BEGIN IMMEDIATE(전역)라 obs 로 적으면 전역 대기가 obs 칸에 숨는다.
+func TestLockSpaceFollowsTheEngine(t *testing.T) {
+	for _, c := range []struct {
+		eng  engine
+		kind txKind
+		want LockSpace
+	}{
+		{enginePG, txWrite, LockGlobal},
+		{enginePG, txObs, LockObs},
+		{engineSQLite, txWrite, LockGlobal},
+		{engineSQLite, txObs, LockGlobal},
+	} {
+		if got := c.eng.lockSpace(c.kind); got != c.want {
+			t.Errorf("%s 의 종류 %d 가 %q 칸이다(기대 %q)", c.eng, c.kind, got, c.want)
 		}
 	}
 }
@@ -167,7 +287,7 @@ func isDBField(e ast.Expr) bool {
 func TestRawHandlesStayInEngine(t *testing.T) {
 	src := parseStoreSource(t)
 	allowed := map[site]string{
-		{"store.go", "DB"}:                "시험 · 진단 전용 접근자(감싸개를 안 지난다고 주석에 적었다)",
+		{"store.go", "DB"}:                "저수준 접근자 - 시험 · 진단과 web 의 날 질의 넷(store 안으로 옮길 차례다)",
 		{"store.go", "openRaw"}:           "SQLite 파일 열기",
 		{"probe.go", "probeMigrationVia"}: "SQLite 파일의 판 재기",
 		{"backup.go", "OpenLedger"}:       "SQLite 원장 내보내기 전용 열기",
@@ -254,7 +374,6 @@ func TestWritesOutsideTxAreListed(t *testing.T) {
 	allowed := map[site]string{
 		{"store.go", "migrateTo"}: "SQLite schema.sql 적용 - PRAGMA 가 있어 트랜잭션 밖이어야 한다",
 		{"store.go", "backup"}:    "SQLite 판올림 전 VACUUM INTO",
-		{"inbox.go", "DropInbox"}: "받는 곳 지우기 - 알림이 서버 DB 로 옮기면 없어진다",
 	}
 
 	// 쓰는 도우미에 s.db 를 넘기는 길. 지금 dbtx 도우미는 다 읽기라 실제 소스에선 0건이 정상이다 -
@@ -389,6 +508,9 @@ func looksLikeWrite(q string) bool {
 // 실행 때 못 가른다 - 그래서 소스에서 막는다. 자리표시 바로 뒤에 `|` · `&` 가 붙거나, 다음 글자가 문자열
 // 따옴표나 또 다른 `?` 면(값 둘이 연산자 없이 붙을 수 없으니) 연산자 자리다. 키를 물을 일이 생기면
 // `jsonb_exists(…)` 처럼 함수로 쓴다.
+//
+// ★ 훑는 곳은 둘이다: Go 소스의 문자열 조각과 store 의 .sql 파일(SQLite 스키마 · 증분, Postgres 기준선 · 준비).
+// .sql 은 인자 없이 돌므로 따옴표 밖 `?` 는 연산자 꼴이든 아니든 하나도 있으면 안 된다(bindDollar 의 ★ 인자 수).
 func TestStoreSQLHasNoJSONBQuestionOperators(t *testing.T) {
 	src := parseStoreSource(t)
 	marks := 0
@@ -402,13 +524,43 @@ func TestStoreSQLHasNoJSONBQuestionOperators(t *testing.T) {
 		if err != nil {
 			return
 		}
-		for _, p := range placeholders(s) {
+		pos, _ := placeholders(s)
+		for _, p := range pos {
 			marks++
 			if reason := questionOperatorAt(s, p); reason != "" {
 				bad = append(bad, at.String()+" "+src.fset.Position(lit.Pos()).String()+": "+reason+" - "+clip(s, 80))
 			}
 		}
 	})
+
+	var sqlFiles []string
+	for _, g := range []string{"*.sql", "migrations/*.sql", "pg/*.sql"} {
+		m, err := filepath.Glob(g)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sqlFiles = append(sqlFiles, m...)
+	}
+	// 증분 17 + SQLite 스키마 1 + Postgres 둘. 덜 세면 아래 단정이 그냥 초록이다.
+	if len(sqlFiles) < 20 || !slices.Contains(sqlFiles, filepath.Join("pg", "001_baseline.sql")) {
+		t.Fatalf("store 의 .sql 파일을 %d개만 찾았다(pg 기준선 포함 20개 이상이어야 한다): %v", len(sqlFiles), sqlFiles)
+	}
+	for _, f := range sqlFiles {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := string(b)
+		pos, _ := placeholders(q)
+		for _, p := range pos {
+			reason := questionOperatorAt(q, p)
+			if reason == "" {
+				reason = "인자 없이 도는 파일의 따옴표 밖 ?"
+			}
+			line := 1 + strings.Count(q[:p], "\n")
+			bad = append(bad, f+":"+strconv.Itoa(line)+": "+reason)
+		}
+	}
 	// 자리표시를 하나도 못 세면 아래 단정이 그냥 초록이다. 지금 store 의 SQL 은 자리표시가 수백 개다.
 	if marks < 200 {
 		t.Fatalf("store 의 SQL 에서 자리표시를 %d개만 셌다 - 이 시험의 탐지가 죽었다", marks)
@@ -419,7 +571,8 @@ func TestStoreSQLHasNoJSONBQuestionOperators(t *testing.T) {
 	// 탐지 자체도 잰다(위가 늘 초록이면 이것이 빨개야 한다).
 	for _, q := range []string{`payload::jsonb ?| array['a']`, `payload::jsonb ?& ?`, `payload::jsonb ? 'item'`, `payload::jsonb ? ?`} {
 		hit := false
-		for _, p := range placeholders(q) {
+		pos, _ := placeholders(q)
+		for _, p := range pos {
 			if questionOperatorAt(q, p) != "" {
 				hit = true
 			}
@@ -429,7 +582,8 @@ func TestStoreSQLHasNoJSONBQuestionOperators(t *testing.T) {
 		}
 	}
 	for _, q := range []string{`WHERE a = ? AND b IN (?, ?)`, `VALUES (?, ?)`, `(payload::jsonb ->> 'item') = ?`} {
-		for _, p := range placeholders(q) {
+		pos, _ := placeholders(q)
+		for _, p := range pos {
 			if r := questionOperatorAt(q, p); r != "" {
 				t.Errorf("탐지가 자리표시를 연산자로 잘못 본다: %q (%s)", q, r)
 			}

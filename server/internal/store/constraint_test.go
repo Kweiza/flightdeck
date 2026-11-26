@@ -65,6 +65,32 @@ func TestJudgeConstraintCode(t *testing.T) {
 	}
 }
 
+// TestJudgeBusyFamily 는 SQLite BUSY 를 확장 코드부터 가르는지 잰다. 확장 없는 BUSY 만 「busy_timeout 을 다
+// 기다렸다」이고, BUSY_SNAPSHOT 은 기다린 것이 아니라 낡은 스냅숏이다(처방이 「트랜잭션 전체를 다시」다).
+func TestJudgeBusyFamily(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		code      int
+		fault     FaultKind
+		inReason  string
+		notReason string
+	}{
+		{"busy_timeout 초과", sqlite3.SQLITE_BUSY, FaultLockTimeout, "busy_timeout 을 넘었다", ""},
+		{"낡은 스냅숏", sqlite3.SQLITE_BUSY_SNAPSHOT, FaultSerialization, "BUSY_SNAPSHOT", "넘었다"},
+		{"복구 중", sqlite3.SQLITE_BUSY_RECOVERY, FaultLockTimeout, "단정하지 않는다", "넘었다"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			v := JudgeConstraintCode(c.code)
+			if v.Kind != "" || v.Fault != c.fault {
+				t.Fatalf("(Kind, Fault) = (%q, %q), 기대 (\"\", %q): %s", v.Kind, v.Fault, c.fault, v.Reason)
+			}
+			if !strings.Contains(v.Reason, c.inReason) || (c.notReason != "" && strings.Contains(v.Reason, c.notReason)) {
+				t.Fatalf("사유가 다르다(있어야 할 것 %q, 없어야 할 것 %q): %s", c.inReason, c.notReason, v.Reason)
+			}
+		})
+	}
+}
+
 // 표 밖 케이스: 사유는 **어떤 코드에도** 비면 안 된다.
 // 사유가 없으면 "접지 않기로 했다"와 "이 축을 아예 안 본다"가 구분되지 않는다.
 func TestJudgeConstraintCodeAlwaysGivesReason(t *testing.T) {
@@ -104,7 +130,8 @@ func TestJudgeSQLState(t *testing.T) {
 		{"추가 전용 트리거는 안 접는다", "23000", "", "", "1차 방어"},
 		{"모르는 제약 축", "23P01", "", "", "아는 축이 아닌"},
 		{"잠금 대기 초과", "55P03", "", FaultLockTimeout, "lock_timeout"},
-		{"교착", "40P01", "", FaultDeadlock, "교착"},
+		{"직렬화 실패", "40001", "", FaultSerialization, "트랜잭션 전체"},
+		{"교착", "40P01", "", FaultDeadlock, "엇갈리면"},
 		{"버려진 트랜잭션", "25P02", "", FaultAborted, "Savepoint"},
 		{"제약이 아님", "42601", "", "", "제약 위반이 아니다"},
 		{"코드 없음", "", "", "", "SQLSTATE 가 없다"},
@@ -141,6 +168,7 @@ func TestAsFaultWrapsOnlyTxFaults(t *testing.T) {
 	}{
 		{fmt.Errorf("문맥: %w", &pgconn.PgError{Code: "55P03"}), FaultLockTimeout, "55P03"},
 		{fmt.Errorf("문맥: %w", &pgconn.PgError{Code: "40P01"}), FaultDeadlock, "40P01"},
+		{fmt.Errorf("문맥: %w", &pgconn.PgError{Code: "40001"}), FaultSerialization, "40001"},
 		{fmt.Errorf("커밋 실패: %w", pgx.ErrTxCommitRollback), FaultAborted, "25P02"},
 	} {
 		got := asFault(c.err)

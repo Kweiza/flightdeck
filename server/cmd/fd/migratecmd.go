@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 
 	"github.com/kweiza/flightdeck/internal/store"
 )
@@ -36,19 +34,20 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 	}
 
 	path := resolveDBPath(a.env, *dbPath)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		fmt.Fprintf(out, "DB 디렉토리를 만들지 못했다(%s): %s\n", path, err)
+	shown := store.ShowTarget(path) // 로그 · 출력에는 이 표시값만 싣는다
+	if err := ensureDBDir(path); err != nil {
+		fmt.Fprintf(out, "DB 디렉토리를 만들지 못했다(%s): %s\n", shown, err)
 		return 1
 	}
 
 	if *rollback {
 		restored, err := store.Rollback(ctx, path, a.log)
 		if err != nil {
-			a.log.Error("되돌리기 실패", "path", path, "error", err.Error())
+			a.log.Error("되돌리기 실패", "path", shown, "error", err.Error())
 			fmt.Fprintf(out, "되돌리기 실패: %s\n", err)
 			return 1
 		}
-		fmt.Fprintf(out, "fd migrate --rollback · %s\n\n  %s 에서 되돌렸다\n", path, restored)
+		fmt.Fprintf(out, "fd migrate --rollback · %s\n\n  %s 에서 되돌렸다\n", shown, restored)
 		return 0
 	}
 
@@ -61,15 +60,15 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 	//   아닌지 모르고, 그 모호함이 컨테이너의 one-shot 단계에서 재시작마다 되풀이된다.
 	if plan, err := store.ProbeMigration(ctx, path); err == nil &&
 		plan.Action == store.MigrateNone && target == store.SchemaVersion {
-		fmt.Fprintf(out, "fd migrate · %s\n\n  이미 맞다 — 스키마 %d판\n", path, store.SchemaVersion)
+		fmt.Fprintf(out, "fd migrate · %s\n\n  이미 맞다: 스키마 %d판\n", shown, store.SchemaVersion)
 		return 0
 	}
 
 	if err := store.MigrateTo(ctx, path, target, a.log); err != nil {
-		a.log.Error("적용 실패", "path", path, "target", target, "error", err.Error())
+		a.log.Error("적용 실패", "path", shown, "target", target, "error", err.Error())
 		fmt.Fprintf(out, "적용 실패: %s\n", err)
 		return 1
 	}
-	fmt.Fprintf(out, "fd migrate · %s\n\n  올렸다 — 스키마 %d판\n", path, target)
+	fmt.Fprintf(out, "fd migrate · %s\n\n  올렸다: 스키마 %d판\n", shown, target)
 	return 0
 }

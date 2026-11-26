@@ -29,8 +29,14 @@ import (
 //
 // 컨테이너에는 /data 볼륨이 마운트돼 있고(설계 §2), 로컬에서는 홈 아래를 쓴다.
 // 마지막 폴백(임시 디렉토리)은 값은 나오지만 재부팅하면 사라지므로 호출부가 그 사실을 로그에 남긴다.
+//
+// ★ FD_DB 가 Postgres 접속 URL 이면 **정규화 전에** 가르고 그대로 낸다. filepath.Clean 은 `//` 를 접어
+// `postgres:/…` 로 만들고, 그러면 엔진 판별이 그것을 SQLite 파일 이름으로 읽는다.
 func DefaultDBPath(get func(string) (string, bool), home string, dataDirExists bool) string {
 	if v, ok := get("FD_DB"); ok && strings.TrimSpace(v) != "" {
+		if t := strings.TrimSpace(v); store.IsPostgresURL(t) {
+			return t
+		}
 		return filepath.Clean(v)
 	}
 	if dataDirExists {
@@ -196,7 +202,7 @@ func buildIdentity(stat func(string) (ExeID, error)) string {
 func runServe(args []string, env func(string) (string, bool), log *slog.Logger) int {
 	fs := newFlagSet("serve")
 	addr := fs.String("addr", envOr(env, "FD_ADDR", ":7420"), "수신 주소")
-	dbPath := fs.String("db", "", "SQLite 파일 경로(비면 자동)")
+	dbPath := fs.String("db", "", "SQLite 파일 경로 또는 postgres:// 접속 URL(비면 자동)")
 	rate := fs.Int("rate-per-minute", 0, "원격 주소당 분당 요청 상한(0 이면 무제한)")
 	// ★ 루프백 면제를 끄는 스위치다. **기본값은 면제 열림이고 그것을 안 바꾼다** —
 	// 로컬 루프백으로 토큰 없이 붙는 세션이 이 제품의 정상 사용이라, 기본값을 뒤집으면
@@ -218,20 +224,18 @@ func runServe(args []string, env func(string) (string, bool), log *slog.Logger) 
 	}
 
 	home, _ := os.UserHomeDir()
-	path := *dbPath
-	if strings.TrimSpace(path) == "" {
-		_, derr := os.Stat("/data")
-		path = DefaultDBPath(env, home, derr == nil)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// ★ path 는 store 에만 넘긴다. 로그에는 shown 이다 - 접속 URL 이면 비밀번호가 든 원문이다.
+	path := resolveDBPath(env, *dbPath)
+	shown := clip(store.ShowTarget(path), 200)
+	if err := ensureDBDir(path); err != nil {
 		log.Error("DB 디렉토리를 만들지 못해 기동을 중단한다",
-			"db_path", clip(path, 200), "error", err.Error())
+			"db_path", shown, "error", err.Error())
 		return 1
 	}
 
 	st, err := store.OpenWithLogger(path, log)
 	if err != nil {
-		log.Error("DB 를 열지 못해 기동을 중단한다", "db_path", clip(path, 200), "error", err.Error())
+		log.Error("DB 를 열지 못해 기동을 중단한다", "db_path", shown, "error", err.Error())
 		return 1
 	}
 	// ★ 자동 갱신 경로에서는 이 defer 가 **안 돈다.** syscall.Exec 는 스택째 버린다.
@@ -286,7 +290,7 @@ func runServe(args []string, env func(string) (string, bool), log *slog.Logger) 
 	//   ctx 로 묶여 있어 종료·자동 갱신 드레인에서 함께 선다.
 	go ledgerJob.Run(ctx)
 
-	log.Info("기동", "route", clip(ln.Addr().String(), 120), "db_path", clip(path, 200),
+	log.Info("기동", "route", clip(ln.Addr().String(), 120), "db_path", shown,
 		"api_version", service.APIVersion, "auth_required", token != "",
 		"ledger_out", clip(ledgerJob.route, 200))
 

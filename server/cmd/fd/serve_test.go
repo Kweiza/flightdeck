@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -415,5 +418,72 @@ func TestServeAPIOptionsLoginScreenFollowsLang(t *testing.T) {
 		if body := rec.Body.String(); !strings.Contains(body, tc.want) {
 			t.Errorf("옵션 %d개: 로그인 화면에 %s 가 없다:\n%s", len(tc.opts), tc.want, body)
 		}
+	}
+}
+
+// TestDefaultDBPathKeepsPostgresURLWhole 는 FD_DB 의 접속 URL 을 파일 경로 정규화 전에 가르는지 잰다.
+// filepath.Clean 을 지나면 `postgres://` 가 `postgres:/` 로 접혀 엔진 판별이 SQLite 파일로 읽는다.
+func TestDefaultDBPathKeepsPostgresURLWhole(t *testing.T) {
+	for in, want := range map[string]string{
+		"postgres://fd:pw@db:5432/fd?sslmode=disable": "postgres://fd:pw@db:5432/fd?sslmode=disable",
+		"  POSTGRESQL://fd@db/fd ":                    "POSTGRESQL://fd@db/fd",
+		"/data//sub/../fd.db":                         "/data/fd.db",
+	} {
+		get := func(k string) (string, bool) { return in, k == "FD_DB" }
+		if got := DefaultDBPath(get, "/home/u", false); got != want {
+			t.Errorf("FD_DB=%q → %q, 기대 %q", in, got, want)
+		}
+	}
+}
+
+// TestServeKeepsPostgresURLOutOfFilesAndLogs 는 접속 URL 이 플래그로 오든 FD_DB 로 오든 파일 API 에 닿지 않고
+// (현재 폴더에 아무것도 안 만든다) Postgres 길로 가며, 로그에 비밀이 안 실리는지 잰다.
+//
+// ★ runServe 를 실물로 부른다. 앞 판은 두 길이 따로 샜다: FD_DB 는 Clean 을 지나 SQLite 파일로 가서 「파일이 없다」
+// 오류에 원문을 실었고, --db 는 Postgres 로 갔지만 그 전에 MkdirAll 이 비밀이 이름에 든 디렉토리를 만들었다.
+// 닿을 수 없는 주소(포트 1)라 열기에서 곧장 실패해 감시기 · 리스너는 안 뜬다.
+func TestServeKeepsPostgresURLOutOfFilesAndLogs(t *testing.T) {
+	const secret = "hunter2"
+	dsn := "postgres://fd:" + secret + "@127.0.0.1:1/fd?sslpassword=" + secret
+	for _, c := range []struct {
+		name string
+		args []string
+		fdDB string
+	}{
+		{"플래그", []string{"--addr", "127.0.0.1:0", "--db", dsn}, ""},
+		{"환경변수", []string{"--addr", "127.0.0.1:0"}, dsn},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Chdir(dir)
+			env := func(k string) (string, bool) {
+				switch k {
+				case "FD_DB":
+					return c.fdDB, c.fdDB != ""
+				case "FD_LEDGER":
+					return filepath.Join(dir, "ledger"), true
+				}
+				return "", false
+			}
+			var logs bytes.Buffer
+			log := slog.New(slog.NewJSONHandler(&logs, nil))
+			if got := runServe(c.args, env, log); got != 1 {
+				t.Fatalf("닿을 수 없는 원장인데 runServe 가 %d 를 냈다", got)
+			}
+			out := logs.String()
+			if strings.Contains(out, secret) {
+				t.Fatalf("로그에 비밀이 샜다: %s", out)
+			}
+			if !strings.Contains(out, "Postgres 접속 실패") || !strings.Contains(out, "postgres://fd@127.0.0.1:1/fd") {
+				t.Fatalf("Postgres 길로 가서 가린 주소로 실패하지 않았다: %s", out)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range entries {
+				t.Errorf("현재 폴더에 %q 를 만들었다 - 접속 URL 이 파일 API 에 닿았다", e.Name())
+			}
+		})
 	}
 }
