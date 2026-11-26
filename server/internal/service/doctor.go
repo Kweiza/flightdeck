@@ -27,6 +27,9 @@ type Health struct {
 	At          time.Time `json:"at"`
 }
 
+// DiskRemote 는 원장이 원격 DB(Postgres)라 디스크 여유를 안 잰 사유다. DiskKnown 은 거짓이다.
+const DiskRemote = "원격 DB, 재지 않음"
+
 // Health 는 서버가 지금 답할 수 있는 상태다.
 //
 // **오류를 반환하지 않는다.** 헬스체크가 실패로 끊기면 "무엇이 고장났나"를 담을 자리가
@@ -45,8 +48,11 @@ func (s *Service) Health(ctx context.Context) Health {
 		h.DBOK = true
 	}
 
-	pct, err := diskFreePct(dirOf(h.DBPath))
-	if err != nil {
+	// ★ Postgres 원장이면 재지 않는다. DBPath 는 가린 접속 URL 이라 그 「상위 디렉토리」를 statfs 하면 현재 폴더나
+	//   없는 경로를 재게 되고, 원장이 사는 디스크는 이 프로세스의 것이 아니다.
+	if s.st.Postgres() {
+		h.DiskError = DiskRemote
+	} else if pct, err := diskFreePct(dirOf(h.DBPath)); err != nil {
 		h.DiskError = clip(err.Error(), 400)
 		s.log.WarnContext(ctx, "디스크 여유 측정 실패", "path", clip(h.DBPath, 200), "error", err.Error())
 	} else {

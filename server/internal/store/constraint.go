@@ -137,7 +137,8 @@ type ConstraintVerdict struct {
 type FaultKind string
 
 const (
-	// FaultLockTimeout 은 잠금 대기가 상한(lockTimeout)을 넘은 것이다(Postgres 55P03 · SQLite BUSY).
+	// FaultLockTimeout 은 잠금 대기가 상한(lockTimeout)을 넘은 것이다(Postgres 55P03 · SQLite BUSY). SQLite 의
+	// BUSY 는 교착을 피하려고 기다리지 않고 낸 것도 여기 든다(코드만으로는 안 갈린다).
 	// 처방: 같은 요청을 다시 보내라. 잦으면 잠금 대기 지표(/metrics)를 봐라.
 	FaultLockTimeout FaultKind = "lock_timeout"
 	// FaultSerialization 은 트랜잭션이 본 스냅숏이 그새 낡아 끝낼 수 없다는 것이다(Postgres 40001 ·
@@ -205,13 +206,15 @@ func JudgeConstraintCode(code int) ConstraintVerdict {
 		return ConstraintVerdict{
 			Reason: fmt.Sprintf("아는 축이 아닌 제약 위반이다(코드 %d) — 접지 않고 서버 결함으로 남긴다", code)}
 	}
-	// ★ BUSY 는 확장 코드를 먼저 가른다. 확장 없는 BUSY(5)만 「busy 처리기가 busy_timeout 을 다 기다리고 포기했다」이다.
-	//   BUSY_SNAPSHOT 은 기다린 것이 아니라 읽기 스냅숏이 낡아 쓰기로 못 올린다는 뜻이라(기다려도 안 풀린다)
-	//   대기 초과로 적으면 진단이 틀린다.
+	// ★ BUSY 는 확장 코드를 먼저 가른다. BUSY_SNAPSHOT 은 기다린 것이 아니라 읽기 스냅숏이 낡아 쓰기로 못 올린다는
+	//   뜻이라(기다려도 안 풀린다) 대기 초과로 적으면 진단이 틀린다.
+	// ★ 확장 없는 BUSY(5)도 「busy_timeout 을 다 기다렸다」로 단정하지 않는다. SQLite 는 교착을 피하려고 busy 처리기를
+	//   부르지 않고 곧장 BUSY 를 낼 수 있다(읽기 트랜잭션이 쓰기로 올리려다 남의 쓰기와 엇갈린 때). 코드만으로는
+	//   두 경우가 안 갈린다 - 둘 다 사유문에 적는다.
 	switch {
 	case code == sqlite3.SQLITE_BUSY:
 		return ConstraintVerdict{Fault: FaultLockTimeout,
-			Reason: fmt.Sprintf("제약 위반이 아니다 - 쓰기 잠금 대기가 busy_timeout 을 넘었다(코드 %d)", code)}
+			Reason: fmt.Sprintf("제약 위반이 아니다 - 잠금을 못 얻음(대기 상한 초과 또는 교착 회피 즉시 반환, 코드 %d)", code)}
 	case code == sqlite3.SQLITE_BUSY_SNAPSHOT:
 		return ConstraintVerdict{Fault: FaultSerialization,
 			Reason: fmt.Sprintf("제약 위반이 아니다 - 읽기 스냅숏을 잡은 뒤 남이 커밋해 쓰기로 못 올린다(코드 %d, BUSY_SNAPSHOT). "+

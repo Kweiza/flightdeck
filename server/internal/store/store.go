@@ -247,13 +247,13 @@ func Open(path string) (*Store, error) {
 // OpenWithLogger 는 Open 에 로거를 주입한다.
 //
 // path 가 Postgres 접속 URL(postgres://…)이면 Postgres 원장에 붙고 판이 이 바이너리와 같은지만 잰다
-// (checkPGVersion). 아니면 SQLite 파일이다.
+// (checkPGVersion). 아니면 SQLite 파일이다. 가르는 것은 ParseTarget 이다.
 func OpenWithLogger(path string, log *slog.Logger) (*Store, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	if engineOf(path) == enginePG {
-		s, err := openPG(path, log, lockTimeout)
+	if t := ParseTarget(path); t.Postgres() {
+		s, err := openPG(t, log, lockTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -463,8 +463,11 @@ func (s *Store) verifyPragmas(ctx context.Context, want map[string]string) error
 // Close 는 DB 를 닫는다.
 func (s *Store) Close() error { return s.db.Close() }
 
-// Path 는 DB 파일 경로다.
+// Path 는 로그 · 출력에 실을 원장 자리다. SQLite 면 파일 경로, Postgres 면 가린 접속 URL(Target.Shown)이다.
 func (s *Store) Path() string { return s.path }
+
+// Postgres 는 이 원장이 Postgres 인가다. 참이면 Path 는 파일 경로가 아니다 - 파일 API(statfs · stat)에 넘기지 마라.
+func (s *Store) Postgres() bool { return s.db.eng == enginePG }
 
 // DB 는 저수준 핸들이다. 자리표시 감싸개를 안 지나므로 Postgres 에서는 `?` 질의가 안 돈다.
 //

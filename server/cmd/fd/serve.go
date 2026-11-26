@@ -30,12 +30,13 @@ import (
 // 컨테이너에는 /data 볼륨이 마운트돼 있고(설계 §2), 로컬에서는 홈 아래를 쓴다.
 // 마지막 폴백(임시 디렉토리)은 값은 나오지만 재부팅하면 사라지므로 호출부가 그 사실을 로그에 남긴다.
 //
-// ★ FD_DB 가 Postgres 접속 URL 이면 **정규화 전에** 가르고 그대로 낸다. filepath.Clean 은 `//` 를 접어
-// `postgres:/…` 로 만들고, 그러면 엔진 판별이 그것을 SQLite 파일 이름으로 읽는다.
+// ★ FD_DB 가 Postgres 접속 URL 이면 **정규화 전에** 가르고 받은 값 그대로 낸다. filepath.Clean 은 `//` 를 접어
+// `postgres:/…` 로 만들고, 그러면 엔진 판별이 그것을 SQLite 파일 이름으로 읽는다. 가르기 · 다듬기는
+// store.ParseTarget 하나가 한다(여기서 따로 다듬지 않는다).
 func DefaultDBPath(get func(string) (string, bool), home string, dataDirExists bool) string {
-	if v, ok := get("FD_DB"); ok && strings.TrimSpace(v) != "" {
-		if t := strings.TrimSpace(v); store.IsPostgresURL(t) {
-			return t
+	if v, ok := get(dbEnv); ok && strings.TrimSpace(v) != "" {
+		if store.ParseTarget(v).Postgres() {
+			return v
 		}
 		return filepath.Clean(v)
 	}
@@ -226,7 +227,7 @@ func runServe(args []string, env func(string) (string, bool), log *slog.Logger) 
 	home, _ := os.UserHomeDir()
 	// ★ path 는 store 에만 넘긴다. 로그에는 shown 이다 - 접속 URL 이면 비밀번호가 든 원문이다.
 	path := resolveDBPath(env, *dbPath)
-	shown := clip(store.ShowTarget(path), 200)
+	shown := clip(store.ParseTarget(path).Shown(), 200)
 	if err := ensureDBDir(path); err != nil {
 		log.Error("DB 디렉토리를 만들지 못해 기동을 중단한다",
 			"db_path", shown, "error", err.Error())

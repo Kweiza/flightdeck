@@ -18,6 +18,7 @@ import (
 
 	"github.com/kweiza/flightdeck/internal/api"
 	"github.com/kweiza/flightdeck/internal/lang"
+	"github.com/kweiza/flightdeck/internal/store"
 	"github.com/kweiza/flightdeck/internal/web"
 )
 
@@ -423,43 +424,82 @@ func TestServeAPIOptionsLoginScreenFollowsLang(t *testing.T) {
 
 // TestDefaultDBPathKeepsPostgresURLWhole 는 FD_DB 의 접속 URL 을 파일 경로 정규화 전에 가르는지 잰다.
 // filepath.Clean 을 지나면 `postgres://` 가 `postgres:/` 로 접혀 엔진 판별이 SQLite 파일로 읽는다.
+// 접속 URL 은 받은 값 그대로 낸다 - 다듬기는 store.ParseTarget 하나가 한다.
 func TestDefaultDBPathKeepsPostgresURLWhole(t *testing.T) {
 	for in, want := range map[string]string{
 		"postgres://fd:pw@db:5432/fd?sslmode=disable": "postgres://fd:pw@db:5432/fd?sslmode=disable",
-		"  POSTGRESQL://fd@db/fd ":                    "POSTGRESQL://fd@db/fd",
+		"  POSTGRESQL://fd@db/fd ":                    "  POSTGRESQL://fd@db/fd ",
 		"/data//sub/../fd.db":                         "/data/fd.db",
 	} {
 		get := func(k string) (string, bool) { return in, k == "FD_DB" }
-		if got := DefaultDBPath(get, "/home/u", false); got != want {
+		got := DefaultDBPath(get, "/home/u", false)
+		if got != want {
 			t.Errorf("FD_DB=%q → %q, 기대 %q", in, got, want)
+		}
+		if store.ParseTarget(got).Postgres() != strings.Contains(in, "://") {
+			t.Errorf("FD_DB=%q → %q 의 엔진이 갈렸다", in, got)
 		}
 	}
 }
 
+// TestResolveDBPathKeepsFlagAsGiven 은 --db 값을 다듬지 않는지 잰다. 예전 serve 는 비지 않은 --db 를 그대로 썼다 -
+// `fd.db ` 를 `fd.db` 로 다듬으면 두 파일이 다 있을 때 오류 없이 다른 원장을 연다. 공백뿐이면 빈 것으로 본다.
+func TestResolveDBPathKeepsFlagAsGiven(t *testing.T) {
+	noEnv := func(string) (string, bool) { return "", false }
+	for _, in := range []string{"fd.db ", " fd.db", " postgres://fd:pw@db/fd "} {
+		if got := resolveDBPath(noEnv, in); got != in {
+			t.Errorf("resolveDBPath(%q) = %q - 플래그 값을 다듬었다", in, got)
+		}
+	}
+	fdDB := func(k string) (string, bool) { return "/srv/x.db", k == "FD_DB" }
+	if got := resolveDBPath(fdDB, "  "); got != "/srv/x.db" {
+		t.Errorf("공백뿐인 --db 를 값으로 봤다: %q", got)
+	}
+}
+
 // TestServeKeepsPostgresURLOutOfFilesAndLogs 는 접속 URL 이 플래그로 오든 FD_DB 로 오든 파일 API 에 닿지 않고
-// (현재 폴더에 아무것도 안 만든다) Postgres 길로 가며, 로그에 비밀이 안 실리는지 잰다.
+// (현재 폴더에 아무것도 안 만든다) Postgres 길로 가며, runServe 가 남기는 **최종 로그 · 오류 본문**에 비밀이 안
+// 실리는지 잰다.
 //
 // ★ runServe 를 실물로 부른다. 앞 판은 두 길이 따로 샜다: FD_DB 는 Clean 을 지나 SQLite 파일로 가서 「파일이 없다」
 // 오류에 원문을 실었고, --db 는 Postgres 로 갔지만 그 전에 MkdirAll 이 비밀이 이름에 든 디렉토리를 만들었다.
 // 닿을 수 없는 주소(포트 1)라 열기에서 곧장 실패해 감시기 · 리스너는 안 뜬다.
+//
+// ★ 표시 함수만 재서는 모자란다. 경계가 모호한 URL 은 표시값을 통째로 가려도 드라이버의 접속 실패 본문이 원문의
+// 조각을 다시 싣는다(`127.0.0.1:1/hunter2@db/fd` 는 pgx 에게 DB 이름이 `hunter2@db/fd` 다). 그래서 기록 전체를 본다.
 func TestServeKeepsPostgresURLOutOfFilesAndLogs(t *testing.T) {
 	const secret = "hunter2"
 	dsn := "postgres://fd:" + secret + "@127.0.0.1:1/fd?sslpassword=" + secret
+	const clean = "postgres://fd@127.0.0.1:1/fd"
 	for _, c := range []struct {
-		name string
-		args []string
-		fdDB string
+		name    string
+		raw     string
+		viaFlag bool
+		shown   string // 비면 「세부를 가렸다」(표시값에 호스트가 없다)를 단정한다
+		secrets []string
 	}{
-		{"플래그", []string{"--addr", "127.0.0.1:0", "--db", dsn}, ""},
-		{"환경변수", []string{"--addr", "127.0.0.1:0"}, dsn},
+		{"플래그", dsn, true, clean, []string{secret}},
+		{"환경변수", dsn, false, clean, []string{secret}},
+		{"앞뒤 공백", "  " + dsn + " ", true, clean, []string{secret}},
+		// 비밀번호가 숫자로 시작하고 `/` 가 들었다. 사용자 127.0.0.1 · 비밀번호 `1/hunter2` 로 적었지만 두 해석기 모두
+		// 호스트 127.0.0.1 · 포트 1 · DB 이름 `hunter2@db/fd` 로 읽는다.
+		{"모호한 `/`", "postgres://127.0.0.1:1/" + secret + "@db/fd", true, "", []string{secret}},
+		// 비밀번호가 숫자로 시작하고 인코딩 안 한 `?` 가 들었다. pgx 는 비밀번호 `8642097531?hunter2` 로, net/url 은
+		// 포트 8642097531 로 읽는다.
+		{"모호한 `?`", "postgres://fd:8642097531?" + secret + "@127.0.0.1:1/fd", false, "", []string{secret, "8642097531"}},
 	} {
+		args := []string{"--addr", "127.0.0.1:0"}
+		fdDB := c.raw
+		if c.viaFlag {
+			args, fdDB = append(args, "--db", c.raw), ""
+		}
 		t.Run(c.name, func(t *testing.T) {
 			dir := t.TempDir()
 			t.Chdir(dir)
 			env := func(k string) (string, bool) {
 				switch k {
 				case "FD_DB":
-					return c.fdDB, c.fdDB != ""
+					return fdDB, fdDB != ""
 				case "FD_LEDGER":
 					return filepath.Join(dir, "ledger"), true
 				}
@@ -467,15 +507,24 @@ func TestServeKeepsPostgresURLOutOfFilesAndLogs(t *testing.T) {
 			}
 			var logs bytes.Buffer
 			log := slog.New(slog.NewJSONHandler(&logs, nil))
-			if got := runServe(c.args, env, log); got != 1 {
+			if got := runServe(args, env, log); got != 1 {
 				t.Fatalf("닿을 수 없는 원장인데 runServe 가 %d 를 냈다", got)
 			}
 			out := logs.String()
-			if strings.Contains(out, secret) {
-				t.Fatalf("로그에 비밀이 샜다: %s", out)
+			for _, s := range c.secrets {
+				if strings.Contains(out, s) {
+					t.Fatalf("로그에 비밀(%s)이 샜다: %s", s, out)
+				}
 			}
-			if !strings.Contains(out, "Postgres 접속 실패") || !strings.Contains(out, "postgres://fd@127.0.0.1:1/fd") {
-				t.Fatalf("Postgres 길로 가서 가린 주소로 실패하지 않았다: %s", out)
+			if !strings.Contains(out, "Postgres 접속 실패") || !strings.Contains(out, "연결 거부") {
+				t.Fatalf("Postgres 길로 가서 연결 거부로 실패하지 않았다: %s", out)
+			}
+			shown := store.ParseTarget(c.raw).Shown()
+			if !strings.Contains(out, shown) {
+				t.Fatalf("표시값 %q 로 실패하지 않았다: %s", shown, out)
+			}
+			if (c.shown == "") == strings.Contains(shown, "127.0.0.1") || (c.shown != "" && shown != c.shown) {
+				t.Fatalf("표시값이 %q 다(기대 %q, 비면 세부 가림)", shown, c.shown)
 			}
 			entries, err := os.ReadDir(dir)
 			if err != nil {

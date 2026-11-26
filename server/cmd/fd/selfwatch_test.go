@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -538,5 +539,30 @@ func TestNewSelfWatcherNamesTheBranchItCannotCover(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestVerifyWithSelfcheckPassesDBByEnvNotArgv 는 감시기가 원장 자리를 자식 argv 가 아니라 환경(FD_DB)으로 넘기는지
+// 잰다. 원장 자리가 접속 URL 이면 비밀번호를 품고, 프로세스 인자는 같은 기기의 다른 사용자도 읽는다(ps).
+// 부모 환경에 다른 FD_DB 가 있어도 넘긴 값이 이겨야 한다.
+func TestVerifyWithSelfcheckPassesDBByEnvNotArgv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("자식을 셸 스크립트로 흉내 낸다")
+	}
+	const dsn = "postgres://fd:hunter2@db/fd"
+	exe := filepath.Join(t.TempDir(), "fd")
+	script := "#!/bin/sh\n" +
+		"[ \"$FD_DB\" = '" + dsn + "' ] || { echo \"FD_DB 가 안 왔다\"; exit 1; }\n" +
+		"echo \"fd selfcheck ok build=argv[$*]\"\n"
+	if err := os.WriteFile(exe, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FD_DB", "/somewhere/else.db")
+	got, err := verifyWithSelfcheck(context.Background(), exe, dsn)
+	if err != nil {
+		t.Fatalf("자식이 거절했다: %v", err)
+	}
+	if got != "argv[selfcheck]" {
+		t.Fatalf("자식 argv 가 %q 다 - selfcheck 하나여야 한다(원장 자리를 argv 에 싣지 않는다)", got)
 	}
 }

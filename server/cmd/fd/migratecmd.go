@@ -34,7 +34,7 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 	}
 
 	path := resolveDBPath(a.env, *dbPath)
-	shown := store.ShowTarget(path) // 로그 · 출력에는 이 표시값만 싣는다
+	shown := store.ParseTarget(path).Shown() // 로그 · 출력에는 이 표시값만 싣는다
 	if err := ensureDBDir(path); err != nil {
 		fmt.Fprintf(out, "DB 디렉토리를 만들지 못했다(%s): %s\n", shown, err)
 		return 1

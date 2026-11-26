@@ -31,14 +31,17 @@ import (
 //
 // ★ openDB 와 runMigrate 가 나눠 쓴다. 두 벌로 두면 `fd migrate` 가 올린 DB 와 이관이 여는
 // DB 가 갈리는데, 그 어긋남은 "적용했다는데 서버가 못 연다" 로만 나타나고 원인이 안 보인다.
+//
+// ★ 플래그 값은 **다듬지 않고** 낸다. 공백만 있으면 빈 것으로 볼 뿐이다. 접속 URL 의 앞뒤 공백은
+// store.ParseTarget 이 가를 때 뺀다. SQLite 파일 이름의 공백(`--db 'fd.db '`)은 이름이라, 여기서 빼면 두 파일이
+// 다 있을 때 오류 없이 다른 원장을 연다.
 func resolveDBPath(env func(string) (string, bool), dbFlag string) string {
-	path := strings.TrimSpace(dbFlag)
-	if path == "" {
-		home, _ := os.UserHomeDir()
-		_, derr := os.Stat("/data")
-		path = DefaultDBPath(env, home, derr == nil)
+	if strings.TrimSpace(dbFlag) != "" {
+		return dbFlag
 	}
-	return path
+	home, _ := os.UserHomeDir()
+	_, derr := os.Stat("/data")
+	return DefaultDBPath(env, home, derr == nil)
 }
 
 // ensureDBDir 는 SQLite 파일의 부모 디렉토리를 만든다. Postgres 접속 URL 이면 아무것도 안 한다.
@@ -47,7 +50,7 @@ func resolveDBPath(env func(string) (string, bool), dbFlag string) string {
 // `postgres://사용자:비밀@호스트/db` 를 `postgres:/사용자:비밀@호스트` 로 접어, 비밀이 이름에 든 디렉토리를 현재
 // 폴더에 만든다.
 func ensureDBDir(path string) error {
-	if store.IsPostgresURL(path) {
+	if store.ParseTarget(path).Postgres() {
 		return nil
 	}
 	return os.MkdirAll(filepath.Dir(path), 0o755)
@@ -60,10 +63,10 @@ func ensureDBDir(path string) error {
 // 많아서 그대로 두면 되쓰기가 영영 못 들어간다. 반대로 내보내기는 **읽는 명령**이라 여기서
 // 적용하면 읽기가 스키마를 바꾸는 셈이 된다 — 그 둘을 한 값으로 접으면 한쪽이 반드시 틀린다.
 //
-// 둘째 반환값은 로그 · 출력에 실을 표시값(store.ShowTarget)이다. 원문은 store 에만 넘긴다.
+// 둘째 반환값은 로그 · 출력에 실을 표시값(store.ParseTarget 의 Shown)이다. 원문은 store 에만 넘긴다.
 func openDB(env func(string) (string, bool), log *slog.Logger, dbFlag string, migrate bool) (*store.Store, string, error) {
 	path := resolveDBPath(env, dbFlag)
-	shown := store.ShowTarget(path)
+	shown := store.ParseTarget(path).Shown()
 	if err := ensureDBDir(path); err != nil {
 		return nil, shown, fmt.Errorf("DB 디렉토리를 만들지 못했다(%q): %w", shown, err)
 	}
@@ -324,7 +327,7 @@ func (a *App) runExport(ctx context.Context, args []string, out io.Writer) int {
 // store.OpenLedger 는 ProbeMigration 으로 먼저 재고 이행이 필요하면 거절한다.
 func (a *App) exportJudgments(ctx context.Context, dbFlag, outDir string, out io.Writer) int {
 	raw := resolveDBPath(a.env, dbFlag)
-	path := store.ShowTarget(raw) // 아래 로그 · 출력에는 이 표시값만 싣는다
+	path := store.ParseTarget(raw).Shown() // 아래 로그 · 출력에는 이 표시값만 싣는다
 
 	st, err := store.OpenLedger(ctx, raw, a.log)
 	if err != nil {

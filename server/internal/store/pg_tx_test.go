@@ -32,7 +32,7 @@ func quietLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, n
 func newPGStore(t *testing.T, wait time.Duration) *Store {
 	t.Helper()
 	dsn := storetest.New(t)
-	s, err := openPG(dsn, quietLog(), wait)
+	s, err := openPG(ParseTarget(dsn), quietLog(), wait)
 	if err != nil {
 		t.Fatalf("openPG: %v", err)
 	}
@@ -678,16 +678,16 @@ func TestPGObsTxLocksPerDeviceRepo(t *testing.T) {
 // 열기 - 판이 안 맞으면 뜨지 않는다
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestPGOpenAcceptsUpperCaseScheme 은 판별(engineOf)이 Postgres 로 가른 대문자 스킴을 여는 경계도 여는지 잰다.
+// TestPGOpenAcceptsUpperCaseScheme 은 판별(ParseTarget)이 Postgres 로 가른 대문자 스킴을 여는 경계도 여는지 잰다.
 // pgx 는 소문자 접두만 URL 로 읽어, 스킴을 안 맞추면 「Postgres 로 갈랐는데 못 연다」가 된다.
 func TestPGOpenAcceptsUpperCaseScheme(t *testing.T) {
 	dsn := storetest.New(t)
 	i := strings.Index(dsn, "://")
 	up := strings.ToUpper(dsn[:i]) + dsn[i:]
-	if up == dsn || engineOf(up) != enginePG {
+	if up == dsn || !ParseTarget(up).Postgres() {
 		t.Fatalf("전제가 깨졌다: 대문자 스킴 %q 가 Postgres 로 갈리지 않는다", up)
 	}
-	raw, err := openPG(up, quietLog(), lockTimeout)
+	raw, err := openPG(ParseTarget(up), quietLog(), lockTimeout)
 	if err != nil {
 		t.Fatalf("대문자 스킴을 못 열었다: %v", err)
 	}
@@ -724,7 +724,7 @@ func TestPGSessionLimitsAreSet(t *testing.T) {
 
 func TestPGOpenRefusesUnstampedOrForeignVersion(t *testing.T) {
 	dsn := storetest.New(t)
-	raw, err := openPG(dsn, quietLog(), lockTimeout)
+	raw, err := openPG(ParseTarget(dsn), quietLog(), lockTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}

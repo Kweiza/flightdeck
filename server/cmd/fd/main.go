@@ -31,8 +31,9 @@ const usage = `fd — flightdeck 클라이언트/서버
   fd hook <event>                         훅. stdin 으로 페이로드를 받는다
                                           (session-start|user-prompt|post-tool|pre-compact|stop)
   fd selfcheck --db <경로>                 이 바이너리로 재기동해도 되는가에만 답한다.
-                                          fd serve 의 자동 갱신이 자식으로 부르고, 거절을
-                                          손으로 재현할 때 같은 명령을 쓴다
+                                          fd serve 의 자동 갱신이 자식으로 부르고(원장은
+                                          FD_DB 로 넘긴다), 거절을 손으로 재현할 때 같은
+                                          명령을 쓴다
 
   fd status [--workspace]                 서버 상태 배너 + 보드(--workspace 면 멤버 요약도)
   fd open [--label …]                     세션 등록(재호출은 재개다)
@@ -108,7 +109,7 @@ func run(args []string, env func(string) (string, bool), stdin io.Reader, stdout
 	case "selfcheck":
 		// ★ App 을 만들지 않는다. 이 명령은 재기동 검증의 피험자라, 서버 도달·세션 열기
 		// 같은 축이 끼면 그 축의 실패가 "새 판이 고장났다"로 오독된다.
-		return runSelfcheck(args[1:], stdout)
+		return runSelfcheck(args[1:], env, stdout)
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return 0

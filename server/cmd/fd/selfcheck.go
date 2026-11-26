@@ -11,7 +11,10 @@ import (
 	"github.com/kweiza/flightdeck/internal/store"
 )
 
-// runSelfcheck 는 `fd selfcheck --db <경로>` 다.
+// dbEnv 는 원장 자리를 주는 환경 변수다. serve(DefaultDBPath)와 selfcheck 가 같은 이름을 쓴다.
+const dbEnv = "FD_DB"
+
+// runSelfcheck 는 `fd selfcheck --db <경로>` 다. --db 가 비면 FD_DB 를 본다(감시기가 자식에게 그것으로 넘긴다).
 //
 // **재기동해도 되는가**에만 답한다. 이 명령이 0 을 내면 감시기가 syscall.Exec 로 넘어간다.
 // 그래서 여기서 하는 일은 최소여야 한다 — 무엇을 더 볼수록 이 명령 자체가 실패 원인이 된다.
@@ -34,21 +37,35 @@ import (
 // 재기동을 걸기 직전이라면 그 축은 이미 증명돼 있다(지금 도는 서버가 바로 그 파일을
 // WAL 로 열고 있다). 서버가 안 돌고 있는데 사람이 이 명령을 부르면 그 축은 관측되지
 // 않은 채로 남고, 실패는 실제 `fd serve` 기동에서 드러난다. 안 잰 축을 잰 척하지 않는다.
-func runSelfcheck(args []string, out io.Writer) int {
+//
+// ★ 원장 자리는 store.ParseTarget 으로 가른다(serve · export 와 같은 함수). Postgres 원장이면 판 재기가 아직
+// 없어 거절하고, 출력에는 표시값만 싣는다 - 이 출력은 감시기의 거절 사유로 로그 · 화면에 그대로 간다.
+// 그래서 Postgres 원장의 서버는 지금 자가 갱신이 선다. 받아들인 한계다(Postgres 판 재기는 이전 실행기 단계의 몫).
+// SQLite 파일 경로는 받은 값 그대로 잰다(이름의 공백도 이름이다).
+func runSelfcheck(args []string, env func(string) (string, bool), out io.Writer) int {
 	fs := newFlagSet("selfcheck")
-	dbPath := fs.String("db", "", "검사할 SQLite 파일 경로")
+	dbPath := fs.String("db", "", "검사할 SQLite 파일 경로(비면 "+dbEnv+")")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if strings.TrimSpace(*dbPath) == "" {
-		fmt.Fprintln(out, "selfcheck: --db 가 비었다 — 무엇을 검사할지가 없다")
+	raw := *dbPath
+	if strings.TrimSpace(raw) == "" {
+		raw, _ = env(dbEnv)
+	}
+	if strings.TrimSpace(raw) == "" {
+		fmt.Fprintln(out, "selfcheck: --db 도 "+dbEnv+" 도 비었다 - 무엇을 검사할지가 없다")
 		return 2
+	}
+	if t := store.ParseTarget(raw); t.Postgres() {
+		fmt.Fprintf(out, "selfcheck: Postgres 원장(%s)의 판 재기는 아직 없다 - 이 판으로 재기동해도 되는지 잴 수 없어 거절한다. "+
+			"Postgres 원장의 판 재기와 자가 갱신은 이전 실행기 단계가 맡는다\n", t.Shown())
+		return 1
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	plan, err := store.ProbeMigration(ctx, *dbPath)
+	plan, err := store.ProbeMigration(ctx, raw)
 	if err != nil {
 		fmt.Fprintf(out, "selfcheck: DB 증분 계획을 읽지 못했다: %v\n", err)
 		return 1

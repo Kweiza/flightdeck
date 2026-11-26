@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -103,79 +104,119 @@ func TestBindRefusalReachesEveryCallShape(t *testing.T) {
 	}
 }
 
-func TestEngineOf(t *testing.T) {
-	for in, want := range map[string]engine{
-		"postgres://fd@db:5432/fd":      enginePG,
-		"postgresql://fd@db/fd":         enginePG,
-		"POSTGRES://fd@db/fd":           enginePG,
-		"/var/lib/flightdeck/fd.db":     engineSQLite,
-		"fd.db":                         engineSQLite,
-		"file:fd.db?mode=ro":            engineSQLite,
-		"./postgres://-looking-file.db": engineSQLite,
+// TestParseTargetClassifiesTrimmedButOpensFilesAsGiven 은 분류는 앞뒤 공백을 뺀 값으로 하고, 여는 값은 Postgres 면
+// 다듬은 것 · SQLite 면 받은 그대로인지 잰다. 공백 붙은 접속 URL 이 SQLite 로 갈리면 파일 API 에 닿아 원문이 오류에
+// 실리고, SQLite 이름의 공백을 빼면 다른 파일을 연다.
+func TestParseTargetClassifiesTrimmedButOpensFilesAsGiven(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		eng  engine
+		open string
+	}{
+		{"postgres://fd@db:5432/fd", enginePG, "postgres://fd@db:5432/fd"},
+		{"postgresql://fd@db/fd", enginePG, "postgresql://fd@db/fd"},
+		{"POSTGRES://fd@db/fd", enginePG, "postgres://fd@db/fd"},
+		{"  postgres://fd:pw@db/fd\n", enginePG, "postgres://fd:pw@db/fd"},
+		{"\tPostgreSQL://fd@db/fd ", enginePG, "postgresql://fd@db/fd"},
+		{"/var/lib/flightdeck/fd.db", engineSQLite, "/var/lib/flightdeck/fd.db"},
+		{"fd.db ", engineSQLite, "fd.db "},
+		{" fd.db", engineSQLite, " fd.db"},
+		{"file:fd.db?mode=ro", engineSQLite, "file:fd.db?mode=ro"},
+		{"./postgres://-looking-file.db", engineSQLite, "./postgres://-looking-file.db"},
 	} {
-		if got := engineOf(in); got != want {
-			t.Errorf("engineOf(%q) = %s, 기대 %s", in, got, want)
+		got := ParseTarget(c.in)
+		if got.eng != c.eng || got.open != c.open {
+			t.Errorf("ParseTarget(%q) = (%s, %q), 기대 (%s, %q)", c.in, got.eng, got.open, c.eng, c.open)
+		}
+		if got.Postgres() != (c.eng == enginePG) {
+			t.Errorf("ParseTarget(%q).Postgres() 가 엔진과 다르다", c.in)
 		}
 	}
 }
 
-// TestRedactDSNShowsOnlyAllowedFields 는 표시값이 허용한 필드(호스트 · 포트 · DB 이름 · 사용자)만 싣는지 잰다.
+// TestTargetShowsOnlyAllowedFields 는 표시값이 허용한 필드(호스트 · 포트 · DB 이름 · 사용자)만 싣는지 잰다.
 // 비밀을 골라 가리는 방식은 목록 밖 비밀(sslpassword)을 흘렸다 - 그래서 비밀 쪽이 아니라 허용 쪽을 단정한다.
-func TestRedactDSNShowsOnlyAllowedFields(t *testing.T) {
+//
+// ★ 경계가 모호한 입력(비밀번호가 숫자로 시작하고 인코딩 안 한 `?` · `/` · `@` 가 든 것)은 pgx 와 net/url 이 다르게
+// 읽는다. pgx 가 비밀번호로 읽는 숫자를 net/url 은 포트로 읽어, 맞대지 않으면 그 숫자가 표시값에 실린다.
+func TestTargetShowsOnlyAllowedFields(t *testing.T) {
 	for in, want := range map[string]string{
-		"postgres://fd:hunter2@db:5432/fd?sslmode=disable":                         "postgres://fd@db:5432/fd",
-		"postgres://fd@db:5432/fd?password=hunter2&sslpassword=hunter2&sslkey=k":   "postgres://fd@db:5432/fd",
-		"POSTGRESQL://fd:hunter2@db/fd":                                            "postgresql://fd@db/fd",
-		"postgres:///fd?host=/run/pg&port=5433&user=fd&password=hunter2&x=hunter2": "postgres:///fd?host=%2Frun%2Fpg&port=5433&user=fd",
-		"postgres://fd:hun/ter2@db/fd":                                             "postgres://<해석 못 한 접속 문자열>",
-		"postgres://fd:12/hunter2@db/fd":                                           "postgres://<해석 못 한 접속 문자열>",
-		"postgres://fd:%zz@db/fd":                                                  "postgres://<해석 못 한 접속 문자열>",
+		"postgres://fd:hunter2@db:5432/fd?sslmode=disable":                                 "postgres://fd@db:5432/fd",
+		"postgres://fd@db:5432/fd?password=hunter2&sslpassword=hunter2&application_name=x": "postgres://fd@db:5432/fd",
+		"POSTGRESQL://fd:hunter2@db/fd":                                                    "postgresql://fd@db/fd",
+		"  postgres://fd:hunter2@db/fd ":                                                   "postgres://fd@db/fd",
+		"postgres:///fd?host=/run/pg&port=5433&user=fd&password=hunter2&x=hunter2":         "postgres:///fd?host=%2Frun%2Fpg&port=5433&user=fd",
+		// pgx 가 못 읽는다(sslkey 만 있고 sslcert 가 없다) - 맞댈 수 없으니 세부를 안 싣는다.
+		"postgres://fd:hunter2@db/fd?sslkey=k": hiddenDSN,
+		// 같은 좌표가 두 자리에 있다 - 어느 쪽이 이기는지 맞대지 않는다.
+		"postgres://fd:hunter2@db/fd?host=other": hiddenDSN,
+		// 깨진 퍼센트 인코딩.
+		"postgres://fd:%zz@db/fd": hiddenDSN,
+		// `/`: 두 해석기 모두 호스트 fd · 포트 12 · DB 이름 `hunter2@db/fd` 로 읽는다(표시 조각의 `@`).
+		"postgres://fd:12/hunter2@db/fd": hiddenDSN,
+		"postgres://fd:hun/ter2@db/fd":   hiddenDSN,
+		// `?`: pgx 는 비밀번호 `8642097531?hunter2` · 호스트 db, net/url 은 호스트 fd · 포트 8642097531 이다.
+		"postgres://fd:8642097531?hunter2@db/fd": hiddenDSN,
+		// `@`: pgx 는 첫 `@` 에서(비밀번호 8642097531, 호스트 `hunter2@db`), net/url 은 마지막 `@` 에서 끊는다.
+		"postgres://fd:8642097531@hunter2@db/fd": hiddenDSN,
+		// 셋이 섞였다: pgx 는 `/` 를 먼저 만나 사용자 정보가 없고 질의 꼴이 깨져 못 읽는다.
+		"postgres://fd:8642097531?x/hun@ter2@db/fd": hiddenDSN,
+		// `@` 다음 `/`: 둘 다 DB 이름을 `hunter2@db/fd` 로 읽는다.
+		"postgres://fd:8642097531@x/hunter2@db/fd": hiddenDSN,
 	} {
-		got := redactDSN(in)
-		if strings.Contains(got, "hunter2") || strings.Contains(got, "ter2") {
-			t.Errorf("비밀이 샜다: %q → %q", in, got)
+		got := ParseTarget(in).Shown()
+		for _, secret := range []string{"hunter2", "ter2", "8642097531"} {
+			if strings.Contains(got, secret) {
+				t.Errorf("비밀이 샜다: %q → %q", in, got)
+			}
 		}
 		if got != want {
-			t.Errorf("redactDSN(%q) = %q, 기대 %q", in, got, want)
+			t.Errorf("ParseTarget(%q).Shown() = %q, 기대 %q", in, got, want)
+		}
+		if fmt.Sprint(ParseTarget(in)) != got {
+			t.Errorf("Target 을 그대로 찍으면 표시값이 아니다: %q", in)
 		}
 	}
 }
 
-// TestShowTargetSeparatesFilesFromURLs 는 파일 경로는 그대로, 접속 URL 은 가린 꼴로 내는지 잰다.
-func TestShowTargetSeparatesFilesFromURLs(t *testing.T) {
+// TestShowSeparatesFilesFromURLs 는 파일 경로는 그대로, 접속 URL 은 가린 꼴로 내는지 잰다.
+func TestShowSeparatesFilesFromURLs(t *testing.T) {
 	for in, want := range map[string]string{
 		"/data/fd.db": "/data/fd.db",
+		"fd.db ":      "fd.db ",
 		"postgres://fd:hunter2@db:5432/fd?sslpassword=hunter2": "postgres://fd@db:5432/fd",
 	} {
-		if got := ShowTarget(in); got != want {
-			t.Errorf("ShowTarget(%q) = %q, 기대 %q", in, got, want)
+		if got := ParseTarget(in).Shown(); got != want {
+			t.Errorf("ParseTarget(%q).Shown() = %q, 기대 %q", in, got, want)
 		}
-	}
-	if !IsPostgresURL("Postgres://fd@db/fd") || IsPostgresURL("/data/fd.db") {
-		t.Error("IsPostgresURL 이 engineOf 와 다르게 가른다")
 	}
 }
 
 // TestSQLiteOnlyPathsRefusePostgresURLs 는 SQLite 파일만 다루는 길이 접속 URL 을 파일 API 에 넘기지 않고
-// 가린 표시값으로 거절하는지 잰다. 넘기면 「파일이 없다」 오류에 원문(비밀번호)이 실린다.
+// 가린 표시값으로 거절하는지 잰다. 넘기면 「파일이 없다」 오류에 원문(비밀번호)이 실린다. 앞에 공백이 붙은 URL 도
+// 같은 길이어야 한다(분류는 다듬은 값으로 한다).
 func TestSQLiteOnlyPathsRefusePostgresURLs(t *testing.T) {
-	const dsn = "postgres://fd:hunter2@127.0.0.1:1/fd?sslpassword=hunter2"
-	ctx := context.Background()
-	_, probeErr := ProbeMigration(ctx, dsn)
-	_, rbErr := Rollback(ctx, dsn, nil)
-	_, ledgerErr := OpenLedger(ctx, dsn, nil)
-	for name, err := range map[string]error{
-		"ProbeMigration": probeErr,
-		"MigrateTo":      MigrateTo(ctx, dsn, SchemaVersion, nil),
-		"Rollback":       rbErr,
-		"OpenLedger":     ledgerErr,
+	for _, dsn := range []string{
+		"postgres://fd:hunter2@127.0.0.1:1/fd?sslpassword=hunter2",
+		" \tpostgres://fd:hunter2@127.0.0.1:1/fd?sslpassword=hunter2",
 	} {
-		if err == nil || !strings.Contains(err.Error(), "SQLite 파일만") {
-			t.Errorf("%s 가 접속 URL 을 SQLite 거절로 안 막았다: %v", name, err)
-			continue
-		}
-		if strings.Contains(err.Error(), "hunter2") {
-			t.Errorf("%s 의 거절에 비밀이 샜다: %v", name, err)
+		ctx := context.Background()
+		_, probeErr := ProbeMigration(ctx, dsn)
+		_, rbErr := Rollback(ctx, dsn, nil)
+		_, ledgerErr := OpenLedger(ctx, dsn, nil)
+		for name, err := range map[string]error{
+			"ProbeMigration": probeErr,
+			"MigrateTo":      MigrateTo(ctx, dsn, SchemaVersion, nil),
+			"Rollback":       rbErr,
+			"OpenLedger":     ledgerErr,
+		} {
+			if err == nil || !strings.Contains(err.Error(), "SQLite 파일만") {
+				t.Errorf("%s 가 접속 URL(%q)을 SQLite 거절로 안 막았다: %v", name, dsn[:3], err)
+				continue
+			}
+			if strings.Contains(err.Error(), "hunter2") {
+				t.Errorf("%s 의 거절에 비밀이 샜다: %v", name, err)
+			}
 		}
 	}
 }
@@ -511,6 +552,9 @@ func looksLikeWrite(q string) bool {
 //
 // ★ 훑는 곳은 둘이다: Go 소스의 문자열 조각과 store 의 .sql 파일(SQLite 스키마 · 증분, Postgres 기준선 · 준비).
 // .sql 은 인자 없이 돌므로 따옴표 밖 `?` 는 연산자 꼴이든 아니든 하나도 있으면 안 된다(bindDollar 의 ★ 인자 수).
+//
+// ★ 한계: 문자열 조각을 하나씩 보므로 실행 중에 이어 붙여 만드는 SQL(`"payload ?" + col` 처럼 연산자와 피연산자가
+// 다른 조각에 있는 것)은 못 본다.
 func TestStoreSQLHasNoJSONBQuestionOperators(t *testing.T) {
 	src := parseStoreSource(t)
 	marks := 0

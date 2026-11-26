@@ -685,8 +685,16 @@ func (w *selfWatcher) step(ctx context.Context, drain func()) Action {
 }
 
 // verifyWithSelfcheck 는 새 바이너리를 자식으로 한 번 돌린다.
+//
+// ★ 검사할 원장은 argv 가 아니라 환경(FD_DB)으로 넘긴다. 원장 자리가 접속 URL 이면 비밀번호를 품고, 프로세스
+// 인자는 같은 기기의 다른 사용자도 읽는다(ps). 부모 환경에 FD_DB 가 따로 있어도 뒤에 붙인 값이 이긴다
+// (exec.Cmd.Env 는 겹친 키의 마지막 값을 쓴다). 자식의 출력은 표시값만 싣는다(runSelfcheck) - 그 출력이 아래
+// 오류 본문으로 감시기의 로그 · 화면에 간다.
+//
+// ★ Postgres 원장이면 자식이 「판 재기는 아직 없다」로 거절해 자가 갱신이 여기서 선다. 받아들인 한계다.
 func verifyWithSelfcheck(ctx context.Context, exe, db string) (string, error) {
-	cmd := exec.CommandContext(ctx, exe, "selfcheck", "--db", db)
+	cmd := exec.CommandContext(ctx, exe, "selfcheck")
+	cmd.Env = append(os.Environ(), dbEnv+"="+db)
 	out, err := cmd.CombinedOutput()
 	line := firstOutputLine(string(out))
 	if err != nil {

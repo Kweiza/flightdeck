@@ -75,7 +75,7 @@ func TestJudgeBusyFamily(t *testing.T) {
 		inReason  string
 		notReason string
 	}{
-		{"busy_timeout 초과", sqlite3.SQLITE_BUSY, FaultLockTimeout, "busy_timeout 을 넘었다", ""},
+		{"잠금 못 얻음", sqlite3.SQLITE_BUSY, FaultLockTimeout, "교착 회피 즉시 반환", "busy_timeout 을 넘었다"},
 		{"낡은 스냅숏", sqlite3.SQLITE_BUSY_SNAPSHOT, FaultSerialization, "BUSY_SNAPSHOT", "넘었다"},
 		{"복구 중", sqlite3.SQLITE_BUSY_RECOVERY, FaultLockTimeout, "단정하지 않는다", "넘었다"},
 	} {

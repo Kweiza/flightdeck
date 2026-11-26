@@ -3,15 +3,20 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -42,43 +47,67 @@ func (e engine) String() string {
 	return "sqlite"
 }
 
-// engineOf 는 열기 인자로 엔진을 가린다. 순수 함수다.
-// postgres:// · postgresql:// 로 시작하면(스킴의 대소문자는 안 가린다) Postgres 접속 URL 이고, 아니면 SQLite 파일 경로다.
-func engineOf(target string) engine {
-	t := strings.ToLower(target)
-	if strings.HasPrefix(t, "postgres://") || strings.HasPrefix(t, "postgresql://") {
-		return enginePG
-	}
-	return engineSQLite
-}
-
-// IsPostgresURL 은 열기 인자가 Postgres 접속 URL 인가다. 순수 함수다.
+// Target 은 원장 열기 인자 하나를 가른 것이다. ParseTarget 만 만든다.
 //
-// ★ 부르는 쪽(cmd)은 이것으로 파일 경로와 접속 URL 을 **정규화 전에** 가른다. 접속 URL 을 파일 API 에
-// 넘기면 둘 다 망가진다: filepath.Clean 은 `//` 를 접어 `postgres:/…` 를 만들어 SQLite 파일 이름으로 보내고,
-// filepath.Dir · MkdirAll 은 사용자 정보(비밀번호)가 든 디렉토리를 현재 폴더에 만든다.
-func IsPostgresURL(target string) bool { return engineOf(target) == enginePG }
-
-// ShowTarget 은 열기 인자를 로그 · 출력에 실을 꼴이다. 파일 경로는 그대로, 접속 URL 은 redactDSN 이다. 순수 함수다.
-func ShowTarget(target string) string {
-	if engineOf(target) == enginePG {
-		return redactDSN(target)
-	}
-	return target
+// ★ 원칙은 하나다: **열기 인자의 원문은 열기 경계(OpenWithLogger · openPG)에서만 쓴다.** 밖으로 나가는 문자열
+// (로그 · 오류 본문 · 명령 출력 · 자식 argv)에는 Shown 만 싣는다. Postgres 접속 URL 의 원문은 비밀번호를 품는다.
+// 분류와 표시를 정하는 곳은 이 타입 하나다 - cmd(serve · migrate · selfcheck · export) · service(doctor)가 따로
+// 가르거나 가리지 않는다. 자리마다 따로 가리면 한 자리가 빠지는 순간 샌다.
+type Target struct {
+	eng engine
+	// open 은 열기 경계만 읽는다. Postgres 면 앞뒤 공백을 빼고 스킴을 소문자로 맞춘 값, SQLite 면 받은 값 그대로다.
+	open string
 }
+
+// ParseTarget 은 열기 인자를 가른다. 순수 함수다.
+//
+// postgres:// · postgresql:// 로 시작하면(스킴의 대소문자는 안 가린다) Postgres 접속 URL 이고, 아니면 SQLite 파일 경로다.
+//
+// ★ 분류는 앞뒤 공백을 뺀 값으로 한다. 공백이 앞에 붙은 접속 URL 을 SQLite 로 가르면 파일 API(os.Stat · MkdirAll ·
+// sql.Open)에 닿아 「파일이 없다」 오류에 원문이 실린다. 부르는 쪽(cmd)도 이것으로 **정규화 전에** 가른다 -
+// filepath.Clean 은 `//` 를 접어 `postgres:/…` 를 만들고, filepath.Dir · MkdirAll 은 비밀번호가 든 디렉토리를 만든다.
+//
+// ★ 그러나 SQLite 파일 경로는 **받은 값 그대로** 연다. 끝에 공백이 든 이름(`fd.db `)도 파일 이름이고, 다듬으면
+// 두 파일이 다 있을 때 오류 없이 다른 원장을 연다.
+func ParseTarget(raw string) Target {
+	if t := strings.TrimSpace(raw); hasPGScheme(t) {
+		return Target{eng: enginePG, open: pgURL(t)}
+	}
+	return Target{eng: engineSQLite, open: raw}
+}
+
+func hasPGScheme(s string) bool {
+	l := strings.ToLower(s)
+	return strings.HasPrefix(l, "postgres://") || strings.HasPrefix(l, "postgresql://")
+}
+
+// Postgres 는 접속 URL 인가다.
+func (t Target) Postgres() bool { return t.eng == enginePG }
+
+// Shown 은 로그 · 오류 · 출력에 실을 꼴이다. 파일 경로는 그대로, 접속 URL 은 redactDSN 이다.
+func (t Target) Shown() string {
+	if t.eng == enginePG {
+		return redactDSN(t.open)
+	}
+	return t.open
+}
+
+// String 은 Shown 이다. %v · %s 로 찍혀도 원문이 안 나간다.
+func (t Target) String() string { return t.Shown() }
 
 // sqliteOnly 는 SQLite 파일만 다루는 길(판 재기 · 판 적용 · 되돌리기 · 원장 열기)이 Postgres 접속 URL 을
-// 받았을 때의 거절이다. nil 이면 파일 경로다.
+// 받았을 때의 거절이다. nil 이면 파일 경로이고, 부르는 쪽은 받은 값을 그대로 파일 경로로 쓴다(ParseTarget 의 ★).
 //
 // ★ 그 길들은 인자를 파일 API(os.Stat · filepath.Glob · sql.Open("sqlite"))에 넘기고 오류에 원문을 싣는다.
 // 접속 URL 이 거기 닿으면 엉뚱한 「파일이 없다」로 죽으면서 비밀번호를 오류에 남긴다. 들어오는 자리에서 가린
 // 표시값으로 거절한다.
 func sqliteOnly(target, what string) error {
-	if engineOf(target) != enginePG {
+	t := ParseTarget(target)
+	if !t.Postgres() {
 		return nil
 	}
 	return fmt.Errorf("%s 는 아직 SQLite 파일만 다룬다(%s) - Postgres 원장의 판 적용 · 되돌리기는 이전 실행기가 맡는다",
-		what, redactDSN(target))
+		what, t.Shown())
 }
 
 // lockTimeout 은 잠금 하나를 기다리는 상한이다. 두 엔진이 같은 값을 쓴다 -
@@ -109,18 +138,18 @@ const idleInTxTimeout = 6 * lockTimeout
 // DSN 에 있던 것과 같은 자리이고, 쓰기 트랜잭션마다 왕복 하나를 던다. 걸렸는지는 되읽어 잰다
 // (verifyPragmas 와 같은 까닭: 적었다는 것은 걸렸다의 근거가 못 된다 - 사이의 연결 중개기가 버릴 수 있다).
 //
-// ★ 해석 실패의 드라이버 문구는 싣지 않는다. 그 문구는 접속 문자열 원문을 품고, 원문의 비밀번호 가리기는
-// 드라이버 스스로 「깨진 문자열에서는 최선일 뿐」이라고 적어 둔 자리다. 가린 표시값(redactDSN)만 싣는다.
-func openPG(dsn string, log *slog.Logger, wait time.Duration) (*Store, error) {
+// ★ 여기가 접속 문자열 원문을 쓰는 유일한 자리다(Target 의 ★). 여기서 나가는 오류는 표시값과 종류 ·
+// SQLSTATE 만 싣는다 - 해석 실패의 드라이버 문구는 원문을 품고(드라이버 스스로 「깨진 문자열에서는 가리기가
+// 최선일 뿐」이라고 적어 둔 자리다), 접속 실패의 문구는 원문의 조각을 다시 싣는다(pgFault).
+func openPG(t Target, log *slog.Logger, wait time.Duration) (*Store, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	dsn = pgURL(dsn)
-	shown := redactDSN(dsn)
-	cfg, err := pgx.ParseConfig(dsn)
+	shown := t.Shown()
+	cfg, err := pgx.ParseConfig(t.open)
 	if err != nil {
 		return nil, fmt.Errorf("Postgres 접속 문자열을 해석하지 못했다(%s) - 드라이버 문구는 원문을 품어 싣지 않는다. "+
-			"postgres://<사용자>@<호스트>:<포트>/<DB> 꼴인지 확인하라", shown)
+			"postgres://<사용자>@<호스트>:<포트>/<DB> 꼴인지, 비밀번호의 / ? @ 를 퍼센트 인코딩했는지 확인하라", shown)
 	}
 	params := pgSessionParams(wait)
 	for _, p := range params {
@@ -134,14 +163,15 @@ func openPG(dsn string, log *slog.Logger, wait time.Duration) (*Store, error) {
 	ctx := context.Background()
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("Postgres 접속 실패(%s): %w", shown, err)
+		return nil, fmt.Errorf("Postgres 접속 실패(%s): %s - 드라이버 문구는 접속 문자열의 조각을 품어 싣지 않는다. "+
+			"비밀번호에 / ? @ 가 있으면 퍼센트 인코딩했는지 확인하라", shown, pgFault(err))
 	}
 	s := &Store{db: &conn{raw: db, eng: enginePG}, path: shown, log: log}
 	for _, p := range params {
 		var got string
 		if err := s.db.QueryRowContext(ctx, `SELECT setting FROM pg_settings WHERE name = ?`, p.name).Scan(&got); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("%s 되읽기 실패(%s): %w", p.name, shown, err)
+			return nil, fmt.Errorf("%s 되읽기 실패(%s): %s", p.name, shown, pgFault(err))
 		}
 		if got != p.ms {
 			db.Close()
@@ -150,6 +180,39 @@ func openPG(dsn string, log *slog.Logger, wait time.Duration) (*Store, error) {
 		}
 	}
 	return s, nil
+}
+
+// pgFault 는 열기 경계에서 난 드라이버 오류를 종류와 SQLSTATE 만으로 옮긴다. 순수 함수다.
+//
+// ★ 드라이버 문구는 싣지 않는다. 접속 단계 오류(pgconn.ConnectError)는 본문에 `user=… database=…` 와 다이얼
+// 주소를 넣고, 서버 거절(PgError)의 문구도 DB · 사용자 이름을 인용한다. 경계가 모호한 접속 문자열에서는 그 자리에
+// 비밀번호 조각이 들어간다 - `postgres://fd:12/hunter2@db/fd` 는 pgx 에게 호스트 fd · 포트 12 · DB 이름
+// `hunter2@db/fd` 다. 표시값을 통째로 가려도 오류 본문이 그 조각을 다시 싣는다.
+//
+// ★ 열기가 성공한 뒤의 업무 오류는 이것을 안 지난다. 열렸다는 것은 그 좌표(사용자 · DB 이름 · 주소)로 실제 서버에
+// 붙었다는 뜻이라, 뒤에 다시 붙다 난 오류가 그 이름을 실어도 비밀번호 조각이 아니다.
+func pgFault(err error) string {
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) {
+		return "서버가 거절했다(SQLSTATE " + pe.Code + ")"
+	}
+	var dns *net.DNSError
+	var op *net.OpError
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
+		return "시간 초과"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "연결 거부(그 주소에서 듣는 서버가 없다)"
+	case errors.As(err, &dns):
+		return "호스트 이름을 풀지 못했다"
+	case errors.As(err, &op):
+		return "네트워크 오류(" + op.Op + ")"
+	}
+	inner := err
+	for u := errors.Unwrap(inner); u != nil; u = errors.Unwrap(inner) {
+		inner = u
+	}
+	return fmt.Sprintf("분류하지 못한 드라이버 오류(%T)", inner)
 }
 
 // pgParam 은 연결 시작 인자 하나다. ms 는 밀리초 정수 문자열이다(pg_settings 의 setting 이 같은 단위로 되읽힌다).
@@ -166,7 +229,7 @@ func pgSessionParams(wait time.Duration) []pgParam {
 
 // pgURL 은 접속 URL 의 스킴만 소문자로 맞춘다. 순수 함수다.
 //
-// ★ engineOf 는 스킴의 대소문자를 안 가리는데 pgx 는 소문자 접두만 URL 로 읽는다(아니면 키=값 꼴로 읽다가
+// ★ ParseTarget 은 스킴의 대소문자를 안 가리는데 pgx 는 소문자 접두만 URL 로 읽는다(아니면 키=값 꼴로 읽다가
 // 실패한다). 판별과 열기가 다른 규칙을 쓰면 「Postgres 로 갈랐는데 못 연다」가 된다. 스킴 뒤(사용자 · 비밀번호 ·
 // DB 이름)는 대소문자가 뜻이라 안 건드린다.
 func pgURL(dsn string) string {
@@ -184,7 +247,8 @@ func pgURL(dsn string) string {
 func (s *Store) checkPGVersion(ctx context.Context) error {
 	var v sql.NullInt64
 	if err := s.db.QueryRowContext(ctx, `SELECT max(version) FROM schema_version`).Scan(&v); err != nil {
-		return fmt.Errorf("Postgres 원장의 판을 읽지 못했다(%s): %w - 기준선이 안 깔린 DB 다", s.path, err)
+		// 열기 경계 안이다(OpenWithLogger 가 openPG 바로 뒤에 부른다) - 드라이버 문구 대신 pgFault 를 싣는다.
+		return fmt.Errorf("Postgres 원장의 판을 읽지 못했다(%s): %s - 42P01 이면 기준선이 안 깔린 DB 다", s.path, pgFault(err))
 	}
 	if !v.Valid {
 		return fmt.Errorf("Postgres 원장에 판 행이 없다(%s) - 기준선을 깐 뒤 판(%d)을 적는 것은 이전 실행기의 몫이다",
@@ -197,19 +261,44 @@ func (s *Store) checkPGVersion(ctx context.Context) error {
 	return nil
 }
 
-// redactDSN 은 로그 · 오류에 실을 접속 URL 이다. 순수 함수다.
+// hiddenDSN 은 세부를 실을 수 없는 접속 URL 의 표시값이다. 엔진 말고는 아무것도 안 싣는다.
+const hiddenDSN = "postgres://<세부 가림: 모호하거나 깨진 접속 문자열>"
+
+// redactDSN 은 로그 · 오류에 실을 접속 URL 이다. dsn 은 ParseTarget 이 다듬은 값이다(Target.Shown 만 부른다).
 //
 // ★ 가리지 않고 **허용한 것만 조립한다**: 호스트 · 포트 · DB 이름 · 사용자(사용자 정보 자리와, 같은 뜻의 질의 인자
 // host · port · dbname · user). 비밀을 하나씩 골라 가리면 목록에 없는 비밀(sslpassword, 앞으로 생길 인자)이 그대로
 // 샌다 - 앞 판이 password 만 가려 sslpassword 를 흘렸다. 그 밖의 질의 인자(sslmode 같은 것)도 싣지 않는다.
 //
-// ★ 표시 조각에 `@` 가 있으면 사용자 정보를 잘못 가른 것이다(비밀번호의 `/` 가 경계를 앞당긴 깨진 URL).
-// 그 조각에 비밀번호가 섞여 있을 수 있으니 통째로 가린다.
+// ★ **두 해석기가 같은 좌표를 읽을 때만** 세부를 싣는다. 표시값은 net/url 로 조립하지만 실제로 붙는 것은 pgx 이고,
+// 둘은 사용자 정보의 끝을 다르게 읽는다: pgx(libpq 와 같다)는 `/` 앞의 첫 `@` 까지를, net/url 은 `/ ? #` 앞의
+// 마지막 `@` 까지를 사용자 정보로 본다. 그래서 인코딩 안 한 `?` 가 든 비밀번호(`fd:123?x@db/fd`)는 pgx 에게
+// 비밀번호 `123?x` 이고 net/url 에게 호스트 fd · 포트 123 이다 - 비밀번호 조각이 포트 자리로 표시값에 실린다.
+// 표시값에 싣는 좌표가 하나라도 pgx 와 어긋나거나 둘 중 하나가 못 읽으면 세부 없이(hiddenDSN) 낸다. 비운 좌표는
+// 맞대지 않는다 - pgx 가 환경 · 기본값으로 채우는 자리이고, 싣지 않으니 샐 것도 없다.
+//
+// ★ 두 해석기가 같게 읽어도 표시 조각에 `@` 가 있으면 비밀번호의 `/` 가 경계를 앞당긴 것이다
+// (`fd:12/hunter2@db/fd` 는 둘 다 DB 이름을 `hunter2@db/fd` 로 읽는다). 그것도 세부 없이 낸다.
+//
+// ★ 순수 함수가 아니다. pgx 해석은 PG* 환경 변수와 ~/.pgpass 를 읽는다. 그 값은 맞대기에만 쓰고 싣지 않는다.
 func redactDSN(dsn string) string {
-	const unparsed = "postgres://<해석 못 한 접속 문자열>"
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return unparsed
+		return hiddenDSN
+	}
+	cfg, err := pgconn.ParseConfig(dsn)
+	if err != nil {
+		return hiddenDSN
+	}
+	shown, ok := urlCoords(u)
+	if !ok {
+		return hiddenDSN
+	}
+	byPGX := pgCoords{user: cfg.User, host: cfg.Host, port: strconv.Itoa(int(cfg.Port)), db: cfg.Database}
+	for _, c := range [][2]string{{shown.user, byPGX.user}, {shown.host, byPGX.host}, {shown.port, byPGX.port}, {shown.db, byPGX.db}} {
+		if c[0] != "" && c[0] != c[1] {
+			return hiddenDSN
+		}
 	}
 	out := url.URL{Scheme: strings.ToLower(u.Scheme), Host: u.Host, Path: u.Path}
 	if u.User != nil {
@@ -222,10 +311,42 @@ func redactDSN(dsn string) string {
 		}
 	}
 	out.RawQuery = keep.Encode()
-	if strings.Contains(out.Host+out.Path+out.RawQuery, "@") {
-		return unparsed
+	if strings.Contains(out.User.String()+out.Host+out.Path+out.RawQuery, "@") {
+		return hiddenDSN
 	}
 	return out.String()
+}
+
+// pgCoords 는 접속 좌표 넷이다(비면 그 해석기가 그 자리를 안 읽었다).
+type pgCoords struct{ user, host, port, db string }
+
+// urlCoords 는 net/url 이 읽어 표시값에 싣는 좌표다. 사용자 정보 · 호스트 · 경로 자리와 같은 뜻의 질의 인자를 합친다.
+// 같은 좌표가 두 자리에 다 있거나 질의 인자가 겹치면 ok=false 다 - 어느 쪽이 이기는지를 두 해석기가 같게 정한다고
+// 기대할 근거가 없다.
+func urlCoords(u *url.URL) (pgCoords, bool) {
+	q := u.Query()
+	ok := true
+	pick := func(inPlace, key string) string {
+		vs, inQuery := q[key]
+		if !inQuery {
+			return inPlace
+		}
+		if inPlace != "" || len(vs) != 1 {
+			ok = false
+		}
+		return vs[0]
+	}
+	var user string
+	if u.User != nil {
+		user = u.User.Username()
+	}
+	c := pgCoords{
+		user: pick(user, "user"),
+		host: pick(u.Hostname(), "host"),
+		port: pick(u.Port(), "port"),
+		db:   pick(strings.TrimPrefix(u.Path, "/"), "dbname"),
+	}
+	return c, ok
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
