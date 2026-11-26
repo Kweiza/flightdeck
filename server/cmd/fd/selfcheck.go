@@ -38,13 +38,12 @@ const dbEnv = "FD_DB"
 // WAL 로 열고 있다). 서버가 안 돌고 있는데 사람이 이 명령을 부르면 그 축은 관측되지
 // 않은 채로 남고, 실패는 실제 `fd serve` 기동에서 드러난다. 안 잰 축을 잰 척하지 않는다.
 //
-// ★ 원장 자리는 store.ParseTarget 으로 가른다(serve · export 와 같은 함수). Postgres 원장이면 판 재기가 아직
-// 없어 거절하고, 출력에는 표시값만 싣는다 - 이 출력은 감시기의 거절 사유로 로그 · 화면에 그대로 간다.
-// 그래서 Postgres 원장의 서버는 지금 자가 갱신이 선다. 받아들인 한계다(Postgres 판 재기는 이전 실행기 단계의 몫).
-// SQLite 파일 경로는 받은 값 그대로 잰다(이름의 공백도 이름이다).
+// ★ 원장 자리는 store 가 가른다(ParseTarget, serve · export 와 같은 함수). Postgres 원장이면 붙어서 기동과 같은 판
+// 재기(판 + DB 로케일)를 하고, 출력에는 표시값과 store 가 걸러 낸 사유만 싣는다 - 이 출력은 감시기의 거절 사유로
+// 로그 · 화면에 그대로 간다. SQLite 파일 경로는 받은 값 그대로 잰다(이름의 공백도 이름이다).
 func runSelfcheck(args []string, env func(string) (string, bool), out io.Writer) int {
 	fs := newFlagSet("selfcheck")
-	dbPath := fs.String("db", "", "검사할 SQLite 파일 경로(비면 "+dbEnv+")")
+	dbPath := fs.String("db", "", "검사할 원장: SQLite 파일 경로 또는 Postgres 접속 URL(비면 "+dbEnv+")")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -56,12 +55,6 @@ func runSelfcheck(args []string, env func(string) (string, bool), out io.Writer)
 		fmt.Fprintln(out, "selfcheck: --db 도 "+dbEnv+" 도 비었다 - 무엇을 검사할지가 없다")
 		return 2
 	}
-	if t := store.ParseTarget(raw); t.Postgres() {
-		fmt.Fprintf(out, "selfcheck: Postgres 원장(%s)의 판 재기는 아직 없다 - 이 판으로 재기동해도 되는지 잴 수 없어 거절한다. "+
-			"Postgres 원장의 판 재기와 자가 갱신은 이전 실행기 단계가 맡는다\n", t.Shown())
-		return 1
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

@@ -539,8 +539,8 @@ func TestHealthAndDoctorNameWhatWasNotObserved(t *testing.T) {
 	openSession(t, s, "p", repo, repo, "cc-1", "")
 
 	h := s.Health(ctx())
-	if !h.OK || !h.DBOK {
-		t.Fatalf("DB 가 살아 있는데 헬스가 %+v 다", h)
+	if !h.OK || !h.DBOK || !h.DBLocaleOK || h.DBLocaleError != "" {
+		t.Fatalf("DB 가 살아 있는데 헬스가 %+v 다(SQLite 는 로케일 관문을 늘 지난다)", h)
 	}
 	if h.APIVersion == "" {
 		t.Fatalf("api_version 이 비었다 — 클라이언트·서버 스큐를 알릴 축이다")

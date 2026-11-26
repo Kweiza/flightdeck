@@ -1763,8 +1763,8 @@ fail-open 기록은 없다. 압력이 실물로 관측된 적이 없고, 근거 
 | 처방 | 상태 | 실제 |
 |---|---|---|
 | 별도 one-shot 컨테이너로 분리 | **있음**(2026-08-23) | `compose.yaml` 의 `migrate` 서비스가 `fd migrate` 를 돌고, 서버는 `condition: service_completed_successfully` 로 그것이 **성공으로 끝난 뒤에만** 뜬다. `store.Open` 은 어떤 적용도 하지 않고 스키마가 안 맞으면 거절한다 |
-| 기동 전 DB 백업 | 있음 | `PlanMigration` 이 백업 여부를 판정하고 `VACUUM INTO` 로 뜬다(`<db>.bak-<UTC>`) |
-| 롤백 명령 | **있음**(2026-08-23) | `fd migrate --rollback` 이 `<db>.bak-*` 중 최신으로 되돌린다 — 원본을 갈고 `-wal`·`-shm` 을 지우는 절차까지 한 명령이다 |
+| 기동 전 DB 백업 | 있음 | `PlanMigration` 이 백업 여부를 판정하고 `VACUUM INTO` 로 뜬다(`<db>.bak-<UTC>`). Postgres 원장은 같은 자리에서 `pg_dump -Fc` 를 덤프 자리(`--backup-dir` · `FD_BACKUP_DIR` · `/backups`)에 `pre-<판>-<UTC>.dump` 로 뜨고, 덤프 자리가 없으면 판을 올리지 않는다 |
+| 롤백 명령 | **있음**(2026-08-23) | `fd migrate --rollback` 이 `<db>.bak-*` 중 최신으로 되돌린다 — 원본을 갈고 `-wal`·`-shm` 을 지우는 절차까지 한 명령이다. Postgres 원장은 살아 있는 DB 를 덮지 않는다: 최신 덤프를 고르고 머리를 잰 뒤, 망가진 DB 의 이름을 바꾸고 `pg_restore --create` 로 원래 이름의 새 DB 에 복원하는 절차를 낸다(실패한 증분은 트랜잭션째 되감기므로 덤프는 커밋까지 간 판올림을 물릴 때 쓴다) |
 
 **적용을 기동에 남겼던 판단과 그것이 뒤집힌 경위.** 2026-08-03 부터 2026-08-22 까지 이 절은
 적용을 `store.Open()` 안에 남기기로 했고, 근거는 한 문장이었다 — *"적용을 떼면 **모든 명령**

@@ -46,7 +46,7 @@ func TestSchemaVersionMatchesTheMigrationList(t *testing.T) {
 		t.Fatal("전제가 깨졌다 — 증분 목록이 0건이다. 볼 것이 없으면 지킬 것도 없다")
 	}
 
-	// 사다리에 빈칸이 없어야 한다. `applyUpgrades` 는 현재 판 다음 것부터 순서대로 얹는데,
+	// 사다리에 빈칸이 없어야 한다. 이전 실행기(UpgradeSteps · applySteps)는 현재 판 다음 것부터 순서대로 얹는데,
 	// 번호가 뛰면 그 위는 영영 안 얹히고 아래는 두 번 얹힐 수 있다.
 	want := BaseSchemaVersion + 1
 	for i, m := range migrations {

@@ -90,6 +90,23 @@ func New(tb testing.TB) string {
 	return fd.clone(tb)
 }
 
+// NewBare 는 이 시험만의 **빈** DB 를 만들어 그 접속 URL 을 돌려준다. 원판을 복제하지 않는다 - 준비도 기준선도 없다.
+// 이전 실행기가 빈 DB 에 기준선을 까는 길을 재는 시험이 쓴다. 시험이 끝나면 지운다.
+//
+// with 는 CREATE DATABASE 뒤에 붙는 선택이다(예: `LOCALE_PROVIDER libc LOCALE 'C'` - 로케일 관문이 거절할 DB). 비면
+// 클러스터의 로케일(initdb)을 받는다. template0 에서 만든다: 로케일을 바꾸려면 template0 이어야 하고, template1 은 누가
+// 무엇을 넣어 뒀을 수 있다. 시험 코드의 상수만 넣어라 - 그대로 문장에 붙는다.
+func NewBare(tb testing.TB, with string) string {
+	tb.Helper()
+	base, admin, err := server()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+	return create(ctx, tb, base, admin, "TEMPLATE template0 "+with)
+}
+
 // CutConnections 는 New 가 준 DB 가 새 연결을 받지 않게 하고(ALLOW_CONNECTIONS false) 지금 붙은 연결을 모두 끊는다.
 // 서버가 다시 떴거나 연결이 끊긴 뒤 연결 풀의 재접속이 실패하는 자리를 흉내 낸다. 끊긴 연결이 다 빠질 때까지 기다린다 -
 // 안 기다리면 아직 안 죽은 연결이 다음 질의를 받아 재접속 길을 안 탄다. 지우는 것은 New 의 정리가 한다
@@ -170,9 +187,24 @@ func (tp *template) clone(tb testing.TB) string {
 	if err != nil {
 		tb.Fatalf("시험 원판 준비 실패: %v", err)
 	}
+	dsn := create(ctx, tb, base, admin, "TEMPLATE "+ident(tmpl))
+	if tp.everyDB != "" {
+		if err := atDB(ctx, dsn, func(db *sql.DB) error {
+			_, err := db.ExecContext(ctx, tp.everyDB)
+			return err
+		}); err != nil {
+			tb.Fatalf("시험 DB 다시 준비 실패(%s): %v", dsn, err)
+		}
+	}
+	return dsn
+}
+
+// create 는 시험 DB 하나를 `CREATE DATABASE t_<난수> <with>` 로 만들고, 시험이 끝나면 지운다. 그 URL 을 낸다.
+func create(ctx context.Context, tb testing.TB, base *url.URL, admin *sql.DB, with string) string {
+	tb.Helper()
 	name := "t_" + strings.ToLower(rand.Text())
-	if _, err := admin.ExecContext(ctx, "CREATE DATABASE "+ident(name)+" TEMPLATE "+ident(tmpl)); err != nil {
-		tb.Fatalf("시험 DB 만들기 실패(%s ← %s): %v", name, tmpl, err)
+	if _, err := admin.ExecContext(ctx, "CREATE DATABASE "+ident(name)+" "+with); err != nil {
+		tb.Fatalf("시험 DB 만들기 실패(%s, %s): %v", name, with, err)
 	}
 	tb.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
@@ -182,14 +214,6 @@ func (tp *template) clone(tb testing.TB) string {
 			tb.Errorf("시험 DB 지우기 실패(%s): %v", name, err)
 		}
 	})
-	if tp.everyDB != "" {
-		if err := atDB(ctx, dbURL(base, name), func(db *sql.DB) error {
-			_, err := db.ExecContext(ctx, tp.everyDB)
-			return err
-		}); err != nil {
-			tb.Fatalf("시험 DB 다시 준비 실패(%s): %v", name, err)
-		}
-	}
 	return dbURL(base, name)
 }
 

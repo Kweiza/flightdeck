@@ -25,7 +25,7 @@ import (
 // "fail-open" 은 큐 잠금 축이지 DB 스키마 축이 아니다.
 //
 // ★ 왜 업그레이드만 떼는 것으로는 부족한가. MigrateApply(빈 DB 신규 설치) 갈래도
-// applyUpgrades 를 부른다("신규 DB 도 증분을 그대로 탄다" — store.go). 그래서 나쁜 증분은
+// 증분 적용(applySteps)을 탄다("신규 DB 도 증분을 그대로 탄다" — store.go). 그래서 나쁜 증분은
 // 신규 설치에서도 크래시루프를 낸다. 그리고 neverExempt 가 DROP TABLE 을 여는 근거는
 // "적용이 기동 밖에 있다" 인데, 신규 설치에서 여전히 안이면 DROP TABLE 증분이 기동 경로에서
 // 돌아 관문이 막으려던 상황이 그대로 남는다.
@@ -78,7 +78,7 @@ func TestOpenRefusesADatabaseThatNeedsUpgrade(t *testing.T) {
 
 // 빈 DB(신규 설치)도 Open 이 만들지 않는다.
 //
-// ★ 이 갈래를 따로 두는 이유: MigrateApply 도 applyUpgrades 를 타므로 여기를 남기면
+// ★ 이 갈래를 따로 두는 이유: MigrateApply 도 증분 적용(applySteps)을 타므로 여기를 남기면
 // 나쁜 증분의 크래시루프 경로가 절반 남는다. 그리고 DROP TABLE 을 여는 근거가 안 선다.
 func TestOpenRefusesToCreateANewDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fd.db")

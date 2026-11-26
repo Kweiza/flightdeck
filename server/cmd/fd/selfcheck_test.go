@@ -2,10 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
+	"io"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kweiza/flightdeck/internal/store"
+	"github.com/kweiza/flightdeck/internal/store/storetest"
 )
 
 // sqlite 드라이버는 internal/store 가 blank import 로 등록한다(cmd/fd 가 그것을 쓴다).
@@ -90,7 +97,7 @@ func TestSelfcheckReadsFDDBWhenFlagIsEmpty(t *testing.T) {
 	}
 }
 
-// TestSelfcheckRefusesPostgresWithoutLeaking 은 Postgres 원장을 받으면 원문을 싣지 않고 「판 재기는 아직 없다」로
+// TestSelfcheckRefusesPostgresWithoutLeaking 은 닿지 않는 Postgres 원장을 받으면 원문을 싣지 않고 표시값과 함께
 // 거절하는지 잰다. 이 출력은 감시기의 거절 사유로 로그 · 화면에 그대로 간다. 앞에 공백이 붙은 URL 도 Postgres 로
 // 갈라야 한다 - SQLite 로 가르면 파일 API(os.Stat)에 닿아 「파일이 없다」 오류에 원문이 실린다.
 func TestSelfcheckRefusesPostgresWithoutLeaking(t *testing.T) {
@@ -117,8 +124,11 @@ func TestSelfcheckRefusesPostgresWithoutLeaking(t *testing.T) {
 					t.Fatalf("출력에 접속 문자열의 조각(%s)이 실렸다: %s", piece, got)
 				}
 			}
-			if !strings.Contains(got, "판 재기는 아직 없다") || !strings.Contains(got, "원장(postgres)") {
+			if !strings.Contains(got, "읽지 못했다") || !strings.Contains(got, "접속 실패(postgres)") {
 				t.Fatalf("Postgres 거절 사유를 표시값과 함께 안 냈다: %s", got)
+			}
+			if left, err := os.ReadDir("."); err != nil || len(left) != 0 {
+				t.Fatalf("접속 URL 이 파일 API 에 닿아 무언가를 남겼다: %v %v", left, err)
 			}
 		})
 	}
@@ -149,5 +159,26 @@ func TestSelfcheckIsWiredIntoMain(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "fd selfcheck ok") {
 		t.Fatalf("계약된 첫 줄이 stdout 으로 안 나왔다: %q", out.String())
+	}
+}
+
+// TestSelfcheckPassesAMigratedPostgresLedger 는 이전 실행기가 올린 Postgres 원장을 selfcheck 가 기동과 같은 판 재기로
+// 통과시키는지 잰다. 접속 URL 은 환경(FD_DB)으로만 받는다(selfcheckArgs) - 출력에 그 원문이 없어야 한다.
+func TestSelfcheckPassesAMigratedPostgresLedger(t *testing.T) {
+	dsn := storetest.NewBare(t, "")
+	if err := store.Migrate(context.Background(), dsn, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatalf("이전 실행기: %v", err)
+	}
+	env := func(k string) (string, bool) { return dsn, k == "FD_DB" }
+	var out bytes.Buffer
+	if code := runSelfcheck(nil, env, &out); code != 0 {
+		t.Fatalf("올린 Postgres 원장인데 종료코드 %d - %s", code, out.String())
+	}
+	got := out.String()
+	if !strings.HasPrefix(got, "fd selfcheck ok build=") || !strings.Contains(got, "증분 계획: none") {
+		t.Fatalf("계약된 첫 줄 · 판정이 아니다: %s", got)
+	}
+	if strings.Contains(got, dsn) {
+		t.Fatalf("출력에 접속 URL 원문이 실렸다: %s", got)
 	}
 }

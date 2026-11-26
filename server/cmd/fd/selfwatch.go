@@ -691,7 +691,7 @@ func (w *selfWatcher) step(ctx context.Context, drain func()) Action {
 // 부모 환경에 FD_DB 가 따로 있어도 뒤에 붙인 값이 이긴다(exec.Cmd.Env 는 겹친 키의 마지막 값을 쓴다).
 // 자식의 출력은 표시값만 싣는다(runSelfcheck) - 그 출력이 아래 오류 본문으로 감시기의 로그 · 화면에 간다.
 //
-// ★ Postgres 원장이면 자식이 「판 재기는 아직 없다」로 거절해 자가 갱신이 여기서 선다. 받아들인 한계다.
+// ★ Postgres 원장이면 자식이 붙어서 기동과 같은 판 재기(판 + DB 로케일)를 한다. 접속 URL 은 환경으로만 간다.
 func verifyWithSelfcheck(ctx context.Context, exe, db string) (string, error) {
 	cmd := exec.CommandContext(ctx, exe, selfcheckArgs(db)...)
 	cmd.Env = append(os.Environ(), dbEnv+"="+db)
@@ -715,7 +715,8 @@ func verifyWithSelfcheck(ctx context.Context, exe, db string) (string, error) {
 //     FD_DB 를 안 읽던 옛 판일 수 있다(되돌리기 배포). 환경만 넘기면 옛 판은 정상 원장도 「--db 가 없다」로 거절하고
 //     자가 갱신이 선다. 파일 경로는 비밀이 아니라 argv 에 실어도 잃을 것이 없다.
 //
-// Postgres 원장은 어느 판의 selfcheck 도 거절하므로(판 재기가 아직 없다) 옛 판과의 호환이 걸리지 않는다.
+// Postgres 원장은 환경으로만 넘긴다. Postgres 판 재기가 생기기 전의 옛 판은 Postgres 원장을 어차피 거절하므로
+// argv 로 실어 줘서 살릴 호환이 없다.
 func selfcheckArgs(db string) []string {
 	if store.ParseTarget(db).Postgres() {
 		return []string{"selfcheck"}

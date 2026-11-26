@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/kweiza/flightdeck/internal/store"
 )
 
 // 진단 — 무엇이 관측됐고 무엇이 안 됐는지를 **이름으로** 낸다.
@@ -16,20 +18,27 @@ import (
 
 // Health 는 /healthz 가 내는 것이다.
 type Health struct {
-	OK          bool      `json:"ok"`
-	APIVersion  string    `json:"api_version"`
-	DBOK        bool      `json:"db_ok"`
-	DBPath      string    `json:"db_path"`
-	DBError     string    `json:"db_error,omitempty"`
-	DBRemote    bool      `json:"db_remote"` // 원장이 Postgres 인가. 그러면 로그에도 종류 · SQLSTATE 만 남는다(/healthz 안내가 따른다)
-	DiskFreePct float64   `json:"disk_free_pct"`
-	DiskKnown   bool      `json:"disk_known"` // false 면 위 숫자는 값이 아니다. 0%와 "못 쟀다"를 가른다
-	DiskError   string    `json:"disk_error,omitempty"`
-	At          time.Time `json:"at"`
+	OK         bool   `json:"ok"`
+	APIVersion string `json:"api_version"`
+	DBOK       bool   `json:"db_ok"`
+	DBPath     string `json:"db_path"`
+	DBError    string `json:"db_error,omitempty"`
+	DBRemote   bool   `json:"db_remote"` // 원장이 Postgres 인가. 그러면 로그에도 종류 · SQLSTATE 만 남는다(/healthz 안내가 따른다)
+	// DBLocaleOK 는 원장 DB 의 로케일이 지금 관문(store.JudgeLocale)을 지나는가다. 기동 검사와 같은 판정을 다시 잰다 -
+	// 연결 풀이 다시 붙은 서버가 기동 때와 다른 DB 일 수 있다. SQLite 는 로케일이 없어 늘 참이다.
+	DBLocaleOK    bool      `json:"db_locale_ok"`
+	DBLocaleError string    `json:"db_locale_error,omitempty"` // 거절이면 걸린 축 전부, 못 쟀으면 그 사유
+	DiskFreePct   float64   `json:"disk_free_pct"`
+	DiskKnown     bool      `json:"disk_known"` // false 면 위 숫자는 값이 아니다. 0%와 "못 쟀다"를 가른다
+	DiskError     string    `json:"disk_error,omitempty"`
+	At            time.Time `json:"at"`
 }
 
 // DiskRemote 는 원장이 원격 DB(Postgres)라 디스크 여유를 안 잰 사유다. DiskKnown 은 거짓이다.
 const DiskRemote = "원격 DB, 재지 않음"
+
+// DBLocaleUnmeasured 는 DB 에 못 붙어 로케일을 안 잰 사유다. DBLocaleOK 는 거짓이다.
+const DBLocaleUnmeasured = "DB 에 접속하지 못해 재지 않았다"
 
 // Health 는 서버가 지금 답할 수 있는 상태다.
 //
@@ -50,6 +59,19 @@ func (s *Service) Health(ctx context.Context) Health {
 	} else {
 		h.DBOK = true
 	}
+	// ★ DB 에 못 붙었으면 로케일은 「못 쟀다」다 - 거짓 하나로 두면 「로케일이 틀렸다」로 읽힌다.
+	if !h.DBOK {
+		h.DBLocaleError = DBLocaleUnmeasured
+	} else if err := s.st.CheckLocale(ctx); err != nil {
+		h.DBLocaleError = clip(err.Error(), 600)
+		msg := "DB 로케일을 재지 못했다"
+		if store.IsLocaleRefusal(err) {
+			msg = "DB 로케일이 관문을 지나지 못했다 - 이 DB 로 다시 뜨면 기동 검사가 거절한다"
+		}
+		s.log.ErrorContext(ctx, msg, "path", clip(h.DBPath, 200), "error", err.Error())
+	} else {
+		h.DBLocaleOK = true
+	}
 
 	// ★ Postgres 원장이면 재지 않는다. DBPath 는 파일 경로가 아닌 표시값이라 그 「상위 디렉토리」를 statfs 하면 현재
 	//   폴더를 재게 되고, 원장이 사는 디스크는 이 프로세스의 것이 아니다.
@@ -62,7 +84,7 @@ func (s *Service) Health(ctx context.Context) Health {
 		h.DiskFreePct, h.DiskKnown = pct, true
 	}
 
-	h.OK = h.DBOK
+	h.OK = h.DBOK && h.DBLocaleOK
 	return h
 }
 

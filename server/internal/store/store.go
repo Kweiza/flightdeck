@@ -30,6 +30,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite" // 순수 Go 드라이버. CGO_ENABLED=0 에서 돌아야 한다
+
+	"github.com/kweiza/flightdeck/internal/store/pg"
 )
 
 //go:embed schema.sql
@@ -103,6 +105,10 @@ type Migration struct {
 	To   int    // 적용 뒤의 버전
 	Name string // 로그에 남길 이름
 	SQL  string
+	// base 는 빈 DB 에 까는 Postgres 기준선 단(pgBaseline)이다. 증분과 셋이 다르다: 앞선 판 대신 빈 DB 인지를 다시 재고,
+	// 역할은 SQL 이 스스로 바꿔 타며(준비는 접속한 초사용자로 돌아야 한다), 판을 적기 전에 로케일 관문을 잰다(pg_trgm 이
+	// 이 단 안에서 생긴다). stepBody 가 이것으로 가른다.
+	base bool
 }
 
 // migrations 는 BaseSchemaVersion 위에 순서대로 얹는 증분 전부다.
@@ -128,6 +134,15 @@ var migrations = []Migration{
 	{To: 17, Name: "개정 이력이 항목을 따라 옮겨 간다", SQL: migrationItemRevisionFollowsMove},
 	{To: 18, Name: "세션이 받는 곳(inbox 소켓)을 싣는다", SQL: migrationSessionInbox},
 }
+
+// pgBaseline 은 빈 Postgres DB 에 까는 기준선 단이다. 준비(초사용자) · 기준선(소유 역할) · 판 행이 한 트랜잭션이다 -
+// 도중에 끊기면 통째로 되감겨 빈 DB 로 남는다. SQLite 처럼 schema.sql(1판) 위에 증분 17개를 다시 얹지 않는다:
+// 기준선이 SQLite 18판을 접어 넣은 것이다(pg/schema.go).
+var pgBaseline = Migration{To: pg.BaselineVersion, Name: "Postgres 기준선(준비 · 표 · 권한)", SQL: pg.Fresh(), base: true}
+
+// pgMigrations 는 Postgres 기준선 위에 순서대로 얹는 증분이다. 다음 판(19)부터 Postgres 에만 쓴다(pg/schema.go).
+// 한 단이 한 트랜잭션이고 소유 역할로 돈다(engine.stepRole).
+var pgMigrations []Migration
 
 // timeLayout 은 저장용 시각 표기다.
 //
@@ -379,18 +394,27 @@ func Open(path string) (*Store, error) {
 
 // OpenWithLogger 는 Open 에 로거를 주입한다.
 //
-// path 가 Postgres 접속 URL(postgres://…)이면 Postgres 원장에 붙고 판이 이 바이너리와 같은지만 잰다
-// (checkPGVersion). 아니면 SQLite 파일이다. 가르는 것은 ParseTarget 이다.
+// path 가 Postgres 접속 URL(postgres://…)이면 Postgres 원장에 붙은 뒤 판 재기(planOpen)를 지나야 연다 - 판이 이
+// 바이너리와 같고 DB 로케일이 관문을 지나야 한다(기동 검사). 아니면 SQLite 파일이고, 붙기 전에 잰다(아래 ★).
+// 가르는 것은 ParseTarget 이다.
 func OpenWithLogger(path string, log *slog.Logger) (*Store, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	if t := ParseTarget(path); t.Postgres() {
+	t := ParseTarget(path)
+	if t.Postgres() {
 		s, err := openPG(t, log, lockTimeout)
 		if err != nil {
 			return nil, err
 		}
-		if err := s.checkPGVersion(context.Background()); err != nil {
+		plan, err := planOpen(context.Background(), s.db)
+		switch {
+		case err != nil:
+			err = fmt.Errorf("DB 상태를 재지 못했다(%s): %w - %s", s.path, err, migrateHint(t))
+		case plan.Action != MigrateNone:
+			err = openRefusal(plan, t)
+		}
+		if err != nil {
 			s.Close()
 			return nil, err
 		}
@@ -404,10 +428,10 @@ func OpenWithLogger(path string, log *slog.Logger) (*Store, error) {
 	//   fail-open 훅이 안 올라간 DB 를 만난다")의 전제가 전수 실측에서 거짓이었다.
 	plan, perr := ProbeMigration(context.Background(), path)
 	if perr != nil {
-		return nil, fmt.Errorf("DB 상태를 재지 못했다(path=%q): %w — %s", clip(path, 200), perr, migrateHint(path))
+		return nil, fmt.Errorf("DB 상태를 재지 못했다(path=%q): %w — %s", clip(path, 200), perr, migrateHint(t))
 	}
 	if plan.Action != MigrateNone {
-		return nil, openRefusal(plan, path)
+		return nil, openRefusal(plan, t)
 	}
 
 	return openRaw(path, log)
@@ -421,7 +445,7 @@ func OpenWithLogger(path string, log *slog.Logger) (*Store, error) {
 // ★ **패키지 밖으로 내보내지 않는다.** 이 문은 관문을 지나지 않으므로, 밖에서 부를 수 있으면
 // 적용을 기동에서 분리한 의미가 없어진다 — 누구든 이것으로 열고 스키마를 만질 수 있다.
 //
-// SQLite 파일만 연다. Postgres 는 OpenWithLogger 가 openPG 로 가르고, MigrateTo 는 Postgres 를 거절한다.
+// SQLite 파일만 연다. Postgres 는 OpenWithLogger · MigrateWith 가 openPG 로 가른다.
 func openRaw(path string, log *slog.Logger) (*Store, error) {
 	if log == nil {
 		log = slog.Default()
@@ -458,8 +482,13 @@ func openRaw(path string, log *slog.Logger) (*Store, error) {
 // ★ RollbackHint 와 같은 규율이다: 절차가 실패한 그 자리에 다음 수가 있어야 한다.
 // 이 문구가 없으면 거절은 "안 뜬다" 로만 보이고, 그 상태에서 운영자가 할 수 있는 것은
 // 같은 바이너리를 다시 띄우는 것뿐이다 — 그것이 §7 이 크래시루프라 부른 모양이다.
-func migrateHint(path string) string {
-	return fmt.Sprintf("적용은 기동에서 분리돼 있다(설계 §7 ①) — `fd migrate --db %s` 를 먼저 돌려라", clip(path, 200))
+//
+// Postgres 원장이면 `--db` 에 실을 것이 없다 - 표시값(pgShown)은 접속 URL 이 아니고, 원문은 비밀번호를 품는다.
+func migrateHint(t Target) string {
+	if t.Postgres() {
+		return "적용은 기동에서 분리돼 있다(설계 §7 ①) - 같은 접속 URL 로 `fd migrate` 를 먼저 돌려라"
+	}
+	return fmt.Sprintf("적용은 기동에서 분리돼 있다(설계 §7 ①) — `fd migrate --db %s` 를 먼저 돌려라", clip(t.Shown(), 200))
 }
 
 // openRefusal 은 Open 이 적용 없이 거절할 때의 사유다. 순수 함수다.
@@ -467,11 +496,11 @@ func migrateHint(path string) string {
 // ★ MigrateReject 를 가르는 이유: 그 갈래는 `fd migrate` 로 못 고친다(DB 가 이 바이너리보다
 // 높거나 flightdeck 의 DB 가 아니다). 거기에 같은 처방을 붙이면 운영자가 고칠 수 없는 것을
 // 고치려 들고, 그 시도가 다음 판올림 대상을 한 번 더 만진다.
-func openRefusal(plan MigrationPlan, path string) error {
+func openRefusal(plan MigrationPlan, t Target) error {
 	if plan.Action == MigrateReject {
 		return fmt.Errorf("이 바이너리는 이 DB 를 아예 열지 않는다(스키마도 안 바꾼다): %s", plan.Reason)
 	}
-	return fmt.Errorf("스키마가 이 바이너리와 안 맞는다(%s): %s — %s", plan.Action, plan.Reason, migrateHint(path))
+	return fmt.Errorf("스키마가 이 바이너리와 안 맞는다(%s): %s — %s", plan.Action, plan.Reason, migrateHint(t))
 }
 
 // dsn 은 접속 문자열을 만든다.
@@ -545,11 +574,14 @@ func CheckPragmasAgainst(want, got map[string]string) error {
 // ★ Open 경로(마이그레이션 적용)와 검증 경로(ProbeMigration 읽기 전용)가 **같은 탐지를 쓴다**.
 // 두 벌로 두면 한쪽만 고쳐져 실제 열기와 검증이 갈린다 — 낡은 탐지로 재기동을 승인하면
 // 새 바이너리·새 DB 스키마가 실행 도중 맞지 않는 조용한 사고가 난다.
-func readMigrationState(ctx context.Context, db Reader) (hasTable bool, dbVersion, objects int, err error) {
+//
+// ★ 엔진마다 다른 것은 카탈로그를 묻는 질의 둘뿐이다(engine.versionTableQuery · schemaObjectsQuery). 판정(PlanMigration)과
+// 판 읽기는 한 벌이다 - 이전 실행기가 증분 트랜잭션 안에서 판을 다시 잴 때도 이것을 쓴다(stepReady).
+func readMigrationState(ctx context.Context, db dbtx) (hasTable bool, dbVersion, objects int, err error) {
+	eng := db.dialect()
 	// schema_version 테이블 존재 확인
 	var n int
-	if err := db.QueryRowContext(ctx,
-		`SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, "schema_version").Scan(&n); err != nil {
+	if err := db.QueryRowContext(ctx, eng.versionTableQuery(), "schema_version").Scan(&n); err != nil {
 		return false, 0, 0, fmt.Errorf("schema_version 테이블 존재 확인 실패: %w", err)
 	}
 	hasTable = n > 0
@@ -566,13 +598,40 @@ func readMigrationState(ctx context.Context, db Reader) (hasTable bool, dbVersio
 	}
 
 	// 객체 수 계산
-	if err := db.QueryRowContext(ctx,
-		`SELECT count(*) FROM sqlite_master WHERE type IN ('table','index','trigger','view')`,
-	).Scan(&objects); err != nil {
-		return false, 0, 0, fmt.Errorf("sqlite_master 읽기 실패: %w", err)
+	if err := db.QueryRowContext(ctx, eng.schemaObjectsQuery()).Scan(&objects); err != nil {
+		return false, 0, 0, fmt.Errorf("스키마 객체 세기 실패: %w", err)
 	}
 
 	return hasTable, dbVersion, objects, nil
+}
+
+// planOpen 은 원장이 이 바이너리로 업무를 받아도 되는지 잰다 - 판(PlanMigration)과 DB 로케일(localeGate). 적용하지 않는다.
+// 기동(OpenWithLogger)과 판 재기(ProbeMigration, fd selfcheck)가 두 엔진 모두 이 하나를 쓴다.
+//
+// ★ 로케일 거절은 MigrateReject 로 낸다. `fd migrate` 로 못 고치는 갈래(DB 를 새로 만들어 옮겨야 한다)라 openRefusal 이
+// migrate 처방을 안 붙이고, selfcheck 가 「이 판으로 열면 거절된다」로 감시기의 재기동을 막는다. 읽기 실패는 오류다.
+//
+// ★ 빈 DB(MigrateApply)와 이미 거절인 판은 로케일을 안 잰다. 빈 DB 에는 아직 pg_trgm 이 없어 한글 trigram 을 잴 수
+// 없다 - 이전 실행기가 기준선 단 안에서 잰다(stepBody). 그 갈래는 어차피 열리지 않는다.
+func planOpen(ctx context.Context, q dbtx) (MigrationPlan, error) {
+	hasTable, dbVersion, objects, err := readMigrationState(ctx, q)
+	if err != nil {
+		return MigrationPlan{}, err
+	}
+	plan := PlanMigration(hasTable, dbVersion, objects, SchemaVersion)
+	if plan.Action == MigrateApply || plan.Action == MigrateReject {
+		return plan, nil
+	}
+	// ★ 거절(*LocaleError)만 판정으로 바꾸고 읽기 실패는 그대로 낸다. 거절은 읽기가 다 성공한 뒤의 판정이라 q 가 트랜잭션이어도
+	//   버려진 문장이 없다(savepoint_guard_test 의 도메인 오류 갈래).
+	if err := localeGate(ctx, q); err != nil {
+		var refusal *LocaleError
+		if errors.As(err, &refusal) {
+			return MigrationPlan{Action: MigrateReject, Reason: refusal.Error()}, nil
+		}
+		return MigrationPlan{}, err
+	}
+	return plan, nil
 }
 
 // verifyPragmas 는 want 에 적힌 pragma 만 되읽어 확인한다.
@@ -818,7 +877,7 @@ func (t *Tx) Ctx() context.Context { return t.ctx }
 // **큐 잠금** 축이지 DB 스키마 축이 아니다. 그리고 셋 중 OpenLedger 는 이미 ProbeMigration →
 // 거절 패턴이었다. 새로 발명한 것이 아니라 남은 둘에 같은 것을 두른 일이다.
 //
-// ★ **절반만 뗄 수는 없었다.** MigrateApply(빈 DB 신규 설치) 갈래도 applyUpgrades 를 부르므로
+// ★ **절반만 뗄 수는 없었다.** MigrateApply(빈 DB 신규 설치) 갈래도 증분 적용(applySteps)을 타므로
 // (아래 그 자리의 주석), 업그레이드만 분리하면 크래시루프 경로가 절반 남는다. 그리고
 // neverExempt 가 DROP TABLE 을 여는 근거가 "적용이 기동 밖에 있다" 인데, 신규 설치에서
 // 여전히 안이면 그 조작이 기동 경로에서 돌아 근거 자체가 안 선다.
@@ -848,24 +907,68 @@ func (t *Tx) Ctx() context.Context { return t.ctx }
 // 적용은 Open() 안에 있었고, 그래서 나쁜 증분은 "서버가 안 뜬다" 로 나타났으며 고칠 수단도
 // 같은 바이너리를 다시 띄우는 것뿐이었다 — §7 이 크래시루프라 부른 모양이다.
 //
-// ★ **판정과 백업은 그대로 s.migrate 가 진다.** 여기서 다시 판정하면 판정이 두 벌이 되고,
+// ★ **판정과 백업은 그대로 s.migrateTo 가 진다.** 여기서 다시 판정하면 판정이 두 벌이 되고,
 // 두 벌은 반드시 표류한다. 이 함수가 더하는 것은 "누가 언제 부르는가" 하나다.
 func Migrate(ctx context.Context, path string, log *slog.Logger) error {
-	return MigrateTo(ctx, path, SchemaVersion, log)
+	return MigrateWith(ctx, path, MigrateOptions{}, log)
 }
 
 // MigrateTo 는 target 까지만 올린다. `fd migrate --to N` 의 본체다.
 func MigrateTo(ctx context.Context, path string, target int, log *slog.Logger) error {
-	// 판 재기(readMigrationState)와 스키마 적용이 SQLite 판뿐이다. 없는 표를 물어 엉뚱한 오류로 죽기 전에 거절한다.
-	if err := sqliteOnly(path, "판 적용(fd migrate)"); err != nil {
-		return err
+	return MigrateWith(ctx, path, MigrateOptions{Target: target}, log)
+}
+
+// MigrateOptions 는 이전 실행기 한 번의 선택이다. 0 값은 「이 바이너리가 아는 최신 판까지, 덤프 자리 없음」이다.
+type MigrateOptions struct {
+	// Target 은 이 판까지만 올린다. 0 이면 SchemaVersion 이다.
+	Target int
+	// BackupDir 은 Postgres 원장의 판올림 전 덤프(pg_dump -Fc) 자리다. 기존 데이터 위에 증분을 얹는데 비어 있으면
+	// 거절한다 - 덤프 없이 판을 올리지 않는다(dumpPG). SQLite 는 안 쓴다(사본이 원장 옆에 뜬다).
+	BackupDir string
+}
+
+// MigrateWith 는 원장을 opt 대로 올린다. 엔진은 path 로 가른다(ParseTarget).
+func MigrateWith(ctx context.Context, path string, opt MigrateOptions, log *slog.Logger) error {
+	if log == nil {
+		log = slog.Default()
 	}
-	s, err := openRaw(path, log)
+	s, run, err := openMigrator(path, opt, log)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
-	return s.migrateTo(ctx, target)
+	return s.migrateTo(ctx, run)
+}
+
+// openMigrator 는 이전 실행기가 쓸 원장(판 재기 없이 연다)과 그 엔진의 실행 입력을 낸다.
+//
+// ★ 두 엔진이 같은 실행기(migrateTo)를 탄다. 엔진마다 다른 것은 여기서 고르는 셋이다 - 여는 길(openRaw · openPG),
+// 기준선 위 증분 목록(migrations · pgMigrations), 판올림 전 백업(원장 옆 VACUUM INTO 사본 · pg_dump 덤프). 기준선을
+// 까는 길은 applyBase 가 가른다.
+func openMigrator(path string, opt MigrateOptions, log *slog.Logger) (*Store, migrateRun, error) {
+	run := migrateRun{target: opt.Target}
+	if run.target == 0 {
+		run.target = SchemaVersion
+	}
+	t := ParseTarget(path)
+	if t.Postgres() {
+		s, err := openPG(t, log, lockTimeout)
+		if err != nil {
+			return nil, run, err
+		}
+		run.steps = pgMigrations
+		run.backup = func(ctx context.Context, to int) (string, error) {
+			return dumpPG(ctx, t, opt.BackupDir, "pg_dump", to, log)
+		}
+		return s, run, nil
+	}
+	s, err := openRaw(path, log)
+	if err != nil {
+		return nil, run, err
+	}
+	run.steps = migrations
+	run.backup = func(ctx context.Context, _ int) (string, error) { return s.backup(ctx) }
+	return s, run, nil
 }
 
 // RollbackHint 는 마이그레이션이 깨졌을 때 되돌리는 절차를 낸다. 순수 함수다.
@@ -953,8 +1056,9 @@ func PlanMigration(hasVersionTable bool, dbVersion, objectCount, codeVersion int
 		return MigrationPlan{
 			Action: MigrateReject, Backup: false,
 			Reason: fmt.Sprintf("스키마 객체가 %d개 있는데 schema_version 에 기록된 버전이 없다 "+
-				"— schema.sql 은 멱등이 아니라 재적용이 실패한다. 앞선 마이그레이션이 중간에 끊긴 것이므로 "+
-				"백업(<db>.bak-*)에서 되돌리거나 손으로 버전을 기록하라", objectCount),
+				"— 기준선(SQLite schema.sql · Postgres pg/001_baseline.sql)은 멱등이 아니라 재적용이 실패한다. "+
+				"앞선 마이그레이션이 중간에 끊긴 것이므로 판올림 전 백업(SQLite <db>.bak-* · Postgres pre-<판>-<시각>.dump)에서 "+
+				"되돌리거나 손으로 버전을 기록하라", objectCount),
 		}
 
 	case dbVersion > codeVersion:
@@ -1013,149 +1117,219 @@ func UpgradeSteps(from, to int, avail []Migration) ([]Migration, error) {
 	return out, nil
 }
 
-// applyUpgrades 는 증분을 순서대로 얹는다. **한 단이 한 트랜잭션이다** —
-// 중간에 끊겨도 얹힌 단까지는 버전 기록과 실제 스키마가 일치하고,
-// 그러면 다음 기동이 남은 단부터 이어서 얹는다.
-func (s *Store) applyUpgrades(ctx context.Context, from, target int) error {
-	steps, err := UpgradeSteps(from, target, migrations)
-	if err != nil {
-		s.log.Error("업그레이드 경로가 없어 DB 를 열지 않는다",
-			"path", s.path, "db_version", from, "code_version", target, "error", err.Error())
-		return fmt.Errorf("스키마 거절: %w", err)
-	}
-	return s.applySteps(ctx, steps)
+// migrateRun 은 이전 실행기 한 번의 입력이다. 엔진마다 다른 것을 여기서 받는다(openMigrator 가 채운다).
+type migrateRun struct {
+	target int
+	// steps 는 기준선 위 증분이다(migrations · pgMigrations). 시험이 바꿔 넣는다.
+	steps []Migration
+	// backup 은 판올림 전 백업을 뜨고 그 자리를 낸다. to 는 이번에 올릴 판이다.
+	backup func(ctx context.Context, to int) (string, error)
 }
 
-// applySteps 는 고른 증분을 한 단에 한 트랜잭션으로 얹는다.
+// migrateTo 는 run.target 까지 올린다. 두 엔진이 같은 길을 탄다:
+// 자기 잠금 → 판 재기 → 판정 → (경로 · 로케일 확인) → 백업 → 기준선 → 증분 → 끝.
+//
+// ★ target 을 받는 것이 `fd migrate --to N` 의 실질이다. 나쁜 증분이 N 단에 있으면
+// N-1 까지만 올려 두고 옛 바이너리로 계속 돌 수 있다 — 그 선택지가 없으면 판올림은
+// 전부 아니면 전무이고, 그것이 설계 §7 이 크래시루프라 부른 상태의 절반이다.
+//
+// ★ 자기 잠금(lockMigrate)을 실행 내내 쥔다. 증분 트랜잭션은 그 위에 전역 업무 잠금을 더 잡는다(applyStep) -
+// 실행기끼리는 자기 잠금이, 실행기와 업무 쓰기는 업무 잠금이 가른다. 스키마가 바뀌는 동안 쓰기는 기다린다.
+func (s *Store) migrateTo(ctx context.Context, run migrateRun) error {
+	unlock, err := s.lockMigrate(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	hasTable, dbVersion, objects, err := readMigrationState(ctx, s.db)
+	if err != nil {
+		return err
+	}
+	plan := PlanMigration(hasTable, dbVersion, objects, run.target)
+
+	switch plan.Action {
+	case MigrateNone:
+		// 판이 맞아도 로케일이 틀리면 서버가 안 뜬다(OpenWithLogger). one-shot 이 성공으로 끝나고 서버만 죽는 것보다 여기서
+		// 같은 판정으로 멈추는 편이 사유가 한 자리에 모인다.
+		if err := localeGate(ctx, s.db); err != nil {
+			return err
+		}
+		s.log.Info("스키마 확인", "path", s.path, "version", dbVersion, "reason", plan.Reason)
+		return nil
+	case MigrateReject:
+		// 열지 못한 사유는 원인 전문으로 남긴다. 이 오류가 곧 운영자가 볼 유일한 단서다.
+		s.log.Error("스키마 버전 불일치로 DB 를 열지 않는다",
+			"path", s.path, "db_version", dbVersion, "code_version", run.target, "reason", plan.Reason)
+		return fmt.Errorf("스키마 거절: %s", plan.Reason)
+	case MigrateApply, MigrateUpgrade:
+	default:
+		return fmt.Errorf("알 수 없는 마이그레이션 판정: %q (%s)", plan.Action, plan.Reason)
+	}
+
+	// ★ 얹을 증분을 백업 · 적용 **전에** 고른다. 빠진 단이 있으면 아무것도 안 바꾸고 거절한다. 뒤에서 알면 백업만 하나
+	//   늘고, Postgres 는 기준선이 커밋된 채 남는다(기준선 18판보다 낮은 --to 가 그 모양이다).
+	// ★ 신규 DB 도 증분을 그대로 탄다. 신규용으로 기준선에 같은 표를 또 적으면 정의가 두 벌이 되고, 신규 설치와
+	//   업그레이드가 다른 모양의 DB 를 갖게 된다.
+	from := dbVersion
+	if plan.Action == MigrateApply {
+		from = s.db.eng.baseVersion()
+	}
+	steps, err := UpgradeSteps(from, run.target, run.steps)
+	if err != nil {
+		s.log.Error("업그레이드 경로가 없어 DB 를 올리지 않는다",
+			"path", s.path, "db_version", dbVersion, "code_version", run.target, "error", err.Error())
+		return fmt.Errorf("스키마 거절: %w", err)
+	}
+	// ★ 로케일은 백업 · 증분 전에 잰다 - 거절될 DB 의 덤프를 뜨고 증분을 얹을 까닭이 없다. 빈 DB 는 기준선 단 안에서
+	//   잰다(pg_trgm 이 거기서 생긴다, stepBody).
+	if plan.Action == MigrateUpgrade {
+		if err := localeGate(ctx, s.db); err != nil {
+			return err
+		}
+	}
+
+	start := time.Now()
+	s.log.Info("마이그레이션 시작",
+		"path", s.path, "from", dbVersion, "to", run.target, "backup", plan.Backup, "reason", plan.Reason)
+	// ★ backupPath 를 실패 문구까지 끌고 간다. 앞선 판은 업그레이드 경로에서 이것을 지역 변수로 버려,
+	//   정확히 설계 §7 이 겨냥한 상황에서 유일한 탈출구의 좌표가 사라졌다.
+	var backupPath string
+	if plan.Backup {
+		// ★ 나쁜 마이그레이션은 1인 운영에서 복구 불가 사건이다. 적용 **전에** 뜬다.
+		if backupPath, err = run.backup(ctx, run.target); err != nil {
+			return err
+		}
+		s.log.Info("마이그레이션 전 백업 완료", "path", s.path, "backup", backupPath)
+	}
+	if plan.Action == MigrateApply {
+		if err := s.applyBase(ctx); err != nil {
+			return s.rollbackable(err, backupPath)
+		}
+	}
+	if err := s.applySteps(ctx, steps); err != nil {
+		return s.rollbackable(err, backupPath)
+	}
+	s.log.Info("마이그레이션 완료",
+		"path", s.path, "version", run.target, "duration", time.Since(start).Seconds())
+	return nil
+}
+
+// applyBase 는 빈 DB 에 기준선을 깐다. 엔진마다 길이 다르다.
+//
+//   - SQLite: schema.sql 을 **트랜잭션 밖에서** 돌리고(그 안의 PRAGMA journal_mode 가 트랜잭션 안에서 못 돈다) 1판을 적는다.
+//     중간에 끊기면 남는 것은 백업뿐이고, 그 상태는 PlanMigration 이 다음 실행에서 dbVersion==0 으로 잡아 다시 적용한다.
+//   - Postgres: 준비 · 기준선 · 판 행이 한 트랜잭션(pgBaseline 단)이다. 끊기면 통째로 되감겨 빈 DB 로 남는다.
+func (s *Store) applyBase(ctx context.Context) error {
+	if s.db.eng == enginePG {
+		return s.applySteps(ctx, []Migration{pgBaseline})
+	}
+	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
+		return fmt.Errorf("스키마 적용 실패(path=%q): %w", s.path, err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO schema_version(version, applied_at) VALUES (?, ?)`,
+		BaseSchemaVersion, fmtTime(time.Now()),
+	); err != nil {
+		return fmt.Errorf("schema_version 기록 실패(스키마는 적용됨, path=%q): %w", s.path, err)
+	}
+	return nil
+}
+
+// applySteps 는 고른 증분을 차례로 얹는다. **한 단이 한 트랜잭션이다** — 중간에 끊겨도 얹힌 단까지는 버전 기록과
+// 실제 스키마가 일치하고, 그러면 다음 실행이 남은 단부터 이어서 얹는다.
+func (s *Store) applySteps(ctx context.Context, steps []Migration) error {
+	for _, m := range steps {
+		if err := s.applyStep(ctx, m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyStep 은 증분 하나를 한 트랜잭션으로 얹는다.
 //
 // ★ **증분 트랜잭션은 업무 쓰기와 같은 전역 잠금을 잡는다**(txWrite). 잠금이 다르면 DDL 도중에 업무 쓰기가
 // 끼어 반쯤 바뀐 스키마 위에서 커밋할 수 있다. 같은 잠금이면 적용이 도는 동안 들어온 쓰기는 적용이 끝날
 // 때까지 기다린다(pg_tx_test.go 의 DDL 중 쓰기 시험). SQLite 는 BEGIN IMMEDIATE 라 원래 그렇다.
 //
 // 끝에서 오류를 한 번 옮긴다(asFault) - 증분의 잠금 대기 초과(55P03)도 Tx 와 같은 *TxFault 로 나간다.
-func (s *Store) applySteps(ctx context.Context, steps []Migration) (err error) {
+func (s *Store) applyStep(ctx context.Context, m Migration) (err error) {
 	defer func() { err = asFault(err) }()
-	for _, m := range steps {
-		start := time.Now()
-		tx, err := s.begin(ctx, txSpec{kind: txWrite})
-		if err != nil {
-			return fmt.Errorf("증분 %d(%s) 트랜잭션 시작 실패(path=%q): %w", m.To, m.Name, s.path, err)
+	start := time.Now()
+	tx, err := s.begin(ctx, txSpec{kind: txWrite})
+	if err != nil {
+		return fmt.Errorf("증분 %d(%s) 트랜잭션 시작 실패(path=%q): %w", m.To, m.Name, s.path, err)
+	}
+	if err := stepBody(ctx, tx, m); err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			return fmt.Errorf("증분 %d(%s) 실패(path=%q): %w (롤백도 실패: %v)", m.To, m.Name, s.path, err, rbErr)
 		}
-		if _, err := tx.ExecContext(ctx, m.SQL); err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-				return fmt.Errorf("증분 %d(%s) 적용 실패(path=%q): %w (롤백도 실패: %v)",
-					m.To, m.Name, s.path, err, rbErr)
+		return fmt.Errorf("증분 %d(%s) 실패(path=%q): %w", m.To, m.Name, s.path, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("증분 %d(%s) 커밋 실패(path=%q): %w", m.To, m.Name, s.path, err)
+	}
+	s.log.Info("증분 적용 완료",
+		"path", s.path, "version", m.To, "reason", m.Name,
+		"duration", time.Since(start).Seconds())
+	return nil
+}
+
+// stepBody 는 증분 트랜잭션 안의 일이다: 판을 다시 재고 → (소유 역할로) SQL 을 돌리고 → 판을 적는다.
+//
+// ★ 기준선 단(m.base)은 역할을 SQL 이 스스로 바꿔 탄다 - 준비(pg/bootstrap.sql)는 역할을 만들고 스키마 권한을 주므로
+// 접속한 초사용자로 돌아야 한다. 판 행은 두 갈래 모두 소유 역할로 적는다(앱 역할은 그 표를 읽기만 한다).
+// 기준선 단은 판을 적기 전에 로케일을 잰다. 거절이면 준비 · 표가 함께 되감겨 빈 DB 로 남는다.
+func stepBody(ctx context.Context, tx *txConn, m Migration) error {
+	if err := stepReady(ctx, tx, m); err != nil {
+		return err
+	}
+	role := tx.dialect().stepRole()
+	if role != "" && !m.base {
+		if _, err := tx.ExecContext(ctx, role); err != nil {
+			return fmt.Errorf("소유 역할로 바꾸지 못했다: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, m.SQL); err != nil {
+		return fmt.Errorf("적용 실패: %w", err)
+	}
+	if m.base {
+		if err := localeGate(ctx, tx); err != nil {
+			return err
+		}
+		if role != "" {
+			if _, err := tx.ExecContext(ctx, role); err != nil {
+				return fmt.Errorf("소유 역할로 바꾸지 못했다: %w", err)
 			}
-			return fmt.Errorf("증분 %d(%s) 적용 실패(path=%q): %w", m.To, m.Name, s.path, err)
 		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO schema_version(version, applied_at) VALUES (?, ?)`,
-			m.To, fmtTime(time.Now())); err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-				return fmt.Errorf("증분 %d(%s) 버전 기록 실패(path=%q): %w (롤백도 실패: %v)",
-					m.To, m.Name, s.path, err, rbErr)
-			}
-			return fmt.Errorf("증분 %d(%s) 버전 기록 실패(path=%q): %w", m.To, m.Name, s.path, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("증분 %d(%s) 커밋 실패(path=%q): %w", m.To, m.Name, s.path, err)
-		}
-		s.log.Info("증분 적용 완료",
-			"path", s.path, "version", m.To, "reason", m.Name,
-			"duration", time.Since(start).Seconds())
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO schema_version(version, applied_at) VALUES (?, ?)`, m.To, fmtTime(time.Now())); err != nil {
+		return fmt.Errorf("버전 기록 실패: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) migrate(ctx context.Context) error { return s.migrateTo(ctx, SchemaVersion) }
-
-// migrateTo 는 target 까지만 올린다.
+// stepReady 는 증분을 얹기 직전, 잠금 안에서 판을 다시 잰다.
 //
-// ★ target 을 인자로 받는 것이 `fd migrate --to N` 의 실질이다. 나쁜 증분이 N 단에 있으면
-// N-1 까지만 올려 두고 옛 바이너리로 계속 돌 수 있다 — 그 선택지가 없으면 판올림은
-// 전부 아니면 전무이고, 그것이 설계 §7 이 크래시루프라 부른 상태의 절반이다.
-func (s *Store) migrateTo(ctx context.Context, target int) error {
-	hasTable, dbVersion, objects, err := readMigrationState(ctx, s.db)
+// ★ 판정은 잠금 밖에서 읽은 판으로 했다. 그 사이에 다른 실행기가 같은 단을 얹었으면(자기 잠금을 쥔 연결이 끊겨
+// 잠금이 사라졌거나, 자기 잠금이 없는 SQLite 판을 두 프로세스가 돌렸다) 여기서 멈춘다. 이것이 없으면 같은 증분이
+// 두 번 얹혀 DDL 이 「이미 있다」로 죽거나, 멱등인 증분이면 판 행이 두 번 적힌다.
+func stepReady(ctx context.Context, tx *txConn, m Migration) error {
+	hasTable, v, objects, err := readMigrationState(ctx, tx)
 	if err != nil {
 		return err
 	}
-
-	plan := PlanMigration(hasTable, dbVersion, objects, target)
-
-	switch plan.Action {
-	case MigrateNone:
-		s.log.Info("스키마 확인", "path", s.path, "version", dbVersion, "reason", plan.Reason)
-		return nil
-
-	case MigrateReject:
-		// 열지 못한 사유는 원인 전문으로 남긴다. 이 오류가 곧 운영자가 볼 유일한 단서다.
-		s.log.Error("스키마 버전 불일치로 DB 를 열지 않는다",
-			"path", s.path, "db_version", dbVersion, "code_version", target, "reason", plan.Reason)
-		return fmt.Errorf("스키마 거절: %s", plan.Reason)
-
-	case MigrateApply:
-		start := time.Now()
-		s.log.Info("마이그레이션 시작",
-			"path", s.path, "from", dbVersion, "to", target, "backup", plan.Backup, "reason", plan.Reason)
-
-		var backupPath string
-		if plan.Backup {
-			// ★ 나쁜 마이그레이션은 1인 운영에서 복구 불가 사건이다. 적용 **전에** 뜬다.
-			backupPath, err = s.backup(ctx)
-			if err != nil {
-				return err
-			}
-			s.log.Info("마이그레이션 전 백업 완료", "path", s.path, "backup", backupPath)
-		}
-
-		// ★ 트랜잭션 밖에서 돌린다. schema.sql 안에 PRAGMA journal_mode 가 있고
-		//   그것은 트랜잭션 안에서 못 돈다. 중간에 끊기면 남는 것은 위 백업뿐이고,
-		//   그 상태는 PlanMigration 이 다음 기동에서 dbVersion==0 으로 잡아 다시 적용한다.
-		if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
-			s.log.Error("스키마 적용 실패 — 되돌리는 절차를 함께 낸다",
-				"path", s.path, "reason", RollbackHint(s.path, backupPath), "error", err.Error())
-			return fmt.Errorf("스키마 적용 실패(path=%q): %w — %s", s.path, err, RollbackHint(s.path, backupPath))
-		}
-		if _, err := s.db.ExecContext(ctx,
-			`INSERT INTO schema_version(version, applied_at) VALUES (?, ?)`,
-			BaseSchemaVersion, fmtTime(time.Now()),
-		); err != nil {
-			return fmt.Errorf("schema_version 기록 실패(스키마는 적용됨, path=%q): %w", s.path, err)
-		}
-		// ★ 신규 DB 도 증분을 그대로 탄다. 신규용으로 schema.sql 에 같은 표를 또 적으면
-		//   정의가 두 벌이 되고, 신규 설치와 업그레이드가 다른 모양의 DB 를 갖게 된다.
-		if err := s.applyUpgrades(ctx, BaseSchemaVersion, target); err != nil {
-			return s.rollbackable(err, backupPath)
-		}
-		s.log.Info("마이그레이션 완료",
-			"path", s.path, "version", target, "duration", time.Since(start).Seconds())
-		return nil
-
-	case MigrateUpgrade:
-		start := time.Now()
-		s.log.Info("마이그레이션 시작",
-			"path", s.path, "from", dbVersion, "to", target, "backup", plan.Backup, "reason", plan.Reason)
-		// ★ backupPath 를 블록 밖에 둔다. 앞선 판은 이 자리에서 `:=` 로 선언해 **버렸고**,
-		//   그래서 아래 실패가 어디로 되돌리는지 말하지 못했다 —
-		//   정확히 설계 §7 이 겨냥한 상황에서 유일한 탈출구의 좌표가 사라진 것이다.
-		var backupPath string
-		if plan.Backup {
-			backupPath, err = s.backup(ctx)
-			if err != nil {
-				return err
-			}
-			s.log.Info("마이그레이션 전 백업 완료", "path", s.path, "backup", backupPath)
-		}
-		if err := s.applyUpgrades(ctx, dbVersion, target); err != nil {
-			return s.rollbackable(err, backupPath)
-		}
-		s.log.Info("마이그레이션 완료",
-			"path", s.path, "version", target, "duration", time.Since(start).Seconds())
-		return nil
-
-	default:
-		return fmt.Errorf("알 수 없는 마이그레이션 판정: %q (%s)", plan.Action, plan.Reason)
+	switch {
+	case m.base && (hasTable || objects > 0):
+		return fmt.Errorf("기준선은 빈 DB 에만 깐다 - 판 표 %t · 객체 %d개가 있다"+
+			"(판을 잰 뒤에 다른 실행기가 깔았거나, 손으로 만든 것이 있다)", hasTable, objects)
+	case !m.base && v != m.To-1:
+		return fmt.Errorf("이 증분은 %d판 위에 얹는데 DB 가 %d판이다 - 판을 잰 뒤에 다른 실행기가 올렸다. 다시 돌려라",
+			m.To-1, v)
 	}
+	return nil
 }
 
 // rollbackable 은 마이그레이션 실패에 **되돌리는 절차**를 붙인다.
@@ -1163,10 +1337,19 @@ func (s *Store) migrateTo(ctx context.Context, target int) error {
 // 두 경로(신규 적용·증분 업그레이드)가 같은 문구를 쓰게 하려고 헬퍼로 뺐다 —
 // 두 벌로 두면 한쪽만 고쳐지고, 그 비대칭이 다시 "어디로 되돌리나"를 지운다.
 func (s *Store) rollbackable(err error, backupPath string) error {
-	hint := RollbackHint(s.path, backupPath)
+	hint := s.rollbackHint(backupPath)
 	s.log.Error("마이그레이션 실패 — 되돌리는 절차를 함께 낸다",
 		"path", s.path, "reason", hint, "error", err.Error())
 	return fmt.Errorf("%w — %s", err, hint)
+}
+
+// rollbackHint 는 이 원장의 엔진에 맞는 되돌리기 절차다. Postgres 는 실패한 단이 트랜잭션째 되감긴다는 것부터 말한다 -
+// 덤프 복원은 끝까지 커밋된 판올림을 통째로 물릴 때의 수단이다.
+func (s *Store) rollbackHint(backupPath string) string {
+	if s.db.eng == enginePG {
+		return "실패한 단은 트랜잭션째 되감겼다(DB 는 마지막으로 커밋된 판에 있다). " + pgRollbackHint(backupPath)
+	}
+	return RollbackHint(s.path, backupPath)
 }
 
 // BackupSuffix 는 백업 파일 이름의 꼬리를 만든다. 사전순 = 시간순이다.

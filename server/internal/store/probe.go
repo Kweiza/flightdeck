@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 )
 
@@ -36,9 +37,19 @@ import (
 //
 // 없는 파일에는 오류를 낸다. sql.Open 은 파일을 **만들기** 때문에, 부재를 확인 안 하고
 // 열면 검증이 빈 DB 를 하나 만들어 놓고 "빈 DB 다"라고 답한다.
+//
+// ★ Postgres 원장이면 붙어서 잰다. 기동(OpenWithLogger)과 같은 판 재기(planOpen)를 쓰므로 판과 DB 로케일을 함께 보고,
+// 로케일 거절은 MigrateReject 로 낸다 - fd selfcheck 가 그것으로 감시기의 재기동을 막는다. 쓰지 않는다(카탈로그 ·
+// schema_version · pg_database 를 읽고 show_trgm 을 부를 뿐이다). 붙었다는 기동 로그 한 줄은 버린다 - 이 재기는
+// 서버를 띄우는 것이 아니다.
 func ProbeMigration(ctx context.Context, path string) (MigrationPlan, error) {
-	if err := sqliteOnly(path, "판 재기"); err != nil {
-		return MigrationPlan{}, err
+	if t := ParseTarget(path); t.Postgres() {
+		s, err := openPG(t, slog.New(slog.DiscardHandler), lockTimeout)
+		if err != nil {
+			return MigrationPlan{}, err
+		}
+		defer s.Close()
+		return planOpen(ctx, s.db)
 	}
 	return probeMigrationVia(ctx, path, ledgerDSN(path))
 }
@@ -54,13 +65,7 @@ func probeMigrationVia(ctx context.Context, path, connStr string) (MigrationPlan
 	}
 	defer db.Close()
 
-	// 판정 입력을 readMigrationState 로 읽는다. Open 경로(migrate)도 같은 함수를 쓴다 —
+	// 판정은 Postgres 기동 · 재기와 **같은 함수**(planOpen → readMigrationState · PlanMigration)를 쓴다.
 	// 두 벌로 두면 한쪽만 고쳐져 탐지가 갈린다. 다른 질의처럼 감싸개(conn)를 지난다.
-	hasTable, dbVersion, objects, err := readMigrationState(ctx, &conn{raw: db, eng: engineSQLite})
-	if err != nil {
-		return MigrationPlan{}, err
-	}
-
-	// 판정은 migrate 와 **같은 순수 함수**를 쓴다. 여기서 다시 판정하면 두 벌이 된다.
-	return PlanMigration(hasTable, dbVersion, objects, SchemaVersion), nil
+	return planOpen(ctx, &conn{raw: db, eng: engineSQLite})
 }

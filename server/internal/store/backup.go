@@ -562,8 +562,31 @@ func OpenLedger(ctx context.Context, path string, log *slog.Logger) (*Store, err
 	return s, nil
 }
 
-// Rollback 은 판올림 전 백업 중 **가장 최근 것**으로 DB 를 되돌린다.
-// 되돌린 백업 경로를 낸다. `fd migrate --rollback` 의 본체다.
+// RollbackOutcome 은 되돌리기 한 번의 결과다.
+type RollbackOutcome struct {
+	// Backup 은 고른 백업이다(SQLite 는 원장 옆 사본, Postgres 는 판올림 전 덤프).
+	Backup string
+	// Steps 는 사람이 돌 절차다. 비어 있으면 이 명령이 원장을 이미 갈았다(SQLite). Postgres 는 살아 있는 DB 를
+	// 덮지 않고, 덤프를 새 DB 로 복원하는 절차를 낸다(pgRollbackHint).
+	Steps string
+}
+
+// Rollback 은 판올림 전 백업 중 **가장 최근 것**으로 되돌린다. `fd migrate --rollback` 의 본체다. 엔진은 path 로 가른다.
+//
+//   - SQLite: <db>.bak-* 중 최신을 원장 위에 덮는다(rollbackSQLite).
+//   - Postgres: backupDir 의 pre-<판>-<시각>.dump 중 최신을 고르고 머리를 잰 뒤 복원 절차를 낸다. DB 에 붙지 않는다.
+func Rollback(ctx context.Context, path, backupDir string, log *slog.Logger) (RollbackOutcome, error) {
+	if log == nil {
+		log = slog.Default()
+	}
+	if ParseTarget(path).Postgres() {
+		return rollbackPG(backupDir)
+	}
+	src, err := rollbackSQLite(path, log)
+	return RollbackOutcome{Backup: src}, err
+}
+
+// rollbackSQLite 는 <db>.bak-* 중 가장 최근 것으로 DB 를 되돌린다. 되돌린 백업 경로를 낸다.
 //
 // ★ 절차는 RollbackHint 가 사람에게 내던 것과 **글자 그대로 같다**: 백업을 원본 위에 덮고
 // -wal·-shm 을 지운다. 백업은 VACUUM INTO 로 뜬 일관 사본이라 WAL 이 없는데, 옛 -wal 을
@@ -573,13 +596,7 @@ func OpenLedger(ctx context.Context, path string, log *slog.Logger) (*Store, err
 // ★ **서버가 멈춰 있어야 한다.** 이 함수는 그것을 강제하지 못한다 — 파일을 쥔 프로세스를
 // 이 자리에서 알 방법이 없다. 도는 서버 밑에서 파일을 갈면 그 프로세스는 옛 페이지 캐시
 // 위에서 계속 돌고, 그 상태는 어디에도 안 나타난다.
-func Rollback(ctx context.Context, path string, log *slog.Logger) (string, error) {
-	if log == nil {
-		log = slog.Default()
-	}
-	if err := sqliteOnly(path, "되돌리기(fd migrate --rollback)"); err != nil {
-		return "", err
-	}
+func rollbackSQLite(path string, log *slog.Logger) (string, error) {
 	backups, err := filepath.Glob(path + ".bak-*")
 	if err != nil {
 		return "", fmt.Errorf("백업을 찾지 못했다(path=%q): %w", clip(path, 200), err)

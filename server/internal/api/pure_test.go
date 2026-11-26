@@ -407,6 +407,34 @@ func TestHealthzKeepsRemoteDiskReason(t *testing.T) {
 	}
 }
 
+// TestHealthzCarriesTheLocaleAxis 는 /healthz 가 로케일 관문의 결과(db_locale_ok)를 늘 싣고, 거절 사유는 고정 문구로
+// 바꾸며, 못 잰 사유는 그대로 내는지 잰다. 거짓일 때도 키가 있어야 한다 - 빠지면 감시가 「모름」과 「틀렸다」를 못 가른다.
+func TestHealthzCarriesTheLocaleAxis(t *testing.T) {
+	ok := HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true, DBLocaleOK: true},
+		true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
+	if !ok.DBLocaleOK || ok.DBLocaleError != "" {
+		t.Fatalf("관문을 지난 원장: (%v, %q)", ok.DBLocaleOK, ok.DBLocaleError)
+	}
+	refused := HealthzOf(service.Health{APIVersion: "1", DBOK: true,
+		DBLocaleError: "DB 로케일이 이 서버가 기대는 값이 아니다 - 정렬 제공자가 builtin 이 아니다(datlocprovider=c)"},
+		true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
+	if refused.DBLocaleOK || !strings.Contains(refused.DBLocaleError, "서버 로그") || strings.Contains(refused.DBLocaleError, "datlocprovider") {
+		t.Fatalf("거절한 원장: (%v, %q)", refused.DBLocaleOK, refused.DBLocaleError)
+	}
+	raw, err := json.Marshal(refused)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"db_locale_ok":false`) {
+		t.Fatalf("거짓인 db_locale_ok 가 본문에서 빠졌다: %s", raw)
+	}
+	down := HealthzOf(service.Health{APIVersion: "1", DBLocaleError: service.DBLocaleUnmeasured},
+		true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
+	if down.DBLocaleOK || down.DBLocaleError != service.DBLocaleUnmeasured {
+		t.Fatalf("못 잰 원장: (%v, %q)", down.DBLocaleOK, down.DBLocaleError)
+	}
+}
+
 // TestHealthzDBErrorPointsAtWhatTheLogHas 는 접속 실패 안내가 서버 로그에 실제로 남는 것을 가리키는지 잰다. Postgres 면
 // store 가 드라이버 문구를 걷어 로그에도 종류 · SQLSTATE 만 남는다 - 「원인 전문은 로그에」라고 하면 없는 것을 찾으러 간다.
 // SQLite 는 로그에 전문(파일 경로)이 있다.

@@ -33,7 +33,8 @@ func quietLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, n
 
 // newPGStore 는 기준선 위에 판 행(SchemaVersion)을 적은 새 DB 의 Store 다. 잠금 대기 상한은 wait 다.
 //
-// 판 행은 시험이 적는다 - 운영에서 그것을 적는 것은 Postgres 이전 실행기의 몫이다(checkPGVersion).
+// 판 행은 시험이 적는다 - 운영에서 그것을 적는 것은 Postgres 이전 실행기(migrateTo)다. 열기 뒤에 기동과 같은 판 재기
+// (planOpen: 판 + DB 로케일)를 지나야 한다 - 시험 서버의 로케일이 관문을 지난다는 것을 시험마다 잰다.
 func newPGStore(t *testing.T, wait time.Duration) *Store {
 	t.Helper()
 	dsn := storetest.New(t)
@@ -43,8 +44,8 @@ func newPGStore(t *testing.T, wait time.Duration) *Store {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	stamp(t, s, SchemaVersion)
-	if err := s.checkPGVersion(context.Background()); err != nil {
-		t.Fatalf("판 재기: %v", err)
+	if plan, err := planOpen(context.Background(), s.db); err != nil || plan.Action != MigrateNone {
+		t.Fatalf("판 재기: %+v, %v", plan, err)
 	}
 	return s
 }
@@ -469,19 +470,35 @@ func TestPGPanicInTxReleasesTheLock(t *testing.T) {
 // 증분 적용 - 업무 쓰기와 같은 잠금
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestPGWriteWaitsForSchemaStep 은 증분(DDL)이 도는 동안 들어온 쓰기가 적용이 커밋될 때까지 기다리는지 잰다.
+// TestPGWriteWaitsForSchemaStep 은 이전 실행기가 증분(DDL)을 얹는 동안 두 잠금을 함께 쥐고, 그동안 들어온 업무 쓰기가
+// 증분이 커밋될 때까지 기다리는지 잰다.
+//
+// ★ 실행기의 길(migrateTo) 그대로 돌린다. 자기 잠금(migrateLockKey, 실행기끼리)은 실행 내내 세션이 쥐고, 증분 트랜잭션은
+// 업무 쓰기와 같은 전역 잠금(globalLockKey)을 쥔다. 키가 하나만 있으면 DDL 도중에 업무 쓰기가 끼어 반쯤 바뀐 스키마
+// 위에서 커밋한다 - 그 쓰기가 판 19 · 새 열을 보는 것이 그것이 안 끼었다는 증거다.
 func TestPGWriteWaitsForSchemaStep(t *testing.T) {
-	s := newPGStore(t, lockTimeout)
+	dsn, s := pgMigrated(t)
 	ctx := context.Background()
-	step := Migration{To: SchemaVersion + 1, Name: "시험 증분",
-		SQL: `ALTER TABLE machine ADD COLUMN t_probe text; SELECT pg_sleep(0.4)`}
+	m, run := pgMigrator(t, dsn, MigrateOptions{Target: SchemaVersion + 1})
+	run.steps = []Migration{{To: SchemaVersion + 1, Name: "시험 증분",
+		SQL: `CREATE TABLE t_step_tbl(x int); ALTER TABLE machine ADD COLUMN t_probe text; SELECT pg_sleep(0.4)`}}
+	run.backup = func(context.Context, int) (string, error) { return "시험 덤프 자리", nil }
 	aDone := make(chan error, 1)
-	go func() { aDone <- s.applySteps(ctx, []Migration{step}) }()
+	go func() { aDone <- m.migrateTo(ctx, run) }()
 	waitUntil(t, "증분이 돈다", func() bool {
 		return pgCount(t, s, `SELECT count(*) FROM pg_stat_activity
 			WHERE datname = current_database() AND state = 'active' AND pid <> pg_backend_pid()
 			  AND query LIKE '%ADD COLUMN t_probe%'`) == 1
 	})
+	if n := advisoryHolders(t, s, migrateLockKey); n != 1 {
+		t.Errorf("증분 도중 실행기 자기 잠금을 쥔 연결 %d개(기대 1)", n)
+	}
+	if n := pgCount(t, s, `SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+		WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 1
+		  AND l.classid::bigint = (?::bigint >> 32) AND l.objid::bigint = (?::bigint & 4294967295)
+		  AND a.pid <> pg_backend_pid() AND a.query LIKE '%ADD COLUMN t_probe%'`, globalLockKey, globalLockKey); n != 1 {
+		t.Errorf("DDL 을 도는 증분 트랜잭션이 전역 업무 잠금을 쥐지 않았다(%d)", n)
+	}
 
 	var version, cols int64
 	err := s.Tx(ctx, func(x *Tx) error {
@@ -505,6 +522,12 @@ func TestPGWriteWaitsForSchemaStep(t *testing.T) {
 	if version != int64(SchemaVersion+1) || cols != 1 {
 		t.Fatalf("증분 도중에 들어온 쓰기가 적용 커밋 전에 돌았다: 판 %d(기대 %d), 새 열 %d개(기대 1)",
 			version, SchemaVersion+1, cols)
+	}
+	if n := notOwnedTables(t, s); n != 0 {
+		t.Fatalf("증분이 만든 표의 주인이 소유 역할이 아니다(%d개)", n)
+	}
+	if n := advisoryHolders(t, s, migrateLockKey); n != 0 {
+		t.Fatalf("실행이 끝났는데 자기 잠금이 남았다(%d)", n)
 	}
 }
 
@@ -740,7 +763,7 @@ func TestPGOpenRefusesUnstampedOrForeignVersion(t *testing.T) {
 		stamp int // 0 이면 판 행을 안 적는다
 		want  string
 	}{
-		{"판 행이 없다", 0, "판 행이 없다"},
+		{"판 행이 없다", 0, "기록된 버전이 없다"},
 		{"다른 판", SchemaVersion - 1, "기대한다"},
 	} {
 		if c.stamp != 0 {

@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/kweiza/flightdeck/internal/store"
-	"os"
+	"github.com/kweiza/flightdeck/internal/store/storetest"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -203,6 +205,95 @@ func TestMigrateRollbackRemovesTheStaleJournal(t *testing.T) {
 		if _, err := os.Stat(side); err == nil {
 			t.Errorf("되돌린 뒤에도 %s 가 남아 있다 — 이 저널이 백업 위에 얹히면 "+
 				"되돌리기가 무효가 되고 '반쯤 적용된' 상태가 되살아난다", filepath.Base(side))
+		}
+	}
+}
+
+// Postgres 원장도 같은 명령이 빈 DB 에 기준선을 깔고, 서버가 그것을 연다. 두 번째는 아무것도 안 한다. 접속 URL 의
+// 어떤 조각도 출력에 안 실린다(표시값은 postgres 다).
+func TestMigrateLaysAPostgresLedgerTheServerCanOpen(t *testing.T) {
+	h := newHarness(t)
+	dsn := storetest.NewBare(t, "")
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := strings.TrimPrefix(u.Path, "/")
+
+	rc, first := h.run("", "migrate", "--db", dsn)
+	if rc != 0 {
+		t.Fatalf("Postgres 적용이 rc=%d 로 끝났다: %s", rc, first)
+	}
+	s, err := store.Open(dsn)
+	if err != nil {
+		t.Fatalf("적용했다는데 서버가 그 원장을 못 연다: %v\n출력: %s", err, first)
+	}
+	s.Close()
+	rc, second := h.run("", "migrate", "--db", dsn)
+	if rc != 0 || !strings.Contains(second, "이미") {
+		t.Fatalf("두 번째 적용(rc=%d)이 '이미 맞다'를 안 말한다: %s", rc, second)
+	}
+	for _, out := range []string{first, second} {
+		if strings.Contains(out, dsn) || strings.Contains(out, name) {
+			t.Fatalf("출력에 접속 URL 조각이 실렸다: %s", out)
+		}
+	}
+}
+
+// Postgres 의 --rollback 은 덤프 자리의 가장 최근 덤프를 골라 복원 절차를 내고, 되돌렸다고 말하지 않는다. 덤프 자리는
+// --backup-dir, 없으면 FD_BACKUP_DIR 이다. DB 에 붙지 않는다(접속 URL 은 닿지 않는 주소다).
+func TestMigrateRollbackNamesThePostgresDump(t *testing.T) {
+	h := newHarness(t)
+	const dsn = "postgres://fduser:s3cret@127.0.0.1:1/ledger?sslmode=disable"
+	dir := t.TempDir()
+
+	rc, out := h.run("", "migrate", "--db", dsn, "--rollback", "--backup-dir", dir)
+	if rc == 0 || !strings.Contains(out, "되돌릴 덤프가 없다") {
+		t.Fatalf("덤프 없는 되돌리기(rc=%d): %s", rc, out)
+	}
+	dump := filepath.Join(dir, "pre-19-20261126T160203Z.dump")
+	if err := os.WriteFile(dump, []byte("PGDMP-test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{backupDirEnv: dir}
+	for k, v := range h.env {
+		env[k] = v
+	}
+	for _, args := range [][]string{
+		{"migrate", "--db", dsn, "--rollback", "--backup-dir", dir},
+		{"migrate", "--db", dsn, "--rollback"}, // FD_BACKUP_DIR
+	} {
+		rc, out := h.runEnv(env, "", args...)
+		if rc != 0 {
+			t.Fatalf("%q: rc=%d: %s", args, rc, out)
+		}
+		for _, frag := range []string{"덤프: " + dump, "아직 되돌리지 않았다", "pg_restore --create"} {
+			if !strings.Contains(out, frag) {
+				t.Errorf("%q: 출력에 %q 가 없다: %s", args, frag, out)
+			}
+		}
+		if strings.Contains(out, "에서 되돌렸다") || strings.Contains(out, "s3cret") || strings.Contains(out, "fduser") {
+			t.Errorf("%q: 되돌렸다고 말하거나 접속 조각을 실었다: %s", args, out)
+		}
+	}
+}
+
+func TestResolveBackupDir(t *testing.T) {
+	fallback := ""
+	if fi, err := os.Stat(defaultBackupDir); err == nil && fi.IsDir() {
+		fallback = defaultBackupDir
+	}
+	for _, c := range []struct {
+		env        map[string]string
+		flag, want string
+	}{
+		{map[string]string{backupDirEnv: "/from-env"}, "/from-flag", "/from-flag"},
+		{map[string]string{backupDirEnv: "/from-env"}, " ", "/from-env"},
+		{map[string]string{backupDirEnv: "  "}, "", fallback},
+		{nil, "", fallback},
+	} {
+		if got := resolveBackupDir(envOf(c.env), c.flag); got != c.want {
+			t.Errorf("resolveBackupDir(%v, %q) = %q, 기대 %q", c.env, c.flag, got, c.want)
 		}
 	}
 }

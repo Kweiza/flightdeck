@@ -68,15 +68,18 @@ type AuthStatus struct {
 // 상황에서도 물어야 하므로). 서버의 파일 경로가 무인증으로 새는 것은
 // "오류 응답에 내부 이름을 넣지 마라"와 같은 규율이고, 그래서 여기서 걷어낸다.
 type HealthzBody struct {
-	OK          bool       `json:"ok"`
-	APIVersion  string     `json:"api_version"`
-	DBOK        bool       `json:"db_ok"`
-	DBError     string     `json:"db_error,omitempty"`
-	DiskFreePct float64    `json:"disk_free_pct"`
-	DiskKnown   bool       `json:"disk_known"`
-	DiskError   string     `json:"disk_error,omitempty"`
-	At          time.Time  `json:"at"`
-	Auth        AuthStatus `json:"auth"`
+	OK         bool   `json:"ok"`
+	APIVersion string `json:"api_version"`
+	DBOK       bool   `json:"db_ok"`
+	DBError    string `json:"db_error,omitempty"`
+	// DBLocaleOK 는 원장 DB 의 로케일이 기동 검사와 같은 관문을 지나는가다(service.Health 의 같은 칸).
+	DBLocaleOK    bool       `json:"db_locale_ok"`
+	DBLocaleError string     `json:"db_locale_error,omitempty"`
+	DiskFreePct   float64    `json:"disk_free_pct"`
+	DiskKnown     bool       `json:"disk_known"`
+	DiskError     string     `json:"disk_error,omitempty"`
+	At            time.Time  `json:"at"`
+	Auth          AuthStatus `json:"auth"`
 	// Build 는 **응답하는 이 프로세스**의 빌드 좌표다. 파일의 것이 아니다.
 	//
 	// ★ api_version 으로는 판 나이를 못 나른다 — 그 값은 계약이 깨질 때만 오르므로
@@ -241,7 +244,7 @@ const dbErrorRemote = "DB 에 접속할 수 없다 - 서버 로그에 종류 · 
 func HealthzOf(h service.Health, tokenSet bool, reach LoopbackReach, build buildinfo.Coord,
 	su SelfUpdateStatus, lb LedgerBackupStatus) HealthzBody {
 	b := HealthzBody{
-		OK: h.OK, APIVersion: h.APIVersion, DBOK: h.DBOK, Build: build,
+		OK: h.OK, APIVersion: h.APIVersion, DBOK: h.DBOK, DBLocaleOK: h.DBLocaleOK, Build: build,
 		SelfUpdate: su, LedgerBackup: lb,
 		DiskFreePct: h.DiskFreePct, DiskKnown: h.DiskKnown, At: h.At,
 		Auth: AuthStatus{
@@ -258,6 +261,15 @@ func HealthzOf(h service.Health, tokenSet bool, reach LoopbackReach, build build
 		b.DBError = dbErrorRemote
 	default:
 		b.DBError = "DB 에 접속할 수 없다 — 원인 전문은 서버 로그에 있다"
+	}
+	// ★ 로케일 사유는 고정 문구로 낸다. 거절 사유 자체(제공자 · 로케일 이름)는 비밀이 아니지만, 못 잰 갈래는 하류 오류
+	//   본문이라 db_error 와 같은 규율을 따른다. 걸린 축 전부는 서버 로그와 인증 뒤 헬스(fd doctor)에 있다.
+	switch {
+	case h.DBLocaleError == "":
+	case h.DBLocaleError == service.DBLocaleUnmeasured:
+		b.DBLocaleError = h.DBLocaleError
+	default:
+		b.DBLocaleError = "DB 로케일이 관문을 못 지났거나 재지 못했다 - 걸린 축은 서버 로그에 있다"
 	}
 	// ★ 원격 DB 라 재지 않은 것은 측정 실패가 아니다 - 그 갈래는 서버 로그도 안 남기므로 「로그를 보라」는 헛걸음이다.
 	//   그 사유는 고정 문구라 경로가 없고, 그대로 낸다.

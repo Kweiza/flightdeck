@@ -19,6 +19,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/kweiza/flightdeck/internal/store/pg"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,7 +106,7 @@ func (t Target) Shown() string {
 // String 은 Shown 이다. %v · %s 로 찍혀도 원문이 안 나간다.
 func (t Target) String() string { return t.Shown() }
 
-// sqliteOnly 는 SQLite 파일만 다루는 길(판 재기 · 판 적용 · 되돌리기 · 원장 열기)이 Postgres 접속 URL 을
+// sqliteOnly 는 SQLite 파일만 다루는 길(원장 내보내기의 열기, OpenLedger)이 Postgres 접속 URL 을
 // 받았을 때의 거절이다. nil 이면 파일 경로이고, 부르는 쪽은 받은 값을 그대로 파일 경로로 쓴다(ParseTarget 의 ★).
 //
 // ★ 그 길들은 인자를 파일 API(os.Stat · filepath.Glob · sql.Open("sqlite"))에 넘기고 오류에 원문을 싣는다.
@@ -115,8 +117,7 @@ func sqliteOnly(target, what string) error {
 	if !t.Postgres() {
 		return nil
 	}
-	return fmt.Errorf("%s 는 아직 SQLite 파일만 다룬다(%s) - Postgres 원장의 판 적용 · 되돌리기는 이전 실행기가 맡는다",
-		what, t.Shown())
+	return fmt.Errorf("%s 는 아직 SQLite 파일만 다룬다(%s)", what, t.Shown())
 }
 
 // lockTimeout 은 잠금 하나를 기다리는 상한이다. 두 엔진이 같은 값을 쓴다 -
@@ -141,7 +142,7 @@ const idleInTxTimeout = 6 * lockTimeout
 // 열기
 // ─────────────────────────────────────────────────────────────────────────────
 
-// openPG 는 Postgres 원장에 붙는다. 판은 재지 않는다(OpenWithLogger 가 checkPGVersion 으로 잰다).
+// openPG 는 Postgres 원장에 붙는다. 판 · 로케일은 재지 않는다(OpenWithLogger 가 planOpen 으로, 이전 실행기가 스스로 잰다).
 //
 // ★ 상한(pgSessionParams)을 트랜잭션마다 `SET LOCAL` 하지 않고 연결 시작 인자로 건다. SQLite 의 busy_timeout 이
 // DSN 에 있던 것과 같은 자리이고, 쓰기 트랜잭션마다 왕복 하나를 던다. 걸렸는지는 되읽어 잰다
@@ -367,25 +368,101 @@ func pgURL(dsn string) string {
 	return strings.ToLower(dsn[:i]) + dsn[i:]
 }
 
-// checkPGVersion 은 Postgres 원장의 판이 이 바이너리의 판과 같은지만 본다.
+// ─────────────────────────────────────────────────────────────────────────────
+// 판 재기 · 이전 실행기 - 엔진마다 다른 조각
+// ─────────────────────────────────────────────────────────────────────────────
+
+// versionTableQuery 는 판 표(schema_version)가 있는지 세는 질의다(인자 하나: 표 이름). 0 또는 1 을 낸다.
+// Postgres 판은 이름 없는 질의(`FROM schema_version`)가 실제로 닿을 표를 찾는다(search_path 를 따른다).
+func (e engine) versionTableQuery() string {
+	if e == enginePG {
+		return `SELECT count(*) FROM pg_catalog.pg_class WHERE oid = to_regclass(?)`
+	}
+	return `SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`
+}
+
+// schemaObjectsQuery 는 스키마 객체 수를 세는 질의다. PlanMigration 이 0(빈 DB) · 1 이하(판 표만) · 그 위를 가른다.
 //
-// ★ 최소한이다. 판 행을 적는 것(기준선을 깐 뒤)과 어긋난 판을 올리는 것, 로케일 재기는 Postgres 이전
-// 실행기의 몫이다. 여기는 「판이 안 맞으면 뜨지 않는다」는 SQLite 쪽 규율만 Postgres 에도 세운다.
-func (s *Store) checkPGVersion(ctx context.Context) error {
-	var v sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT max(version) FROM schema_version`).Scan(&v); err != nil {
-		// 열기 경계 안이다(OpenWithLogger 가 openPG 바로 뒤에 부른다) - 드라이버 문구 대신 pgFault 를 싣는다.
-		return fmt.Errorf("Postgres 원장의 판을 읽지 못했다(%s): %s - 42P01 이면 기준선이 안 깔린 DB 다", s.path, pgFault(err))
+// ★ Postgres 판은 이름 없는 질의가 닿는 스키마(current_schema)의 관계(표 · 인덱스 · 뷰 · 시퀀스 · 외부 표)를 센다.
+// 확장이 깐 것은 뺀다 - 준비(pg/bootstrap.sql)만 돈 DB 에는 pg_trgm 이 있지만 그것은 아직 빈 원장이다. 트리거 ·
+// 함수는 안 센다: 표 없이 그것만 있는 DB 는 기준선이 만들 수 없는 모양이고, 기준선의 객체는 표부터 생긴다.
+func (e engine) schemaObjectsQuery() string {
+	if e == enginePG {
+		return `SELECT count(*) FROM pg_catalog.pg_class c
+			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'v', 'm', 'i', 'S', 'f')
+			  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+			                  WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')`
 	}
-	if !v.Valid {
-		return fmt.Errorf("Postgres 원장에 판 행이 없다(%s) - 기준선을 깐 뒤 판(%d)을 적는 것은 이전 실행기의 몫이다",
-			s.path, SchemaVersion)
+	return `SELECT count(*) FROM sqlite_master WHERE type IN ('table','index','trigger','view')`
+}
+
+// baseVersion 은 빈 DB 에 처음 까는 기준선의 판이다. SQLite 는 schema.sql(1판) 위에 증분 전부를 얹고, Postgres 는
+// 기준선이 곧 SQLite 18판을 접어 넣은 판이다(pgBaseline).
+func (e engine) baseVersion() int {
+	if e == enginePG {
+		return pgBaseline.To
 	}
-	if int(v.Int64) != SchemaVersion {
-		return fmt.Errorf("Postgres 원장의 판이 %d 인데 이 바이너리는 %d 를 기대한다(%s) - 판을 맞추는 것은 이전 실행기의 몫이다",
-			v.Int64, SchemaVersion, s.path)
+	return BaseSchemaVersion
+}
+
+// stepRole 은 증분 하나를 적용하기 전에 트랜잭션 안에서 바꿔 타는 역할이다. 빈 문자열이면 안 바꾼다.
+//
+// ★ Postgres 의 표 · 함수 · 트리거는 소유 역할(pg.OwnerRole)의 것이어야 앱 역할과 권한이 갈린다(pg/001_baseline.sql
+// 머리말). 이전 실행기가 초사용자나 그 역할의 구성원으로 붙어도 증분이 만든 객체의 주인이 소유 역할이 되게 한다.
+// LOCAL 이라 커밋 · 롤백과 함께 풀린다. 기준선 단(pg.Fresh)은 준비를 접속 사용자로 돌려야 해서 SQL 이 스스로 바꿔 탄다.
+func (e engine) stepRole() string {
+	if e == enginePG {
+		return "SET LOCAL ROLE " + pg.OwnerRole
 	}
-	return nil
+	return ""
+}
+
+// migrateLockKey 는 이전 실행기 자기 잠금의 키다("fd:migr8"). 전역 업무 잠금(globalLockKey)과 다른 키다.
+const migrateLockKey int64 = 0x6664_3a6d_6967_7238
+
+// lockMigrate 는 이전 실행기 자기 잠금을 잡는다. 돌려준 함수가 놓는다. SQLite 는 잡지 않는다(파일 하나를 BEGIN IMMEDIATE
+// 가 한 줄로 세우고, 백업도 그 파일 옆이다).
+//
+// ★ 세션 잠금(pg_try_advisory_lock)이고 풀에서 떼어 낸 연결 하나가 쥔다. 판 재기 → 판올림 전 덤프 → 증분 전부가 한
+// 실행이고, 그동안 다른 실행기가 같은 판을 재고 같은 증분을 얹으면 안 된다. 증분 트랜잭션은 이것과 함께 전역 업무
+// 잠금을 잡는다(applyStep) - 이 잠금은 실행기끼리를, 업무 잠금은 실행기와 업무 쓰기를 가른다. 증분 트랜잭션이 이 키를
+// 또 잡으면 같은 프로세스의 다른 연결이라 자기 잠금에 막힌다.
+//
+// ★ 기다리지 않는다. 다른 실행기가 덤프를 뜨는 중이면 몇 분이 걸린다 - 기다렸다가 lock_timeout 으로 죽는 것보다 「다른
+// 실행기가 돈다」를 곧장 말하는 편이 운영자에게 낫다.
+//
+// ★ 쥔 연결이 도중에 끊기면 잠금도 사라진다. 그래도 증분은 두 번 안 얹힌다 - 단마다 잠금 안에서 판을 다시 읽는다(stepReady).
+func (s *Store) lockMigrate(ctx context.Context) (func(), error) {
+	eng := s.db.eng
+	if eng != enginePG {
+		return func() {}, nil
+	}
+	c, err := s.db.raw.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("이전 실행기 잠금용 연결을 얻지 못했다: %w", eng.connFault(err))
+	}
+	var got bool
+	rs, err := eng.query(ctx, c, `SELECT pg_try_advisory_lock(?)`, []any{migrateLockKey})
+	if err == nil {
+		err = rowOf(rs, nil).Scan(&got)
+	}
+	if err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("이전 실행기 잠금을 잡지 못했다: %w", err)
+	}
+	if !got {
+		_ = c.Close()
+		return nil, errors.New("다른 이전 실행기(fd migrate)가 이 원장을 올리고 있다 - 그것이 끝난 뒤 다시 돌려라")
+	}
+	return func() {
+		// 놓기가 실패해도(연결이 이미 끊겼다) 세션과 함께 사라진다. 살아 있는데 실패했으면 연결을 버려 세션을 끝낸다 -
+		// 쥔 채로 풀에 돌려보내면 그 연결을 받는 다음 실행이 잠금을 쥔 줄 모르고 쥔다.
+		if _, err := eng.exec(context.Background(), c, `SELECT pg_advisory_unlock(?)`, []any{migrateLockKey}); err != nil {
+			_ = c.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = c.Close()
+	}, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -846,7 +923,7 @@ func (e engine) lockStmt(sp txSpec) (string, []any) {
 }
 
 // begin 은 store 의 트랜잭션이 열리는 단 한 자리다. 종류가 격리 수준과 잠금을 정한다.
-// 부르는 자리는 runTx(Tx · ObsTx) · ReadTx · applySteps 셋뿐이다(engine_test.go 가 잠근다).
+// 부르는 자리는 runTx(Tx · ObsTx) · ReadTx · applyStep 셋뿐이다(engine_test.go 가 잠근다).
 //
 // 쓰기 종류는 잠금을 받기까지 기다린 시간을 잰다(/metrics). Postgres 는 잠금 문장만 잰다 - 연결 풀 대기는
 // DBStats 의 풀 축이 따로 센다. SQLite 는 BEGIN IMMEDIATE 가 곧 잠금이라 BeginTx 전체를 잰다(풀 대기가 섞인다).

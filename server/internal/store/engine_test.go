@@ -194,32 +194,42 @@ func TestShowSeparatesFilesFromURLs(t *testing.T) {
 	}
 }
 
-// TestSQLiteOnlyPathsRefusePostgresURLs 는 SQLite 파일만 다루는 길이 접속 URL 을 파일 API 에 넘기지 않고
-// 표시값으로 거절하는지 잰다. 넘기면 「파일이 없다」 오류에 원문(비밀번호)이 실린다. 앞에 공백이 붙은 URL 도
-// 같은 길이어야 한다(분류는 다듬은 값으로 한다).
-func TestSQLiteOnlyPathsRefusePostgresURLs(t *testing.T) {
+// TestPostgresURLsNeverReachFileAPIs 는 원장 길이 접속 URL 을 파일 API 에 넘기지 않는지 잰다. 넘기면 「파일이 없다」
+// 오류에 원문(비밀번호)이 실리고, 파일 API 가 그 이름의 파일을 만든다. 앞에 공백이 붙은 URL 도 같은 길이어야 한다
+// (분류는 다듬은 값으로 한다).
+//   - SQLite 파일만 다루는 길(OpenLedger)은 표시값으로 거절한다.
+//   - Postgres 를 다루는 길(판 재기 · 판 적용 · 되돌리기)은 Postgres 로 가서 실패한다(닿지 않는 포트 · 덤프 자리 없음).
+//     그 오류에도 원문 조각이 없다.
+func TestPostgresURLsNeverReachFileAPIs(t *testing.T) {
+	t.Chdir(t.TempDir())
 	for _, dsn := range []string{
 		"postgres://fd:hunter2@127.0.0.1:1/fd?sslpassword=hunter2",
 		" \tpostgres://fd:hunter2@127.0.0.1:1/fd?sslpassword=hunter2",
 	} {
 		ctx := context.Background()
 		_, probeErr := ProbeMigration(ctx, dsn)
-		_, rbErr := Rollback(ctx, dsn, nil)
+		_, rbErr := Rollback(ctx, dsn, "", nil)
 		_, ledgerErr := OpenLedger(ctx, dsn, nil)
-		for name, err := range map[string]error{
-			"ProbeMigration": probeErr,
-			"MigrateTo":      MigrateTo(ctx, dsn, SchemaVersion, nil),
-			"Rollback":       rbErr,
-			"OpenLedger":     ledgerErr,
+		for name, c := range map[string]struct {
+			err  error
+			want string
+		}{
+			"ProbeMigration": {probeErr, "Postgres 접속 실패(postgres)"},
+			"MigrateTo":      {MigrateTo(ctx, dsn, SchemaVersion, nil), "Postgres 접속 실패(postgres)"},
+			"Rollback":       {rbErr, "덤프 자리(--backup-dir)가 없다"},
+			"OpenLedger":     {ledgerErr, "SQLite 파일만"},
 		} {
-			if err == nil || !strings.Contains(err.Error(), "SQLite 파일만") {
-				t.Errorf("%s 가 접속 URL(%q)을 SQLite 거절로 안 막았다: %v", name, dsn[:3], err)
+			if c.err == nil || !strings.Contains(c.err.Error(), c.want) {
+				t.Errorf("%s 가 접속 URL(%q)을 %q 로 안 막았다: %v", name, dsn[:3], c.want, c.err)
 				continue
 			}
-			if strings.Contains(err.Error(), "hunter2") {
-				t.Errorf("%s 의 거절에 비밀이 샜다: %v", name, err)
+			if strings.Contains(c.err.Error(), "hunter2") {
+				t.Errorf("%s 의 거절에 비밀이 샜다: %v", name, c.err)
 			}
 		}
+	}
+	if left, err := os.ReadDir("."); err != nil || len(left) != 0 {
+		t.Fatalf("접속 URL 이 파일 API 에 닿아 무언가를 남겼다: %v %v", left, err)
 	}
 }
 
@@ -488,7 +498,7 @@ func TestNoRawDatabaseOutsideStore(t *testing.T) {
 }
 
 // TestTxKindsAreFour 는 트랜잭션을 여는 자리를 잠근다: BeginTx 는 begin 한 곳, begin 을 부르는 것은
-// runTx(Tx · ObsTx) · ReadTx · applySteps(증분 적용) 셋뿐이다.
+// runTx(Tx · ObsTx) · ReadTx · applyStep(증분 적용) 셋뿐이다.
 //
 // ★ 직렬성 규칙(격리 수준 · 전역 잠금)은 begin 에만 산다. 다른 자리에서 트랜잭션을 열면 그 트랜잭션은
 // 잠금도 격리 수준도 없이 돈다 - Postgres 에서 조용히 깨지는 바로 그 모양이다.
@@ -510,7 +520,7 @@ func TestTxKindsAreFour(t *testing.T) {
 	})
 	for name, want := range map[string][]site{
 		"BeginTx": {{"engine.go", "begin"}},
-		"begin":   {{"store.go", "ReadTx"}, {"store.go", "applySteps"}, {"store.go", "runTx"}},
+		"begin":   {{"store.go", "ReadTx"}, {"store.go", "applyStep"}, {"store.go", "runTx"}},
 		"runTx":   {{"store.go", "ObsTx"}, {"store.go", "Tx"}},
 	} {
 		var got []site
@@ -532,7 +542,7 @@ func TestTxKindsAreFour(t *testing.T) {
 func TestWritesOutsideTxAreListed(t *testing.T) {
 	src := parseStoreSource(t)
 	allowed := map[site]string{
-		{"store.go", "migrateTo"}: "SQLite schema.sql 적용 - PRAGMA 가 있어 트랜잭션 밖이어야 한다",
+		{"store.go", "applyBase"}: "SQLite schema.sql 적용 - PRAGMA 가 있어 트랜잭션 밖이어야 한다",
 		{"store.go", "backup"}:    "SQLite 판올림 전 VACUUM INTO",
 	}
 

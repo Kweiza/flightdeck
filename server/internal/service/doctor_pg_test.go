@@ -46,7 +46,7 @@ func TestHealthDoesNotMeasureDiskForPostgres(t *testing.T) {
 	st, _ := openPGLedger(t, log)
 
 	h := New(st, log).Health(context.Background())
-	if !h.OK || !h.DBOK {
+	if !h.OK || !h.DBOK || !h.DBLocaleOK {
 		t.Fatalf("살아 있는 원장인데 헬스가 %+v 다", h)
 	}
 	if !h.DBRemote {
@@ -82,7 +82,10 @@ func TestHealthCarriesNoDSNPieceAfterReconnectFails(t *testing.T) {
 		if h.OK || h.DBOK {
 			t.Fatalf("접속을 막았는데 헬스가 정상이다: %+v", h)
 		}
-		for what, text := range map[string]string{"DBError": h.DBError, "로그": logs.String()} {
+		if h.DBLocaleOK || h.DBLocaleError != DBLocaleUnmeasured {
+			t.Fatalf("접속을 막았는데 로케일 축이 (%v, %q)다 - 못 쟀다고 해야 한다", h.DBLocaleOK, h.DBLocaleError)
+		}
+		for what, text := range map[string]string{"DBError": h.DBError, "DBLocaleError": h.DBLocaleError, "로그": logs.String()} {
 			for _, piece := range []string{name, "user=", "failed to connect"} {
 				if strings.Contains(text, piece) {
 					t.Fatalf("%s 에 접속 문자열의 조각(%s)이 실렸다: %s", what, piece, text)
@@ -92,5 +95,30 @@ func TestHealthCarriesNoDSNPieceAfterReconnectFails(t *testing.T) {
 	}
 	if !strings.Contains(h.DBError, "SQLSTATE 55000") || !strings.Contains(logs.String(), "SQLSTATE 55000") {
 		t.Fatalf("재접속 거절의 종류 · SQLSTATE 가 DBError · 로그에 없다: %q / %s", h.DBError, logs.String())
+	}
+}
+
+// TestHealthTurnsOffWhenTheLocaleGateFails 는 기동 뒤에 원장 DB 가 로케일 관문을 못 지나게 되면 헬스가 그것을 잡는지
+// 잰다(OK 거짓, db_locale_ok 거짓, 걸린 축). 기동 검사와 같은 판정이다 - 여기서는 pg_trgm 이 빠진 DB 로 만든다
+// (로케일 자체는 만든 뒤에 못 바꾼다).
+func TestHealthTurnsOffWhenTheLocaleGateFails(t *testing.T) {
+	var logs bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logs, nil))
+	st, dsn := openPGLedger(t, log)
+	raw, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.Exec(`DROP EXTENSION pg_trgm CASCADE`)
+	raw.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(st, log).Health(context.Background())
+	if h.OK || !h.DBOK || h.DBLocaleOK {
+		t.Fatalf("로케일 관문을 못 지나는 원장인데 헬스가 %+v 다", h)
+	}
+	if !strings.Contains(h.DBLocaleError, "pg_trgm") || !strings.Contains(logs.String(), "pg_trgm") {
+		t.Fatalf("걸린 축이 헬스 · 로그에 없다: %q / %s", h.DBLocaleError, logs.String())
 	}
 }

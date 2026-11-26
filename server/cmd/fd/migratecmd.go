@@ -4,9 +4,32 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 
 	"github.com/kweiza/flightdeck/internal/store"
 )
+
+// backupDirEnv 는 Postgres 원장의 판올림 전 덤프 자리를 주는 환경 변수다(--backup-dir 가 비었을 때).
+const backupDirEnv = "FD_BACKUP_DIR"
+
+// defaultBackupDir 는 배치(compose)가 덤프 볼륨을 붙이는 자리다. 있을 때만 쓴다.
+const defaultBackupDir = "/backups"
+
+// resolveBackupDir 는 덤프 자리를 고른다: 플래그 → FD_BACKUP_DIR → 있으면 /backups. 다 없으면 빈 값이고, 그러면
+// 덤프가 필요한 판올림은 거절된다(임시 디렉토리로 물러서지 않는다 - 컨테이너가 다시 뜨면 사라지는 덤프는 백업이 아니다).
+func resolveBackupDir(env func(string) (string, bool), flag string) string {
+	if strings.TrimSpace(flag) != "" {
+		return flag
+	}
+	if v, ok := env(backupDirEnv); ok && strings.TrimSpace(v) != "" {
+		return v
+	}
+	if fi, err := os.Stat(defaultBackupDir); err == nil && fi.IsDir() {
+		return defaultBackupDir
+	}
+	return ""
+}
 
 // `fd migrate` — 설계 §7 처방 ①·③(적용을 기동에서 분리 · 롤백 명령).
 //
@@ -19,9 +42,10 @@ import (
 // 판정을 여기 복제하면 두 벌이 되고, 두 벌은 반드시 표류한다.
 func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int {
 	fs := newFlagSet("migrate")
-	dbPath := fs.String("db", "", "SQLite 파일 경로(비면 자동)")
+	dbPath := fs.String("db", "", "원장: SQLite 파일 경로 또는 Postgres 접속 URL(비면 자동)")
 	to := fs.Int("to", 0, "이 버전까지만 올린다(0 이면 이 바이너리가 아는 최신)")
-	rollback := fs.Bool("rollback", false, "판올림 전 백업 중 최신 것으로 되돌린다")
+	rollback := fs.Bool("rollback", false, "판올림 전 백업 중 최신 것으로 되돌린다(Postgres 는 복원 절차를 낸다)")
+	backupDir := fs.String("backup-dir", "", "Postgres 판올림 전 덤프 자리(비면 "+backupDirEnv+", 그것도 비면 "+defaultBackupDir+" 가 있을 때 그곳)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -40,14 +64,22 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 		return 1
 	}
 
+	dumps := resolveBackupDir(a.env, *backupDir)
+
 	if *rollback {
-		restored, err := store.Rollback(ctx, path, a.log)
+		got, err := store.Rollback(ctx, path, dumps, a.log)
 		if err != nil {
 			a.log.Error("되돌리기 실패", "path", shown, "error", err.Error())
 			fmt.Fprintf(out, "되돌리기 실패: %s\n", err)
 			return 1
 		}
-		fmt.Fprintf(out, "fd migrate --rollback · %s\n\n  %s 에서 되돌렸다\n", shown, restored)
+		if got.Steps == "" {
+			fmt.Fprintf(out, "fd migrate --rollback · %s\n\n  %s 에서 되돌렸다\n", shown, got.Backup)
+			return 0
+		}
+		// ★ Postgres 는 살아 있는 DB 를 덮지 않는다. 덤프를 고르고 머리를 잰 것까지가 이 명령이고, 복원은 사람이 서버를
+		//   멈추고 돈다 - 그래서 「되돌렸다」라고 쓰지 않는다.
+		fmt.Fprintf(out, "fd migrate --rollback · %s\n\n  덤프: %s\n  아직 되돌리지 않았다. %s\n", shown, got.Backup, got.Steps)
 		return 0
 	}
 
@@ -64,7 +96,7 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 		return 0
 	}
 
-	if err := store.MigrateTo(ctx, path, target, a.log); err != nil {
+	if err := store.MigrateWith(ctx, path, store.MigrateOptions{Target: target, BackupDir: dumps}, a.log); err != nil {
 		a.log.Error("적용 실패", "path", shown, "target", target, "error", err.Error())
 		fmt.Fprintf(out, "적용 실패: %s\n", err)
 		return 1
