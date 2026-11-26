@@ -234,8 +234,13 @@ codex                      # 한 번은 TUI 로 띄워 "Hooks need review" 를 �
 cd server
 gofmt -l .                                            # 빈 출력
 go vet ./... && GOOS=linux go vet ./... && GOOS=windows go vet ./...
-go test ./...                                         # 수 분 걸린다
+# 시험: PG 시험 컨테이너를 띄워 FD_TEST_PG 로 주고, 끝나면 내린다(수 분 걸린다)
+(p=fdtest-$(basename "$(dirname "$PWD")"); trap 'docker compose -f ../compose.test.yaml -p "$p" down' EXIT; trap 'exit 143' HUP INT TERM; docker compose -f ../compose.test.yaml -p "$p" up -d --wait && FD_TEST_PG="postgres://postgres@$(docker compose -f ../compose.test.yaml -p "$p" port pg-test 5432)/postgres?sslmode=disable" go test ./...)
 ```
+
+시험은 Postgres 에서 돈다. 시험 전용 컨테이너는 `compose.test.yaml` 이고(Docker 가 필요하다), 시험은 그 주소를
+`FD_TEST_PG` 로 받는다. `FD_TEST_PG` 가 없으면 시험은 건너뛰지 않고 **실패**한다. 위 한 줄이 띄우기 · 돌리기 ·
+내리기를 다 하고, 시험이 실패하거나 셸이 끊겨도 컨테이너를 내린다.
 
 코드가 바뀐 push 는 `.claude-plugin/plugin.json` 의 `version` 을 같이 올린다 — 안 올리면
 `/plugin update` 가 새 코드를 안 가져온다. 구성과 관문의 자세한 이유는 [개발](docs/development.ko.md)에 있다.

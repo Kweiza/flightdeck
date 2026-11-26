@@ -6,10 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/printer"
-	"go/token"
 	"io"
 	"log/slog"
 	"net/http"
@@ -28,13 +24,15 @@ import (
 	"github.com/kweiza/flightdeck/internal/model"
 	"github.com/kweiza/flightdeck/internal/service"
 	"github.com/kweiza/flightdeck/internal/store"
+	"github.com/kweiza/flightdeck/internal/store/storetest/freshstore"
 )
 
 // REST 왕복 지연의 기준 수치를 잰다: pick · note · finish, 그리고 랜딩 레인 경합.
 //
 // ★ 저장 엔진을 바꾸기 전후에 **같은 도구**로 잰다. 요청은 실물 HTTP(httptest)로 나가
-// api 게이트 사슬(멱등 기록 포함) → service → store 를 다 탄다. 엔진을 바꿀 때 고칠 자리는
-// benchStore 하나다. api 를 불러야 해서 외부 시험 패키지다(service 안에서는 순환 import).
+// api 게이트 사슬(멱등 기록 포함) → service → store 를 다 탄다. 원장은 store 쪽 벤치와 같은
+// freshstore.Open 이 연다 — 엔진을 바꿀 때 고칠 자리는 그 함수 하나다. api 를 불러야 해서 외부 시험
+// 패키지다(service 안에서는 순환 import).
 //
 // ★ git 은 뺀다. 판정 자리(pick · finish)는 요청마다 git 을 지금 읽는다(derive_cache.go 머리말).
 // 그 비용은 저장 엔진과 무관하고 호스트 부하로 크게 흔들려, 엔진이 바꾼 몫을 묻어 버린다.
@@ -49,26 +47,6 @@ import (
 // p50 · p95 · p99(ms, 가까운 순위)로 낸다. 두 출력은 benchstat 으로 맞댄다.
 
 const benchProject = "bench"
-
-// benchStore 는 빈 원장 하나를 연다. **엔진을 바꿀 때 이 함수만 바꾼다.**
-//
-// ★ 짝이 있다: store 의 bench_test.go 에 같은 몸통의 benchStore 가 있다(시험 패키지끼리는 함수를
-// 나눠 쓸 수 없다). 한쪽만 바꾸면 두 벤치가 다른 엔진을 재므로 TestBenchStoreTwinsMatch 가
-// 두 선언을 맞대 다르면 빨개진다. 바꿀 때는 둘을 함께 바꾼다.
-func benchStore(tb testing.TB) *store.Store {
-	tb.Helper()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	path := filepath.Join(tb.TempDir(), "fd.db")
-	if err := store.Migrate(context.Background(), path, log); err != nil {
-		tb.Fatalf("DB 적용 실패: %v", err)
-	}
-	st, err := store.OpenWithLogger(path, log)
-	if err != nil {
-		tb.Fatalf("DB 열기 실패: %v", err)
-	}
-	tb.Cleanup(func() { st.Close() })
-	return st
-}
 
 // restBench 는 실물 HTTP 서버 하나와 그 프로젝트의 워크트리들이다. 세션은 벤치가 연다.
 type restBench struct {
@@ -97,7 +75,7 @@ func newRESTBench(tb testing.TB, n int) *restBench {
 	}
 	git := newStillGit(repo, worktrees)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	st := benchStore(tb)
+	st := freshstore.Open(tb)
 	svc := service.New(st, log, service.WithGitFactory(func(string) service.GitReader { return git }))
 	srv := httptest.NewServer(api.NewServer(svc, api.Options{Log: log}))
 	tb.Cleanup(srv.Close) // 저장소 닫기보다 먼저 돈다(정리는 거꾸로 돈다)
@@ -508,38 +486,4 @@ func (stillGit) Ancestry(context.Context, string, string) (judge.AncestryResult,
 
 func (stillGit) FileAt(_ context.Context, ref, path string) ([]byte, error) {
 	return nil, fmt.Errorf("%s:%s: %w", ref, path, gitreader.ErrFileNotInRef)
-}
-
-// TestBenchStoreTwinsMatch 는 두 벤치(store 의 bench_test.go 와 이 파일)의 원장 생성 함수가
-// 같은지 본다. 한쪽만 엔진을 바꾸면 두 벤치가 서로 다른 엔진을 재고, 그 출력을 맞댄 판정이
-// 조용히 틀린다. 벤치는 기본 go test 에서 안 돌아 그 어긋남을 스스로 못 알린다, 그래서 이 시험은
-// 기본으로 돈다(파일 둘을 읽을 뿐이다).
-func TestBenchStoreTwinsMatch(t *testing.T) {
-	here := benchStoreDecl(t, "rest_bench_test.go")
-	there := benchStoreDecl(t, filepath.Join("..", "store", "bench_test.go"))
-	if here != there {
-		t.Fatalf("두 benchStore 가 다르다, 함께 바꿔라.\n이 파일:\n%s\nstore 쪽:\n%s", here, there)
-	}
-}
-
-// benchStoreDecl 은 파일의 benchStore 선언을 주석 없이 찍는다. 문서 주석은 서로 짝을 가리키느라
-// 다르니 맞대지 않는다.
-func benchStoreDecl(t *testing.T, path string) string {
-	t.Helper()
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, path, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, d := range f.Decls {
-		if fn, ok := d.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == "benchStore" {
-			var buf bytes.Buffer
-			if err := printer.Fprint(&buf, fset, fn); err != nil {
-				t.Fatal(err)
-			}
-			return buf.String()
-		}
-	}
-	t.Fatalf("%s 에 benchStore 가 없다", path)
-	return ""
 }

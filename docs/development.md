@@ -19,6 +19,7 @@ The repository root is the plugin root (what `${CLAUDE_PLUGIN_ROOT}` points at).
 | `board/` | Owner kanban board (`board.py` · `index.html` · `install.sh`). Its tests `test_board.py` run under `go test ./cmd/fd` |
 | `server/` | One Go module — server, CLI, MCP and hooks are **one binary** |
 | `compose.yaml` | Server container (one-shot schema apply + server) |
+| `compose.test.yaml` | Test-only Postgres (`pg-test`). The tests take it from `FD_TEST_PG` |
 | `DESIGN.md` | Document of record for the design |
 | `docs/*.md` · `docs/*.ko.md` | Topic docs (concepts · server · codex · several repositories · reference · development) |
 
@@ -29,8 +30,20 @@ cd server
 gofmt -l .                        # must print nothing — check first that cwd is inside the module
 go vet ./...
 GOOS=linux go vet ./... && GOOS=windows go vet ./...
-go test ./...                     # takes a few minutes
+# tests: start the PG test container, pass it as FD_TEST_PG, take it down afterwards (takes a few minutes)
+(p=fdtest-$(basename "$(dirname "$PWD")"); trap 'docker compose -f ../compose.test.yaml -p "$p" down' EXIT; trap 'exit 143' HUP INT TERM; docker compose -f ../compose.test.yaml -p "$p" up -d --wait && FD_TEST_PG="postgres://postgres@$(docker compose -f ../compose.test.yaml -p "$p" port pg-test 5432)/postgres?sslmode=disable" go test ./...)
 ```
+
+- **The tests run on Postgres.** Start `pg-test` from `compose.test.yaml` (Docker required) and pass its address
+  as `FD_TEST_PG`. The test helper (`server/internal/store/storetest`) gives each test a new database cloned
+  from a template database and drops it when the test ends.
+- **Without `FD_TEST_PG` the tests fail — they do not skip.** A skip would leave a package that ran nothing green.
+- **The test container shares nothing with production.** Every compose command names `-f ../compose.test.yaml`
+  (leave it out and compose picks the production `compose.yaml`, so the take-down would stop the production server).
+  The project name differs per checkout (`fdtest-<directory>`) and the host port is picked by Docker on loopback,
+  so two checkouts running the gates at once never take each other down.
+- **The take-down rides the subshell's EXIT trap.** It runs when a test fails, when the start fails, and when the
+  shell gets HUP · INT · TERM. The exit code is that of `go test`.
 
 - **Cross-check with `go vet`, not `go build`.** `go build` skips `_test.go`, so test code broken on
   another OS stays silent.

@@ -19,6 +19,7 @@
 | `board/` | 소유자 칸반 보드(`board.py` · `index.html` · `install.sh`). 시험 `test_board.py` 는 `go test ./cmd/fd` 가 돌린다 |
 | `server/` | Go 모듈 하나 — 서버 · CLI · MCP · 훅이 **한 바이너리**다 |
 | `compose.yaml` | 서버 컨테이너(스키마 적용 one-shot + 서버) |
+| `compose.test.yaml` | 시험 전용 Postgres(`pg-test`). 시험이 `FD_TEST_PG` 로 받는다 |
 | `DESIGN.md` | 설계 정본 |
 | `docs/*.md` · `docs/*.ko.md` | 주제별 문서(개념 · 서버 운영 · codex · 여러 저장소 · 레퍼런스 · 개발) |
 
@@ -29,8 +30,18 @@ cd server
 gofmt -l .                        # 빈 출력이어야 한다 — 먼저 cwd 가 모듈 안인지 봐라
 go vet ./...
 GOOS=linux go vet ./... && GOOS=windows go vet ./...
-go test ./...                     # 수 분 걸린다
+# 시험: PG 시험 컨테이너를 띄워 FD_TEST_PG 로 주고, 끝나면 내린다(수 분 걸린다)
+(p=fdtest-$(basename "$(dirname "$PWD")"); trap 'docker compose -f ../compose.test.yaml -p "$p" down' EXIT; trap 'exit 143' HUP INT TERM; docker compose -f ../compose.test.yaml -p "$p" up -d --wait && FD_TEST_PG="postgres://postgres@$(docker compose -f ../compose.test.yaml -p "$p" port pg-test 5432)/postgres?sslmode=disable" go test ./...)
 ```
+
+- **시험은 Postgres 에서 돈다.** `compose.test.yaml` 의 `pg-test`(Docker 필요)를 띄우고 그 주소를 `FD_TEST_PG` 로
+  준다. 시험 도우미(`server/internal/store/storetest`)가 시험마다 원판 DB 를 복제한 새 DB 를 만들고 끝나면 지운다.
+- **`FD_TEST_PG` 가 없으면 실패한다 — 건너뛰지 않는다.** 건너뛰면 아무것도 안 돈 패키지가 초록으로 남는다.
+- **시험 컨테이너는 운영과 아무것도 나누지 않는다.** 모든 compose 명령에 `-f ../compose.test.yaml` 을 적는다
+  (빠뜨리면 운영 `compose.yaml` 을 집어 내리기가 운영 서버를 내린다). 프로젝트 이름은 체크아웃마다 다르고
+  (`fdtest-<디렉토리>`), 호스트 포트는 루프백에 도커가 고른다 — 체크아웃 둘이 동시에 관문을 돌려도 서로를 내리지 않는다.
+- **내리기는 서브셸의 EXIT 트랩이 진다.** 시험이 실패해도, 띄우기가 실패해도, 셸이 HUP · INT · TERM 을 받아도
+  컨테이너를 내린다. 종료 코드는 `go test` 의 것이다.
 
 - **교차 검증은 `go build` 가 아니라 `go vet` 으로 한다.** `go build` 는 `_test.go` 를 건너뛰어
   시험 코드가 다른 OS 에서 깨져도 조용하다.

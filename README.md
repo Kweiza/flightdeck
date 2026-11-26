@@ -248,8 +248,13 @@ module in `server/`.
 cd server
 gofmt -l .                                            # must print nothing
 go vet ./... && GOOS=linux go vet ./... && GOOS=windows go vet ./...
-go test ./...                                         # takes a few minutes
+# tests: start the PG test container, pass it as FD_TEST_PG, take it down afterwards (takes a few minutes)
+(p=fdtest-$(basename "$(dirname "$PWD")"); trap 'docker compose -f ../compose.test.yaml -p "$p" down' EXIT; trap 'exit 143' HUP INT TERM; docker compose -f ../compose.test.yaml -p "$p" up -d --wait && FD_TEST_PG="postgres://postgres@$(docker compose -f ../compose.test.yaml -p "$p" port pg-test 5432)/postgres?sslmode=disable" go test ./...)
 ```
+
+The tests run on Postgres. The test-only container is `compose.test.yaml` (Docker required), and the tests
+take its address from `FD_TEST_PG`. Without `FD_TEST_PG` the tests **fail** rather than skip. The one line
+above starts, runs and takes down, and it takes the container down even when a test fails or the shell is cut off.
 
 A push that changes code bumps `version` in `.claude-plugin/plugin.json` too — otherwise
 `/plugin update` never fetches the new code. Layout and the reasons behind each gate are in

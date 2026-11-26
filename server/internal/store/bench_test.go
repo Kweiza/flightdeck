@@ -4,9 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -15,13 +12,15 @@ import (
 
 	"github.com/kweiza/flightdeck/internal/model"
 	"github.com/kweiza/flightdeck/internal/store"
+	"github.com/kweiza/flightdeck/internal/store/storetest/freshstore"
 )
 
 // 저장 엔진의 경합 기준 수치를 잰다: 동시 선점 · 발번 · 같은 행을 읽고 고치는 트랜잭션 동시.
 //
 // ★ 저장 엔진을 바꾸기 전후에 **같은 도구**로 잰다. 그래서 이 파일은 외부 시험 패키지이고
-// store 의 공개 API 만 부른다(s.db 같은 엔진 속에 손이 안 닿는다). 엔진을 바꿀 때 고칠 자리는
-// benchStore 하나다. 레인 경합은 레인 판정이 사는 service 쪽 벤치(BenchmarkRESTLane)가 REST 로 잰다.
+// store 의 공개 API 만 부른다(s.db 같은 엔진 속에 손이 안 닿는다). 원장은 freshstore.Open 이 연다 —
+// service 쪽 벤치도 같은 함수를 불러 두 벤치가 늘 같은 엔진을 잰다. 엔진을 바꿀 때 고칠 자리는 그 함수
+// 하나다. 레인 경합은 레인 판정이 사는 service 쪽 벤치(BenchmarkRESTLane)가 REST 로 잰다.
 //
 // ★ 벤치 함수라 기본 `go test` 에서는 안 돈다. 잴 때는 횟수를 박는다:
 //
@@ -35,30 +34,10 @@ import (
 
 const benchProject = "bench"
 
-// benchStore 는 빈 원장 하나를 연다. **엔진을 바꿀 때 이 함수만 바꾼다.**
-//
-// ★ 짝이 있다: service 의 rest_bench_test.go 에 같은 몸통의 benchStore 가 있다(시험 패키지끼리는
-// 함수를 나눠 쓸 수 없다). 한쪽만 바꾸면 두 벤치가 다른 엔진을 재므로, 그쪽의
-// TestBenchStoreTwinsMatch 가 두 선언을 맞대 다르면 빨개진다. 바꿀 때는 둘을 함께 바꾼다.
-func benchStore(tb testing.TB) *store.Store {
-	tb.Helper()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	path := filepath.Join(tb.TempDir(), "fd.db")
-	if err := store.Migrate(context.Background(), path, log); err != nil {
-		tb.Fatalf("DB 적용 실패: %v", err)
-	}
-	st, err := store.OpenWithLogger(path, log)
-	if err != nil {
-		tb.Fatalf("DB 열기 실패: %v", err)
-	}
-	tb.Cleanup(func() { st.Close() })
-	return st
-}
-
 // benchFixture 는 프로젝트 하나와 세션 n 개를 연다. 세션 id 를 연 순서대로 낸다.
 func benchFixture(tb testing.TB, n int) (*store.Store, []string) {
 	tb.Helper()
-	st := benchStore(tb)
+	st := freshstore.Open(tb)
 	ctx := context.Background()
 	if err := st.UpsertProject(ctx, model.Project{ID: benchProject, Path: "/repo/" + benchProject}); err != nil {
 		tb.Fatalf("프로젝트 등록 실패: %v", err)

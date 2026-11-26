@@ -1,0 +1,51 @@
+# flightdeck 시험 전용 Postgres. 운영 compose.yaml 과 아무것도 나누지 않는다.
+#
+# 시험(`go test ./...`)은 FD_TEST_PG 로 이 서버를 받아 시험마다 새 DB 를 만들고 지운다
+# (server/internal/store/storetest). FD_TEST_PG 가 없으면 시험은 **실패**한다 — 건너뛰면
+# 「아무것도 안 돌았는데 초록」이 된다.
+#
+# 띄우고 · 돌리고 · 내리는 한 줄(server 디렉토리에서, bash · zsh 둘 다):
+#
+#   (p=fdtest-$(basename "$(dirname "$PWD")"); trap 'docker compose -f ../compose.test.yaml -p "$p" down' EXIT; trap 'exit 143' HUP INT TERM; docker compose -f ../compose.test.yaml -p "$p" up -d --wait && FD_TEST_PG="postgres://postgres@$(docker compose -f ../compose.test.yaml -p "$p" port pg-test 5432)/postgres?sslmode=disable" go test ./...)
+#
+# ★ **`-f ../compose.test.yaml` 을 모든 compose 명령에 적는다.** 빠뜨리면 compose 가 이 디렉토리의
+#   compose.yaml(운영)을 집는다 — 내리기 명령이 그러면 운영 서버를 내린다.
+# ★ **프로젝트 이름(-p)은 체크아웃마다 다르다.** 워크트리 둘이 같은 이름으로 관문을 돌리면 먼저 끝난
+#   쪽의 down 이 다른 쪽 시험 도중에 서버를 내린다. 아래 `name` 은 -p 를 안 줬을 때의 기본값이고,
+#   운영 프로젝트와 겹치지 않게만 둔다.
+# ★ 내리기는 서브셸의 EXIT 트랩이 진다: 시험이 실패해도, 띄우기가 실패해도, 셸이 HUP · INT · TERM 을
+#   받아도 돈다(시그널은 `exit 143` 으로 바꿔 EXIT 트랩을 태운다). 셸만 TERM 을 받으면 셸은 돌던
+#   `go test` 가 끝난 뒤에 내린다. 종료 코드는 `go test`(또는 실패한 띄우기)의 것이다. 괄호 덕에 트랩과
+#   종료가 서브셸 안에 갇혀, 대화형 셸에 붙여 넣어도 그 셸을 닫지 않는다.
+
+name: fd-test
+
+services:
+  pg-test:
+    # 운영 DB 와 같은 큰 판(PostgreSQL 17).
+    image: postgres:17
+    environment:
+      # ★ 로케일은 두 축이고 둘 다 여기서 못박는다.
+      #   - 정렬: 기본 정렬 규칙을 builtin 제공자의 C.UTF-8 로 둔다(datlocale). 코드포인트 순이다.
+      #   - 글자 가르기: PG17 의 pg_trgm 은 제공자가 아니라 DB 의 libc LC_CTYPE(datctype)으로 글자를
+      #     가른다. 그것이 `C` 면 한글이 글자가 아니게 되어 show_trgm('판단을') 이 0개, 한글 검색이 조용히
+      #     0건이다. initdb 는 --lc-* 를 안 주면 환경(LANG)에서 가져오므로 이미지의 LANG 에 기대지 않게
+      #     --lc-ctype 를 준다. --lc-collate 도 같은 값으로 둬 libc 쪽 정렬도 환경에서 안 오게 한다.
+      #   storetest 의 시험이 넷(제공자 · datlocale · datctype · datcollate)과 show_trgm 을 잠근다.
+      POSTGRES_INITDB_ARGS: "--locale-provider=builtin --builtin-locale=C.UTF-8 --lc-collate=C.UTF-8 --lc-ctype=C.UTF-8 -E UTF8"
+      # 비밀번호 없이 받는다. 이 서버는 루프백에만 열리고 데이터는 메모리에만 있다(아래).
+      POSTGRES_HOST_AUTH_METHOD: trust
+    # 데이터는 메모리에만 둔다: 내리면 사라지고, 이미지의 VOLUME 자리에 익명 볼륨도 안 생긴다.
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports:
+      # ★ 루프백에만, 호스트 포트는 도커가 고른다. 고정 포트면 동시에 도는 관문 둘이 같은 포트를
+      #   다투고, 운영 포트와 겹칠 자리도 생긴다. 고른 포트는 `docker compose … port pg-test 5432` 가 준다.
+      - "127.0.0.1::5432"
+    healthcheck:
+      # ★ TCP 로 묻는다(-h 127.0.0.1). 이미지는 초기화 동안 소켓만 여는 임시 서버를 띄우는데, 소켓으로
+      #   물으면 그 임시 서버를 「준비됨」으로 읽어 `up --wait` 가 너무 일찍 풀린다.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "postgres"]
+      interval: 1s
+      timeout: 3s
+      retries: 60

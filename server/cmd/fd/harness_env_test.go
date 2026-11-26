@@ -28,13 +28,16 @@ import (
 // ★ 하네스가 고정하지 않은 키는 **없는 값**으로 결정적이다 — envOf 는 닫힌 맵이라 프로세스 환경을
 // 안 물려받는다. 그래서 CODEX_* 가 없는 하네스는 늘 Claude Code 갈래를 돈다. codex 갈래를 보려면
 // 그 키를 넣은 env 로 따로 돌려라(고정하면 Claude Code 갈래가 안 보이게 된다).
+//
+// FD_TEST_PG 는 시험 도우미 패키지(store/storetest)만 읽는다. 실행 파일에는 안 실리고, 시험 DB 서버
+// 주소라 하네스(envOf)가 고정할 축이 아니다 — 도우미가 프로세스 환경에서 직접 읽는다.
 var knownEnvAxes = []string{
 	"CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_SESSION_ATTENDED",
 	"CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CONFIG_DIR",
 	"CLAUDE_ENV_FILE", "CLAUDE_PID", "CLAUDE_PLUGIN_DATA", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR",
 	"CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED", "CODEX_SESSION_ID", "CODEX_THREAD_ID",
 	"FD_ADDR", "FD_DB", "FD_FOLLOWUP_SINK", "FD_LANG", "FD_LEDGER", "FD_LOG", "FD_PLUGIN_ROOT", "FD_PROJECT", "FD_SESSION", "FD_STATE_DIR",
-	"FD_TIMEOUT", "FD_TOKEN", "FD_URL", "FD_WORKTREE",
+	"FD_TEST_PG", "FD_TIMEOUT", "FD_TOKEN", "FD_URL", "FD_WORKTREE",
 	"HOME", "PATH", "USER", "XDG_STATE_HOME",
 }
 
