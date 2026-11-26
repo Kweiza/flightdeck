@@ -566,21 +566,25 @@ func OpenLedger(ctx context.Context, path string, log *slog.Logger) (*Store, err
 type RollbackOutcome struct {
 	// Backup 은 고른 백업이다(SQLite 는 원장 옆 사본, Postgres 는 판올림 전 덤프).
 	Backup string
-	// Steps 는 사람이 돌 절차다. 비어 있으면 이 명령이 원장을 이미 갈았다(SQLite). Postgres 는 살아 있는 DB 를
-	// 덮지 않고, 덤프를 새 DB 로 복원하는 절차를 낸다(pgRollbackHint).
+	// Steps 는 사람이 돌 절차의 설명이다. 비어 있으면 이 명령이 원장을 이미 갈았다(SQLite). Postgres 는 살아 있는 DB 를
+	// 덮지 않고, 덤프를 새 DB 로 복원하는 절차를 낸다(pgRollbackSteps).
 	Steps string
+	// Script 는 Postgres 의 복원 셸 스크립트다(pgRollbackScript). 그대로 돌리는 것이 절차다 - 접속은 환경 변수로만 받고
+	// 출력에 비밀번호도 호스트도 없다.
+	Script string
 }
 
 // Rollback 은 판올림 전 백업 중 **가장 최근 것**으로 되돌린다. `fd migrate --rollback` 의 본체다. 엔진은 path 로 가른다.
 //
 //   - SQLite: <db>.bak-* 중 최신을 원장 위에 덮는다(rollbackSQLite).
-//   - Postgres: backupDir 의 pre-<판>-<시각>.dump 중 최신을 고르고 머리를 잰 뒤 복원 절차를 낸다. DB 에 붙지 않는다.
+//   - Postgres: 원장에 붙어 식별과 판을 읽고, backupDir 의 덤프 중 그 원장의 최신(fd-<원장>-from<판>-<시각>.dump)을 고른다.
+//     머리를 재고, 덤프 뒤로 커밋된 판올림이 있을 때만 복원 절차를 낸다(rollbackPG). 원장은 바꾸지 않는다.
 func Rollback(ctx context.Context, path, backupDir string, log *slog.Logger) (RollbackOutcome, error) {
 	if log == nil {
 		log = slog.Default()
 	}
 	if ParseTarget(path).Postgres() {
-		return rollbackPG(backupDir)
+		return rollbackPG(ctx, ParseTarget(path), backupDir)
 	}
 	src, err := rollbackSQLite(path, log)
 	return RollbackOutcome{Backup: src}, err

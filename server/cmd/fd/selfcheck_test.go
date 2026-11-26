@@ -42,14 +42,84 @@ func selfcheckDBAt(t *testing.T, path string, sqls ...string) string {
 	return path
 }
 
+// migrated 는 path 의 원장을 이전 실행기로 target 판까지 올린다(0 이면 지금 판).
+func migrated(t *testing.T, path string, target int) string {
+	t.Helper()
+	if target == 0 {
+		target = store.SchemaVersion
+	}
+	if err := store.MigrateTo(context.Background(), path, target, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatalf("이전 실행기: %v", err)
+	}
+	return path
+}
+
 func TestSelfcheckPassesOnCleanDB(t *testing.T) {
 	var out bytes.Buffer
-	code := runSelfcheck([]string{"--db", selfcheckDB(t)}, noSelfcheckEnv, &out)
+	code := runSelfcheck([]string{"--db", migrated(t, selfcheckDB(t), 0)}, noSelfcheckEnv, &out)
 	if code != 0 {
 		t.Fatalf("깨끗한 DB 인데 종료코드 %d — %s", code, out.String())
 	}
 	if !strings.HasPrefix(out.String(), "fd selfcheck ok build=") {
 		t.Fatalf("계약된 첫 줄이 아니다: %q", out.String())
+	}
+}
+
+// TestSelfcheckPassesOnlyWhatBootOpens 는 selfcheck 의 판정이 기동 검사와 같은지 두 엔진에서 잰다: 증분 계획이 none 일
+// 때만 통과다. apply(빈 DB) · upgrade(낮은 판)를 통과로 내면 감시기가 새 판으로 넘어간 뒤 그 기동이 「fd migrate 를 먼저
+// 돌려라」로 죽는다 - 기동은 증분을 적용하지 않는다.
+func TestSelfcheckPassesOnlyWhatBootOpens(t *testing.T) {
+	pgAt := func(t *testing.T, version int) string {
+		dsn := storetest.NewBare(t, "")
+		if version < 0 {
+			return dsn
+		}
+		migrated(t, dsn, 0)
+		if version != store.SchemaVersion {
+			db, err := sql.Open("pgx", dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err := db.Exec(`UPDATE schema_version SET version = $1`, version); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dsn
+	}
+	for _, c := range []struct {
+		name string
+		db   func(t *testing.T) string
+		plan store.MigrationAction
+	}{
+		{"SQLite none", func(t *testing.T) string { return migrated(t, selfcheckDB(t), 0) }, store.MigrateNone},
+		{"SQLite apply", func(t *testing.T) string { return selfcheckDB(t) }, store.MigrateApply},
+		{"SQLite upgrade", func(t *testing.T) string { return migrated(t, selfcheckDB(t), store.SchemaVersion-1) }, store.MigrateUpgrade},
+		{"Postgres none", func(t *testing.T) string { return pgAt(t, store.SchemaVersion) }, store.MigrateNone},
+		{"Postgres apply", func(t *testing.T) string { return pgAt(t, -1) }, store.MigrateApply},
+		{"Postgres upgrade", func(t *testing.T) string { return pgAt(t, store.SchemaVersion-1) }, store.MigrateUpgrade},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path := c.db(t)
+			if plan, err := store.ProbeMigration(context.Background(), path); err != nil || plan.Action != c.plan {
+				t.Fatalf("준비한 원장의 계획 %+v, %v (기대 %s)", plan, err, c.plan)
+			}
+			env := func(k string) (string, bool) { return path, k == "FD_DB" }
+			var out bytes.Buffer
+			code := runSelfcheck(nil, env, &out)
+			if c.plan == store.MigrateNone {
+				if code != 0 || !strings.HasPrefix(out.String(), "fd selfcheck ok build=") {
+					t.Fatalf("기동이 여는 원장인데 종료코드 %d - %s", code, out.String())
+				}
+				return
+			}
+			if code != 1 || !strings.Contains(out.String(), "("+string(c.plan)+")") || !strings.Contains(out.String(), "fd migrate") {
+				t.Fatalf("기동이 거절할 원장(%s)인데 종료코드 %d - %s", c.plan, code, out.String())
+			}
+			if _, err := store.Open(path); err == nil {
+				t.Fatalf("selfcheck 가 거절한 원장(%s)을 기동이 열었다 - 두 판정이 어긋난다", c.plan)
+			}
+		})
 	}
 }
 
@@ -89,7 +159,7 @@ func noSelfcheckEnv(string) (string, bool) { return "", false }
 // TestSelfcheckReadsFDDBWhenFlagIsEmpty 는 --db 가 비면 FD_DB 를 재는지 잰다. 감시기는 원장 자리를 늘 이 환경
 // 변수로 넘기고, Postgres 접속 URL 은 argv 에 싣지 않는다(selfcheckArgs).
 func TestSelfcheckReadsFDDBWhenFlagIsEmpty(t *testing.T) {
-	path := selfcheckDB(t)
+	path := migrated(t, selfcheckDB(t), 0)
 	env := func(k string) (string, bool) { return path, k == "FD_DB" }
 	var out bytes.Buffer
 	if code := runSelfcheck(nil, env, &out); code != 0 {
@@ -137,7 +207,7 @@ func TestSelfcheckRefusesPostgresWithoutLeaking(t *testing.T) {
 // TestSelfcheckKeepsFileNameAsGiven 은 SQLite 파일 경로를 다듬지 않고 받은 그대로 재는지 잰다. 이름 끝의 공백도
 // 이름이다 - 다듬으면 없는 `fd.db` 를 재거나, 둘 다 있으면 다른 원장을 잰다.
 func TestSelfcheckKeepsFileNameAsGiven(t *testing.T) {
-	path := selfcheckDBAt(t, filepath.Join(t.TempDir(), "fd.db "))
+	path := migrated(t, selfcheckDBAt(t, filepath.Join(t.TempDir(), "fd.db ")), 0)
 	var out bytes.Buffer
 	if code := runSelfcheck([]string{"--db", path}, noSelfcheckEnv, &out); code != 0 {
 		t.Fatalf("이름 끝에 공백이 든 DB 를 못 쟀다(종료코드 %d) - %s", code, out.String())
@@ -152,7 +222,7 @@ func TestSelfcheckKeepsFileNameAsGiven(t *testing.T) {
 func TestSelfcheckIsWiredIntoMain(t *testing.T) {
 	var out, errBuf bytes.Buffer
 	noEnv := func(string) (string, bool) { return "", false }
-	code := run([]string{"selfcheck", "--db", selfcheckDB(t)},
+	code := run([]string{"selfcheck", "--db", migrated(t, selfcheckDB(t), 0)},
 		noEnv, strings.NewReader(""), &out, &errBuf)
 	if code != 0 {
 		t.Fatalf("main 경유 종료코드 %d — out=%q err=%q", code, out.String(), errBuf.String())

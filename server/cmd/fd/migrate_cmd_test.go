@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -240,19 +243,38 @@ func TestMigrateLaysAPostgresLedgerTheServerCanOpen(t *testing.T) {
 	}
 }
 
-// Postgres 의 --rollback 은 덤프 자리의 가장 최근 덤프를 골라 복원 절차를 내고, 되돌렸다고 말하지 않는다. 덤프 자리는
-// --backup-dir, 없으면 FD_BACKUP_DIR 이다. DB 에 붙지 않는다(접속 URL 은 닿지 않는 주소다).
+// Postgres 의 --rollback 은 원장에 붙어 그 원장의 가장 최근 덤프를 고르고 복원 스크립트를 내며, 되돌렸다고 말하지 않는다.
+// 덤프 자리는 --backup-dir, 없으면 FD_BACKUP_DIR 이다. 출력에 접속 URL 의 조각이 없다.
 func TestMigrateRollbackNamesThePostgresDump(t *testing.T) {
 	h := newHarness(t)
-	const dsn = "postgres://fduser:s3cret@127.0.0.1:1/ledger?sslmode=disable"
+	dsn := storetest.NewBare(t, "")
+	if err := store.Migrate(context.Background(), dsn, nil); err != nil {
+		t.Fatalf("이전 실행기: %v", err)
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
 	dir := t.TempDir()
 
 	rc, out := h.run("", "migrate", "--db", dsn, "--rollback", "--backup-dir", dir)
 	if rc == 0 || !strings.Contains(out, "되돌릴 덤프가 없다") {
 		t.Fatalf("덤프 없는 되돌리기(rc=%d): %s", rc, out)
 	}
-	dump := filepath.Join(dir, "pre-19-20261126T160203Z.dump")
+	id := regexp.MustCompile(`식별 ([0-9a-f]{16})`).FindStringSubmatch(out)
+	if id == nil {
+		t.Fatalf("덤프 없는 되돌리기가 원장 식별을 안 말한다: %s", out)
+	}
+	dump := filepath.Join(dir, fmt.Sprintf("fd-%s-from%d-20261126T160203Z.dump", id[1], store.SchemaVersion))
 	if err := os.WriteFile(dump, []byte("PGDMP-test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE schema_version SET version = version + 1`); err != nil { // 덤프 뒤로 판올림이 커밋됐다
 		t.Fatal(err)
 	}
 	env := map[string]string{backupDirEnv: dir}
@@ -267,12 +289,12 @@ func TestMigrateRollbackNamesThePostgresDump(t *testing.T) {
 		if rc != 0 {
 			t.Fatalf("%q: rc=%d: %s", args, rc, out)
 		}
-		for _, frag := range []string{"덤프: " + dump, "아직 되돌리지 않았다", "pg_restore --create"} {
+		for _, frag := range []string{"덤프: " + dump, "아직 되돌리지 않았다", "\n#!/bin/sh\n", `pg_restore -h "$PGHOST" -p "$PGPORT" -U "$PGUSER"`} {
 			if !strings.Contains(out, frag) {
 				t.Errorf("%q: 출력에 %q 가 없다: %s", args, frag, out)
 			}
 		}
-		if strings.Contains(out, "에서 되돌렸다") || strings.Contains(out, "s3cret") || strings.Contains(out, "fduser") {
+		if strings.Contains(out, "에서 되돌렸다") || strings.Contains(out, strings.TrimPrefix(u.Path, "/")) || strings.Contains(out, u.Host) {
 			t.Errorf("%q: 되돌렸다고 말하거나 접속 조각을 실었다: %s", args, out)
 		}
 	}

@@ -78,8 +78,9 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 			return 0
 		}
 		// ★ Postgres 는 살아 있는 DB 를 덮지 않는다. 덤프를 고르고 머리를 잰 것까지가 이 명령이고, 복원은 사람이 서버를
-		//   멈추고 돈다 - 그래서 「되돌렸다」라고 쓰지 않는다.
-		fmt.Fprintf(out, "fd migrate --rollback · %s\n\n  덤프: %s\n  아직 되돌리지 않았다. %s\n", shown, got.Backup, got.Steps)
+		//   멈추고 스크립트를 돈다 - 그래서 「되돌렸다」라고 쓰지 않는다. 스크립트는 출력의 마지막이다(#!/bin/sh 부터 끝까지
+		//   파일로 옮겨 그대로 돌린다).
+		fmt.Fprintf(out, "fd migrate --rollback · %s\n\n  덤프: %s\n  아직 되돌리지 않았다. %s\n\n%s\n", shown, got.Backup, got.Steps, got.Script)
 		return 0
 	}
 

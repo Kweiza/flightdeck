@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"net/url"
 	"os"
 	"os/exec"
@@ -94,10 +93,35 @@ func advisoryHolders(t *testing.T, s *Store, key int64) int64 {
 		  AND l.classid::bigint = (?::bigint >> 32) AND l.objid::bigint = (?::bigint & 4294967295)`, key, key)
 }
 
-func failingBackup(t *testing.T) func(context.Context, int) (string, error) {
-	return func(context.Context, int) (string, error) {
+func failingBackup(t *testing.T) func(context.Context, *migrateSession, int) (string, error) {
+	return func(context.Context, *migrateSession, int) (string, error) {
 		t.Error("백업을 뜨면 안 되는 자리에서 떴다")
 		return "", nil
+	}
+}
+
+// TestMigrateHintNamesWhoMayRunIt 은 기동 거절의 처방(OpenRefusal)이 Postgres 원장에는 누구로 붙어 `fd migrate` 를 돌릴지
+// 말하는지 잰다. 서버 계정(앱 역할)으로 돌리면 준비 · 증분이 권한으로 실패한다. 접속 URL 의 조각은 싣지 않는다.
+func TestMigrateHintNamesWhoMayRunIt(t *testing.T) {
+	const dsn = "postgres://fd_app_user:s3cret@db.example/ledger"
+	for _, a := range []MigrationAction{MigrateApply, MigrateUpgrade} {
+		err := OpenRefusal(MigrationPlan{Action: a, Reason: "시험 사유"}, dsn)
+		if err == nil || !strings.Contains(err.Error(), "초사용자나 소유 역할("+pg.OwnerRole+")로 접속해 `fd migrate`") {
+			t.Fatalf("%s 처방: %v", a, err)
+		}
+		for _, leak := range []string{"s3cret", "fd_app_user", "db.example", "ledger"} {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("%s 처방에 접속 조각 %q 가 실렸다: %v", a, leak, err)
+			}
+		}
+	}
+	for _, tg := range []Target{ParseTarget(dsn), ParseTarget("/srv/fd.db")} {
+		if h := migrateHint(tg); strings.Contains(h, "—") {
+			t.Errorf("처방에 긴 대시: %q", h)
+		}
+	}
+	if err := OpenRefusal(MigrationPlan{Action: MigrateNone}, dsn); err != nil {
+		t.Fatalf("none 인데 거절: %v", err)
 	}
 }
 
@@ -186,14 +210,15 @@ func TestPGLocaleGateRefusesEverywhere(t *testing.T) {
 }
 
 // TestPGMigrateSelfLockTurnsAwaySecondRunner 는 실행기끼리 자기 잠금으로 갈리는지 잰다: 쥔 동안 온 실행기는 기다리지 않고
-// 곧장 거절되고, 놓은 뒤에는 돈다. 실행이 끝나면 잠금을 놓는다.
+// 곧장 거절되고, 놓은 뒤에는 돈다. 실행이 끝나면 두 잠금을 다 놓는다.
 func TestPGMigrateSelfLockTurnsAwaySecondRunner(t *testing.T) {
 	ctx := context.Background()
 	dsn, s := pgMigrated(t)
-	unlock, err := s.lockMigrate(ctx)
+	sess, err := s.openMigrateSession(ctx)
 	if err != nil {
-		t.Fatalf("자기 잠금: %v", err)
+		t.Fatalf("실행기 세션: %v", err)
 	}
+	unlock := sess.release
 	m, run := pgMigrator(t, dsn, MigrateOptions{})
 	run.backup = failingBackup(t)
 	start := time.Now()
@@ -209,8 +234,10 @@ func TestPGMigrateSelfLockTurnsAwaySecondRunner(t *testing.T) {
 	if err := m.migrateTo(ctx, run); err != nil {
 		t.Fatalf("잠금을 놓은 뒤: %v", err)
 	}
-	if n := advisoryHolders(t, s, migrateLockKey); n != 0 {
-		t.Fatalf("실행이 끝났는데 자기 잠금을 쥔 연결이 %d개", n)
+	for _, k := range []int64{migrateLockKey, globalLockKey} {
+		if n := advisoryHolders(t, s, k); n != 0 {
+			t.Fatalf("실행이 끝났는데 잠금 %x 를 쥔 연결이 %d개", k, n)
+		}
 	}
 }
 
@@ -220,14 +247,19 @@ func TestPGStepRechecksVersionInsideTheLock(t *testing.T) {
 	ctx := context.Background()
 	_, s := pgMigrated(t)
 	stamp(t, s, SchemaVersion+1)
-	err := s.applyStep(ctx, Migration{To: SchemaVersion + 1, Name: "시험 증분", SQL: `CREATE TABLE t_twice(x int)`})
+	sess, err := s.openMigrateSession(ctx)
+	if err != nil {
+		t.Fatalf("실행기 세션: %v", err)
+	}
+	defer sess.release()
+	err = s.applyStep(ctx, sess, Migration{To: SchemaVersion + 1, Name: "시험 증분", SQL: `CREATE TABLE t_twice(x int)`})
 	if err == nil || !strings.Contains(err.Error(), "다른 실행기가 올렸다") {
 		t.Fatalf("이미 얹힌 단: %v", err)
 	}
 	if pgTableExists(t, s, "t_twice") {
 		t.Fatal("이미 얹힌 단을 또 얹었다")
 	}
-	if err := s.applyStep(ctx, pgBaseline); err == nil || !strings.Contains(err.Error(), "빈 DB 에만") {
+	if err := s.applyStep(ctx, sess, pgBaseline); err == nil || !strings.Contains(err.Error(), "빈 DB 에만") {
 		t.Fatalf("깔린 DB 위 기준선: %v", err)
 	}
 }
@@ -260,37 +292,271 @@ func TestPGMigrateBelowBaselineLeavesEmptyDB(t *testing.T) {
 	}
 }
 
-// TestPGDumpAndRestoreRehearsal 은 판올림 전 덤프를 실제 pg_dump 로 뜨고, `fd migrate --rollback` 이 낸 절차 그대로
-// 되살려 옛 판 바이너리가 다시 뜨는지 잰다. pg_dump · pg_restore 가 PATH 에 없으면 건너뛴다 - 실행 경계(argv · 환경 ·
-// 실패 분류)는 pgdump_test.go 가 가짜 실행 파일로 잰다.
-func TestPGDumpAndRestoreRehearsal(t *testing.T) {
-	for _, bin := range []string{"pg_dump", "pg_restore"} {
+// TestPGEmptyMeansEverySchema 는 「빈 DB」를 public 만이 아니라 모든 사용자 스키마로 재는지 잰다. 다른 스키마에 객체가
+// 있는 DB 를 빈 DB 로 보면 남의 DB 위에 기준선을 깐다. 확장이 깐 객체는 남의 데이터가 아니라 세지 않는다.
+func TestPGEmptyMeansEverySchema(t *testing.T) {
+	ctx := context.Background()
+	for name, prep := range map[string]string{
+		"다른 스키마의 표":   `CREATE SCHEMA t_other; CREATE TABLE t_other.x(a int)`,
+		"다른 스키마의 뷰":   `CREATE SCHEMA t_other; CREATE VIEW t_other.v AS SELECT 1 AS a`,
+		"다른 스키마의 시퀀스": `CREATE SCHEMA t_other; CREATE SEQUENCE t_other.s`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dsn := storetest.NewBare(t, "")
+			s := pgOpen(t, dsn)
+			pgExec(t, s, prep)
+			if err := Migrate(ctx, dsn, quietLog()); err == nil || !strings.Contains(err.Error(), "schema_version 표가 없는데 객체가") {
+				t.Fatalf("남의 객체가 있는 DB 를 빈 DB 로 봤다: %v", err)
+			}
+			if pgTableExists(t, s, "machine") {
+				t.Fatal("남의 객체가 있는 DB 위에 기준선을 깔았다")
+			}
+		})
+	}
+	t.Run("확장이 깐 뷰", func(t *testing.T) {
+		dsn := storetest.NewBare(t, "")
+		s := pgOpen(t, dsn)
+		pgExec(t, s, `CREATE EXTENSION pg_buffercache`)
+		if plan, err := ProbeMigration(ctx, dsn); err != nil || plan.Action != MigrateApply {
+			t.Fatalf("확장만 있는 DB 의 판 재기: %+v, %v", plan, err)
+		}
+	})
+}
+
+// TestPGServerAccountCanJudgeTheLedger 는 서버 계정(앱 역할의 구성원 - 초사용자도 소유 역할도 아니다)으로 붙어도 기동의 판
+// 재기(planOpen)와 /healthz 의 로케일 재기(CheckLocale)가 이전 실행기와 같은 답을 내는지 잰다. 카탈로그를 못 읽어 빈 DB ·
+// 읽기 실패로 보이면 운영 서버만 뜨지 않는다.
+func TestPGServerAccountCanJudgeTheLedger(t *testing.T) {
+	ctx := context.Background()
+	dsn, s := pgMigrated(t)
+	role := "t_srv_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	pgExec(t, s, `CREATE ROLE `+role+` LOGIN IN ROLE `+pg.AppRole)
+	t.Cleanup(func() { _, _ = s.db.ExecContext(context.Background(), `DROP ROLE IF EXISTS `+role) })
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.User(role)
+	app := u.String()
+
+	if plan, err := ProbeMigration(ctx, app); err != nil || plan.Action != MigrateNone {
+		t.Fatalf("서버 계정의 판 재기: %+v, %v", plan, err)
+	}
+	opened, err := OpenWithLogger(app, quietLog())
+	if err != nil {
+		t.Fatalf("서버 계정으로 기동하지 못했다: %v", err)
+	}
+	defer opened.Close()
+	if err := opened.CheckLocale(ctx); err != nil {
+		t.Fatalf("서버 계정의 로케일 재기: %v", err)
+	}
+	var who string
+	if err := opened.db.QueryRowContext(ctx, `SELECT current_user`).Scan(&who); err != nil || who != role {
+		t.Fatalf("서버 계정으로 붙지 않았다: %q, %v", who, err)
+	}
+}
+
+// blockingPGDump 는 PATH 앞에 가짜 pg_dump 를 둔다. 가짜는 뜨기 시작했다는 표시를 남기고, 풀릴 때까지 기다렸다가 사용자
+// 정의 형식의 머리만 쓴다(원장에 붙지 않는다). started 는 뜨기 시작한 수, release 는 모두 풀어 준다.
+func blockingPGDump(t *testing.T) (started func() int, release func()) {
+	t.Helper()
+	rec := t.TempDir()
+	bin := fakePGDump(t, rec, `: > "`+rec+`/started.$$"
+i=0
+while [ ! -e "`+rec+`/go" ]; do sleep 0.05; i=$((i+1)); [ "$i" -gt 1200 ] && exit 3; done
+printf 'PGDMP-fake' > "$out"`)
+	t.Setenv("PATH", filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	started = func() int {
+		m, _ := filepath.Glob(filepath.Join(rec, "started.*"))
+		return len(m)
+	}
+	release = func() { _ = os.WriteFile(filepath.Join(rec, "go"), nil, 0o600) }
+	t.Cleanup(release) // 중간에 실패한 시험이 가짜를 붙들어 두지 않게
+	return started, release
+}
+
+// upgradeRun 은 dsn 의 원장을 판 하나 올리는 실행기다(덤프 자리 dir). 증분은 표 t_after 하나를 만든다.
+func upgradeRun(t *testing.T, dsn, dir string) (*Store, migrateRun) {
+	t.Helper()
+	m, run := pgMigrator(t, dsn, MigrateOptions{Target: SchemaVersion + 1, BackupDir: dir})
+	run.steps = []Migration{{To: SchemaVersion + 1, Name: "시험 증분", SQL: `CREATE TABLE t_after(x int)`}}
+	return m, run
+}
+
+// TestPGWriteWaitsForTheDump 는 덤프와 증분이 한 잠금 안에 있는지 잰다: 실행기가 판올림 전 덤프를 뜨는 동안 들어온 업무
+// 쓰기는 덤프 · 증분 · 판 행이 다 커밋될 때까지 기다린다. 덤프 뒤 · 첫 증분 전에 쓰기가 끼면 덤프에도 없고 옛 판에서
+// 커밋된 행이 생긴다 - 그 쓰기가 새 판을 보는 것이 안 끼었다는 증거다.
+func TestPGWriteWaitsForTheDump(t *testing.T) {
+	ctx := context.Background()
+	dsn, s := pgMigrated(t)
+	started, release := blockingPGDump(t)
+	dir := t.TempDir()
+	m, run := upgradeRun(t, dsn, dir)
+	aDone := make(chan error, 1)
+	go func() { aDone <- m.migrateTo(ctx, run) }()
+	waitUntil(t, "덤프가 뜬다", func() bool { return started() == 1 })
+	for _, k := range []int64{migrateLockKey, globalLockKey} {
+		if n := advisoryHolders(t, s, k); n != 1 {
+			t.Errorf("덤프 도중 잠금 %x 를 쥔 연결 %d개(기대 1 - 실행기 세션)", k, n)
+		}
+	}
+
+	w, err := openPG(ParseTarget(dsn), quietLog(), time.Minute)
+	if err != nil {
+		t.Fatalf("업무 쓰기 연결: %v", err)
+	}
+	defer w.Close()
+	var version int64
+	wDone := make(chan error, 1)
+	go func() {
+		wDone <- w.Tx(ctx, func(x *Tx) error {
+			if err := x.tx.QueryRowContext(x.ctx, `SELECT max(version) FROM schema_version`).Scan(&version); err != nil {
+				return err
+			}
+			return insertMachine(x, "m-during-dump")
+		})
+	}()
+	waitUntil(t, "업무 쓰기가 전역 잠금을 기다린다", func() bool { return lockWaiters(t, s) == 1 })
+	select {
+	case err := <-wDone:
+		t.Fatalf("덤프를 뜨는 동안 업무 쓰기가 끝났다: %v", err)
+	default:
+	}
+	release()
+	if err := <-aDone; err != nil {
+		t.Fatalf("판올림: %v", err)
+	}
+	if err := <-wDone; err != nil {
+		t.Fatalf("기다린 업무 쓰기: %v", err)
+	}
+	if version != int64(SchemaVersion+1) {
+		t.Fatalf("덤프 도중에 들어온 쓰기가 판 %d 에서 커밋됐다(기대 %d) - 덤프와 증분 사이에 끼었다", version, SchemaVersion+1)
+	}
+	if names := dirNames(t, dir); len(names) != 1 || !strings.HasSuffix(names[0], dumpExt) {
+		t.Fatalf("백업 자리: %q", names)
+	}
+}
+
+// TestPGLostRunnerFailsClosed 는 덤프 도중 실행기 세션이 끊긴 자리를 잰다(pg_terminate_backend). 잠금은 세션과 함께
+// 사라지므로 다음 실행기가 곧장 돈다 - 끊긴 실행기의 pg_dump 는 그것을 모른 채 계속 돈다. 끊긴 실행기는 봉인(sealDump)에서
+// 실패해 덤프에 최종 이름을 안 붙이고(닫힌 실패) 증분도 안 얹는다. 판은 다음 실행기가 한 번만 올린다.
+func TestPGLostRunnerFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	dsn, s := pgMigrated(t)
+	started, release := blockingPGDump(t)
+	dir := t.TempDir()
+	runner := func() <-chan error {
+		m, run := upgradeRun(t, dsn, dir)
+		done := make(chan error, 1)
+		go func() { done <- m.migrateTo(ctx, run) }()
+		return done
+	}
+
+	aDone := runner()
+	waitUntil(t, "A 의 덤프가 뜬다", func() bool { return started() == 1 })
+	pid := pgCount(t, s, `SELECT l.pid::bigint FROM pg_locks l JOIN pg_database d ON d.oid = l.database
+		WHERE l.locktype = 'advisory' AND l.granted AND d.datname = current_database() AND l.objsubid = 1
+		  AND l.classid::bigint = (?::bigint >> 32) AND l.objid::bigint = (?::bigint & 4294967295)`, migrateLockKey, migrateLockKey)
+	if n := pgCount(t, s, `SELECT count(*) WHERE pg_terminate_backend(?::int)`, pid); n != 1 {
+		t.Fatalf("실행기 세션(pid %d)을 끊지 못했다", pid)
+	}
+	waitUntil(t, "A 의 잠금이 세션과 함께 사라진다", func() bool {
+		return advisoryHolders(t, s, migrateLockKey) == 0 && advisoryHolders(t, s, globalLockKey) == 0
+	})
+
+	bDone := runner()
+	waitUntil(t, "B 의 덤프가 A 의 덤프와 함께 뜬다", func() bool { return started() == 2 })
+	release()
+	aErr, bErr := <-aDone, <-bDone
+	if aErr == nil || !strings.Contains(aErr.Error(), "덤프에 최종 이름을 붙이지 않는다") {
+		t.Fatalf("잠금을 잃은 실행기: %v", aErr)
+	}
+	if bErr != nil {
+		t.Fatalf("다음 실행기: %v", bErr)
+	}
+	if v := pgVersion(t, s); v != SchemaVersion+1 || !pgTableExists(t, s, "t_after") {
+		t.Fatalf("판올림 뒤: 판 %d, t_after %v", v, pgTableExists(t, s, "t_after"))
+	}
+	if n := pgCount(t, s, `SELECT count(*) FROM schema_version WHERE version = ?`, SchemaVersion+1); n != 1 {
+		t.Fatalf("판 %d 행 %d개(기대 1)", SchemaVersion+1, n)
+	}
+	if names := dirNames(t, dir); len(names) != 1 || !strings.HasSuffix(names[0], dumpExt) {
+		t.Fatalf("백업 자리에 다음 실행기의 덤프 하나만 있어야 한다: %q", names)
+	}
+}
+
+// needPGTools 는 실제 덤프 · 복원 예행에 필요한 도구가 PATH 에 없으면 건너뛴다. 실행 경계(argv · 환경 · 실패 분류)는
+// pgdump_test.go 가 가짜 실행 파일로 잰다.
+func needPGTools(t *testing.T) {
+	t.Helper()
+	for _, bin := range []string{"pg_dump", "pg_restore", "psql", "sh", "sed"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			t.Skipf("%s 가 없다 - 실제 덤프 · 복원 예행은 건너뛴다", bin)
 		}
 	}
+}
+
+// clusterEnv 는 사람이 되돌리기 스크립트 앞에 둘 환경이다: 원장 클러스터(FD_TEST_PG)의 PGHOST · PGPORT · PGUSER(와 있으면
+// PGPASSWORD). 그 밖의 PG 변수는 물려주지 않는다. extra 가 덧붙는다.
+func clusterEnv(t *testing.T, extra ...string) []string {
+	t.Helper()
+	u, err := url.Parse(os.Getenv(storetest.EnvDSN))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "PGHOST=" + u.Hostname(), "PGPORT=" + u.Port(),
+		"PGUSER=" + u.User.Username()}
+	if pw, ok := u.User.Password(); ok {
+		env = append(env, "PGPASSWORD="+pw)
+	}
+	return append(env, extra...)
+}
+
+// runScript 는 되돌리기가 낸 스크립트를 낸 그대로 sh 로 돌린다.
+func runScript(t *testing.T, script string, env []string) (string, error) {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = env
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	return out.String(), err
+}
+
+// dbExists 는 클러스터에 그 이름의 DB 가 있는가다.
+func dbExists(t *testing.T, s *Store, name string) bool {
+	return pgCount(t, s, `SELECT count(*) FROM pg_database WHERE datname = ?`, name) == 1
+}
+
+// TestPGDumpAndRestoreRehearsal 은 판올림 전 덤프를 실제 pg_dump 로 뜨고, `fd migrate --rollback` 이 낸 스크립트를 낸
+// 그대로 돌려 되살린 원장으로 옛 판 바이너리가 다시 뜨는지 잰다. 접속은 사람이 둘 PGHOST · PGPORT · PGUSER 뿐이고,
+// PGDATABASE 는 없는 DB 로 둔다 - 관리 DB 를 안 적은 명령이 있으면 거기서 실패한다.
+func TestPGDumpAndRestoreRehearsal(t *testing.T) {
+	needPGTools(t)
 	ctx := context.Background()
 	dsn, s := pgMigrated(t)
 	pgExec(t, s, `INSERT INTO machine(id, hostname, first_seen, last_seen) VALUES ('m-before', 'h', 't', 't')`)
 	dir := filepath.Join(t.TempDir(), "backups")
-	m, run := pgMigrator(t, dsn, MigrateOptions{Target: SchemaVersion + 1, BackupDir: dir})
-	run.steps = []Migration{{To: SchemaVersion + 1, Name: "시험 증분", SQL: `CREATE TABLE t_after(x int)`}}
+	m, run := upgradeRun(t, dsn, dir)
 	if err := m.migrateTo(ctx, run); err != nil {
 		t.Fatalf("덤프를 뜨는 판올림: %v", err)
 	}
 	if v := pgVersion(t, s); v != SchemaVersion+1 || !pgTableExists(t, s, "t_after") {
 		t.Fatalf("판올림 뒤: 판 %d, t_after %v", v, pgTableExists(t, s, "t_after"))
 	}
-
+	led, err := readLedgerFacts(ctx, s.db)
+	if err != nil {
+		t.Fatal(err)
+	}
 	out, err := Rollback(ctx, dsn, dir, quietLog())
 	if err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
-	if want := dumpPrefix + strconv.Itoa(SchemaVersion+1) + "-"; filepath.Dir(out.Backup) != dir || !strings.HasPrefix(filepath.Base(out.Backup), want) {
-		t.Fatalf("되돌릴 덤프 %q (기대 %q 안의 %s*)", out.Backup, dir, want)
+	if info, ok := parseDumpName(filepath.Base(out.Backup)); filepath.Dir(out.Backup) != dir || !ok || info.Ledger != led.ID || info.From != SchemaVersion {
+		t.Fatalf("되돌릴 덤프 %q (기대 %q 안의 이 원장 · 판 %d 덤프)", out.Backup, dir, SchemaVersion)
 	}
 
-	// 절차 (1) - 서버를 멈추고(이 시험의 연결을 다 닫고) 망가진 DB 의 이름을 바꾼다.
+	// 서버를 멈춘다(이 시험의 연결을 다 닫는다). 관리 연결은 클러스터의 관리 DB 에 붙는다.
 	_ = m.Close()
 	_ = s.Close()
 	u, err := url.Parse(dsn)
@@ -298,40 +564,23 @@ func TestPGDumpAndRestoreRehearsal(t *testing.T) {
 		t.Fatal(err)
 	}
 	name := strings.TrimPrefix(u.Path, "/")
-	adminURL := os.Getenv(storetest.EnvDSN)
-	admin, err := sql.Open("pgx", adminURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer admin.Close()
-	quote := func(n string) string { return `"` + strings.ReplaceAll(n, `"`, `""`) + `"` }
-	if _, err := admin.ExecContext(ctx, "ALTER DATABASE "+quote(name)+" RENAME TO "+quote(name+"_broken")); err != nil {
-		t.Fatalf("(1) 이름 바꾸기: %v", err)
-	}
+	admin := pgOpen(t, os.Getenv(storetest.EnvDSN))
 	t.Cleanup(func() {
-		_, _ = admin.ExecContext(context.Background(), "DROP DATABASE IF EXISTS "+quote(name+"_broken")+" WITH (FORCE)")
+		_, _ = admin.db.ExecContext(context.Background(), `DROP DATABASE IF EXISTS "`+name+`_broken" WITH (FORCE)`)
 	})
 
-	// 절차 (2) - 덤프에 든 DB 정의로 원래 이름의 DB 를 새로 만들며 복원한다. 접속은 관리 DB(postgres) URL 로, 환경으로만 넘긴다.
-	env, err := libpqEnv(ParseTarget(adminURL), os.Environ())
-	if err != nil {
-		t.Fatalf("관리 접속을 libpq 로 못 넘긴다: %v", err)
+	got, err := runScript(t, out.Script, clusterEnv(t, "PGDATABASE=t_no_such_db"))
+	if err != nil || !strings.Contains(got, "복원했다") {
+		t.Fatalf("스크립트: %v\n%s", err, got)
 	}
-	if !strings.Contains(out.Steps, "pg_restore --create --exit-on-error --dbname=postgres") {
-		t.Fatalf("절차가 바뀌었다 - 이 예행도 맞춰라: %s", out.Steps)
-	}
-	cmd := exec.CommandContext(ctx, "pg_restore", "--create", "--exit-on-error", "--dbname=postgres", out.Backup)
-	cmd.Env = env
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("(2) pg_restore: %v\n%s", err, stderr.String())
+	if !dbExists(t, admin, name+"_broken") {
+		t.Fatal("망가진 DB 가 _broken 으로 남지 않았다")
 	}
 
-	// 절차 (3) - 덤프를 뜬 판(지금 판)의 바이너리가 다시 뜬다: 판 · 로케일 관문을 지난다.
+	// 덤프를 뜬 판(지금 판)의 바이너리가 다시 뜬다: 판 · 로케일 관문을 지난다.
 	opened, err := OpenWithLogger(dsn, quietLog())
 	if err != nil {
-		t.Fatalf("(3) 되살린 원장으로 기동하지 못했다: %v", err)
+		t.Fatalf("되살린 원장으로 기동하지 못했다: %v", err)
 	}
 	_ = opened.Close()
 	r := pgOpen(t, dsn)
@@ -347,5 +596,95 @@ func TestPGDumpAndRestoreRehearsal(t *testing.T) {
 	// 준비의 DB 단위 권한(PUBLIC 의 TEMPORARY 회수)도 덤프의 DB 정의로 돌아와야 한다.
 	if n := pgCount(t, r, `SELECT count(*) WHERE has_database_privilege(?, current_database(), 'TEMPORARY')`, pg.AppRole); n != 0 {
 		t.Fatalf("되살린 DB 에서 %s 이 임시 표를 만들 수 있다", pg.AppRole)
+	}
+	if l, err := readLedgerFacts(ctx, r.db); err != nil || l.ID != led.ID {
+		t.Fatalf("되살린 원장의 식별이 바뀌었다: %+v, %v (기대 %s) - 다음 되돌리기가 이 원장의 덤프를 못 찾는다", l, err, led.ID)
+	}
+}
+
+// TestPGRollbackScriptPutsTheLedgerBackOnFailure 는 복원이 도중에 실패하면 스크립트가 반쪽 DB 를 지우고 망가진 원장을 제
+// 이름으로 되돌리는지 잰다. 덤프 뒤에 지운 역할에 준 권한이 덤프에 들어 있어, pg_restore 는 DB 를 만든 뒤 권한 단계에서
+// 실패한다(--exit-on-error).
+func TestPGRollbackScriptPutsTheLedgerBackOnFailure(t *testing.T) {
+	needPGTools(t)
+	ctx := context.Background()
+	dsn, s := pgMigrated(t)
+	role := "t_gone_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	pgExec(t, s, `CREATE ROLE `+role)
+	t.Cleanup(func() { _, _ = s.db.ExecContext(context.Background(), `DROP ROLE IF EXISTS `+role) })
+	pgExec(t, s, `GRANT SELECT ON machine TO `+role)
+	dir := filepath.Join(t.TempDir(), "backups")
+	m, run := upgradeRun(t, dsn, dir)
+	if err := m.migrateTo(ctx, run); err != nil {
+		t.Fatalf("덤프를 뜨는 판올림: %v", err)
+	}
+	pgExec(t, s, `REVOKE SELECT ON machine FROM `+role)
+	pgExec(t, s, `DROP ROLE `+role)
+	out, err := Rollback(ctx, dsn, dir, quietLog())
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	_ = m.Close()
+	_ = s.Close()
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := strings.TrimPrefix(u.Path, "/")
+	admin := pgOpen(t, os.Getenv(storetest.EnvDSN))
+
+	got, err := runScript(t, out.Script, clusterEnv(t, "PGDATABASE=t_no_such_db"))
+	if err == nil || !strings.Contains(got, "복원이 실패했다") {
+		t.Fatalf("실패해야 할 복원: %v\n%s", err, got)
+	}
+	if dbExists(t, admin, name+"_broken") {
+		t.Fatal("실패한 복원 뒤에 _broken 이 남았다 - 원장이 제 이름으로 안 돌아왔다")
+	}
+	r := pgOpen(t, dsn)
+	if v := pgVersion(t, r); v != SchemaVersion+1 || !pgTableExists(t, r, "t_after") {
+		t.Fatalf("제 이름으로 돌아온 DB 가 원래 원장이 아니다: 판 %d, t_after %v", v, pgTableExists(t, r, "t_after"))
+	}
+}
+
+// TestPGRollbackScriptStopsWithoutCluster 는 사람이 대상 클러스터를 안 적었으면 스크립트가 아무것도 안 바꾸고 첫 줄에서
+// 멈추는지 잰다. libpq 기본값(로컬 소켓의 기본 서버)으로 흘러가면 원장이 원격인데 엉뚱한 서버의 같은 이름 DB 를 바꾼다.
+func TestPGRollbackScriptStopsWithoutCluster(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh 가 없다")
+	}
+	ctx := context.Background()
+	dsn, s := pgMigrated(t)
+	led, err := readLedgerFacts(ctx, s.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, dumpName(led.ID, SchemaVersion, time.Now())), []byte(dumpMagic+"-x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stamp(t, s, SchemaVersion+1)
+	out, err := Rollback(ctx, dsn, dir, quietLog())
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := strings.TrimPrefix(u.Path, "/")
+	for _, drop := range []string{"PGHOST=", "PGPORT=", "PGUSER="} {
+		var env []string
+		for _, kv := range clusterEnv(t) {
+			if !strings.HasPrefix(kv, drop) {
+				env = append(env, kv)
+			}
+		}
+		got, err := runScript(t, out.Script, env)
+		if err == nil || !strings.Contains(got, "원장 클러스터의") {
+			t.Fatalf("%s 없이 돌았다: %v\n%s", drop, err, got)
+		}
+		if dbExists(t, s, name+"_broken") || pgVersion(t, s) != SchemaVersion+1 {
+			t.Fatalf("%s 없이 돈 스크립트가 원장을 바꿨다", drop)
+		}
 	}
 }

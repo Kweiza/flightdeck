@@ -383,14 +383,18 @@ func (e engine) versionTableQuery() string {
 
 // schemaObjectsQuery 는 스키마 객체 수를 세는 질의다. PlanMigration 이 0(빈 DB) · 1 이하(판 표만) · 그 위를 가른다.
 //
-// ★ Postgres 판은 이름 없는 질의가 닿는 스키마(current_schema)의 관계(표 · 인덱스 · 뷰 · 시퀀스 · 외부 표)를 센다.
-// 확장이 깐 것은 뺀다 - 준비(pg/bootstrap.sql)만 돈 DB 에는 pg_trgm 이 있지만 그것은 아직 빈 원장이다. 트리거 ·
-// 함수는 안 센다: 표 없이 그것만 있는 DB 는 기준선이 만들 수 없는 모양이고, 기준선의 객체는 표부터 생긴다.
+// ★ Postgres 판은 사용자 스키마 **전부**의 관계(표 · 인덱스 · 뷰 · 시퀀스 · 외부 표)를 센다. 시스템 스키마(pg_catalog ·
+// pg_toast · pg_temp_N 등 pg_ 로 시작하는 이름은 사용자가 못 만든다)와 information_schema 만 뺀다. 이름 없는 질의가
+// 닿는 스키마(current_schema)만 세면 public 은 비고 다른 스키마에 업무 표가 있는 DB 를 빈 DB 로 읽어, 백업 없이 기준선을
+// 깔고 DB 단위 권한(PUBLIC 의 TEMPORARY 회수)까지 바꾼다. 확장이 깐 것은 뺀다 - 준비(pg/bootstrap.sql)만 돈 DB 에는
+// pg_trgm 이 있지만 그것은 아직 빈 원장이다. 트리거 · 함수는 안 센다: 표 없이 그것만 있는 DB 는 기준선이 만들 수 없는
+// 모양이고, 기준선의 객체는 표부터 생긴다.
 func (e engine) schemaObjectsQuery() string {
 	if e == enginePG {
 		return `SELECT count(*) FROM pg_catalog.pg_class c
 			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-			WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'v', 'm', 'i', 'S', 'f')
+			WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+			  AND c.relkind IN ('r', 'p', 'v', 'm', 'i', 'S', 'f')
 			  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
 			                  WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')`
 	}
@@ -421,48 +425,112 @@ func (e engine) stepRole() string {
 // migrateLockKey 는 이전 실행기 자기 잠금의 키다("fd:migr8"). 전역 업무 잠금(globalLockKey)과 다른 키다.
 const migrateLockKey int64 = 0x6664_3a6d_6967_7238
 
-// lockMigrate 는 이전 실행기 자기 잠금을 잡는다. 돌려준 함수가 놓는다. SQLite 는 잡지 않는다(파일 하나를 BEGIN IMMEDIATE
-// 가 한 줄로 세우고, 백업도 그 파일 옆이다).
+// sessHandle 은 이전 실행기 세션이 질의와 트랜잭션을 여는 날 핸들이다(*sql.DB · *sql.Conn 이 함께 만족한다).
+type sessHandle interface {
+	rawHandle
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
+}
+
+// migrateSession 은 이전 실행기 한 번이 쥐는 실행 자리다. 판 재기 · 로케일 · 덤프 식별 · 판 재확인 · 증분 트랜잭션이 다
+// 이것을 지난다(dbtx 를 만족하고, 증분 트랜잭션은 txSpec.on 으로 이 위에서 연다).
 //
-// ★ 세션 잠금(pg_try_advisory_lock)이고 풀에서 떼어 낸 연결 하나가 쥔다. 판 재기 → 판올림 전 덤프 → 증분 전부가 한
-// 실행이고, 그동안 다른 실행기가 같은 판을 재고 같은 증분을 얹으면 안 된다. 증분 트랜잭션은 이것과 함께 전역 업무
-// 잠금을 잡는다(applyStep) - 이 잠금은 실행기끼리를, 업무 잠금은 실행기와 업무 쓰기를 가른다. 증분 트랜잭션이 이 키를
-// 또 잡으면 같은 프로세스의 다른 연결이라 자기 잠금에 막힌다.
+//   - Postgres: 풀에서 떼어 낸 연결 하나(pin)가 두 세션 잠금을 쥔다. 자기 잠금(migrateLockKey)은 실행기끼리를, 전역 업무
+//     잠금(globalLockKey)은 실행기와 업무 쓰기를 가른다. 판을 읽기 **전에** 둘 다 잡고, 덤프 · 판 재확인 · 모든 증분 · 판
+//     행 갱신이 끝날 때까지 놓지 않는다. 그래서 판을 읽은 뒤 다른 실행기가 판을 올리지 못하고, 덤프를 시작한 뒤 첫 증분
+//     전에 업무 쓰기가 커밋하지 못한다(그 쓰기는 기다리다 판올림 뒤에 커밋하거나 lock_timeout 으로 실패한다 - 덤프 뒤에
+//     끼어 복원하면 사라지는 쓰기가 없다).
+//   - SQLite: 풀(*sql.DB) 그대로이고 잠그지 않는다. 앞 판과 같은 길이다(파일 하나를 BEGIN IMMEDIATE 가 한 줄로 세운다).
 //
-// ★ 기다리지 않는다. 다른 실행기가 덤프를 뜨는 중이면 몇 분이 걸린다 - 기다렸다가 lock_timeout 으로 죽는 것보다 「다른
-// 실행기가 돈다」를 곧장 말하는 편이 운영자에게 낫다.
+// ★ 증분 트랜잭션은 이 연결 위에서 연다. 업무 쓰기와 같은 문장(pg_advisory_xact_lock(globalLockKey))을 첫 문장으로 잡지만
+// 같은 세션이 이미 그 키를 쥐고 있으므로 곧장 받는다(권고 잠금은 세션 안에서 다시 잡혀도 기다리지 않는다). 다른 연결에서
+// 열면 자기 세션 잠금에 막혀 lock_timeout 으로 죽는다.
 //
-// ★ 쥔 연결이 도중에 끊기면 잠금도 사라진다. 그래도 증분은 두 번 안 얹힌다 - 단마다 잠금 안에서 판을 다시 읽는다(stepReady).
-func (s *Store) lockMigrate(ctx context.Context) (func(), error) {
+// ★ pin 이 끊기면 세션 잠금도 사라진다. *sql.Conn 은 다른 연결로 갈아타지 않으므로 그 뒤의 질의 · 증분은 모두 실패한다.
+// 덤프는 다른 프로세스(pg_dump)라 끊긴 것을 모르므로, 최종 이름을 붙이기 전에 held 로 잠금을 다시 잰다(sealDump).
+type migrateSession struct {
+	h   sessHandle
+	eng engine
+	pin *sql.Conn // Postgres 만. nil 이면 풀이고 잠금이 없다
+}
+
+func (m *migrateSession) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	return m.eng.exec(ctx, m.h, q, args)
+}
+
+func (m *migrateSession) QueryContext(ctx context.Context, q string, args ...any) (*rowSet, error) {
+	return m.eng.query(ctx, m.h, q, args)
+}
+
+func (m *migrateSession) QueryRowContext(ctx context.Context, q string, args ...any) *row {
+	return rowOf(m.QueryContext(ctx, q, args...))
+}
+
+func (m *migrateSession) dialect() engine { return m.eng }
+
+// openMigrateSession 은 이전 실행기 세션을 연다. 돌려준 세션의 release 가 놓는다.
+//
+// ★ 자기 잠금은 기다리지 않는다(pg_try_advisory_lock). 다른 실행기가 덤프를 뜨는 중이면 몇 분이 걸린다 - 기다렸다가
+// lock_timeout 으로 죽는 것보다 「다른 실행기가 돈다」를 곧장 말하는 편이 운영자에게 낫다. 전역 업무 잠금은 기다린다
+// (pg_advisory_lock, 상한은 연결의 lock_timeout) - 쥐고 있는 것은 짧은 업무 쓰기 트랜잭션이다. 그 대기는 업무 쓰기와 같은
+// 계측(LockGlobal)에 들고, 대기 초과는 같은 TxFault(lock_not_available)로 나간다.
+func (s *Store) openMigrateSession(ctx context.Context) (*migrateSession, error) {
 	eng := s.db.eng
 	if eng != enginePG {
-		return func() {}, nil
+		return &migrateSession{h: s.db.raw, eng: eng}, nil
 	}
 	c, err := s.db.raw.Conn(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("이전 실행기 잠금용 연결을 얻지 못했다: %w", eng.connFault(err))
+		return nil, fmt.Errorf("이전 실행기 연결을 얻지 못했다: %w", eng.connFault(err))
 	}
+	m := &migrateSession{h: c, eng: eng, pin: c}
 	var got bool
-	rs, err := eng.query(ctx, c, `SELECT pg_try_advisory_lock(?)`, []any{migrateLockKey})
-	if err == nil {
-		err = rowOf(rs, nil).Scan(&got)
-	}
-	if err != nil {
-		_ = c.Close()
+	if err := m.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(?)`, migrateLockKey).Scan(&got); err != nil {
+		m.release()
 		return nil, fmt.Errorf("이전 실행기 잠금을 잡지 못했다: %w", err)
 	}
 	if !got {
-		_ = c.Close()
+		m.release()
 		return nil, errors.New("다른 이전 실행기(fd migrate)가 이 원장을 올리고 있다 - 그것이 끝난 뒤 다시 돌려라")
 	}
-	return func() {
-		// 놓기가 실패해도(연결이 이미 끊겼다) 세션과 함께 사라진다. 살아 있는데 실패했으면 연결을 버려 세션을 끝낸다 -
-		// 쥔 채로 풀에 돌려보내면 그 연결을 받는 다음 실행이 잠금을 쥔 줄 모르고 쥔다.
-		if _, err := eng.exec(context.Background(), c, `SELECT pg_advisory_unlock(?)`, []any{migrateLockKey}); err != nil {
-			_ = c.Raw(func(any) error { return driver.ErrBadConn })
-		}
-		_ = c.Close()
-	}, nil
+	start := time.Now()
+	_, err = m.ExecContext(ctx, `SELECT pg_advisory_lock(?)`, globalLockKey)
+	s.locks.observe(LockGlobal, time.Since(start), err)
+	if err != nil {
+		m.release()
+		return nil, fmt.Errorf("업무 쓰기 잠금을 잡지 못했다(진행 중인 업무 쓰기가 끝나기를 기다린다): %w", asFault(err))
+	}
+	return m, nil
+}
+
+// held 는 이 세션이 두 잠금을 아직 쥐고 있는가를 잰다. 연결이 끊겼으면 질의가 실패하고, 살아 있어도 잠금이 없으면
+// 거절한다. SQLite 는 잠금이 없어 늘 nil 이다.
+func (m *migrateSession) held(ctx context.Context) error {
+	if m.pin == nil {
+		return nil
+	}
+	var n int
+	err := m.QueryRowContext(ctx, `SELECT count(DISTINCT (classid, objid)) FROM pg_catalog.pg_locks
+		WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted AND objsubid = 1
+		  AND ((classid::bigint << 32) | objid::bigint) IN (?, ?)`, migrateLockKey, globalLockKey).Scan(&n)
+	if err != nil {
+		return fmt.Errorf("이전 실행기 잠금을 다시 재지 못했다(연결이 끊겼으면 잠금도 사라졌다): %w", err)
+	}
+	if n != 2 {
+		return fmt.Errorf("이전 실행기가 잠금을 잃었다(쥔 잠금 %d개, 기대 2)", n)
+	}
+	return nil
+}
+
+// release 는 세션을 놓는다. 놓기가 실패해도(연결이 이미 끊겼다) 잠금은 세션과 함께 사라진다. 살아 있는데 실패했으면
+// 연결을 버려 세션을 끝낸다 - 쥔 채로 풀에 돌려보내면 그 연결을 받는 다음 질의가 잠금을 쥔 줄 모르고 쥔다.
+func (m *migrateSession) release() {
+	if m.pin == nil {
+		return
+	}
+	if _, err := m.ExecContext(context.Background(), `SELECT pg_advisory_unlock_all()`); err != nil {
+		_ = m.pin.Raw(func(any) error { return driver.ErrBadConn })
+	}
+	_ = m.pin.Close()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -826,6 +894,9 @@ const (
 type txSpec struct {
 	kind         txKind
 	device, repo string // txObs 의 잠금 좌표
+	// on 은 트랜잭션을 열 이전 실행기 세션이다(증분 적용). nil 이면 풀에서 연다. 증분은 실행기가 쥔 두 세션 잠금과 같은
+	// 연결에서 돌아야 전역 잠금을 다시 잡다가 스스로 막히지 않는다(migrateSession 의 ★).
+	on *migrateSession
 }
 
 // 잠금 키. 전역 키는 bigint 한 개 공간, 관측 키는 int4 두 개 공간이다 - PG 는 두 공간을 겹치지 않게 둔다.
@@ -929,8 +1000,12 @@ func (e engine) lockStmt(sp txSpec) (string, []any) {
 // DBStats 의 풀 축이 따로 센다. SQLite 는 BEGIN IMMEDIATE 가 곧 잠금이라 BeginTx 전체를 잰다(풀 대기가 섞인다).
 func (s *Store) begin(ctx context.Context, sp txSpec) (*txConn, error) {
 	eng := s.db.eng
+	var h sessHandle = s.db.raw
+	if sp.on != nil {
+		h = sp.on.h
+	}
 	start := time.Now()
-	raw, err := s.db.raw.BeginTx(ctx, eng.txOptions(sp.kind))
+	raw, err := h.BeginTx(ctx, eng.txOptions(sp.kind))
 	err = eng.connFault(err)
 	var tx *txConn
 	if err == nil {

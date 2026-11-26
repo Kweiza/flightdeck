@@ -473,16 +473,17 @@ func TestPGPanicInTxReleasesTheLock(t *testing.T) {
 // TestPGWriteWaitsForSchemaStep 은 이전 실행기가 증분(DDL)을 얹는 동안 두 잠금을 함께 쥐고, 그동안 들어온 업무 쓰기가
 // 증분이 커밋될 때까지 기다리는지 잰다.
 //
-// ★ 실행기의 길(migrateTo) 그대로 돌린다. 자기 잠금(migrateLockKey, 실행기끼리)은 실행 내내 세션이 쥐고, 증분 트랜잭션은
-// 업무 쓰기와 같은 전역 잠금(globalLockKey)을 쥔다. 키가 하나만 있으면 DDL 도중에 업무 쓰기가 끼어 반쯤 바뀐 스키마
-// 위에서 커밋한다 - 그 쓰기가 판 19 · 새 열을 보는 것이 그것이 안 끼었다는 증거다.
+// ★ 실행기의 길(migrateTo) 그대로 돌린다. 실행기 세션이 판을 읽기 전부터 끝까지 자기 잠금(migrateLockKey, 실행기끼리)과
+// 업무 쓰기의 전역 잠금(globalLockKey)을 함께 쥐고, 증분 트랜잭션은 같은 세션에서 전역 잠금을 다시 잡는다(같은 세션이라
+// 안 막힌다). 키가 하나만 있으면 DDL 도중에 업무 쓰기가 끼어 반쯤 바뀐 스키마 위에서 커밋한다 - 그 쓰기가 판 19 · 새 열을
+// 보는 것이 그것이 안 끼었다는 증거다. 덤프를 뜨는 동안의 쓰기는 TestPGWriteWaitsForTheDump 가 잰다.
 func TestPGWriteWaitsForSchemaStep(t *testing.T) {
 	dsn, s := pgMigrated(t)
 	ctx := context.Background()
 	m, run := pgMigrator(t, dsn, MigrateOptions{Target: SchemaVersion + 1})
 	run.steps = []Migration{{To: SchemaVersion + 1, Name: "시험 증분",
 		SQL: `CREATE TABLE t_step_tbl(x int); ALTER TABLE machine ADD COLUMN t_probe text; SELECT pg_sleep(0.4)`}}
-	run.backup = func(context.Context, int) (string, error) { return "시험 덤프 자리", nil }
+	run.backup = func(context.Context, *migrateSession, int) (string, error) { return "시험 덤프 자리", nil }
 	aDone := make(chan error, 1)
 	go func() { aDone <- m.migrateTo(ctx, run) }()
 	waitUntil(t, "증분이 돈다", func() bool {
@@ -536,20 +537,25 @@ func TestPGWriteWaitsForSchemaStep(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // TestPGLockTimeoutIsATxFault 는 전역 잠금의 대기 초과가 여는 자리와 무관하게 같은 TxFault 로 오는지 잰다.
-// 증분 적용(applySteps)이 asFault 를 안 지나면 같은 55P03 이 거기서만 드라이버 오류로 나간다.
+// 이전 실행기 세션(openMigrateSession)이 asFault 를 안 지나면 같은 55P03 이 거기서만 드라이버 오류로 나간다.
 func TestPGLockTimeoutIsATxFault(t *testing.T) {
 	const wait = 200 * time.Millisecond
 	s := newPGStore(t, wait)
 	a := hold(t, s.Tx, nil)
 
 	ctx := context.Background()
-	step := Migration{To: SchemaVersion + 1, Name: "시험 증분", SQL: `SELECT 1`}
 	for _, c := range []struct {
 		name string
 		run  func() error
 	}{
 		{"업무 쓰기", func() error { return s.Tx(ctx, noop) }},
-		{"증분 적용", func() error { return s.applySteps(ctx, []Migration{step}) }},
+		{"이전 실행기", func() error {
+			sess, err := s.openMigrateSession(ctx)
+			if err == nil {
+				sess.release()
+			}
+			return err
+		}},
 	} {
 		start := time.Now()
 		err := c.run()
@@ -563,6 +569,9 @@ func TestPGLockTimeoutIsATxFault(t *testing.T) {
 		}
 	}
 	a.finish(t)
+	if n := advisoryHolders(t, s, migrateLockKey); n != 0 {
+		t.Fatalf("전역 잠금을 못 잡은 실행기가 자기 잠금을 놓지 않았다(%d)", n)
+	}
 
 	w := s.DBStats().Locks[LockGlobal]
 	if w.NotAcquired != 2 || w.Count != 1 {

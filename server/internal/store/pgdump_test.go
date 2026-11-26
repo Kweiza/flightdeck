@@ -10,117 +10,206 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// Postgres 판올림 전 덤프 · 되돌리기의 실행 경계 시험. DB 에 붙지 않는다 - pg_dump 자리에 가짜 실행 파일을 둔다.
-// 실제 pg_dump · pg_restore 로 뜨고 되살리는 시험은 pg_migrate_test.go 의 TestPGDumpAndRestoreRehearsal 이다.
+// Postgres 판올림 전 덤프 · 되돌리기의 실행 경계 시험. 덤프는 pg_dump 자리에 가짜 실행 파일을 둔다. 되돌리기는 원장에
+// 붙어 식별 · 판을 읽으므로 FD_TEST_PG 의 시험 DB 를 쓴다. 실제 pg_dump · pg_restore 로 뜨고 되살리는 시험은
+// pg_migrate_test.go 의 TestPGDumpAndRestoreRehearsal 이다.
 
-// cleanPGEnv 는 이 시험이 기대는 해석에 물려받은 PG 환경 변수가 끼지 않게 비운다(pgx 는 빈 값을 무시한다).
+// cleanPGEnv 는 이 시험이 기대는 해석에 물려받은 PG 환경 변수가 끼지 않게 비운다(pgx 는 빈 값을 무시한다). HOME 도 빈
+// 자리로 돌린다 - pgx 는 ~/.postgresql/root.crt 가 있으면 그것을 루트 인증서로 읽는다.
 func cleanPGEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{"PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE", "PGSSLMODE",
 		"PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGCHANNELBINDING", "PGREQUIREAUTH", "PGSSLNEGOTIATION",
-		"PGSERVICE", "PGAPPNAME"} {
+		"PGSERVICE", "PGAPPNAME", "PGTARGETSESSIONATTRS", "PGCONNECT_TIMEOUT"} {
 		t.Setenv(k, "")
 	}
+	t.Setenv("HOME", t.TempDir())
 }
 
-func TestDumpNameAndStamp(t *testing.T) {
+const (
+	ledgerA = "0123456789abcdef"
+	ledgerB = "fedcba9876543210"
+)
+
+func TestDumpNameRoundTrip(t *testing.T) {
 	at := time.Date(2026, 11, 27, 1, 2, 3, 0, time.FixedZone("KST", 9*3600))
-	name := dumpName(19, at)
-	if name != "pre-19-20261126T160203Z.dump" {
+	name := dumpName(ledgerA, 18, at)
+	if name != "fd-"+ledgerA+"-from18-20261126T160203Z.dump" {
 		t.Fatalf("dumpName = %q (UTC 로 찍어야 한다)", name)
 	}
-	if st, ok := dumpStamp(name); !ok || st != "20261126T160203Z" {
-		t.Fatalf("dumpStamp(%q) = %q, %v", name, st, ok)
+	if got, ok := parseDumpName(name); !ok || got != (dumpInfo{Ledger: ledgerA, From: 18, Stamp: "20261126T160203Z"}) {
+		t.Fatalf("parseDumpName(%q) = %+v, %v", name, got, ok)
 	}
 	for _, bad := range []string{
-		"pre-19.dump",                       // 시각 없음 - 다시 돌리면 덮인다
-		"pre-x-20261126T160203Z.dump",       // 판이 수가 아니다
-		"pre-19-2026.dump",                  // 시각 폭이 다르다
-		"pre-19-20261326T160203Z.dump",      // 시각이 아니다
-		"pre-19-20261126T160203Z.dump.part", // 뜨는 중인 파일
-		"fd.db.bak-20261126T160203Z",        // SQLite 백업
-		"pre--20261126T160203Z.dump",
+		"fd-" + ledgerA + "-from18.dump",                         // 시각 없음 - 다시 돌리면 덮인다
+		"fd-" + ledgerA + "-fromx-20261126T160203Z.dump",         // 판이 수가 아니다
+		"fd-" + ledgerA + "-from018-20261126T160203Z.dump",       // 판 표기가 둘이 된다
+		"fd-" + ledgerA + "-from-1-20261126T160203Z.dump",        // 음수
+		"fd-" + ledgerA + "-from18-2026.dump",                    // 시각 폭이 다르다
+		"fd-" + ledgerA + "-from18-20261326T160203Z.dump",        // 시각이 아니다
+		"fd-" + ledgerA + "-from18-20261126T160203Z.dump.x.part", // 뜨는 중인 파일
+		"fd-0123456789ABCDEF-from18-20261126T160203Z.dump",       // 식별은 소문자 16진
+		"fd-0123456789abcde-from18-20261126T160203Z.dump",        // 식별 폭이 다르다
+		"pre-19-20261126T160203Z.dump",                           // 원장 식별이 없는 옛 이름
+		"fd.db.bak-20261126T160203Z",                             // SQLite 백업
 	} {
-		if _, ok := dumpStamp(bad); ok {
-			t.Errorf("dumpStamp(%q) 가 덤프 이름으로 받았다", bad)
+		if got, ok := parseDumpName(bad); ok {
+			t.Errorf("parseDumpName(%q) 가 덤프 이름으로 받았다: %+v", bad, got)
 		}
 	}
 }
 
-// TestLatestDumpPicksNewestByTime 은 되돌리기가 판이 아니라 뜬 시각으로 고르는지, 덤프가 아닌 것을 안 집는지 잰다.
-func TestLatestDumpPicksNewestByTime(t *testing.T) {
+// TestLedgerIDSeparatesClustersAndDatabases 는 원장 식별이 클러스터와 DB 이름을 둘 다 가르는지, 이름을 싣지 않는지 잰다.
+func TestLedgerIDSeparatesClustersAndDatabases(t *testing.T) {
+	a := ledgerID("7300000000000000001", "fd")
+	for _, other := range []string{ledgerID("7300000000000000002", "fd"), ledgerID("7300000000000000001", "fd_test"),
+		ledgerID("730000000000000000", "1fd")} {
+		if other == a {
+			t.Fatalf("다른 원장이 같은 식별 %s 를 받았다", a)
+		}
+	}
+	if a != ledgerID("7300000000000000001", "fd") || len(a) != ledgerIDLen || strings.Contains(a, "fd") {
+		t.Fatalf("식별 %q", a)
+	}
+	if adminDB("postgres") != "template1" || adminDB("fd") != "postgres" {
+		t.Fatalf("관리 DB: %q %q", adminDB("postgres"), adminDB("fd"))
+	}
+}
+
+// TestLatestDumpPicksNewestOfThisLedger 는 되돌리기가 이 원장의 덤프만, 판이 아니라 뜬 시각으로 고르는지, 덤프가 아닌 것을
+// 안 집는지 잰다.
+func TestLatestDumpPicksNewestOfThisLedger(t *testing.T) {
 	dir := t.TempDir()
 	for _, n := range []string{
-		"pre-18-20261101T000000Z.dump",
-		"pre-19-20261102T000000Z.dump",
-		"pre-17-20261104T000000Z.dump",      // 판은 낮지만 가장 나중에 떴다
-		"pre-19-20261105T000000Z.dump.part", // 덜 뜬 것
+		"fd-" + ledgerA + "-from17-20261101T000000Z.dump",
+		"fd-" + ledgerA + "-from18-20261102T000000Z.dump",
+		"fd-" + ledgerA + "-from16-20261104T000000Z.dump",           // 판은 낮지만 이 원장에서 가장 나중에 떴다
+		"fd-" + ledgerA + "-from18-20261105T000000Z.dump.1234.part", // 덜 뜬 것
+		"fd-" + ledgerB + "-from18-20261108T000000Z.dump",           // 다른 원장 - 더 최근이어도 안 고른다
+		"pre-18-20261109T000000Z.dump",                              // 식별 없는 옛 이름
 		"notes.txt",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, n), []byte(dumpMagic), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.Mkdir(filepath.Join(dir, "pre-19-20261109T000000Z.dump"), 0o700); err != nil {
+	if err := os.Mkdir(filepath.Join(dir, "fd-"+ledgerA+"-from18-20261109T000000Z.dump"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	got, err := latestDump(dir)
-	if err != nil || filepath.Base(got) != "pre-17-20261104T000000Z.dump" {
-		t.Fatalf("latestDump = %q, %v (기대 pre-17-20261104T000000Z.dump)", got, err)
+	got, info, err := latestDump(dir, ledgerA)
+	if err != nil || filepath.Base(got) != "fd-"+ledgerA+"-from16-20261104T000000Z.dump" || info.From != 16 {
+		t.Fatalf("latestDump = %q, %+v, %v (기대 from16-20261104)", got, info, err)
 	}
-
+	if got, _, err := latestDump(dir, ledgerB); err != nil || filepath.Base(got) != "fd-"+ledgerB+"-from18-20261108T000000Z.dump" {
+		t.Fatalf("다른 원장: %q, %v", got, err)
+	}
+	_, _, err = latestDump(dir, "00000000000000ff")
+	if err == nil || !strings.Contains(err.Error(), "되돌릴 덤프가 없다") || !strings.Contains(err.Error(), "다른 원장의 덤프 4개") {
+		t.Fatalf("이 원장의 덤프가 없는 자리: %v", err)
+	}
 	empty := t.TempDir()
-	if _, err := latestDump(empty); err == nil || !strings.Contains(err.Error(), "되돌릴 덤프가 없다") {
-		t.Fatalf("덤프 없는 자리: %v", err)
-	}
-	if _, err := latestDump(filepath.Join(empty, "none")); err == nil || !strings.Contains(err.Error(), "백업 자리를 읽지 못했다") {
+	if _, _, err := latestDump(filepath.Join(empty, "none"), ledgerA); err == nil || !strings.Contains(err.Error(), "백업 자리를 읽지 못했다") {
 		t.Fatalf("없는 자리: %v", err)
 	}
 }
 
-// TestPGSSLModeCarriesOnlyWhatLibpqCanMatch 는 pgx 가 푼 TLS 설정을 libpq 의 sslmode 로 되옮기는 표다. 같은 뜻으로
-// 못 넘기는 것(서버 인증서를 재는 모드 · 여러 호스트)은 거절해야 한다 - 약하게 넘기면 백업 접속만 검증 없이 붙는다.
-func TestPGSSLModeCarriesOnlyWhatLibpqCanMatch(t *testing.T) {
+// TestPGTLSCarriesOnlyWhatLibpqCanMatch 는 pgx 가 푼 TLS 설정을 libpq 의 sslmode · sslrootcert 로 되옮기는 표다. 서버
+// 인증서를 재는 모드는 서버와 같은 루트 인증서 파일을 찾을 때만 받는다. 같은 뜻으로 못 넘기는 것(시스템 인증서 저장소 ·
+// 여러 호스트)은 거절해야 한다 - 약하게 넘기면 백업 접속만 검증 없이 붙는다.
+func TestPGTLSCarriesOnlyWhatLibpqCanMatch(t *testing.T) {
 	cleanPGEnv(t)
 	root := writeTestRootCert(t)
+	other := writeTestRootCert(t)
 	const base = "postgres://u:pw@db.example:5432/ledger"
 	for _, c := range []struct {
-		url, want, refuse string
+		name, url, env     string
+		want, root, refuse string
 	}{
-		{base + "?sslmode=disable", "disable", ""},
-		{base + "?sslmode=allow", "allow", ""},
-		{base + "?sslmode=prefer", "prefer", ""},
-		{base, "prefer", ""}, // libpq 와 pgx 의 기본값
-		{base + "?sslmode=require", "require", ""},
-		{base + "?sslmode=verify-ca", "", "서버 인증서"},
-		{base + "?sslmode=verify-full", "", "서버 인증서"},
-		{base + "?sslmode=verify-full&sslrootcert=system", "", "서버 인증서"},
-		{base + "?sslmode=require&sslrootcert=" + root, "", "서버 인증서"}, // libpq 는 이것을 verify-ca 로 본다
-		{"postgres://u:pw@db1.example:5432,db2.example:5432/ledger?sslmode=disable", "", "호스트가 여럿"},
+		{"disable", base + "?sslmode=disable", "", "disable", "", ""},
+		{"allow", base + "?sslmode=allow", "", "allow", "", ""},
+		{"prefer", base + "?sslmode=prefer", "", "prefer", "", ""},
+		{"기본값", base, "", "prefer", "", ""}, // libpq 와 pgx 의 기본값
+		{"require", base + "?sslmode=require", "", "require", "", ""},
+		{"verify-ca", base + "?sslmode=verify-ca&sslrootcert=" + root, "", "verify-ca", root, ""},
+		{"verify-full", base + "?sslmode=verify-full&sslrootcert=" + root, "", "verify-full", root, ""},
+		{"루트를 준 require", base + "?sslmode=require&sslrootcert=" + root, "", "verify-ca", root, ""}, // libpq 도 verify-ca 로 본다
+		{"환경의 루트", base + "?sslmode=verify-full", root, "verify-full", root, ""},
+		{"URL 이 환경을 이긴다", base + "?sslmode=verify-full&sslrootcert=" + root, other, "verify-full", root, ""},
+		{"루트 없는 verify-ca", base + "?sslmode=verify-ca", "", "", "", "루트 인증서 파일 없이"},
+		{"루트 없는 verify-full", base + "?sslmode=verify-full", "", "", "", "루트 인증서 파일 없이"},
+		{"시스템 저장소", base + "?sslmode=verify-full&sslrootcert=system", "", "", "", "루트 인증서 파일을 찾지 못했다"},
+		{"여러 호스트", "postgres://u:pw@db1.example:5432,db2.example:5432/ledger?sslmode=disable", "", "", "", "호스트가 여럿"},
 	} {
-		cfg, err := pgx.ParseConfig(c.url)
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("PGSSLROOTCERT", c.env)
+			cfg, err := pgx.ParseConfig(c.url)
+			if err != nil {
+				t.Fatalf("해석 실패: %v", err)
+			}
+			var environ []string
+			if c.env != "" {
+				environ = []string{"PGSSLROOTCERT=" + c.env}
+			}
+			mode, got, err := pgTLS(&cfg.Config, sslRootCandidates(c.url, environ))
+			switch {
+			case c.refuse == "" && (err != nil || mode != c.want || got != c.root):
+				t.Errorf("%q %q, %v (기대 %q %q)", mode, got, err, c.want, c.root)
+			case c.refuse != "" && (err == nil || !strings.Contains(err.Error(), c.refuse)):
+				t.Errorf("거절해야 하는데 %q %q, %v", mode, got, err)
+			}
+		})
+	}
+
+	// 루트 인증서가 서버가 읽은 것과 다르면(후보 파일이 그 사이 바뀌었다) 받지 않는다.
+	cfg, err := pgx.ParseConfig(base + "?sslmode=verify-full&sslrootcert=" + root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := pgTLS(&cfg.Config, []string{other}); err == nil || !strings.Contains(err.Error(), "찾지 못했다") {
+		t.Fatalf("다른 루트 인증서를 받았다: %v", err)
+	}
+}
+
+// TestTargetSessionAttrsCarriesTheServersChoice 는 접속 URL 의 target_session_attrs 가 libpq 값으로 되옮겨지는지 잰다.
+// 빠뜨리면 서버는 주 서버에 붙는데 덤프는 지연된 복제본에서 성공할 수 있다.
+func TestTargetSessionAttrsCarriesTheServersChoice(t *testing.T) {
+	cleanPGEnv(t)
+	for _, v := range []string{"any", "read-write", "read-only", "primary", "standby", "prefer-standby"} {
+		cfg, err := pgx.ParseConfig("postgres://u@db.example/ledger?sslmode=disable&target_session_attrs=" + v)
 		if err != nil {
-			t.Fatalf("%s: 해석 실패: %v", c.url, err)
+			t.Fatalf("%s: %v", v, err)
 		}
-		got, err := pgSSLMode(&cfg.Config)
-		switch {
-		case c.refuse == "" && (err != nil || got != c.want):
-			t.Errorf("%s: %q, %v (기대 %q)", c.url, got, err, c.want)
-		case c.refuse != "" && (err == nil || !strings.Contains(err.Error(), c.refuse)):
-			t.Errorf("%s: 거절해야 하는데 %q, %v", c.url, got, err)
+		got, err := targetSessionAttrs(&cfg.Config)
+		want := v
+		if v == "any" {
+			want = ""
 		}
+		if err != nil || got != want {
+			t.Errorf("%s: %q, %v", v, got, err)
+		}
+	}
+	cfg, err := pgx.ParseConfig("postgres://u@db.example/ledger?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ValidateConnect = func(context.Context, *pgconn.PgConn) error { return nil }
+	if _, err := targetSessionAttrs(&cfg.Config); err == nil {
+		t.Fatal("모르는 접속 검증을 받았다")
 	}
 }
 
@@ -146,40 +235,46 @@ func writeTestRootCert(t *testing.T) string {
 }
 
 // TestLibpqEnvRebuildsTheConnection 은 libpq 도구에 넘길 환경이 서버의 해석에서만 나오는지 잰다. 물려받은 PG 변수는
-// 빠지고, 비밀번호는 PGPASSWORD 하나에만 있고, 접속을 지키는 설정(channel_binding · require_auth)이 따라간다.
+// 빠지고, 비밀번호는 PGPASSWORD 하나에만 있고, 어느 서버를 받는가(target_session_attrs) · 얼마나 기다리는가
+// (connect_timeout) · 접속을 지키는 설정(sslrootcert · channel_binding · require_auth)이 따라간다.
 func TestLibpqEnvRebuildsTheConnection(t *testing.T) {
 	cleanPGEnv(t)
+	root := writeTestRootCert(t)
 	const pw = "s3cret-pw"
-	tg := ParseTarget("postgres://fduser:" + pw + "@db.example:6543/ledger?sslmode=require" +
-		"&channel_binding=require&require_auth=scram-sha-256")
+	tg := ParseTarget("postgres://fduser:" + pw + "@db.example:6543/ledger?sslmode=verify-full&sslrootcert=" + root +
+		"&channel_binding=require&require_auth=scram-sha-256&target_session_attrs=read-write&connect_timeout=7")
 	inherited := []string{"PATH=/usr/bin", "HOME=/h", "LANG=C.UTF-8",
-		"PGPASSWORD=inherited", "PGHOST=elsewhere", "PGSERVICE=svc", "PGSSLMODE=disable", "PGOPTIONS=-c x=y"}
+		"PGPASSWORD=inherited", "PGHOST=elsewhere", "PGSERVICE=svc", "PGSSLMODE=disable", "PGOPTIONS=-c x=y",
+		"PGTARGETSESSIONATTRS=standby", "PGCONNECT_TIMEOUT=999"}
 	env, err := libpqEnv(tg, inherited)
 	if err != nil {
 		t.Fatalf("libpqEnv: %v", err)
 	}
 	want := []string{"PATH=/usr/bin", "HOME=/h", "LANG=C.UTF-8",
-		"PGHOST=db.example", "PGPORT=6543", "PGUSER=fduser", "PGDATABASE=ledger", "PGSSLMODE=require",
-		"PGPASSWORD=" + pw, "PGCHANNELBINDING=require", "PGREQUIREAUTH=scram-sha-256"}
+		"PGHOST=db.example", "PGPORT=6543", "PGUSER=fduser", "PGDATABASE=ledger", "PGSSLMODE=verify-full",
+		"PGSSLROOTCERT=" + root, "PGPASSWORD=" + pw, "PGTARGETSESSIONATTRS=read-write", "PGCONNECT_TIMEOUT=7",
+		"PGCHANNELBINDING=require", "PGREQUIREAUTH=scram-sha-256"}
 	if !slices.Equal(env, want) {
 		t.Fatalf("환경:\n got %q\nwant %q", env, want)
 	}
 
-	// 기본값(channel_binding=prefer · 빈 require_auth)은 싣지 않는다 - libpq 의 기본값과 같다.
+	// 기본값(channel_binding=prefer · 빈 require_auth · any · 시간 제한 없음)은 싣지 않는다 - libpq 의 기본값과 같다.
 	plain, err := libpqEnv(ParseTarget("postgres://fduser@db.example/ledger?sslmode=disable"), nil)
 	if err != nil {
 		t.Fatalf("libpqEnv(비밀번호 없음): %v", err)
 	}
 	for _, kv := range plain {
-		if strings.HasPrefix(kv, "PGPASSWORD=") || strings.HasPrefix(kv, "PGCHANNELBINDING=") || strings.HasPrefix(kv, "PGREQUIREAUTH=") {
-			t.Errorf("기본 접속에 %q 가 실렸다: %q", kv, plain)
+		for _, k := range []string{"PGPASSWORD=", "PGCHANNELBINDING=", "PGREQUIREAUTH=", "PGTARGETSESSIONATTRS=", "PGCONNECT_TIMEOUT=", "PGSSLROOTCERT="} {
+			if strings.HasPrefix(kv, k) {
+				t.Errorf("기본 접속에 %q 가 실렸다: %q", kv, plain)
+			}
 		}
 	}
 
 	// 거절 · 해석 실패는 표시값과 고정 문구만 싣는다.
 	for raw, frag := range map[string]string{
-		"postgres://fduser:" + pw + "@db.example/ledger?sslmode=verify-full": "같은 뜻으로 넘길 수 없는 접속이다(postgres)",
-		"postgres://fduser:" + pw + "@db.example:notaport/ledger":            "해석하지 못했다(postgres)",
+		"postgres://fduser:" + pw + "@db.example/ledger?sslmode=verify-full&sslrootcert=system": "같은 뜻으로 넘길 수 없는 접속이다(postgres)",
+		"postgres://fduser:" + pw + "@db.example:notaport/ledger":                               "해석하지 못했다(postgres)",
 	} {
 		_, err := libpqEnv(ParseTarget(raw), nil)
 		if err == nil || !strings.Contains(err.Error(), frag) {
@@ -195,8 +290,8 @@ func TestLibpqEnvRebuildsTheConnection(t *testing.T) {
 }
 
 func TestPGDumpArgsCarryNoConnection(t *testing.T) {
-	got := pgDumpArgs("pg_dump", "/b/pre-19-20261126T160203Z.dump.part")
-	want := []string{"pg_dump", "--format=custom", "--no-password", "--file=/b/pre-19-20261126T160203Z.dump.part"}
+	got := pgDumpArgs("/usr/bin/pg_dump", "/b/x.dump.1.part")
+	want := []string{"/usr/bin/pg_dump", "--format=custom", "--no-password", "--file=/b/x.dump.1.part"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("argv = %q, 기대 %q", got, want)
 	}
@@ -264,8 +359,10 @@ func dirNames(t *testing.T, dir string) []string {
 	return out
 }
 
-// TestDumpPGRunsTheToolWithoutSecretsInArgv 는 덤프 한 번의 실행 경계를 잰다: 접속은 환경으로만 가고, 다 뜬 뒤에만 정식
-// 이름이 생기고, 실패는 고정 문구로 오고 반쪽 파일을 안 남긴다.
+func sealOK(context.Context) error { return nil }
+
+// TestDumpPGRunsTheToolWithoutSecretsInArgv 는 덤프 한 번의 실행 경계를 잰다: 접속은 환경으로만 가고, 다 뜨고 봉인(seal)을
+// 지난 뒤에만 정식 이름이 생기고, 실패는 고정 문구로 오고 반쪽 파일을 안 남긴다.
 func TestDumpPGRunsTheToolWithoutSecretsInArgv(t *testing.T) {
 	cleanPGEnv(t)
 	t.Setenv("PGAPPNAME", "inherited-app") // 물려받은 PG 변수 - 도구에 안 가야 한다
@@ -276,14 +373,14 @@ func TestDumpPGRunsTheToolWithoutSecretsInArgv(t *testing.T) {
 	t.Run("성공", func(t *testing.T) {
 		rec, dir := t.TempDir(), filepath.Join(t.TempDir(), "backups")
 		bin := fakePGDump(t, rec, `printf 'PGDMP-fake' > "$out"`)
-		got, err := dumpPG(ctx, tg, dir, bin, 19, quietLog())
+		got, err := dumpPG(ctx, tg, dir, bin, ledgerA, 18, sealOK, quietLog())
 		if err != nil {
 			t.Fatalf("dumpPG: %v", err)
 		}
 		if filepath.Dir(got) != dir {
 			t.Fatalf("덤프 자리 %q (기대 %q 안)", got, dir)
 		}
-		if _, ok := dumpStamp(filepath.Base(got)); !ok || !strings.HasPrefix(filepath.Base(got), "pre-19-") {
+		if info, ok := parseDumpName(filepath.Base(got)); !ok || info.Ledger != ledgerA || info.From != 18 {
 			t.Fatalf("덤프 이름 %q", filepath.Base(got))
 		}
 		if names := dirNames(t, dir); len(names) != 1 || names[0] != filepath.Base(got) {
@@ -293,9 +390,10 @@ func TestDumpPGRunsTheToolWithoutSecretsInArgv(t *testing.T) {
 			t.Fatalf("백업 자리 권한: %v, %v", fi.Mode(), err)
 		}
 		args, _ := os.ReadFile(filepath.Join(rec, "args"))
-		wantArgs := "--format=custom\n--no-password\n--file=" + got + ".part\n"
-		if string(args) != wantArgs {
-			t.Fatalf("argv:\n%s\n기대:\n%s", args, wantArgs)
+		lines := strings.Split(strings.TrimSuffix(string(args), "\n"), "\n")
+		if len(lines) != 3 || lines[0] != "--format=custom" || lines[1] != "--no-password" ||
+			!strings.HasPrefix(lines[2], "--file="+got+".") || !strings.HasSuffix(lines[2], ".part") {
+			t.Fatalf("argv:\n%s", args)
 		}
 		env, _ := os.ReadFile(filepath.Join(rec, "env"))
 		wantEnv := "PGDATABASE=ledger\nPGHOST=127.0.0.1\nPGPASSWORD=" + pw + "\nPGPORT=5432\nPGSSLMODE=disable\nPGUSER=fduser\n"
@@ -306,16 +404,20 @@ func TestDumpPGRunsTheToolWithoutSecretsInArgv(t *testing.T) {
 
 	for _, c := range []struct {
 		name, body, want string
+		seal             func(context.Context) error
 	}{
 		{"인증 실패", `printf 'PGDMP-half' > "$out"; echo 'pg_dump: error: connection to server at "10.1.2.3", port 5432 failed: FATAL:  password authentication failed for user "fduser"' >&2; exit 1`,
-			"pg_dump 가 실패했다(종료 코드 1): 인증에 실패했다"},
-		{"형식이 아닌 출력", `printf 'oops' > "$out"`, "사용자 정의 형식이 아니다"},
-		{"빈 출력", `: > "$out"`, "사용자 정의 형식이 아니다"},
+			"pg_dump 가 실패했다(종료 코드 1): 인증에 실패했다", sealOK},
+		{"형식이 아닌 출력", `printf 'oops' > "$out"`, "사용자 정의 형식이 아니다", sealOK},
+		{"빈 출력", `: > "$out"`, "사용자 정의 형식이 아니다", sealOK},
+		// 실행기가 잠금을 잃었다(연결이 끊겼다) - 다 뜬 덤프여도 이름을 안 붙인다.
+		{"봉인 실패", `printf 'PGDMP-fake' > "$out"`, "덤프에 최종 이름을 붙이지 않는다 - 이전 실행기가 잠금을 잃었다",
+			func(context.Context) error { return errors.New("이전 실행기가 잠금을 잃었다") }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			rec, dir := t.TempDir(), t.TempDir()
 			bin := fakePGDump(t, rec, c.body)
-			_, err := dumpPG(ctx, tg, dir, bin, 19, quietLog())
+			_, err := dumpPG(ctx, tg, dir, bin, ledgerA, 18, c.seal, quietLog())
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("오류에 %q 가 없다: %v", c.want, err)
 			}
@@ -333,22 +435,25 @@ func TestDumpPGRunsTheToolWithoutSecretsInArgv(t *testing.T) {
 	t.Run("거절은 도구를 안 부른다", func(t *testing.T) {
 		rec, dir := t.TempDir(), t.TempDir()
 		bin := fakePGDump(t, rec, `printf 'PGDMP' > "$out"`)
-		_, err := dumpPG(ctx, ParseTarget("postgres://fduser:"+pw+"@db.example/ledger?sslmode=verify-full"), dir, bin, 19, quietLog())
+		_, err := dumpPG(ctx, ParseTarget("postgres://fduser:"+pw+"@db.example/ledger?sslmode=verify-full"), dir, bin, ledgerA, 18, sealOK, quietLog())
 		if err == nil || !strings.Contains(err.Error(), "덤프 없이 판을 올리지 않는다") || strings.Contains(err.Error(), pw) {
-			t.Fatalf("verify-full 접속: %v", err)
+			t.Fatalf("루트 인증서 없는 verify-full 접속: %v", err)
 		}
 		if _, err := os.Stat(filepath.Join(rec, "args")); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("거절했는데 pg_dump 가 돌았다: %v", err)
 		}
+		if names := dirNames(t, dir); len(names) != 0 {
+			t.Fatalf("거절한 실행이 무엇을 남겼다: %q", names)
+		}
 	})
 
 	t.Run("자리 없음 · 도구 없음", func(t *testing.T) {
-		if _, err := dumpPG(ctx, tg, " ", "pg_dump", 19, quietLog()); err == nil || !strings.Contains(err.Error(), "덤프 자리가 없다(--backup-dir)") {
+		if _, err := dumpPG(ctx, tg, " ", "pg_dump", ledgerA, 18, sealOK, quietLog()); err == nil || !strings.Contains(err.Error(), "덤프 자리가 없다(--backup-dir)") {
 			t.Fatalf("빈 자리: %v", err)
 		}
 		dir := t.TempDir()
 		for _, bin := range []string{"fd-no-such-pg_dump", filepath.Join(dir, "missing", "pg_dump")} {
-			if _, err := dumpPG(ctx, tg, dir, bin, 19, quietLog()); err == nil || !strings.Contains(err.Error(), "pg_dump 를 찾지 못했다") {
+			if _, err := dumpPG(ctx, tg, dir, bin, ledgerA, 18, sealOK, quietLog()); err == nil || !strings.Contains(err.Error(), "pg_dump 를 찾지 못했다") {
 				t.Fatalf("%s: %v", bin, err)
 			}
 		}
@@ -358,11 +463,19 @@ func TestDumpPGRunsTheToolWithoutSecretsInArgv(t *testing.T) {
 	})
 }
 
-// TestRollbackPGNamesTheNewestDump 는 `fd migrate --rollback` 의 Postgres 갈래가 가장 최근 덤프를 고르고, 그것이 깨졌으면
-// 옛 덤프로 조용히 넘어가지 않는지 잰다. DB 에 붙지 않는다(접속 URL 은 닿지 않는 주소다).
-func TestRollbackPGNamesTheNewestDump(t *testing.T) {
+// TestRollbackPGPicksThisLedgersDump 는 `fd migrate --rollback` 의 Postgres 갈래를 잰다: 원장에 붙어 그 원장의 덤프 중
+// 가장 최근 것만 고르고, 덤프 뒤로 커밋된 판올림이 없으면 절차를 안 내고, 가장 최근 덤프가 깨졌으면 옛 덤프로 조용히
+// 넘어가지 않는다. 낸 스크립트는 대상 클러스터와 관리 DB 를 명령마다 적고, 접속 조각을 싣지 않는다.
+func TestRollbackPGPicksThisLedgersDump(t *testing.T) {
 	ctx := context.Background()
-	const dsn = "postgres://fduser:s3cret-pw@127.0.0.1:1/ledger?sslmode=disable"
+	dsn, s := pgMigrated(t)
+	led, err := readLedgerFacts(ctx, s.db)
+	if err != nil {
+		t.Fatalf("원장 식별: %v", err)
+	}
+	if led.Admin != "postgres" {
+		t.Fatalf("시험 DB 의 관리 DB %q", led.Admin)
+	}
 	write := func(dir, name, body string) string {
 		p := filepath.Join(dir, name)
 		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
@@ -374,31 +487,54 @@ func TestRollbackPGNamesTheNewestDump(t *testing.T) {
 	if _, err := Rollback(ctx, dsn, "", quietLog()); err == nil || !strings.Contains(err.Error(), "덤프 자리(--backup-dir)가 없다") {
 		t.Fatalf("빈 자리: %v", err)
 	}
-	if _, err := Rollback(ctx, dsn, t.TempDir(), quietLog()); err == nil || !strings.Contains(err.Error(), "되돌릴 덤프가 없다") {
-		t.Fatalf("덤프 없음: %v", err)
+	const unreachable = "postgres://fduser:s3cret-pw@127.0.0.1:1/ledger?sslmode=disable&connect_timeout=2"
+	if _, err := Rollback(ctx, unreachable, t.TempDir(), quietLog()); err == nil || !strings.Contains(err.Error(), "되돌릴 원장을 가리려면") ||
+		strings.Contains(err.Error(), "s3cret-pw") {
+		t.Fatalf("닿지 않는 원장: %v", err)
 	}
 
 	dir := t.TempDir()
-	write(dir, "pre-19-20261101T000000Z.dump", dumpMagic+"-old")
-	newest := write(dir, "pre-19-20261102T000000Z.dump", dumpMagic+"-new")
+	write(dir, "fd-"+led.ID+"-from"+strconv.Itoa(SchemaVersion-1)+"-20261101T000000Z.dump", dumpMagic+"-old")
+	newest := write(dir, "fd-"+led.ID+"-from"+strconv.Itoa(SchemaVersion)+"-20261102T000000Z.dump", dumpMagic+"-new")
+	write(dir, "fd-"+ledgerB+"-from"+strconv.Itoa(SchemaVersion)+"-20261109T000000Z.dump", dumpMagic+"-other") // 다른 원장
+
+	// 지금 판 = 덤프를 뜬 판: 덤프 뒤로 커밋된 판올림이 없다(판올림이 실패해 되감겼다).
+	if _, err := Rollback(ctx, dsn, dir, quietLog()); err == nil || !strings.Contains(err.Error(), "되돌릴 판올림이 없다") {
+		t.Fatalf("판올림이 커밋되지 않은 원장: %v", err)
+	}
+
+	stamp(t, s, SchemaVersion+1) // 덤프 뒤로 판올림이 커밋됐다
 	out, err := Rollback(ctx, dsn, dir, quietLog())
 	if err != nil || out.Backup != newest {
 		t.Fatalf("Rollback = %+v, %v (기대 %q)", out, err, newest)
 	}
-	for _, frag := range []string{"pg_restore --create --exit-on-error --dbname=postgres", `"` + newest + `"`, "RENAME TO"} {
-		if !strings.Contains(out.Steps, frag) {
-			t.Errorf("절차에 %q 가 없다: %s", frag, out.Steps)
+	for _, frag := range []string{
+		`pg_restore -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres --create --exit-on-error "$dump"`,
+		`psql -X -q -v ON_ERROR_STOP=1 -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres`,
+		`"${PGHOST:?`, "dump='" + newest + "'", `ALTER DATABASE :"db" RENAME TO :"broken";`, `DROP DATABASE IF EXISTS :"db";`,
+	} {
+		if !strings.Contains(out.Script, frag) {
+			t.Errorf("스크립트에 %q 가 없다:\n%s", frag, out.Script)
 		}
 	}
-	if strings.Contains(out.Steps, "s3cret-pw") || strings.Contains(out.Steps, "ledger") {
-		t.Errorf("절차에 접속 조각이 샜다: %s", out.Steps)
+	if !strings.Contains(out.Steps, "판 "+strconv.Itoa(SchemaVersion)+" 에서 뜬 덤프") {
+		t.Errorf("설명에 덤프를 뜬 판이 없다: %s", out.Steps)
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{strings.TrimPrefix(u.Path, "/"), u.Host, u.User.Username() + "@"} {
+		if strings.Contains(out.Steps+out.Script, leak) {
+			t.Errorf("절차에 접속 조각 %q 가 샜다:\n%s\n%s", leak, out.Steps, out.Script)
+		}
 	}
 
-	write(dir, "pre-19-20261103T000000Z.dump", "truncated")
+	write(dir, "fd-"+led.ID+"-from"+strconv.Itoa(SchemaVersion)+"-20261103T000000Z.dump", "truncated")
 	if _, err := Rollback(ctx, dsn, dir, quietLog()); err == nil || !strings.Contains(err.Error(), "가장 최근 덤프가 깨졌다") {
 		t.Fatalf("깨진 최신 덤프: %v", err)
 	}
-	if !strings.Contains(pgRollbackHint(""), "덤프를 뜨지 않았다") {
-		t.Fatalf("덤프 없는 실패의 절차: %q", pgRollbackHint(""))
+	if !strings.Contains(pgFailureHint(""), "덤프를 뜨지 않았다") || !strings.Contains(pgFailureHint(newest), "fd migrate --rollback") {
+		t.Fatalf("실패 안내: %q · %q", pgFailureHint(""), pgFailureHint(newest))
 	}
 }

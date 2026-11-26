@@ -22,7 +22,11 @@ const dbEnv = "FD_DB"
 // 보는 것 셋:
 //  1. 이 바이너리가 실행된다(이 프로세스가 떴다는 것 자체)
 //  2. 자기 빌드 좌표를 낸다
-//  3. DB 증분 계획이 거절이 아니다 — **적용하지 않는다**
+//  3. DB 증분 계획이 none 이다(이 판이 그 DB 로 바로 뜬다) - **적용하지 않는다**
+//
+// ★ 3번의 판정과 문구는 기동 검사(OpenWithLogger)의 것 그대로다(store.OpenRefusal): 기동은 none 이 아닌 계획을 다
+// 거절한다. apply(빈 DB) · upgrade(낮은 판)를 통과로 내면 감시기가 새 판으로 넘어간 뒤 그 기동이 「fd migrate 를 먼저
+// 돌려라」로 죽는다 - 증분 적용이 기동에서 분리된 뒤로(설계 §7 ①) 그 두 갈래는 「다시 떠도 되는가」에 아니다.
 //
 // ★ 3번이 강등도 막는다. 옛 바이너리로 되돌리면 DB 버전이 그 바이너리의 SchemaVersion
 // 보다 높고, PlanMigration 이 이미 그 경우를 거절로 낸다. 규칙을 새로 만들지 않는다.
@@ -63,13 +67,13 @@ func runSelfcheck(args []string, env func(string) (string, bool), out io.Writer)
 		fmt.Fprintf(out, "selfcheck: DB 증분 계획을 읽지 못했다: %v\n", err)
 		return 1
 	}
-	if plan.Action == store.MigrateReject {
-		fmt.Fprintf(out, "selfcheck: 이 판으로 DB 를 열면 거절된다 — %s\n", plan.Reason)
+	if err := store.OpenRefusal(plan, raw); err != nil {
+		fmt.Fprintf(out, "selfcheck: 이 판으로 DB 를 열면 거절된다 - %s\n", err)
 		return 1
 	}
 
 	// 계약: 첫 줄에서 감시기가 새 판의 좌표를 읽는다.
 	fmt.Fprintf(out, "fd selfcheck ok build=%s\n", buildinfo.Short(buildinfo.Self()))
-	fmt.Fprintf(out, "  증분 계획: %s — %s\n", plan.Action, plan.Reason)
+	fmt.Fprintf(out, "  증분 계획: %s - %s\n", plan.Action, plan.Reason)
 	return 0
 }
