@@ -541,10 +541,24 @@ func OpenLedger(ctx context.Context, path string, log *slog.Logger) (*Store, err
 	if plan.Action != MigrateNone {
 		return nil, ledgerOpenRefusal(plan)
 	}
+	return openSQLiteReader(ctx, path, log)
+}
 
+// openSQLiteReader 는 SQLite 파일을 읽으려고 연다(ledgerDSN). 판을 재지도 스키마를 바꾸지도 않는다 - 판은 부르는 쪽이
+// 잰다(원장 내보내기는 이 바이너리의 판, 이관은 이관 판). 원장 내보내기(OpenLedger)와 SQLite 이관의 원본(openImportSource)이
+// 나눠 쓴다.
+//
+// 없는 파일에는 오류를 낸다. sql.Open 은 파일을 **만들기** 때문이다(OpenLedger 의 ★).
+func openSQLiteReader(ctx context.Context, path string, log *slog.Logger) (*Store, error) {
+	if log == nil {
+		log = slog.Default()
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("DB 파일이 없다(path=%q): %w", clip(path, 200), err)
+	}
 	db, err := sql.Open("sqlite", ledgerDSN(path))
 	if err != nil {
-		return nil, fmt.Errorf("원장용 sqlite 열기 실패(path=%q): %w", clip(path, 200), err)
+		return nil, fmt.Errorf("읽기용 sqlite 열기 실패(path=%q): %w", clip(path, 200), err)
 	}
 	// 읽기 한 갈래뿐이라 커넥션을 늘릴 이유가 없다. 트랜잭션이 커넥션 하나에 묶인다.
 	db.SetMaxOpenConns(1)
@@ -552,7 +566,7 @@ func OpenLedger(ctx context.Context, path string, log *slog.Logger) (*Store, err
 
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("원장용 sqlite 접속 실패(path=%q): %w", clip(path, 200), err)
+		return nil, fmt.Errorf("읽기용 sqlite 접속 실패(path=%q): %w", clip(path, 200), err)
 	}
 
 	s := &Store{db: &conn{raw: db, eng: engineSQLite}, path: path, log: log}

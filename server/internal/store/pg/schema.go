@@ -9,13 +9,14 @@
 // ★ 판(schema_version 행)을 적는 것은 이 SQL 이 아니라 이전 실행기다 — SQLite 의 schema.sql 이 판 행을 안
 // 적고 실행기가 적는 것과 같다.
 //
-// ★ 이관(SQLite → PG)이 지켜야 할 것. 저장 계층을 PG 로 옮기는 쪽도 여기를 본다.
+// ★ 이관(SQLite → PG)이 지켜야 할 것. 저장 계층을 PG 로 옮기는 쪽도 여기를 본다. 이관의 순수 규칙은 import.go ·
+// verify.go 이고(옮기는 표 목록 · 칸의 뜻 · 사전 검사 · 행 지문 · 순번), 실행은 store 의 ImportSQLite 다.
 //   - identity 칼럼 다섯(pick_eval · resource_hold · event · landing_queue 의 id, item_after.seq)은
 //     GENERATED ALWAYS 다. 옛 번호를 그대로 넣으려면 OwnerRole 로 `INSERT … OVERRIDING SYSTEM VALUE` 하고,
-//     표마다 `setval(pg_get_serial_sequence('<표>', '<칼럼>'), n)` 으로 번호를 맞춘다. n 은 SQLite 의
-//     sqlite_sequence 에 그 표의 줄이 있으면 그 seq 다 — AUTOINCREMENT 는 지워진 최고 번호도 다시 쓰지 않으므로
-//     max(<칼럼>) 로 맞추면 그 번호를 다시 낸다. 줄이 없으면(item_after.seq 는 rowid 다) max(<칼럼>) 이고,
-//     n 이 없거나 0 이면 건너뛴다(시퀀스는 1 부터 낸다).
+//     표마다 `setval(pg_get_serial_sequence('<표>', '<칼럼>'), n, true)` 로 번호를 맞춘다. n 은 원본에서 이미 발급된
+//     가장 큰 번호다. AUTOINCREMENT 표는 greatest(max(<칼럼>), sqlite_sequence.seq) 다 — 지워진 최고 번호도 다시
+//     쓰지 않으므로 max(<칼럼>) 만으로 맞추면 그 번호를 다시 낸다. item_after.seq 는 rowid 라 max(rowid) 다.
+//     n 이 0 이면(발급된 번호가 없다) `setval(…, 1, false)` 로 새 시퀀스처럼 1 부터 낸다(Sequence).
 //   - snapshot 의 기본키는 (project, key_digest) 다(key 의 sha256 계산 칼럼, fd_key_digest). upsert 의 충돌
 //     대상도 그것이다. 지문이 같은 다른 키는 넣기 전에 23000(snapshot_key_digest_unique)으로 거절된다.
 //   - 선점(claim)을 다시 쓰는 upsert 는 살아 있는 남의 행에서 23505(claim_one_live_holder)로 거절된다.

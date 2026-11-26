@@ -339,7 +339,8 @@ func TestSnapshotKeyDigestCollisionIsRefused(t *testing.T) {
 
 // 앱 코드는 identity 번호를 손으로 정하지 않는다. GENERATED ALWAYS 는 실수만 막는다 — OVERRIDING SYSTEM VALUE
 // 는 INSERT 권한만 보므로 앱 역할도 쓸 수 있다. 그래서 그 구절이 서버 코드(시험 · 이 스키마 패키지 밖)에 없다는
-// 것을 소스에서 잰다. 이관이 그 구절을 쓰게 되면 그 파일 하나를 여기서 콕 집어 허락한다.
+// 것을 소스에서 잰다. 옛 번호를 옮기는 이관의 그 구절은 이 패키지(import.go 의 InsertSQL)에만 있고, 이관은
+// 소유 역할로만 돈다 — 그래서 이 패키지는 재지 않는다.
 func TestServerCodeNeverOverridesIdentity(t *testing.T) {
 	root, err := filepath.Abs("../../..") // server 모듈 뿌리
 	if err != nil {

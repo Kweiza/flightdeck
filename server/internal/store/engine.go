@@ -1024,7 +1024,7 @@ func (e engine) lockStmt(sp txSpec) (string, []any) {
 }
 
 // begin 은 store 의 트랜잭션이 열리는 단 한 자리다. 종류가 격리 수준과 잠금을 정한다.
-// 부르는 자리는 runTx(Tx · ObsTx) · ReadTx · stepTx(증분) · exportSnapshot(판올림 전 덤프의 스냅숏) 넷뿐이다
+// 부르는 자리는 runTx(Tx · ObsTx) · ReadTx · sessionTx(증분 · SQLite 이관) · exportSnapshot(판올림 전 덤프의 스냅숏) 넷뿐이다
 // (engine_test.go 가 잠근다).
 //
 // 쓰기 종류는 잠금을 받기까지 기다린 시간을 잰다(/metrics). Postgres 는 잠금 문장만 잰다 - 연결 풀 대기는

@@ -67,7 +67,14 @@ func resolveDumpTimeout(env func(string) (string, bool)) (time.Duration, error) 
 // ★ **판정도 백업도 여기서 다시 하지 않는다.** 전부 store 의 PlanMigration·migrateTo 가 진다.
 // 이 파일이 더하는 것은 "누가 언제 부르는가" 와 그 결과를 사람에게 말하는 것뿐이다 —
 // 판정을 여기 복제하면 두 벌이 되고, 두 벌은 반드시 표류한다.
+//
+// 첫 인자가 하위 동사(migrateSubcommands - import-sqlite · verify)면 판올림 대신 그 동사를 돈다.
 func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int {
+	if len(args) > 0 {
+		if sub, ok := migrateSubcommands[args[0]]; ok {
+			return sub(a, ctx, args[1:], out)
+		}
+	}
 	fs := newFlagSet("migrate")
 	dbPath := fs.String("db", "", "원장: SQLite 파일 경로 또는 Postgres 접속 URL(비면 자동)")
 	to := fs.Int("to", 0, "이 버전까지만 올린다(0 이면 이 바이너리가 아는 최신)")

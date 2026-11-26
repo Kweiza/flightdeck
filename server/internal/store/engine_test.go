@@ -395,7 +395,7 @@ func TestRawHandlesStayInEngine(t *testing.T) {
 		{"store.go", "DB"}:                "저수준 접근자 - 시험 전용(store 밖 소스는 TestNoRawDatabaseOutsideStore 가 막는다)",
 		{"store.go", "openRaw"}:           "SQLite 파일 열기",
 		{"probe.go", "probeMigrationVia"}: "SQLite 파일의 판 재기",
-		{"backup.go", "OpenLedger"}:       "SQLite 원장 내보내기 전용 열기",
+		{"backup.go", "openSQLiteReader"}: "SQLite 파일 읽기 전용 열기(원장 내보내기 · 이관 원본)",
 	}
 	raw := map[string]bool{"DB": true, "Tx": true, "Conn": true, "Stmt": true, "Open": true, "OpenDB": true, "TxOptions": true}
 	var bad []string
@@ -498,7 +498,7 @@ func TestNoRawDatabaseOutsideStore(t *testing.T) {
 }
 
 // TestTxKindsAreFour 는 트랜잭션을 여는 자리를 잠근다: BeginTx 는 begin 한 곳, begin 을 부르는 것은
-// runTx(Tx · ObsTx) · ReadTx · stepTx(증분 적용) · exportSnapshot(판올림 전 덤프의 스냅숏) 넷뿐이다.
+// runTx(Tx · ObsTx) · ReadTx · sessionTx(증분 적용 · SQLite 이관) · exportSnapshot(판올림 전 덤프의 스냅숏) 넷뿐이다.
 //
 // ★ 직렬성 규칙(격리 수준 · 전역 잠금)은 begin 에만 산다. 다른 자리에서 트랜잭션을 열면 그 트랜잭션은
 // 잠금도 격리 수준도 없이 돈다 - Postgres 에서 조용히 깨지는 바로 그 모양이다.
@@ -520,7 +520,7 @@ func TestTxKindsAreFour(t *testing.T) {
 	})
 	for name, want := range map[string][]site{
 		"BeginTx": {{"engine.go", "begin"}},
-		"begin":   {{"pgdump.go", "exportSnapshot"}, {"store.go", "ReadTx"}, {"store.go", "runTx"}, {"store.go", "stepTx"}},
+		"begin":   {{"pgdump.go", "exportSnapshot"}, {"store.go", "ReadTx"}, {"store.go", "runTx"}, {"store.go", "sessionTx"}},
 		"runTx":   {{"store.go", "ObsTx"}, {"store.go", "Tx"}},
 	} {
 		var got []site

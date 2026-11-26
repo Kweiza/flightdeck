@@ -680,7 +680,7 @@ func (s *Store) Postgres() bool { return s.db.eng == enginePG }
 func (s *Store) DB() *sql.DB { return s.db.raw }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 트랜잭션 종류는 넷이다: Tx · ObsTx(runTx) · ReadTx · 증분 적용(applySteps). 여는 자리는 engine.go 의
+// 트랜잭션 종류는 넷이다: Tx · ObsTx(runTx) · ReadTx · 실행기 세션 트랜잭션(sessionTx - 증분 적용 · SQLite 이관). 여는 자리는 engine.go 의
 // begin 하나다(engine_test.go 가 소스로 잠근다).
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1278,34 +1278,46 @@ func (s *Store) applyStep(ctx context.Context, sess *migrateSession, m Migration
 	return s.stepTx(ctx, sess, m, stepBody)
 }
 
-// stepTx 는 증분 트랜잭션 하나의 수명이다: 실행기 세션에서 열고 → body → 커밋, 실패하면 되감는다. 안의 일(stepBody)과
-// 가른 것은 수명 규칙(어느 길로 나가도 닫는다)을 따로 재려고다. 끝에서 오류를 한 번 옮긴다(asFault) - 증분의 잠금 대기
-// 초과(55P03)도 Tx 와 같은 *TxFault 로 나간다.
+// stepTx 는 증분 트랜잭션 하나다: 실행기 세션 트랜잭션(sessionTx) 안에서 body 를 돌리고, 커밋하면 적용 로그를 남긴다.
+// 안의 일(stepBody)과 가른 것은 수명 규칙(어느 길로 나가도 닫는다)을 따로 재려고다.
+func (s *Store) stepTx(ctx context.Context, sess *migrateSession, m Migration, body func(context.Context, *txConn, Migration) error) error {
+	start := time.Now()
+	err := s.sessionTx(ctx, sess, fmt.Sprintf("증분 %d(%s)", m.To, m.Name), func(ctx context.Context, tx *txConn) error {
+		return body(ctx, tx, m)
+	})
+	if err != nil {
+		return err
+	}
+	s.log.Info("증분 적용 완료",
+		"path", s.path, "version", m.To, "reason", m.Name,
+		"duration", time.Since(start).Seconds())
+	return nil
+}
+
+// sessionTx 는 실행기 세션(sess) 위 쓰기 트랜잭션 하나의 수명이다: 열고 → body → 커밋, 실패하면 되감는다. 증분 적용
+// (stepTx)과 SQLite 이관(importInto)이 쓴다 - 둘 다 실행기가 쥔 두 세션 잠금과 같은 연결에서 돌아야 한다(txSpec.on).
+// what 은 오류 문구의 머리다. 끝에서 오류를 한 번 옮긴다(asFault) - 잠금 대기 초과(55P03)도 Tx 와 같은 *TxFault 로 나간다.
 //
 // ★ 열자마자 되감기를 미뤄 둔다(defer). body 가 패닉이면 명시 롤백을 건너뛰는데, 그러면 트랜잭션이 열린 채로 세션 해제
 // (migrateSession.release)까지 올라가고 *sql.Conn 의 Close 가 열린 트랜잭션이 끝나기를 영영 기다린다 - 패닉이 밖으로
 // 나가지도 못하고 실행기가 선다. defer 는 세션 해제보다 먼저 돈다(안쪽 함수의 defer 가 먼저다). 커밋한 뒤의 되감기는
 // sql.ErrTxDone 으로 아무것도 안 한다.
-func (s *Store) stepTx(ctx context.Context, sess *migrateSession, m Migration, body func(context.Context, *txConn, Migration) error) (err error) {
+func (s *Store) sessionTx(ctx context.Context, sess *migrateSession, what string, body func(context.Context, *txConn) error) (err error) {
 	defer func() { err = asFault(err) }()
-	start := time.Now()
 	tx, err := s.begin(ctx, txSpec{kind: txWrite, on: sess})
 	if err != nil {
-		return fmt.Errorf("증분 %d(%s) 트랜잭션 시작 실패(path=%q): %w", m.To, m.Name, s.path, err)
+		return fmt.Errorf("%s 트랜잭션 시작 실패(path=%q): %w", what, s.path, err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := body(ctx, tx, m); err != nil {
+	if err := body(ctx, tx); err != nil {
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			return fmt.Errorf("증분 %d(%s) 실패(path=%q): %w (롤백도 실패: %v)", m.To, m.Name, s.path, err, rbErr)
+			return fmt.Errorf("%s 실패(path=%q): %w (롤백도 실패: %v)", what, s.path, err, rbErr)
 		}
-		return fmt.Errorf("증분 %d(%s) 실패(path=%q): %w", m.To, m.Name, s.path, err)
+		return fmt.Errorf("%s 실패(path=%q): %w", what, s.path, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("증분 %d(%s) 커밋 실패(path=%q): %w", m.To, m.Name, s.path, err)
+		return fmt.Errorf("%s 커밋 실패(path=%q): %w", what, s.path, err)
 	}
-	s.log.Info("증분 적용 완료",
-		"path", s.path, "version", m.To, "reason", m.Name,
-		"duration", time.Since(start).Seconds())
 	return nil
 }
 

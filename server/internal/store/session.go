@@ -655,7 +655,7 @@ func eachRow(ctx context.Context, db Reader, query string, args []any, what stri
 	defer rows.Close()
 	for rows.Next() {
 		if err := fn(rows); err != nil {
-			return fmt.Errorf("%s 행 해석 실패: %w", what, err)
+			return fmt.Errorf("%s 행 처리 실패: %w", what, err)
 		}
 	}
 	if err := rows.Err(); err != nil {

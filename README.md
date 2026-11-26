@@ -279,6 +279,38 @@ sql() { docker compose --profile postgres run --rm --entrypoint psql db-backup -
 
 5. Start again with `docker compose --profile postgres up -d`. Drop the renamed old database once the check is done.
 
+### Moving a SQLite ledger to Postgres
+
+`fd migrate import-sqlite` moves a ledger at the last SQLite version (18) into an **empty** Postgres ledger in one
+transaction. Inside that transaction it then compares the two ledgers and does not commit on any mismatch.
+`fd migrate verify` runs only that comparison again (it writes nothing). The comparison covers, per table, the row count and
+a fingerprint over every column, plus the identity sequences (the next number must exceed the highest number the source
+ever issued); mismatched rows are listed by primary key. Exit codes: 0 = moved · matched, 1 = refused · mismatch · failure,
+2 = usage.
+
+```bash
+# 1. Stop the server that writes the source and copy the ledger file. The import reads only the copy.
+# 2. Lay the baseline on the target database, stopping at the import version (18).
+fd migrate --db <URL> --to 18
+# 3. Dry run: only the pre-checks and the target checks; nothing is written.
+fd migrate import-sqlite --from <copy> --db <URL> --dry-run
+# 4. Move. On success it prints the comparison table and the number of rows moved.
+fd migrate import-sqlite --from <copy> --db <URL>
+# 5. (Optional) compare again before starting the server on the new ledger. Once the server writes, they differ.
+fd migrate verify --from <copy> --db <URL>
+```
+
+- The account must be a superuser or a member of `fd_owner`. The import inserts the old identity numbers as they are and
+  sets each sequence above the source's highest number (a deleted top number is never issued again), which only the owner
+  role may do.
+- A source older than version 18 is refused. First upgrade the copy with this version of fd (`fd migrate --db <copy>`).
+- A source whose tables or columns differ from version 18 (a hand-edited ledger) is refused.
+- A target with even one row in a business table is refused, as is one not at version 18 or one that fails the locale gate.
+- Pre-checks: NUL bytes and broken UTF-8 in text columns, broken JSON and `\u0000` in JSON columns, a storage type that does
+  not match the column, NULL primary keys, colliding snapshot key digests, and foreign keys pointing at missing rows. If
+  anything hits, nothing is written and each hit is listed by table · column · reason · primary key. Fix those rows in the
+  copy and run it again.
+
 ## Several repositories
 
 When one product spans several repositories, declare the members in a root `.flightdeck.yaml` and
