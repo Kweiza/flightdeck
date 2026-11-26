@@ -646,6 +646,11 @@ func (s *Store) ListItems(ctx context.Context, project string) ([]model.Item, er
 // ★ 닫힌 시각이 없는 행(closed_at NULL - 스키마가 막지 않는다)은 `NULLS LAST` 로 끝에 둔다. 적지 않으면 엔진마다
 // 자리가 갈린다: SQLite 는 NULL 을 가장 작은 값으로 봐서 DESC 의 끝에, Postgres 는 가장 큰 값으로 봐서 DESC 의
 // 처음에 둔다. 처음에 오면 시각 없는 옛 행이 「최근에 닫힌 것」 자리를 차지하고 limit 이 진짜 최근 것을 자른다.
+//
+// ★ limit 이 음수면 「전부」다. SQLite 의 음수 LIMIT 이 그 뜻이고(옮기기 전 동작), Postgres 는 음수 LIMIT 을 오류로
+// 거절하므로 LIMIT 절을 빼서 두 엔진에 같은 뜻을 세운다. 0 은 두 엔진 모두 빈 목록이다(전체 수는 그대로 낸다).
+// HTTP 표면은 자기 기본값 · 상한으로 접은 양수만 넘긴다(handleListClosedItems) - 그것은 표면의 정책이고 이 계약과
+// 겹치지 않는다.
 func (s *Store) ListClosed(ctx context.Context, project string, state model.ItemState, limit int) ([]model.Item, int, error) {
 	where := ` FROM item WHERE project = ? AND state IN ('done','dropped')`
 	args := []any{project}
@@ -657,7 +662,12 @@ func (s *Store) ListClosed(ctx context.Context, project string, state model.Item
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("닫힌 항목 수 조회 실패(project=%q): %w", clip(project, 64), err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+itemCols+where+` ORDER BY closed_at DESC NULLS LAST, id LIMIT ?`, append(args, limit)...)
+	list := `SELECT ` + itemCols + where + ` ORDER BY closed_at DESC NULLS LAST, id`
+	if limit >= 0 {
+		list += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, list, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("닫힌 항목 조회 실패(project=%q): %w", clip(project, 64), err)
 	}
@@ -944,6 +954,11 @@ func (t *Tx) ClaimItem(project, itemID, sessionID string, at time.Time) (model.C
 		return c, err
 	}
 
+	if t.s.claimGap != nil { // 시험의 끼움 자리(Store.claimGap) - 운영은 nil 이다
+		if err := t.s.claimGap(t); err != nil {
+			return model.Claim{}, err
+		}
+	}
 	now := atStamp(at)
 	written, err := t.writeClaim(project, itemID, sessionID, now)
 	if err != nil {
@@ -1015,7 +1030,8 @@ func (t *Tx) claimTakenMeanwhile(project, itemID, sessionID string, state model.
 			clip(project, 64), clip(itemID, 64), err)
 	}
 	t.s.log.Warn("선점 확인 뒤에 살아 있는 선점이 생겼다 - 쓰기가 한 줄로 서지 않았다",
-		"project", clip(project, 64), "item", clip(itemID, 64), "holder", clip(live.SessionID, 64))
+		"project", clip(project, 64), "item", clip(itemID, 64), "holder", clip(live.SessionID, 64),
+		"requester", clip(sessionID, 64))
 	if c, done, err := claimAnswer(project, itemID, JudgeClaim(true, state, live.SessionID, sessionID), live, live.SessionID); done {
 		return c, err
 	}
@@ -1274,12 +1290,16 @@ func (s *Store) ReleasedItems(ctx context.Context, sessionID string, since time.
 // 순서가 안 정해지고, 그 경계에서 답이 뒤집힌다. `id` 는 삽입 순서다(SQLite 는 AUTOINCREMENT, Postgres 는
 // identity 인데 이벤트 추가가 전역 잠금에서 한 줄로 서서 번호 순서가 곧 커밋 순서다).
 //
-// ★ payload 의 item 은 SQL 이 아니라 Go 가 읽는다(payloadItem). SQL 로 꺼내는 꼴이 두 엔진에 같지 않고
-// (SQLite 의 json_extract 는 Postgres 에 없고, Postgres 의 ->> 는 JSON 형으로 바꾼 뒤에만 서는데 SQLite 에는 그
-// 캐스트가 없다), Postgres 의 JSON 해석은 json · jsonb 둘 다 문서 안 어디든 \u0000 이스케이프가 있으면
-// 22P05 로 질의 전체를 죽인다 - 남의 칸에 든 것이라도 그렇다. 그래서 SQL 은 종류 · 프로젝트 · 시각으로만
-// 거르고, 이 프로젝트의 선점 이력을 다 받아 항목을 가린다. 이 함수는 진단용이라(업무 경로의 호출자가 없다)
+// ★ payload 의 item 은 SQL 이 아니라 Go 가 읽는다(payloadTopString - 그 계약이 옮기기 전 json_extract 의 뜻이다).
+// SQL 로 꺼내는 꼴이 두 엔진에 같지 않고(SQLite 의 json_extract 는 Postgres 에 없고, Postgres 의 ->> 는 JSON 형으로
+// 바꾼 뒤에만 서는데 SQLite 에는 그 캐스트가 없다), Postgres 의 JSON 해석은 json · jsonb 둘 다 문서 안 어디든 \u0000
+// 이스케이프가 있으면 22P05 로 질의 전체를 죽인다 - 남의 칸에 든 것이라도 그렇다. 그래서 SQL 은 종류 · 프로젝트 ·
+// 시각으로만 거르고, 이 프로젝트의 선점 이력을 다 받아 항목을 가린다. 이 함수는 진단용이라(업무 경로의 호출자가 없다)
 // 더 읽는 행 수보다 한 벌의 SQL 이 앞선다.
+//
+// ★ 결말 표시가 롤백인 행(PayloadRolledBack)은 재생에서 뺀다. 예약 이벤트는 롤백 갈래에서도 원장에 흐르므로(event.go
+// 의 TxOutcomeKey), 실패한 마무리가 점유자를 비우고 실패한 선점이 점유자를 만드는 오답이 난다. 표시 없는 옛 행은
+// 지금처럼 센다 - 이것은 이력 진단이지 자격 판정이 아니라, 빼면 표시 이전 구간의 이력이 통째로 사라진다.
 func (s *Store) ClaimHolderAt(ctx context.Context, project, itemID string, at time.Time) (string, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT kind, COALESCE(session_id, ''), payload FROM event
@@ -1299,12 +1319,12 @@ func (s *Store) ClaimHolderAt(ctx context.Context, project, itemID string, at ti
 		if err := rows.Scan(&kind, &sessionID, &payload); err != nil {
 			return "", fmt.Errorf("선점 이력 행 해석 실패: %w", err)
 		}
-		item, ok, err := payloadItem(payload)
+		item, ok, err := payloadTopString(payload, "item")
 		if err != nil {
 			return "", fmt.Errorf("선점 이력 payload 해석 실패(project=%q item=%q kind=%s): %w",
 				clip(project, 64), clip(itemID, 64), kind, err)
 		}
-		if !ok || item != itemID {
+		if !ok || item != itemID || PayloadRolledBack(payload) {
 			continue
 		}
 		if kind == "item.claim" {
@@ -1317,31 +1337,6 @@ func (s *Store) ClaimHolderAt(ctx context.Context, project, itemID string, at ti
 		return "", fmt.Errorf("선점 이력 순회 실패: %w", err)
 	}
 	return holder, nil
-}
-
-// payloadItem 은 원장 payload 의 최상위 "item" 이 문자열이면 그 값이다. SQLite 의 `json_extract(payload, '$.item')`
-// 을 글과 견주던 뜻 그대로 읽는다: JSON 이 아니면 오류(json_extract 도 질의를 죽인다), 객체가 아니거나 · item 이
-// 없거나 · null 이거나 · 문자열이 아니면 「이 항목이 아니다」(json_extract 가 NULL 이나 글 아닌 값을 내던 자리)다.
-// 키는 글자 그대로 견준다 - 구조체 꼬리표로 풀면 encoding/json 이 대소문자를 가리지 않아 "Item" 도 잡힌다.
-func payloadItem(payload string) (string, bool, error) {
-	var top map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(payload), &top); err != nil {
-		var shape *json.UnmarshalTypeError
-		if errors.As(err, &shape) {
-			return "", false, nil
-		}
-		return "", false, err
-	}
-	raw, ok := top["item"]
-	if !ok {
-		return "", false, nil
-	}
-	var item *string
-	// raw 는 이미 맞는 JSON 이라 여기서 나는 오류는 형 불일치(글이 아닌 값)뿐이다.
-	if err := json.Unmarshal(raw, &item); err != nil || item == nil {
-		return "", false, nil
-	}
-	return *item, true, nil
 }
 
 // SiblingClaimedItems 는 **같은 대화의 다른 카드**가 지금 쥔 항목 id 를 낸다.
@@ -1436,10 +1431,12 @@ func (s *Store) ClaimedItems(ctx context.Context, sessionID string) ([]string, e
 // 판정해서 푼다)이 정확히 그 자리에서 안 섰다.
 //
 // 항목 id 순으로 정렬한다 — 처방 문면에 그대로 실리므로 같은 상태에 같은 문장이어야 한다.
+// 같은 id 를 두 프로젝트에서 쥐면 id 만으로는 순서가 안 정해지고(PK 가 (project, item_id)다) 엔진마다 갈리므로
+// project 로 끝을 맺는다.
 func (s *Store) ClaimedRefs(ctx context.Context, sessionID string) ([]model.Claim, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT project, item_id FROM claim
-		 WHERE session_id = ? AND released_at IS NULL ORDER BY item_id`, sessionID)
+		 WHERE session_id = ? AND released_at IS NULL ORDER BY item_id, project`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("선점 좌표 조회 실패(session_id=%q): %w", clip(sessionID, 64), err)
 	}

@@ -222,11 +222,13 @@ func (t *Tx) FindSession(machineID, worktree, ccSessionID string) (model.Session
 // ★ 이 조회를 받는 인덱스가 없다(session_by_project 는 (project,state), UNIQUE 는 machine 선두).
 // 지금 이 표는 수십 행 규모라 전수 주사가 무해하고, 부르는 자리도 **세션이 새로 만들어질 때
 // 한 번**뿐이다(재개 경로는 안 탄다). 표가 커지면 cc_session_id 인덱스를 먼저 봐라.
+//
+// 열린 순서로 내고 같은 시각이면 id 순이다 - 시각만으로는 순서가 안 정해지고 엔진마다 갈린다.
 func (t *Tx) DivergentSessions(ccSessionID, project, machineID string) ([]model.Session, error) {
 	rows, err := t.tx.QueryContext(t.ctx,
 		`SELECT `+sessionCols+` FROM session
 		 WHERE cc_session_id = ? AND (project <> ? OR machine_id <> ?)
-		 ORDER BY opened_at`, ccSessionID, project, machineID)
+		 ORDER BY opened_at, id`, ccSessionID, project, machineID)
 	if err != nil {
 		return nil, fmt.Errorf("정체 갈림 조회 실패(cc_session=%q): %w", clip(ccSessionID, 64), err)
 	}
@@ -472,7 +474,7 @@ func (s *Store) ListLive(ctx context.Context, project string, since time.Time) (
 }
 
 // loadViews 는 거름(filter, 인자 args)에 걸린 세션을 신호 · 발자국 · 선점과 함께 opened_at 내림차순으로
-// 낸다. 질의는 넷(세션 목록, 세 축)이고 세 축은 같은 거름의 하위 질의다. 결과가 없으면 빈 조각이다.
+// 낸다(같은 시각이면 id 내림차순 - 시각만으로는 순서가 안 정해지고 엔진마다 갈린다). 질의는 넷(세션 목록, 세 축)이고 세 축은 같은 거름의 하위 질의다. 결과가 없으면 빈 조각이다.
 //
 // ★ ListLive 와 SummarizeOutside 의 선점자가 **같은 적재**를 쓴다. 두 벌이면 한쪽 축만 고친 순간
 // 창 안 카드와 창 밖 선점 줄이 다른 조건으로 갈린다.
@@ -480,7 +482,7 @@ func loadViews(ctx context.Context, tx Reader, filter string, args []any) ([]mod
 	rows, err := tx.QueryContext(ctx, `
 		SELECT `+sessionCols+` FROM session s
 		WHERE `+filter+`
-		ORDER BY s.opened_at DESC`, args...)
+		ORDER BY s.opened_at DESC, s.id DESC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("세션 목록 조회 실패: %w", err)
 	}

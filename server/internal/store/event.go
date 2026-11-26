@@ -128,8 +128,70 @@ func markTxOutcome(payload any, committed bool) any {
 //
 // store 밖에서 결말을 읽는 자리가 키 이름을 다시 적지 않게 여기 둔다.
 func PayloadCommitted(payload string) bool {
-	var p map[string]any
-	return json.Unmarshal([]byte(payload), &p) == nil && p[TxOutcomeKey] == TxCommitted
+	return payloadTxOutcome(payload) == TxCommitted
+}
+
+// PayloadRolledBack 은 예약 이벤트 payload 의 결말 표시가 롤백인가다. 표시가 없거나 payload 를 못 읽으면 거짓이다 -
+// 롤백을 단정할 관측이 없다.
+//
+// ★ PayloadCommitted 의 부정이 아니다. 표시 없는 옛 행은 둘 다 거짓이다. 어느 쪽을 쓸지는 그 행으로 무엇을 하는가가
+// 정한다: 행을 근거로 쓰기를 하면 커밋이 확인된 행만(PayloadCommitted), 이력을 되짚는 진단이면 롤백이 확인된 행만
+// 뺀다(이것). 진단에서 표시 없는 행까지 빼면 표시 이전 구간이 통째로 사라진다.
+func PayloadRolledBack(payload string) bool {
+	return payloadTxOutcome(payload) == TxRolledBack
+}
+
+// payloadTxOutcome 은 payload 의 결말 표시(TxOutcomeKey)다. 표시가 없거나 못 읽으면 빈 문자열이다. 결말을 읽는 곳은
+// 이 한 곳이다 - PayloadCommitted · PayloadRolledBack 이 같은 읽기를 쓴다.
+func payloadTxOutcome(payload string) string {
+	v, ok, err := payloadTopString(payload, TxOutcomeKey)
+	if err != nil || !ok {
+		return ""
+	}
+	return v
+}
+
+// payloadTopString 은 원장 payload 최상위 객체에서 key 의 **첫** 값이 JSON 문자열이면 그 값이다.
+//
+// ★ 계약은 SQLite 의 `json_extract(payload, '$.<key>')` 를 글과 견주던 뜻이다(옮기기 전 질의가 그렇게 읽었다).
+//   - 표준 JSON(RFC 8259)만 받는다. 아니면 오류다(json_extract 도 깨진 JSON 에서 질의를 죽인다). SQLite 가 더 받는
+//     JSON5(따옴표 없는 키, 끝 쉼표)도 오류다 - 원장 payload 는 모두 encoding/json 출력이라 생기지 않는다.
+//   - 중복 키는 **첫 값**이다(json_extract 와 같다). encoding/json 의 맵 · 구조체 풀기는 끝 값을 쓰므로 토큰을 걷는다.
+//   - 키는 글자 그대로 견준다. 구조체 꼬리표로 풀면 대소문자를 안 가려 "Item" 도 잡힌다.
+//   - 최상위가 객체가 아니거나 · 키가 없거나 · 첫 값이 문자열이 아니면(null · 수 · 불리언 · 배열 · 객체) 「없음」이다.
+//     json_extract 가 NULL 이나 글 아닌 값을 내던 자리라 어느 글 id 와도 안 맞았다.
+func payloadTopString(payload, key string) (string, bool, error) {
+	// 문서 전체가 맞는지 먼저 본다 - 찾는 키 뒤가 깨져 있어도 오류여야 json_extract 와 같다.
+	var whole json.RawMessage
+	if err := json.Unmarshal([]byte(payload), &whole); err != nil {
+		return "", false, err
+	}
+	dec := json.NewDecoder(strings.NewReader(payload))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return "", false, err
+	}
+	for dec.More() {
+		k, err := dec.Token()
+		if err != nil {
+			return "", false, err
+		}
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return "", false, err
+		}
+		if k != key {
+			continue
+		}
+		if len(raw) == 0 || raw[0] != '"' {
+			return "", false, nil
+		}
+		var v string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return "", false, err
+		}
+		return v, true, nil
+	}
+	return "", false, nil
 }
 
 // ListEvents 는 종류로 걸러 최신순으로 낸다. kind 가 비면 전 종류다.

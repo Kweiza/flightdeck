@@ -1,12 +1,15 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,8 +19,9 @@ import (
 // item.go · session.go 의 업무 SQL 이 두 엔진에서 같은 답을 내는지 잰다. 모든 단정을 SQLite 파일과 Postgres 시험 DB
 // 에서 한 번씩 돈다(bothEngines) - SQLite 는 지금 운영 길이라 답이 그대로여야 하고, Postgres 는 옮겨 갈 길이다.
 //
-// ★ 방언이 갈리던 자리 넷은 따로 잠근다(아래 시험들). 첫 시험은 두 파일의 나머지 실행 자리를 실제 호출로 한 번씩
-// 다 지나게 해, 「읽어 보니 두 엔진에 같은 꼴이다」를 실행으로 굳힌다.
+// ★ 방언이 갈리던 자리 넷과 답이 갈릴 수 있던 자리(롤백 행 재생, 0행 경로, 같은 시각 순서, limit 계약)는 아래 시험들이
+// 따로 잠근다. 첫 시험은 두 파일의 나머지 실행 자리를 실제 호출로 한 번씩 다 지나게 해, 「읽어 보니 두 엔진에 같은
+// 꼴이다」를 실행으로 굳힌다.
 
 // TestItemSessionSQLRunsOnBothEngines 는 item.go · session.go 의 공개 질의를 한 줄거리로 다 부른다.
 func TestItemSessionSQLRunsOnBothEngines(t *testing.T) {
@@ -440,16 +444,19 @@ func TestWriteClaimLeavesALiveClaimAlone(t *testing.T) {
 // TestClaimHolderAtReadsTheItemFromThePayload 는 원장 payload 의 item 을 두 엔진이 같이 읽는지 잰다.
 //
 // ★ payload 의 다른 칸에 \u0000 이스케이프가 든 행을 둔다. Postgres 는 json · jsonb 어느 쪽으로 읽어도 그것을
-// 거절해(22P05) 질의 전체가 죽는다 - SQL 이 payload 를 해석하지 않고 Go 가 읽는 까닭이다(payloadItem).
+// 거절해(22P05) 질의 전체가 죽는다 - SQL 이 payload 를 해석하지 않고 Go 가 읽는 까닭이다(payloadTopString).
+// 중복 키 행은 첫 값의 항목만 점유자를 얻는지 양쪽 항목에서 본다(json_extract 와 같은 뜻).
 func TestClaimHolderAtReadsTheItemFromThePayload(t *testing.T) {
 	bothEngines(t, func(t *testing.T, s *Store) {
 		ctx := context.Background()
 		seed(t, s, "p")
 		x := mustSession(t, s, "p", "cc-x")
 		y := mustSession(t, s, "p", "cc-y")
+		d := mustSession(t, s, "p", "cc-d")
 		t1 := time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
 		insertEventAt(t, s, fmtTime(t1), "p", x.ID, `{"item":"fd-x","why":"a\u0000b"}`, "item.claim")
 		insertEventAt(t, s, fmtTime(t1), "p", y.ID, `{"item":"fd-y"}`, "item.claim")
+		insertEventAt(t, s, fmtTime(t1), "p", d.ID, `{"item":"fd-a","item":"fd-b"}`, "item.claim")
 		insertEventAt(t, s, fmtTime(t1.Add(time.Minute)), "p", x.ID, `{"item":"fd-x"}`, "item.finish")
 
 		for _, c := range []struct {
@@ -461,6 +468,8 @@ func TestClaimHolderAtReadsTheItemFromThePayload(t *testing.T) {
 			{"fd-x", t1.Add(2 * time.Minute), ""},
 			{"fd-y", t1.Add(2 * time.Minute), y.ID},
 			{"fd-z", t1.Add(2 * time.Minute), ""},
+			{"fd-a", t1.Add(2 * time.Minute), d.ID},
+			{"fd-b", t1.Add(2 * time.Minute), ""},
 		} {
 			got, err := s.ClaimHolderAt(ctx, "p", c.item, c.at)
 			if err != nil || got != c.want {
@@ -470,40 +479,243 @@ func TestClaimHolderAtReadsTheItemFromThePayload(t *testing.T) {
 	})
 }
 
-// TestPayloadItemReadsLikeJSONExtract 는 payloadItem 이 SQLite 의 `json_extract(payload, '$.item') = ?` 와 같은
-// 자리에서 맞고 · 빠지고 · 죽는지 잰다. 같은 판을 SQLite 에 직접 물어 견준다 - 옮기기 전 식이 기준이다.
-func TestPayloadItemReadsLikeJSONExtract(t *testing.T) {
+// TestClaimHolderAtSkipsRolledBackRows 는 결말 표시가 롤백인 원장 행이 점유자 재생에 안 끼는지 잰다. 롤백된 마무리는
+// 점유자를 비우지 않고, 롤백된 선점은 점유자를 만들지 않는다. 표시 없는 옛 행과 커밋 표시 행은 센다(대조).
+func TestClaimHolderAtSkipsRolledBackRows(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p")
+		a := mustSession(t, s, "p", "cc-a")
+		b := mustSession(t, s, "p", "cc-b")
+		mark := func(item, outcome string) string {
+			return fmt.Sprintf(`{"item":%q,%q:%q}`, item, TxOutcomeKey, outcome)
+		}
+		t1 := time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
+		// fd-1: 커밋된 선점 뒤에 롤백된 마무리 - 점유자가 남아야 한다.
+		insertEventAt(t, s, fmtTime(t1), "p", a.ID, mark("fd-1", TxCommitted), "item.claim")
+		insertEventAt(t, s, fmtTime(t1.Add(time.Second)), "p", a.ID, mark("fd-1", TxRolledBack), "item.finish")
+		// fd-2: 롤백된 선점 - 점유자가 없어야 한다.
+		insertEventAt(t, s, fmtTime(t1), "p", b.ID, mark("fd-2", TxRolledBack), "item.claim")
+		// fd-3: 표시 없는 옛 선점 뒤에 롤백된 회수 - 옛 행은 세고 롤백은 뺀다.
+		insertEventAt(t, s, fmtTime(t1), "p", b.ID, `{"item":"fd-3"}`, "item.claim")
+		insertEventAt(t, s, fmtTime(t1.Add(time.Second)), "p", a.ID, mark("fd-3", TxRolledBack), "claim.reclaim")
+		// fd-4: 대조 - 커밋된 마무리는 점유자를 비운다.
+		insertEventAt(t, s, fmtTime(t1), "p", a.ID, mark("fd-4", TxCommitted), "item.claim")
+		insertEventAt(t, s, fmtTime(t1.Add(time.Second)), "p", a.ID, mark("fd-4", TxCommitted), "item.finish")
+
+		at := t1.Add(time.Minute)
+		for _, c := range []struct{ item, want string }{
+			{"fd-1", a.ID}, {"fd-2", ""}, {"fd-3", b.ID}, {"fd-4", ""},
+		} {
+			got, err := s.ClaimHolderAt(ctx, "p", c.item, at)
+			if err != nil || got != c.want {
+				t.Fatalf("ClaimHolderAt(%s) = %q, %v (기대 %q)", c.item, got, err, c.want)
+			}
+		}
+	})
+}
+
+// TestClaimItemAnswersAClaimThatAppearedAfterTheCheck 는 점유자 확인과 선점 쓰기 사이에 살아 있는 선점이 생긴 자리를
+// ClaimItem 호출로 재현해, 0행 경로가 점유자를 담은 거절이나 이어 쥐기로 끝나는지 잰다. 끼움 자리(claimGap)가 그
+// 틈에 선점 행을 넣는다 - 쓰기가 한 줄로 서는 운영에서는 생기지 않는 틈이다.
+func TestClaimItemAnswersAClaimThatAppearedAfterTheCheck(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p")
+		mustItem(t, s, "p", "it")
+		a := mustSession(t, s, "p", "cc-a")
+		b := mustSession(t, s, "p", "cc-b")
+		var logged bytes.Buffer
+		s.log = slog.New(slog.NewTextHandler(&logged, nil))
+		at := time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
+		cutIn := func(holder string) {
+			s.claimGap = func(x *Tx) error {
+				_, err := x.tx.ExecContext(x.ctx,
+					`INSERT INTO claim(project, item_id, session_id, at) VALUES (?, ?, ?, ?)`,
+					"p", "it", holder, fmtTime(at))
+				return err
+			}
+		}
+
+		// 남이 끼어들면 점유자를 담은 거절이다. 요청한 세션도 경고에 남는다.
+		cutIn(b.ID)
+		_, err := s.ClaimItem(ctx, "p", "it", a.ID, at)
+		var held *ClaimHeldError
+		if !errors.As(err, &held) || held.Holder != b.ID {
+			t.Fatalf("끼어든 남의 선점은 그 점유자를 담은 ClaimHeldError 여야 한다: %v", err)
+		}
+		for _, want := range []string{"holder=" + b.ID, "requester=" + a.ID} {
+			if !strings.Contains(logged.String(), want) {
+				t.Fatalf("경고에 %s 가 없다: %s", want, logged.String())
+			}
+		}
+
+		// 자기 선점이 끼어들면 이어 쥐기다.
+		cutIn(a.ID)
+		cl, err := s.ClaimItem(ctx, "p", "it", a.ID, at)
+		if err != nil || cl.SessionID != a.ID {
+			t.Fatalf("끼어든 자기 선점은 이어 쥐기여야 한다: %+v %v", cl, err)
+		}
+		s.claimGap = nil
+		if live, err := s.GetClaim(ctx, "p", "it"); err != nil || live.SessionID != a.ID || live.ReleasedAt != nil {
+			t.Fatalf("이어 쥔 선점이 남아야 한다: %+v %v", live, err)
+		}
+	})
+}
+
+// TestSameTimeRowsKeepOneOrder 는 정렬 칸이 같은 행들이 두 엔진에서 같은 순서로 나오는지 잰다. 같은 opened_at 의 세션을
+// id 순과 다른 순서로 넣고, 같은 항목 id 를 두 프로젝트에서 쥔다(넣는 순서도 거꾸로).
+func TestSameTimeRowsKeepOneOrder(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p")
+		seed(t, s, "q")
+		opened := time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
+		// 넣는 순서도, 유니크 색인(machine_id, worktree, cc_session_id)의 worktree 순서도 id 순과 다르게 둔다 - 어느 쪽을
+		// 따라 읽어도 id 순과 우연히 같아지지 않게.
+		for _, r := range []struct{ id, worktree string }{{"s-c", "/w/1"}, {"s-a", "/w/3"}, {"s-b", "/w/2"}} {
+			if _, err := s.db.ExecContext(ctx,
+				`INSERT INTO session(id, project, machine_id, worktree, cc_session_id, state, opened_at)
+				 VALUES (?, 'q', 'm1', ?, 'cc-same', 'active', ?)`, r.id, r.worktree, fmtTime(opened)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ids := func(ss []model.Session) []string {
+			out := []string{}
+			for _, x := range ss {
+				out = append(out, x.ID)
+			}
+			return out
+		}
+
+		var div []model.Session
+		if err := s.Tx(ctx, func(x *Tx) error {
+			var err error
+			div, err = x.DivergentSessions("cc-same", "p", "m1")
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := ids(div); !slices.Equal(got, []string{"s-a", "s-b", "s-c"}) {
+			t.Fatalf("DivergentSessions 순서 %v (기대 열린 순, 같은 시각은 id 순)", got)
+		}
+
+		live, err := s.ListLive(ctx, "q", opened.Add(-time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var liveIDs []string
+		for _, v := range live {
+			liveIDs = append(liveIDs, v.Session.ID)
+		}
+		if !slices.Equal(liveIDs, []string{"s-c", "s-b", "s-a"}) {
+			t.Fatalf("ListLive 순서 %v (기대 열린 역순, 같은 시각은 id 역순)", liveIDs)
+		}
+
+		a := mustSession(t, s, "p", "cc-refs")
+		for _, project := range []string{"q", "p"} {
+			mustItem(t, s, project, "it")
+			if _, err := s.ClaimItem(ctx, project, "it", a.ID, opened); err != nil {
+				t.Fatal(err)
+			}
+		}
+		refs, err := s.ClaimedRefs(ctx, a.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, c := range refs {
+			got = append(got, c.Project+"/"+c.ItemID)
+		}
+		if !slices.Equal(got, []string{"p/it", "q/it"}) {
+			t.Fatalf("ClaimedRefs 순서 %v (기대 항목 id 순, 같은 id 는 프로젝트 순)", got)
+		}
+	})
+}
+
+// TestListClosedLimitContract 는 limit 의 세 갈래가 두 엔진에서 같은지 잰다: 음수는 전부, 0 은 빈 목록, 양수는 그만큼.
+// 전체 수는 셋 다 같다. Postgres 는 음수 LIMIT 을 오류로 거절하므로 LIMIT 절을 그대로 두면 음수 갈래가 죽는다.
+func TestListClosedLimitContract(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p")
+		for _, id := range []string{"c1", "c2", "c3"} {
+			mustItem(t, s, "p", id)
+			if err := s.SetItemState(ctx, "p", id, model.ItemDone, "끝"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, c := range []struct{ limit, want int }{{-1, 3}, {0, 0}, {2, 2}, {5, 3}} {
+			items, total, err := s.ListClosed(ctx, "p", "", c.limit)
+			if err != nil || len(items) != c.want || total != 3 {
+				t.Fatalf("ListClosed(limit=%d) = %d개 · 전체 %d · %v (기대 %d개 · 전체 3)", c.limit, len(items), total, err, c.want)
+			}
+		}
+	})
+}
+
+// TestPayloadTopStringReadsLikeJSONExtract 는 payloadTopString 이 SQLite 의 `json_extract(payload, '$.item') = ?` 와
+// 같은 자리에서 맞고 · 빠지고 · 죽는지, 옮기기 전 식을 SQLite 에 직접 물어 견준다. 행마다 무엇을 재는지 적는다.
+//
+// ★ JSON5 행은 일부러 갈린다: SQLite 는 받고 payloadTopString 은 오류다(계약: 표준 JSON 만). 원장 payload 는
+// encoding/json 출력이라 생기지 않고, 옛 원장을 옮길 때의 검사는 이관 쪽 몫이다.
+func TestPayloadTopStringReadsLikeJSONExtract(t *testing.T) {
 	s := newStore(t)
-	for _, payload := range []string{
-		`{"item":"fd-x"}`,
-		`{"item":"fd-x","why":"a\u0000b"}`,
-		`{"Item":"fd-x"}`,
-		`{"item":null}`,
-		`{"item":3}`,
-		`{"item":["fd-x"]}`,
-		`{"other":"fd-x"}`,
-		`{}`,
-		`["fd-x"]`,
-		`"fd-x"`,
-		`3`,
-		`null`,
-		`{"item":"fd-x"}`,
-		`not json`,
-		`{"item":"fd-x"`,
+	const hit, miss, fail = "hit", "miss", "error"
+	for _, c := range []struct {
+		why, payload, id, want string
+		json5                  bool
+	}{
+		{"기본", `{"item":"fd-x"}`, "fd-x", hit, false},
+		{"값 안 이스케이프를 푼다", `{"item":"fd-\u0078"}`, "fd-x", hit, false},
+		{"남의 칸의 \\u0000", `{"item":"fd-x","why":"a\u0000b"}`, "fd-x", hit, false},
+		{"키는 글자 그대로", `{"Item":"fd-x"}`, "fd-x", miss, false},
+		{"중복 키는 첫 값", `{"item":"fd-a","item":"fd-b"}`, "fd-a", hit, false},
+		{"중복 키의 끝 값은 아니다", `{"item":"fd-a","item":"fd-b"}`, "fd-b", miss, false},
+		{"첫 값이 null 이면 거기서 끝", `{"item":null,"item":"fd-x"}`, "fd-x", miss, false},
+		{"null", `{"item":null}`, "fd-x", miss, false},
+		{"수는 글 id 와 안 맞는다", `{"item":3}`, "3", miss, false},
+		{"불리언은 글 id 와 안 맞는다", `{"item":true}`, "true", miss, false},
+		{"불리언은 1 과도 안 맞는다", `{"item":true}`, "1", miss, false},
+		{"배열 값", `{"item":["fd-x"]}`, "fd-x", miss, false},
+		{"객체 값", `{"item":{"id":"fd-x"}}`, "fd-x", miss, false},
+		{"키 없음", `{"other":"fd-x"}`, "fd-x", miss, false},
+		{"최상위만 본다", `{"nested":{"item":"fd-x"}}`, "fd-x", miss, false},
+		{"빈 객체", `{}`, "fd-x", miss, false},
+		{"최상위가 배열", `["fd-x"]`, "fd-x", miss, false},
+		{"최상위가 글", `"fd-x"`, "fd-x", miss, false},
+		{"최상위가 수", `3`, "fd-x", miss, false},
+		{"최상위가 null", `null`, "fd-x", miss, false},
+		{"JSON 이 아니다", `not json`, "fd-x", fail, false},
+		{"닫히지 않았다", `{"item":"fd-x"`, "fd-x", fail, false},
+		{"찾는 키 뒤가 깨졌다", `{"item":"fd-x","why":}`, "fd-x", fail, false},
+		{"문서 뒤에 군더더기", `{"item":"fd-x"} x`, "fd-x", fail, false},
+		{"JSON5 따옴표 없는 키", `{item:"fd-x"}`, "fd-x", fail, true},
+		{"JSON5 끝 쉼표", `{"item":"fd-x",}`, "fd-x", fail, true},
 	} {
-		var want sql.NullString
+		var sqlite sql.NullString
 		sqlErr := s.db.QueryRowContext(context.Background(),
-			`SELECT CASE WHEN json_extract(?, '$.item') = 'fd-x' THEN 'hit' ELSE 'miss' END`, payload).Scan(&want)
-		item, ok, err := payloadItem(payload)
-		got := "miss"
-		if ok && item == "fd-x" {
-			got = "hit"
+			`SELECT CASE WHEN json_extract(?, '$.item') = ? THEN 'hit' ELSE 'miss' END`, c.payload, c.id).Scan(&sqlite)
+		if sqlErr != nil {
+			sqlite.String = fail
 		}
-		if (sqlErr != nil) != (err != nil) {
-			t.Fatalf("payload %s: json_extract 오류 %v, payloadItem 오류 %v - 죽는 자리가 달라졌다", payload, sqlErr, err)
+		v, ok, err := payloadTopString(c.payload, "item")
+		got := miss
+		switch {
+		case err != nil:
+			got = fail
+		case ok && v == c.id:
+			got = hit
 		}
-		if sqlErr == nil && want.String != got {
-			t.Fatalf("payload %s: json_extract %q, payloadItem %q", payload, want.String, got)
+		if got != c.want {
+			t.Errorf("%s: payload %s id %s - payloadTopString %s (기대 %s, err=%v)", c.why, c.payload, c.id, got, c.want, err)
+		}
+		wantSQLite := c.want
+		if c.json5 {
+			wantSQLite = hit // SQLite 만 받는다 - 계약이 갈리는 자리를 기록으로 잠근다
+		}
+		if sqlite.String != wantSQLite {
+			t.Errorf("%s: payload %s id %s - json_extract %s (기대 %s, err=%v)", c.why, c.payload, c.id, sqlite.String, wantSQLite, sqlErr)
 		}
 	}
 }

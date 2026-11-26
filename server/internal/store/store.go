@@ -168,6 +168,11 @@ type Store struct {
 	path  string
 	log   *slog.Logger
 	locks lockMeter
+
+	// claimGap 은 시험의 끼움 자리다: ClaimItem 의 점유자 확인과 선점 쓰기 사이에 같은 트랜잭션으로 불린다. 운영은
+	// nil 이다. 쓰기가 한 줄로 서는 동안은 그 틈에 남이 못 끼므로, 0행 경로(claimTakenMeanwhile)를 ClaimItem 호출로
+	// 재현할 길이 이것뿐이다.
+	claimGap func(*Tx) error
 }
 
 // Tx 는 진행 중인 쓰기 트랜잭션이다.
