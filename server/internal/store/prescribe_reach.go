@@ -20,6 +20,9 @@ type AckCounts struct {
 	Acked     int
 }
 
+// convKeySep 은 대화 키(machine_id, cc_session_id)를 한 글로 이을 때의 구분자다(단위 구분자 0x1f).
+const convKeySep = "\x1f"
+
 // AckReach 는 처방 확인율의 **분모를 가른** 세 수를 **두 구간으로** 낸다 —
 // 전 역사 한 벌(all)과 since 이후 한 벌(recent).
 //
@@ -80,10 +83,13 @@ func (s *Store) AckReach(ctx context.Context, project string, since time.Time) (
 	cut := fmtTime(since)
 	// conv 는 카드 → **대화** 키다. 세션 행이 없는 이벤트(원장 복원본 등. event.session_id 에는
 	// FK 가 없다)는 접을 근거가 없으므로 카드 자신을 키로 삼는다 — 옛 카드 단위 셈으로의 폴백이다.
-	// char(31)은 단위 구분자다. 두 축을 이어 붙일 때 경로나 id 에 안 나오는 바이트여야 한다.
+	// 단위 구분자(0x1f)로 두 축을 잇는다. 경로나 id 에 안 나오는 바이트여야 한다.
+	//
+	// ★ 구분자는 자리표시로 넘긴다. 글자 하나를 내는 함수가 엔진마다 이름이 달라(SQLite char · Postgres chr)
+	//   SQL 안에 적으면 한쪽에서 깨진다 - Postgres 는 char(31) 을 형 이름(character(31))으로 읽어 구문 오류다.
 	row := s.db.QueryRowContext(ctx, `
 		WITH conv AS (
-		  SELECT id AS sid, machine_id || char(31) || cc_session_id AS k FROM session
+		  SELECT id AS sid, machine_id || ? || cc_session_id AS k FROM session
 		),
 		ev AS (
 		  SELECT e.kind AS kind, e.at AS at,
@@ -110,7 +116,7 @@ func (s *Store) AckReach(ctx context.Context, project string, since time.Time) (
 		          AND k IN (SELECT k FROM judged)),
 		       (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe_ack' AND at >= ?
 		          AND k IN (SELECT k FROM ev WHERE kind='prescribe' AND at >= ?))`,
-		project, cut, cut, cut, cut)
+		convKeySep, project, cut, cut, cut, cut)
 	if err := row.Scan(&all.Emitted, &all.Reachable, &all.Acked,
 		&recent.Emitted, &recent.Reachable, &recent.Acked); err != nil {
 		return AckCounts{}, AckCounts{}, fmt.Errorf("확인율 도달성 조회 실패(project=%q since=%s): %w",

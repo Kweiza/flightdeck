@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -33,16 +32,26 @@ type ConvLifecycle struct {
 	EverEnqueued bool              // EarliestOpen 이후 줄에 선 적(닫힌 행 포함)이 있나
 }
 
-// doneItemFinishPayload 는 item.finish 원장 payload 에서 이 함수가 읽는 전부다.
+// doneFinishItem 은 item.finish 원장 payload 가 「이 항목을 done 으로 닫았다」인지 읽고, 그렇다면 그 항목 id 다.
 //
-// ★ 필드명은 finish.go 가 실제로 쓰는 것(item·mode)과 markTxOutcome 이 얹는 결말 표시(tx)
-// 그대로다 — event.go 의 reproPayload·CloseDeclarationsByItem 이 이미 같은 필드를 각자
-// 읽는다(grep 근거: finish.go 의 `"item": in.ItemID, "mode": string(in.Outcome)`,
-// event.go 의 TxOutcomeKey="tx"). 두 벌로 다시 적지 않는다.
-type doneItemFinishPayload struct {
-	Item string `json:"item"`
-	Mode string `json:"mode"`
-	Tx   string `json:"tx"`
+// ★ 키 이름은 finish.go 가 실제로 쓰는 것(item·mode)과 markTxOutcome 이 얹는 결말 표시(tx) 그대로다.
+// ★ 판독은 원장 payload 판독기 한 벌(payloadTopString · PayloadRolledBack)로 한다 - 표준 JSON 만 받고, 중복 키는 첫 값,
+// 키는 글자 그대로 견준다. 구조체 풀기로 따로 읽으면 중복 키의 끝 값을 쓰고 키의 대소문자를 안 가려, 같은 행을
+// 다른 판정(CloseDeclarationsByItem · 후속 자격)과 다르게 읽는다. 결말 칸의 타입이 틀린 행도 행째 버리지 않는다 -
+// 롤백이 확인된 행만 뺀다(QueueReproduction 의 「결말 표시가 없는 행은 센다」와 같은 규율).
+// ★ payload 를 못 읽은 행(깨진 JSON)은 안 센다 - 항목 id 를 모른다.
+func doneFinishItem(payload string) (string, bool) {
+	item, ok, err := payloadTopString(payload, "item")
+	if err != nil || !ok || item == "" {
+		return "", false
+	}
+	if mode, ok, _ := payloadTopString(payload, "mode"); !ok || mode != string(model.ItemDone) {
+		return "", false
+	}
+	if PayloadRolledBack(payload) {
+		return "", false
+	}
+	return item, true
 }
 
 // ConversationLifecycle 은 세션 하나가 속한 대화 전체의 라이프사이클 관측을 모은다.
@@ -58,13 +67,17 @@ func (s *Store) ConversationLifecycle(ctx context.Context, project, sessionID st
 	}
 
 	// ① 형제 카드: 같은 (machine_id, cc_session_id). cc 가 비면 자기 하나다(위 파일 주석).
+	//
+	// ★ 순서를 적는다. UNION 의 결과 순서는 엔진이 고른다(SQLite 는 중복 제거를 정렬로 해서 id 순, Postgres 는 해시로
+	//   하면 아무 순서) - 적지 않으면 SessionIDs 가 엔진마다 다른 순서로 나간다.
 	sibRows, err := s.db.QueryContext(ctx, `
 		SELECT s2.id, s2.opened_at FROM session s1
 		JOIN session s2 ON s2.machine_id = s1.machine_id
 		 AND s2.cc_session_id = s1.cc_session_id AND s1.cc_session_id <> ''
 		WHERE s1.id = ?
 		UNION
-		SELECT id, opened_at FROM session WHERE id = ?`, sessionID, sessionID)
+		SELECT id, opened_at FROM session WHERE id = ?
+		ORDER BY id`, sessionID, sessionID)
 	if err != nil {
 		return out, fmt.Errorf("대화 형제 카드 조회 실패(project=%q session=%q): %w",
 			clip(project, 64), clip(sessionID, 64), err)
@@ -153,15 +166,16 @@ func (s *Store) ConversationLifecycle(ctx context.Context, project, sessionID st
 	}
 
 	// EverEnqueued: EarliestOpen 이후 줄에 선 적(닫힌 행 포함)이 있나.
-	var everEnqueued int
+	//
+	// ★ bool 로 읽는다. EXISTS 는 SQLite 에서 정수 0 · 1 이고 Postgres 에서 boolean 이다. database/sql 은 정수 0 · 1 을
+	//   bool 로 옮기지만 boolean 을 정수로는 못 옮긴다(Postgres 에서 Scan 오류).
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT EXISTS(SELECT 1 FROM landing_queue
 		  WHERE project = ? AND session_id IN (`+inClause+`) AND enqueued_at >= ?)`,
-		append(append([]any{project}, sidArgs...), sinceStr)...).Scan(&everEnqueued); err != nil {
+		append(append([]any{project}, sidArgs...), sinceStr)...).Scan(&out.EverEnqueued); err != nil {
 		return out, fmt.Errorf("대화 줄 이력 조회 실패(project=%q session=%q): %w",
 			clip(project, 64), clip(sessionID, 64), err)
 	}
-	out.EverEnqueued = everEnqueued != 0
 
 	// ④ 쥔 자원.
 	heldRows, err := s.db.QueryContext(ctx, `
@@ -186,11 +200,7 @@ func (s *Store) ConversationLifecycle(ctx context.Context, project, sessionID st
 	}
 	heldRows.Close()
 
-	// ⑤ done 항목: EarliestOpen 이후 이 대화가 done 으로 닫은 항목(롤백 제외).
-	//
-	// ★ payload 를 못 읽은 행은 안 센다 — 이 파일이 참고하는 event.go 의 여러 함수와
-	// 같은 규율이다(readReproPayload 등). tx 표시가 **없는** 행은 롤백이 아니라 "관측 못 함"
-	// 이므로 센다 — QueueReproduction 의 "결말 표시가 없는 행은 센다" 규율 그대로다.
+	// ⑤ done 항목: EarliestOpen 이후 이 대화가 done 으로 닫은 항목(롤백 제외). 판독은 doneFinishItem 이다.
 	evRows, err := s.db.QueryContext(ctx, `
 		SELECT payload FROM event
 		WHERE project = ? AND kind = 'item.finish' AND session_id IN (`+inClause+`) AND at >= ?
@@ -206,16 +216,10 @@ func (s *Store) ConversationLifecycle(ctx context.Context, project, sessionID st
 			evRows.Close()
 			return out, fmt.Errorf("대화 종료 선언 행 해석 실패: %w", err)
 		}
-		var p doneItemFinishPayload
-		if json.Unmarshal([]byte(payload), &p) != nil {
-			continue
-		}
-		if p.Item == "" || p.Mode != string(model.ItemDone) || p.Tx == TxRolledBack {
-			continue
-		}
-		if !seen[p.Item] {
-			seen[p.Item] = true
-			out.DoneItems = append(out.DoneItems, p.Item)
+		item, ok := doneFinishItem(payload)
+		if ok && !seen[item] {
+			seen[item] = true
+			out.DoneItems = append(out.DoneItems, item)
 		}
 	}
 	if err := evRows.Err(); err != nil {

@@ -424,8 +424,8 @@ func (s *Store) WriteLedger(ctx context.Context, d LedgerDump) error {
 	return s.Tx(ctx, func(t *Tx) error {
 		// ★ supersedes 는 judgment 를 자기참조하고, 원장의 id 순서가 그 참조 순서와 같다는
 		//   보장이 없다. FK 검사를 커밋 시점으로 미뤄 순서 제약을 없앤다(move.go 와 같은 수단).
-		//   이 pragma 는 **이 트랜잭션에만** 걸리고 커밋 때 전부 검사된다.
-		if _, err := t.tx.ExecContext(t.ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
+		//   미루기는 **이 트랜잭션에만** 걸리고 커밋 때 전부 검사된다(deferForeignKeys).
+		if _, err := t.tx.ExecContext(t.ctx, t.tx.dialect().deferForeignKeys()); err != nil {
 			return fmt.Errorf("FK 검사 미루기 실패: %w", err)
 		}
 		machineStmt := ledgerInsert("machine", machineCols)

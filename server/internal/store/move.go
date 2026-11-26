@@ -87,8 +87,12 @@ var itemKeyedTables = []string{"item_after", "claim", "job", "item_revision"}
 // ★ item_dependents 는 2026-08-23 에 증분 011 이 **표째 걷었다**. 앞 회차에는 값만 비우고
 // 목록에 남겼는데(그때는 표가 살아 있어 빼면 대조 시험이 빨개졌다), 이제는 반대로 남기면
 // 빨개진다 — 그 대조가 살아 있는 스키마를 본다.
+//
+// ★ FK 검사를 커밋까지 미룬다(deferForeignKeys). 항목 행을 먼저 옮기는 순간 딸린 행이 옛 좌표를 가리키므로, 문장마다
+// 검사하면 첫 UPDATE 가 막힌다. 커밋 때는 모두 새 좌표라 맞는다. 미루지 않아도 되는 순서는 없다 - 딸린 행을 먼저 옮기면
+// 그 행이 아직 없는 새 좌표를 가리킨다.
 func (t *Tx) MoveItem(project, itemID, toProject, sessionID string) error {
-	if _, err := t.tx.ExecContext(t.ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
+	if _, err := t.tx.ExecContext(t.ctx, t.tx.dialect().deferForeignKeys()); err != nil {
 		return fmt.Errorf("FK 검사 지연 설정 실패: %w", err)
 	}
 	res, err := t.tx.ExecContext(t.ctx,

@@ -647,8 +647,7 @@ func (s *Store) ListItems(ctx context.Context, project string) ([]model.Item, er
 // 자리가 갈린다: SQLite 는 NULL 을 가장 작은 값으로 봐서 DESC 의 끝에, Postgres 는 가장 큰 값으로 봐서 DESC 의
 // 처음에 둔다. 처음에 오면 시각 없는 옛 행이 「최근에 닫힌 것」 자리를 차지하고 limit 이 진짜 최근 것을 자른다.
 //
-// ★ limit 이 음수면 「전부」다. SQLite 의 음수 LIMIT 이 그 뜻이고(옮기기 전 동작), Postgres 는 음수 LIMIT 을 오류로
-// 거절하므로 LIMIT 절을 빼서 두 엔진에 같은 뜻을 세운다. 0 은 두 엔진 모두 빈 목록이다(전체 수는 그대로 낸다).
+// ★ limit 이 음수면 「전부」다(withLimit). 0 은 두 엔진 모두 빈 목록이다(전체 수는 그대로 낸다).
 // HTTP 표면은 자기 기본값 · 상한으로 접은 양수만 넘긴다(handleListClosedItems) - 그것은 표면의 정책이고 이 계약과
 // 겹치지 않는다.
 func (s *Store) ListClosed(ctx context.Context, project string, state model.ItemState, limit int) ([]model.Item, int, error) {
@@ -662,11 +661,7 @@ func (s *Store) ListClosed(ctx context.Context, project string, state model.Item
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("닫힌 항목 수 조회 실패(project=%q): %w", clip(project, 64), err)
 	}
-	list := `SELECT ` + itemCols + where + ` ORDER BY closed_at DESC NULLS LAST, id`
-	if limit >= 0 {
-		list += ` LIMIT ?`
-		args = append(args, limit)
-	}
+	list, args := withLimit(`SELECT `+itemCols+where+` ORDER BY closed_at DESC NULLS LAST, id`, args, limit)
 	rows, err := s.db.QueryContext(ctx, list, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("닫힌 항목 조회 실패(project=%q): %w", clip(project, 64), err)
@@ -1059,14 +1054,32 @@ func (t *Tx) claimRow(project, itemID string) (model.Claim, error) {
 	return claimRow(t.ctx, t.tx, project, itemID)
 }
 
-func claimRow(ctx context.Context, q dbtx, project, itemID string) (model.Claim, error) {
+// claimCols 는 선점 조회의 칼럼 목록이다. scanClaim 이 이 순서로 읽는다.
+const claimCols = `project, item_id, session_id, at, released_at, force_reason`
+
+// scanClaim 은 claimCols 순서의 한 행을 읽는다. claimRow(한 항목) 와 ListLiveClaims(프로젝트 전체)가 같이 쓴다.
+func scanClaim(sc interface{ Scan(...any) error }) (model.Claim, error) {
 	var c model.Claim
 	var at string
 	var released, force sql.NullString
-	err := q.QueryRowContext(ctx, `
-		SELECT project, item_id, session_id, at, released_at, force_reason
-		FROM claim WHERE project = ? AND item_id = ?`, project, itemID).
-		Scan(&c.Project, &c.ItemID, &c.SessionID, &at, &released, &force)
+	if err := sc.Scan(&c.Project, &c.ItemID, &c.SessionID, &at, &released, &force); err != nil {
+		return model.Claim{}, err
+	}
+	c.ForceReason = str(force)
+	var err error
+	if c.At, err = parseTime(at); err != nil {
+		return model.Claim{}, err
+	}
+	if c.ReleasedAt, err = parseNullTime(released); err != nil {
+		return model.Claim{}, err
+	}
+	return c, nil
+}
+
+func claimRow(ctx context.Context, q dbtx, project, itemID string) (model.Claim, error) {
+	c, err := scanClaim(q.QueryRowContext(ctx, `
+		SELECT `+claimCols+`
+		FROM claim WHERE project = ? AND item_id = ?`, project, itemID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return c, notFound(NFClaim, project, itemID)
 	}
@@ -1074,14 +1087,36 @@ func claimRow(ctx context.Context, q dbtx, project, itemID string) (model.Claim,
 		return c, fmt.Errorf("선점 조회 실패(project=%q item=%q): %w",
 			clip(project, 64), clip(itemID, 64), err)
 	}
-	c.ForceReason = str(force)
-	if c.At, err = parseTime(at); err != nil {
-		return c, err
-	}
-	if c.ReleasedAt, err = parseNullTime(released); err != nil {
-		return c, err
-	}
 	return c, nil
+}
+
+// ListLiveClaims 는 프로젝트에서 반납되지 않은 선점 전부를 **쥔 시각 순**으로 낸다(보드의 큐 패널).
+//
+// ★ 살아 있는 세션 목록에서 뽑지 않는다. 창 밖 세션이 쥔 선점이야말로 회수가 필요한 경우인데,
+// 세션에서 뽑으면 그것이 화면에서 통째로 사라진다.
+//
+// ★ 같은 시각의 선점은 항목 id 로 끝을 맺는다. 적지 않으면 같은 시각 행의 순서를 엔진이 고르고(정렬이 안정적이라는
+// 보장이 어느 쪽에도 없다) 보드의 줄 순서가 새로고침마다 · 엔진마다 갈린다.
+func (s *Store) ListLiveClaims(ctx context.Context, project string) ([]model.Claim, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+claimCols+` FROM claim
+		WHERE project = ? AND released_at IS NULL ORDER BY at, item_id`, project)
+	if err != nil {
+		return nil, fmt.Errorf("살아 있는 선점 조회 실패(project=%q): %w", clip(project, 64), err)
+	}
+	defer rows.Close()
+	var out []model.Claim
+	for rows.Next() {
+		c, err := scanClaim(rows)
+		if err != nil {
+			return nil, fmt.Errorf("살아 있는 선점 행 해석 실패(project=%q): %w", clip(project, 64), err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("살아 있는 선점 순회 실패(project=%q): %w", clip(project, 64), err)
+	}
+	return out, nil
 }
 
 // GetClaim 은 항목의 선점 행을 읽는다(반납된 것도 낸다 — 이력이 자산이다).
@@ -1535,6 +1570,51 @@ func (t *Tx) RecordPickEval(e model.PickEval) error {
 // RecordPickEval 은 단발 트랜잭션으로 감싼 것이다.
 func (s *Store) RecordPickEval(ctx context.Context, e model.PickEval) error {
 	return s.Tx(ctx, func(t *Tx) error { return t.RecordPickEval(e) })
+}
+
+// ListPickEvals 는 프로젝트의 큐 판정 기록을 **최신순**(id 내림차순)으로 limit 개까지 낸다(보드의 탈락 사유 분포).
+// limit 이 음수면 전부다(withLimit).
+//
+// ★ 사유 JSON 이 깨졌으면 삼키지 않는다 - 분포가 조용히 짧아지면 "탈락이 없었다"와 "우리가 못 읽었다"가 같은
+// 화면이 된다. 묶음 구성원(picked_with)도 같다.
+func (s *Store) ListPickEvals(ctx context.Context, project string, limit int) ([]model.PickEval, error) {
+	q, args := withLimit(`
+		SELECT session_id, at, picked, picked_with, rejected
+		FROM pick_eval WHERE project = ? ORDER BY id DESC`, []any{project}, limit)
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("큐 판정 기록 조회 실패(project=%q): %w", clip(project, 64), err)
+	}
+	defer rows.Close()
+
+	var out []model.PickEval
+	for rows.Next() {
+		e := model.PickEval{Project: project}
+		var at, rejected string
+		var picked, with sql.NullString
+		if err := rows.Scan(&e.SessionID, &at, &picked, &with, &rejected); err != nil {
+			return nil, fmt.Errorf("큐 판정 행 해석 실패(project=%q): %w", clip(project, 64), err)
+		}
+		e.Picked = str(picked)
+		if e.At, err = parseTime(at); err != nil {
+			return nil, err
+		}
+		if with.Valid {
+			if err := json.Unmarshal([]byte(with.String), &e.PickedWith); err != nil {
+				return nil, fmt.Errorf("묶음 구성원 해석 실패(project=%q session=%q): %w",
+					clip(project, 64), clip(e.SessionID, 64), err)
+			}
+		}
+		if err := json.Unmarshal([]byte(rejected), &e.Rejected); err != nil {
+			return nil, fmt.Errorf("탈락 사유 해석 실패(project=%q session=%q): %w",
+				clip(project, 64), clip(e.SessionID, 64), err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("큐 판정 목록 순회 실패(project=%q): %w", clip(project, 64), err)
+	}
+	return out, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

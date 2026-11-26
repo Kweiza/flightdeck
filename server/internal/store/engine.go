@@ -27,11 +27,10 @@ import (
 //
 // 엔진이 갈리는 자리는 이 파일(열기 · 트랜잭션 시작 · 자리표시 · 엔진마다 다른 질의 조각)과 constraint.go(오류 번역)
 // 둘뿐이다. 질의를 쓰는 자리(item.go 등)는 엔진을 모른다 - `?` 자리표시로 쓰고 conn · txConn 을 지난다. 스키마가
-// 엔진마다 달라 질의 조각이 갈려야 하는 자리는 dialect() 의 메서드가 고른다(itemAfterOrder · snapshotKey · judgmentSearch).
-// 날 *sql.DB · *sql.Tx 는 이 파일 밖으로 안 나간다. 예외는 DB() 하나이고, 시험만이 아니라 web 의 날 질의 넷
-// (query.go 의 pickEvals · closedItems · unackedJobs, page.go 의 claimHolders)이 아직 그것으로 질의한다.
-// 그 넷은 감싸개를 안 지나 Postgres 에서는 안 돈다 - 이전의 뒤 단계가 store 안으로 옮긴다.
-// engine_test.go 가 store 안의 경계를 소스로 잠근다.
+// 엔진마다 달라 질의 조각이 갈려야 하는 자리는 dialect() 의 메서드가 고른다(itemAfterOrder · snapshotKey · judgmentSearch ·
+// deferForeignKeys).
+// 날 *sql.DB · *sql.Tx 는 이 파일 밖으로 안 나간다. 예외는 DB() 하나이고 시험만 쓴다. engine_test.go 가 store 안의 경계를,
+// 그리고 store 밖 소스가 database/sql 을 안 쓰는 것을 소스로 잠근다.
 //
 // ★ 두 엔진이 함께 있는 것은 옮기는 동안뿐이다. Postgres 로 옮긴 뒤 SQLite 실행 경로는 빠진다.
 
@@ -804,6 +803,18 @@ func (e engine) snapshotKey() string {
 		return "key_digest"
 	}
 	return "key"
+}
+
+// deferForeignKeys 는 이 트랜잭션의 FK 검사를 커밋까지 미루는 문장이다(항목 옮기기 · 원장 되쓰기). SQLite 판은 pragma 이고
+// 커밋 · 롤백 때 저절로 꺼진다. Postgres 판은 SET CONSTRAINTS 이고 이 트랜잭션에만 걸린다. 미룰 수 있는 것은 DEFERRABLE 로
+// 선언한 제약뿐이라 기준선(pg/001_baseline.sql)이 FK 를 전부 DEFERRABLE INITIALLY IMMEDIATE 로 둔다 - 평소에는 지금처럼
+// 문장마다 검사하고, 이 문장 뒤로만 커밋까지 미룬다. pragma 가 FK 전부를 미루므로 ALL 이 같은 뜻이다.
+// 같은 뜻의 공통 구문이 두 엔진에 없어 문장 하나를 엔진이 고른다.
+func (e engine) deferForeignKeys() string {
+	if e == enginePG {
+		return "SET CONSTRAINTS ALL DEFERRED"
+	}
+	return "PRAGMA defer_foreign_keys = ON"
 }
 
 // judgmentSearch 는 판단 전문 검색의 질의다. 검색 색인이 엔진마다 다른 물건이다: SQLite 판은 FTS5 가상 표

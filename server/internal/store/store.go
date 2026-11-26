@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -603,8 +604,8 @@ func (s *Store) Postgres() bool { return s.db.eng == enginePG }
 
 // DB 는 저수준 핸들이다. 자리표시 감싸개를 안 지나므로 Postgres 에서는 `?` 질의가 안 돈다.
 //
-// ★ 지금 쓰는 자리는 시험과 web 의 날 질의 넷(engine.go 머리말)이다. 그 넷이 store 안으로 옮기면 시험 전용이 된다.
-// 새 질의를 여기에 걸지 마라. 접속 확인은 Ping 이다(날 핸들의 오류는 접속 문자열의 조각을 싣는다).
+// ★ 시험 전용이다. store 밖 소스가 이것을 부르면 TestNoRawDatabaseOutsideStore 가 빨개진다 - 읽을 것이 필요하면
+// store 에 접근자를 둔다. 접속 확인은 Ping 이다(날 핸들의 오류는 접속 문자열의 조각을 싣는다).
 func (s *Store) DB() *sql.DB { return s.db.raw }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1250,6 +1251,17 @@ func parseNullTime(ns sql.NullString) (*time.Time, error) {
 		return nil, err
 	}
 	return &t, nil
+}
+
+// withLimit 은 목록 질의 끝에 LIMIT 을 붙인 질의와 인자를 낸다. limit 이 음수면 안 붙인다 - 「전부」다.
+//
+// ★ 음수 LIMIT 의 뜻이 엔진마다 다르다. SQLite 는 「상한 없음」이고 Postgres 는 오류로 거절한다. 절을 빼서 두 엔진에
+// 같은 뜻을 세운다. 0 은 두 엔진 모두 빈 목록이다. args 는 고치지 않는다(사본에 덧붙인다).
+func withLimit(q string, args []any, limit int) (string, []any) {
+	if limit < 0 {
+		return q, args
+	}
+	return q + ` LIMIT ?`, append(slices.Clip(args), limit)
 }
 
 // nullStr 은 빈 문자열을 NULL 로 바꾼다.

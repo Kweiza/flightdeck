@@ -1382,7 +1382,7 @@ func resourceLaneWarns(rl service.ResourceLane) bool {
 // land(resources:["env:db"]) 한 줄이면 그날 배타가 섰다.
 //
 // 그러니 0건은 **「아무도 안 쥐었다」와 「걸 자리가 없다」를 겸하면 안 된다.** 이 제품이
-// 반복해 맞은 실패가 「없는 축을 조용히 빼는 것」이고(web/query.go:18) 이 줄이 그 실패의
+// 반복해 맞은 실패가 「없는 축을 조용히 빼는 것」이고(store.UnackedJobs 의 ★) 이 줄이 그 실패의
 // 실물 1건이다.
 func heldOrNoneLine(held []model.ResourceHold) string { return heldOrNoneLineFor(held, "") }
 

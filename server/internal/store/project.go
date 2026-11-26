@@ -399,7 +399,7 @@ func projectRefCountsBy(ctx context.Context, q dbtx, only string) (map[string]ma
 //	   PRAGMA foreign_keys=OFF 도 트리거 드롭도 잔해 몇 건과 바꿀 값이 아니다.
 //	   줄에서만 빼면 되는 경우라 화면의 보관이 그 자리를 받는다.
 //
-// ★ ⒞ 를 왜 pragma defer_foreign_keys(move.go 의 선례)로 안 미루는가: defer 는 **트랜잭션
+// ★ ⒞ 를 왜 FK 검사 미루기(move.go 의 선례)로 안 미루는가: defer 는 **트랜잭션
 // 끝까지 미룬 뒤에도 그 사이 부모·자식이 결국 같은 그림으로 맞춰지는** 경우에만 의미가
 // 있다(move.go 는 item 을 옮기는 동안 FK 검사를 커밋 시점으로 미뤄서 "부모 먼저" 대
 // "자식 먼저" 문제를 해소한다 — 끝나면 둘 다 새 프로젝트를 가리켜 앞뒤 상관없이 맞는다).
@@ -500,13 +500,11 @@ func (e *RemovalBlockedError) Unwrap() error { return e.Err }
 // 사이엔 물리적 시간 간격이 있고, 그 사이 다른 세션이 fd add 로 항목을 넣으면 그 항목은
 // 세어지지도 거절되지도 않은 채 DELETE FROM item WHERE project = ? 로 조용히 사라진다.
 //
-// ★ 이 재-셈이 실제로 경합을 닫는 이유: 이 DB 핸들은 DSN 에 _txlock=immediate 가 걸려
-// 있어(1차 근거: Tx **타입** 주석, store.go:118-132 — TestTxSurvivesReadThenWriteContention
-// 의 실측 수치까지 그 안에 있다. dsn() 이 그 값을 DSN 문자열로 조립하는 자리는 store.go:216-218
-// 로 보조로 든다) s.Tx 가 BEGIN IMMEDIATE 로 열리고, **BEGIN 시점에 이미 쓰기 잠금을 쥔다.**
-// 그래서 이 함수가 시작된 순간부터 커밋·롤백까지 다른 모든 쓰기
-// 트랜잭션(다른 세션의 fd add 포함)은 그 잠금 뒤에 줄을 선다 — 이 안의 재-셈(SELECT)과
-// 아래 DELETE 사이에 새 행이 끼어드는 것이 SQLite 잠금 모델로 원리적으로 불가능하다.
+// ★ 이 재-셈이 실제로 경합을 닫는 이유: s.Tx 는 **첫 문장 전에 전역 쓰기 잠금을 쥔다**(Tx 타입 주석 ·
+// engine.go 의 begin). SQLite 는 BEGIN IMMEDIATE 이고, Postgres 는 READ COMMITTED 로 열어 첫 문장으로 전역 advisory
+// 잠금을 잡는다 - 잠금 뒤의 문장마다 새 스냅숏이라 앞 쓰기의 커밋이 보인다. 그래서 이 함수가 시작된 순간부터
+// 커밋·롤백까지 다른 모든 쓰기 트랜잭션(다른 세션의 fd add 포함)은 그 잠금 뒤에 줄을 선다 - 이 안의
+// 재-셈(SELECT)과 아래 DELETE 사이에 새 행이 끼어드는 것이 두 엔진 모두에서 원리적으로 불가능하다.
 // 재-셈을 트랜잭션 **밖**(예: service 층)에서 한 번 더 해도 같은 시간 간격 문제가
 // 그대로 남는다 — 반드시 이 트랜잭션 **안**이어야 한다.
 //
@@ -581,8 +579,8 @@ func (s *Store) RemoveProject(ctx context.Context, id string) error {
 // 이다(호출부가 원래 오류를 그대로 fmt.Errorf 로 감싼다).
 //
 // ★ 1차 방어는 JudgeProjectRemoval 의 재-판정이다(바로 위 RemoveProject 주석) — item·
-// judgment·judgment_foreign 세 축이 걸리는 레이스는 이제 여기 절대 안 온다(_txlock=immediate
-// 가 재-셈과 DELETE 사이의 끼어듦 자체를 막는다). 이 함수가 실제로 잡는 것은 **그 세
+// judgment·judgment_foreign 세 축이 걸리는 레이스는 이제 여기 절대 안 온다(전역 쓰기 잠금이
+// 재-셈과 DELETE 사이의 끼어듦 자체를 막는다). 이 함수가 실제로 잡는 것은 **그 세
 // 축이 안 보는 나머지 넷**이다 — claim·resource_hold·job·landing_queue 도 session(id)
 // 를 CASCADE 없이 참조하는데(ProjectRefCounts 의 그 주석) 미리 세지 않기로 했으므로,
 // 다른 프로젝트의 그 표 행이 이 프로젝트의 세션을 가리키면 session 삭제 시점에 여기로

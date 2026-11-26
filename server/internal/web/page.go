@@ -3,7 +3,6 @@ package web
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -845,7 +844,7 @@ func (h *handler) unackedPanel(ctx context.Context, project, label string) Unack
 	pan := UnackedPanel{Panel: Panel{Derived: label}}
 	pan.Tier = "Tier B — 러너가 아직 없다. 그래도 잡 표를 실제로 조회한다(안 보면 " +
 		"\"결과가 없다\"와 \"이 화면이 그 축을 안 본다\"가 구분되지 않는다)."
-	jobs, err := unackedJobs(ctx, h.svc.Store().DB(), project, 50)
+	jobs, err := h.svc.Store().UnackedJobs(ctx, project, 50)
 	if err != nil {
 		pan.Err = Clip(err.Error(), 400)
 		h.log.ErrorContext(ctx, "미확인 잡 조회 실패", "project", project, "error", err.Error())
@@ -898,7 +897,7 @@ func (h *handler) queuePanel(ctx context.Context, project string, board service.
 
 	// 선점된 항목은 ListOpen 에 안 들어온다(state='claimed'). 빼면 진행 중인 일이
 	// 큐 화면에서 통째로 사라지므로 선점 행을 직접 읽어 붙인다.
-	holds, err := claimHolders(ctx, st.DB(), project)
+	holds, err := st.ListLiveClaims(ctx, project)
 	if err != nil {
 		pan.Err = joinErr(pan.Err, "선점 목록을 못 읽었다: "+Clip(err.Error(), 400))
 		h.log.ErrorContext(ctx, "선점 목록 조회 실패", "project", project, "error", err.Error())
@@ -922,7 +921,7 @@ func (h *handler) queuePanel(ctx context.Context, project string, board service.
 
 	// 탈락 사유 분포. 없으면 "분포 없음"이 아니라 **판정 기록이 없다**고 쓴다 —
 	// 둘은 다른 사실이고, 뭉개면 큐가 다시 블랙박스가 된다.
-	evals, err := pickEvals(ctx, st.DB(), project, 200)
+	evals, err := st.ListPickEvals(ctx, project, 200)
 	if err != nil {
 		pan.StatsErr = Clip(err.Error(), 400)
 		h.log.ErrorContext(ctx, "큐 판정 기록 조회 실패", "project", project, "error", err.Error())
@@ -1058,7 +1057,7 @@ func (h *handler) landingPanel(ctx context.Context, proj model.Project, label st
 		"러너가 없는 지금은 비어 있고, 그 자리를 지금 HEAD 로 메우지 않는다."
 
 	st := h.svc.Store()
-	items, err := closedItems(ctx, st.DB(), proj.ID, 30)
+	items, _, err := st.ListClosed(ctx, proj.ID, "", 30)
 	if err != nil {
 		pan.Err = Clip(err.Error(), 400)
 		h.log.ErrorContext(ctx, "종료된 항목 조회 실패", "project", proj.ID, "error", err.Error())
@@ -1116,8 +1115,8 @@ func (h *handler) landingPanel(ctx context.Context, proj model.Project, label st
 // fillLane 은 랜딩 줄을 패널에 채운다 — Task 6 부터는 자원별로(service.ResourceLane 마다)
 // 채운다.
 //
-// ★ **조회는 service.LandingLane 하나로 한다.** query.go 에 생 SQL 을 두 번째로
-// 만들면 판정이 두 자리에 생기고, 한쪽만 고치는 순간 화면과 보드가 조용히 어긋난다
+// ★ **조회는 service.LandingLane 하나로 한다.** web 에 생 SQL 을 두 번째로
+// 만들면(web 은 SQL 을 안 쓴다 - store 의 TestNoRawDatabaseOutsideStore) 판정이 두 자리에 생기고, 한쪽만 고치는 순간 화면과 보드가 조용히 어긋난다
 // (board.go 가 같은 규율을 적어 뒀다). 그 함수는 점유자·줄의 정합 재확인까지 한다.
 //
 // ★ **생존 창으로 거르지 않는다.** 창 밖 세션이 맨 앞에서 막고 있는 상황이야말로
@@ -1343,46 +1342,6 @@ func noteRow(now time.Time, j model.Judgment) NoteRow {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-
-// holderRow 는 살아 있는 선점 한 행이다.
-type holderRow struct {
-	ItemID    string
-	SessionID string
-	At        time.Time
-}
-
-// claimHolders 는 반납되지 않은 선점을 읽는다.
-//
-// ★ 살아 있는 세션 목록에서 뽑지 않는다. 창 밖 세션이 쥔 선점이야말로 회수가 필요한 경우인데,
-// 세션에서 뽑으면 그것이 화면에서 통째로 사라진다.
-func claimHolders(ctx context.Context, db *sql.DB, project string) ([]holderRow, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT item_id, session_id, at FROM claim
-		WHERE project = ? AND released_at IS NULL ORDER BY at`, project)
-	if err != nil {
-		return nil, fmt.Errorf("선점 조회 실패(project=%q): %w", Clip(project, 64), err)
-	}
-	defer rows.Close()
-
-	var out []holderRow
-	for rows.Next() {
-		var (
-			r  holderRow
-			at string
-		)
-		if err := rows.Scan(&r.ItemID, &r.SessionID, &at); err != nil {
-			return nil, fmt.Errorf("선점 행 해석 실패: %w", err)
-		}
-		if r.At, err = parseStamp(at); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("선점 목록 순회 실패: %w", err)
-	}
-	return out, nil
-}
 
 func joinErr(a, b string) string {
 	if a == "" {

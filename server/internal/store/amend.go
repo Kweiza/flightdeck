@@ -156,7 +156,8 @@ func (t *Tx) AmendItem(project, itemID string, p AmendPatch, sessionID string) (
 
 // nextItemRev 는 이 항목의 다음 개정 번호다.
 //
-// 트랜잭션 안에서 뽑는다 — `_txlock=immediate` 가 두 세션의 동시 amend 사이를 닫는다.
+// 트랜잭션 안에서 뽑는다 - 전역 쓰기 잠금(SQLite BEGIN IMMEDIATE · Postgres 전역 advisory 잠금 + READ COMMITTED)이
+// 두 세션의 동시 amend 사이를 닫는다. 잠금 뒤에 읽으므로 앞 amend 의 커밋된 rev 가 보인다.
 // 그래도 새면 PK 가 제약 위반으로 터진다(조용한 덮어쓰기가 아니다).
 func (t *Tx) nextItemRev(project, itemID string) (int, error) {
 	var n int
@@ -244,8 +245,7 @@ func (s *Store) ItemRevisions(ctx context.Context, project, itemID string) ([]mo
 // "같은 값 재지정이거나, 읽는 사이에 들어온 개정이다"로 두 갈래를 열어 둔다. 여기서
 // "합쳐져 보인다"고 적어 두면 그 화면 문구의 근거가 거짓이 된다(재리뷰 ②).
 //
-// 이 오차를 없애려면 읽기 트랜잭션이 필요한데 열지 않는다 — `_txlock=immediate` 는 쓰기
-// 잠금이고, 이 조회 때문에 그것을 잡으면 읽기 하나가 모든 쓰기를 세운다.
+// 이 오차를 없애려면 두 조회를 한 스냅숏(ReadTx)에서 읽어야 하는데, 두 조회는 호출부(service)가 따로 부른다.
 func MarkItemRevisionChanges(revs []model.ItemRevision, current model.Item) {
 	for i := range revs {
 		before := model.Item{Title: revs[i].Title, Body: revs[i].Body, Paths: revs[i].Paths}

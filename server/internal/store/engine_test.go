@@ -382,7 +382,7 @@ func isDBField(e ast.Expr) bool {
 func TestRawHandlesStayInEngine(t *testing.T) {
 	src := parseStoreSource(t)
 	allowed := map[site]string{
-		{"store.go", "DB"}:                "저수준 접근자 - 시험과 web 의 날 질의 넷(store 안으로 옮길 차례다)",
+		{"store.go", "DB"}:                "저수준 접근자 - 시험 전용(store 밖 소스는 TestNoRawDatabaseOutsideStore 가 막는다)",
 		{"store.go", "openRaw"}:           "SQLite 파일 열기",
 		{"probe.go", "probeMigrationVia"}: "SQLite 파일의 판 재기",
 		{"backup.go", "OpenLedger"}:       "SQLite 원장 내보내기 전용 열기",
@@ -419,6 +419,71 @@ func TestRawHandlesStayInEngine(t *testing.T) {
 		if !seen[at] {
 			t.Errorf("예외 목록이 낡았다: %s(%s)에 날 핸들이 더는 없다 - 목록에서 지워라", at, why)
 		}
+	}
+}
+
+// TestNoRawDatabaseOutsideStore 는 store 밖의 시험 아닌 소스가 DB 핸들을 직접 쥐지 않는지 잠근다: database/sql 을
+// 가져오지 않고, 인자 없는 `.DB()` 를 부르지 않는다(Store.DB 는 *sql.DB 를 내므로 가져오기 없이도 질의할 수 있다).
+//
+// ★ store 밖의 질의는 자리표시 감싸개도, 엔진별 질의 조각도, 오류 번역도 안 지난다 - Postgres 에서 `?` 질의가 그대로
+// 거절되고, 같은 질의가 store 와 두 벌이 된다. 읽을 것이 필요하면 store 에 접근자를 둔다.
+func TestNoRawDatabaseOutsideStore(t *testing.T) {
+	root, err := filepath.Abs("../..") // server 모듈 뿌리
+	if err != nil {
+		t.Fatal(err)
+	}
+	self, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var files, bad []string
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			// store 와 그 아래(pg · storetest)는 이 경계의 안쪽이다.
+			if path == self || strings.HasPrefix(path, self+string(filepath.Separator)) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, path)
+		files = append(files, rel)
+		for _, im := range f.Imports {
+			if p, _ := strconv.Unquote(im.Path.Value); p == "database/sql" {
+				bad = append(bad, rel+": database/sql 을 가져온다")
+			}
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok && len(call.Args) == 0 {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "DB" {
+					bad = append(bad, fset.Position(call.Pos()).String()+": .DB() 를 부른다")
+				}
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 빈 목록이면 아래가 초록이 된다 - 훑은 수를 먼저 잰다(web · api · service · cmd 가 다 들어야 한다).
+	for _, want := range []string{"internal/web/", "internal/api/", "internal/service/", "cmd/fd/"} {
+		if !slices.ContainsFunc(files, func(f string) bool { return strings.HasPrefix(filepath.ToSlash(f), want) }) {
+			t.Fatalf("%s 의 소스를 하나도 못 훑었다(훑은 파일 %d개) - 이 시험의 좌표(작업 디렉토리)가 틀렸다", want, len(files))
+		}
+	}
+	if len(bad) > 0 {
+		t.Errorf("store 밖 소스가 DB 핸들을 직접 쥔다 - 질의는 store 의 접근자로 옮겨라:\n  %s", strings.Join(bad, "\n  "))
 	}
 }
 

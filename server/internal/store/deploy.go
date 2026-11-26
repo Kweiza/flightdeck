@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -31,6 +30,10 @@ const eventServerDeploy = "server.deploy"
 // 원장을 안 건드린다.
 //
 // exe 는 안정 식별자면 무엇이든 된다. 지금 호출부는 ExeID.String()(ino·size·mtime)을 준다.
+//
+// ★ 「마지막 배포」는 event id 가 가장 큰 server.deploy 행이다. id 순서가 커밋 순서인 것은 이벤트 추가가 전역 쓰기
+// 잠금 안에서 id 를 받고 커밋까지 잠금을 쥐기 때문이다(event.go 의 TryLogEvent) - Postgres 의 identity 는 INSERT 때
+// 번호를 받으므로 잠금 없이는 늦게 커밋한 낮은 id 가 생긴다.
 //
 // ★ **뜨지 못한 기동은 여기까지 안 온다.** 호출부(cmd/fd 의 runServe)가 api.Listen 이
 // 성공한 **뒤에만** noteBuild 를 부른다 — 포트를 이미 물려 곧바로 죽는 기동은 원장에
@@ -72,12 +75,10 @@ func (s *Store) NoteServerBuild(ctx context.Context, exe string) (deployed bool,
 	case err != nil:
 		return false, fmt.Errorf("마지막 배포 조회 실패: %w", err)
 	default:
-		var last struct {
-			Exe string `json:"exe"`
-		}
 		// ★ payload 를 못 읽으면 배포로 친다. 여기서 침묵하면 정체를 잃은 채로 영영
 		//   "안 바뀌었다"가 되어, 진짜 배포가 와도 원장이 모른다.
-		if jerr := json.Unmarshal([]byte(payload), &last); jerr == nil && last.Exe == exe {
+		// ★ 판독은 원장 payload 판독기 한 벌(payloadTopString)이다 - 중복 키는 첫 값, 키는 글자 그대로.
+		if last, ok, jerr := payloadTopString(payload, "exe"); jerr == nil && ok && last == exe {
 			return false, nil
 		}
 	}
