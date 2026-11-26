@@ -39,12 +39,13 @@ import (
 //
 // ★ 덤프는 이전 실행기 세션이 두 잠금(자기 잠금 · 전역 업무 잠금)을 쥔 동안 뜬다(migrateSession). 판을 읽은 뒤부터 마지막
 // 증분까지 남의 판올림도 업무 쓰기도 끼지 못하므로, 덤프는 읽은 판의 상태 그대로다. pg_dump 는 다른 프로세스라 세션이
-// 끊긴 것을 모른다 - 그래서 최종 이름을 붙이기 전에 세션에서 잠금과 판을 다시 잰다(sealDump). 끊겼으면 이름을 안 붙이고
-// 실패한다.
+// 끊긴 것을 모른다 - 그래서 최종 이름을 붙이기 전에 스냅숏 트랜잭션을 연 채로 세션의 잠금을 다시 잰다(sealDump). 끊겼으면
+// 이름을 안 붙이고 실패한다.
 //
 // ★ 덤프 한 번에는 기한이 있다(DumpTimeout). 덤프가 도는 동안 업무 쓰기는 전역 잠금에 서므로, 덤프가 멈추면(백업 볼륨이
-// 응답을 멈추면 pg_dump 도, 그 파일을 읽는 실행기도 함께 선다) 기한이 곧 업무 쓰기가 막히는 최악의 길이다. 같은 기한이
-// 스냅숏 트랜잭션의 서버 상한(snapshotTxLimits)과 pg_dump 자식의 문맥(backupPG)에 걸린다.
+// 응답을 멈추면 pg_dump 도, 그 파일을 읽거나 게시하는 실행기도 함께 선다) 기한이 곧 업무 쓰기가 막히는 최악의 길이다. 같은
+// 기한이 스냅숏 트랜잭션의 서버 상한(snapshotTxLimits)과 pg_dump 자식의 문맥(backupPG)에 걸린다. 스냅숏 트랜잭션은 게시와
+// 정리가 끝날 때까지 열려 있어 그 파일 입출력도 이 기한 안이다(backupPG 의 ★).
 //
 // ★ pg_dump 는 실행기 세션이 내보낸 스냅숏을 본다(dumpSnapshot, pg_dump --snapshot). 호스트 이름 하나가 주 서버와 지연
 // 복제본으로 갈리면 세션은 주 서버를 잠그는데 pg_dump 는 복제본에 붙을 수 있다. 스냅숏은 내보낸 서버 · DB 에만 있으므로
@@ -85,14 +86,24 @@ const (
 	maxDumpTimeout = math.MaxInt32 * time.Millisecond
 )
 
-// dumpTimeout 은 이번 판올림의 덤프 기한이다: 0 이면 DefaultDumpTimeout, 범위 밖이면 거절한다.
+// CheckDumpTimeout 은 덤프 기한 d 가 받는 범위(minDumpTimeout 이상 · maxDumpTimeout 이하) 안인가를 잰다. 범위 판정은 이
+// 한 자리다 - 실행기(MigrateOptions.dumpTimeout)와, 판을 재기 전에 설정을 읽는 fd migrate 가 함께 부른다. 0(「기본값」)은
+// 부른 쪽이 먼저 가른다.
+func CheckDumpTimeout(d time.Duration) error {
+	if d < minDumpTimeout || d > maxDumpTimeout {
+		return fmt.Errorf("덤프 기한(FD_DUMP_TIMEOUT)이 %s 다 - %s 이상 %s 이하여야 한다", d, minDumpTimeout, maxDumpTimeout)
+	}
+	return nil
+}
+
+// dumpTimeout 은 이번 판올림의 덤프 기한이다: 0 이면 DefaultDumpTimeout, 범위 밖이면 거절한다(CheckDumpTimeout).
 func (o MigrateOptions) dumpTimeout() (time.Duration, error) {
 	d := o.DumpTimeout
 	if d == 0 {
 		return DefaultDumpTimeout, nil
 	}
-	if d < minDumpTimeout || d > maxDumpTimeout {
-		return 0, fmt.Errorf("덤프 기한(FD_DUMP_TIMEOUT)이 %s 다 - %s 이상 %s 이하여야 한다", d, minDumpTimeout, maxDumpTimeout)
+	if err := CheckDumpTimeout(d); err != nil {
+		return 0, err
 	}
 	return d, nil
 }
@@ -544,7 +555,8 @@ func (d *dumpSnapshot) end() error {
 // 끊고, 세션 잠금 둘도 함께 사라진다 - 덤프를 다 떠도 봉인(sealDump)에서 실패해 판을 못 올린다. 서버 설정의
 // transaction_timeout 도 같은 자리에서 끊는다. 그렇다고 둘을 풀면(0) 덤프가 멈춘 날 세션 잠금 둘이 끝없이 남고 업무 쓰기가
 // 모두 lock_timeout 으로 돌아간다. 그래서 둘 다 덤프 기한으로 바꾼다: 실행기 프로세스나 그 파일 입출력이 서 있어도 기한이
-// 지나면 **서버가 스스로** 이 연결을 끊고, 세션 잠금은 연결과 함께 풀린다.
+// 지나면 **서버가 스스로** 이 연결을 끊고, 세션 잠금은 연결과 함께 풀린다. 이 상한은 트랜잭션이 열린 동안만 산다 - 그래서
+// 트랜잭션은 덤프의 게시 · 정리가 끝난 뒤에야 닫는다(backupPG 의 ★).
 //
 // ★ 덤프 창의 문맥(backupPG)은 이 트랜잭션을 열기 전에 같은 기한으로 시작한다. 그래서 실행기가 살아 있으면 서버보다 먼저
 // pg_dump 를 멈추고 스스로 닫는다. 서버의 끊기는 실행기가 서 있을 때의 안전망이다.
@@ -569,8 +581,8 @@ func snapshotTxLimits(limit time.Duration) []string {
 // 이 트랜잭션의 스냅숏이고, 뒤의 원장 식별 · 판 읽기도 그것을 본다 - 덤프 내용과 덤프 이름(식별 · 판)이 한 시점이다.
 //
 // ★ 세션이 쥔 두 잠금(세션 단위 권고 잠금)은 이 트랜잭션과 따로 산다 - 닫아도(ROLLBACK) 안 풀린다. 다만 같은 연결이라
-// 이 트랜잭션이 열린 동안 세션의 다른 질의 · 증분 트랜잭션은 그 안으로 섞인다. 그래서 봉인 전에 닫고(backupPG), 판올림 전
-// 덤프를 나가기 전에 반드시 닫는다.
+// 이 트랜잭션이 열린 동안 세션의 다른 질의 · 증분 트랜잭션은 그 안으로 섞인다. 봉인의 잠금 재기(sealDump)는 일부러 그 안에서
+// 돌고, 증분이 열리기 전에(판올림 전 덤프를 나가기 전에) 반드시 닫는다(backupPG).
 //
 // ★ 이 트랜잭션은 시간 상한을 덤프 기한(limit)으로 바꾼다(snapshotTxLimits). 그 까닭과 자리는 그 값의 ★.
 func (s *Store) exportSnapshot(ctx context.Context, sess *migrateSession, limit time.Duration) (*dumpSnapshot, error) {
@@ -602,17 +614,24 @@ func (s *Store) exportSnapshot(ctx context.Context, sess *migrateSession, limit 
 }
 
 // backupPG 는 이전 실행기의 판올림 전 덤프다(openMigrator 가 run.backup 으로 건다). 실행기 세션에서 스냅숏을 내보내고
-// pg_dump 가 그것을 보게 하며, 다 뜬 뒤에는 스냅숏 트랜잭션을 닫고 같은 세션에서 잠금과 판을 다시 재야 이름을 붙인다(sealDump).
+// pg_dump 가 그것을 보게 하며, 다 뜬 뒤에는 스냅숏 트랜잭션을 연 채로 같은 세션에서 잠금을 다시 재야 이름을 붙인다(sealDump).
+// 트랜잭션은 게시와 정리가 끝난 뒤에 닫는다.
 //
 // 잠금 · 스냅숏 · 증분의 차례(한 연결):
 //  1. 세션 잠금 둘(자기 · 전역 업무)을 잡고 판을 읽는다(migrateTo).
-//  2. 덤프 창을 연다: 3~5 가 덤프 기한(limit)을 넘으면 문맥이 dumpDeadline 으로 끝난다.
+//  2. 덤프 창을 연다: 3~6 이 덤프 기한(limit)을 넘으면 문맥이 dumpDeadline 으로 끝난다.
 //  3. RR 읽기 전용 트랜잭션을 열어 서버 상한을 덤프 기한으로 바꾸고(snapshotTxLimits) 스냅숏을 내보내고, 그 안에서 원장
 //     식별과 판을 잰다. 판이 1의 것과 달라야 할 까닭이 없다(잠금 안이다) - 다르면 멈춘다.
 //  4. pg_dump --snapshot 이 그 스냅숏을 가져와 뜬다. 내보낸 트랜잭션이 열려 있어야 가져온다. 기한이 지나면 자식을 죽인다.
-//  5. 다 뜨면 머리의 DB 이름을 원장의 실제 이름과 맞추고(checkDumpDatabase) 트랜잭션을 닫은 뒤(봉인) 세션 잠금 둘과 판을
-//     다시 잰다. 그 사이 기한이 지나 서버가 연결을 끊었으면 여기서 실패한다(닫힌 실패). 그 뒤 덮지 않고 게시한다.
-//  6. 증분 트랜잭션은 이 함수가 돌아온 뒤 같은 연결에서 부른 쪽의 문맥으로 연다 - 3의 트랜잭션은 어느 길로 나가도 닫혀 있다.
+//  5. 다 뜨면 머리의 DB 이름을 원장의 실제 이름과 맞추고(checkDumpDatabase), 트랜잭션을 연 채로 세션 잠금 둘을 다시 잰다
+//     (봉인). 그 사이 기한이 지나 연결이 끊겼으면 여기서 실패한다(닫힌 실패). 그 뒤 덮지 않고 게시하고 임시 이름을 지운다.
+//  6. 게시와 정리가 끝난 뒤에야 트랜잭션을 닫는다. 닫지 못하면(그 사이 연결을 잃었다) 판을 올리지 않는다.
+//  7. 증분 트랜잭션은 이 함수가 돌아온 뒤 같은 연결에서 부른 쪽의 문맥으로 연다 - 3의 트랜잭션은 어느 길로 나가도 닫혀 있다.
+//
+// ★ 트랜잭션을 게시 · 정리 뒤에 닫는 까닭. 닫는 순간 두 서버 상한(SET LOCAL)이 사라지고, 문맥이 끝날 때 database/sql 이
+// 트랜잭션을 되감으며 연결을 버리는 길도 사라진다. 세션 잠금 둘만 남는다. 그때 게시(link)나 정리(remove)가 응답을 멈춘 볼륨에
+// 서면 기한이 지나도 아무도 연결을 끊지 않아 업무 쓰기가 끝없이 막힌다. 열어 두면 덤프의 파일 입출력 전부가 같은 기한 안이다.
+// 세션 단위 상한(idle_session_timeout)으로 메우지 않는다 - 그 값은 연결과 함께 업무 풀로 돌아가므로 모든 길에서 되돌려야 한다.
 func (s *Store) backupPG(ctx context.Context, t Target, sess *migrateSession, from int, dir string, limit time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeoutCause(ctx, limit, dumpDeadline{limit})
 	defer cancel()
@@ -624,30 +643,43 @@ func (s *Store) backupPG(ctx context.Context, t Target, sess *migrateSession, fr
 	if snap.version != from {
 		return "", fmt.Errorf("덤프 스냅숏의 판(%d)이 실행기가 읽은 판(%d)과 다르다 - 판을 올리지 않는다", snap.version, from)
 	}
-	return dumpPG(ctx, t, dumpJob{dir: dir, bin: "pg_dump", ledger: snap.ledger, from: from, snapshot: snap.id,
-		lockWait: s.pgLim.lock, seal: func(ctx context.Context) error {
-			if err := snap.end(); err != nil {
-				return fmt.Errorf("덤프 스냅숏 트랜잭션을 닫지 못했다(연결이 끊겼으면 잠금도 사라졌다): %w", err)
-			}
-			return sealDump(ctx, sess, from)
-		}}, s.log)
+	dst, err := dumpPG(ctx, t, dumpJob{dir: dir, bin: "pg_dump", ledger: snap.ledger, from: from, snapshot: snap.id,
+		lockWait: s.pgLim.lock, seal: func(ctx context.Context) error { return sealDump(ctx, sess) }}, s.log)
+	if err != nil {
+		return "", err
+	}
+	// 게시한 덤프는 지우지 않는다. 봉인을 지났으므로 잠금이 끊긴 적 없이 뜬 from 판 그대로이고, 판을 안 올리니 되돌리기도
+	// 고르지 않는다(rollbackPG 는 지금 판이 덤프의 판보다 높을 때만 낸다). 지우기도 멈췄을 수 있는 볼륨의 입출력이다.
+	if err := snap.end(); err != nil {
+		return "", fmt.Errorf("덤프는 게시했지만(%q) 게시 · 정리가 끝나기 전에 실행기 연결을 잃었다 - %w. 판을 올리지 않았다. 다시 돌려라",
+			clip(dst, 200), withDumpDeadline(ctx, fmt.Errorf("덤프 스냅숏 트랜잭션을 닫지 못했다: %w", err)))
+	}
+	return dst, nil
 }
 
-// sealDump 는 덤프에 최종 이름을 붙여도 되는가를 잰다: 실행기 세션이 두 잠금을 아직 쥐고 있고(held), 판이 덤프를 시작할
-// 때(from)와 같다. 세션이 끊겼다면 그 사이 남이 판을 올렸을 수 있고, 그러면 덤프는 from 판의 상태가 아니다.
-func sealDump(ctx context.Context, sess *migrateSession, from int) error {
-	if err := sess.held(ctx); err != nil {
-		return err
-	}
-	_, v, _, err := readMigrationState(ctx, sess)
-	if err != nil {
-		return fmt.Errorf("덤프 뒤에 판을 다시 읽지 못했다: %w", err)
-	}
-	if v != from {
-		return fmt.Errorf("덤프를 뜨는 동안 판이 %d 에서 %d 로 바뀌었다", from, v)
-	}
-	return nil
+// sealDump 는 덤프에 최종 이름을 붙여도 되는가를 잰다: 실행기 세션이 두 잠금을 아직 쥐고 있다(held). 덤프 스냅숏 트랜잭션을
+// 연 채로 부른다(backupPG) - 같은 연결이라 이 질의도 그 트랜잭션 안에서 돈다.
+//
+// ★ 판은 다시 읽지 않는다. 이 질의가 지나면 연결은 스냅숏을 내보낸 그 백엔드이고, 세션 잠금은 연결과 함께만 사라지므로 판을
+// 읽기 전(openMigrateSession)부터 지금까지 놓인 적이 없다 - 그동안 남의 판올림(자기 잠금)도 업무 쓰기(전역 잠금)도 커밋하지
+// 못했으니 판은 스냅숏에서 잰 그대로다(backupPG 가 from 과 맞춘다). 이 트랜잭션(REPEATABLE READ) 안에서 판을 읽어도 스냅숏의
+// 판이 나올 뿐이다. 증분은 저마다 잠금 안에서 판을 다시 잰다(stepReady).
+func sealDump(ctx context.Context, sess *migrateSession) error {
+	return sess.held(ctx)
 }
+
+// withDumpDeadline 은 덤프 창의 문맥(backupPG)이 덤프 기한으로 끝났으면 err(실행기 연결을 잃은 자리) 앞에 기한을 붙인다.
+// 부른 쪽의 취소처럼 기한이 아닌 끝은 기한이라 말하지 않는다.
+func withDumpDeadline(ctx context.Context, err error) error {
+	var dl dumpDeadline
+	if c := context.Cause(ctx); errors.As(c, &dl) {
+		return fmt.Errorf("%w(기한이 지나면 서버가 실행기 연결을 끊고 잠금을 푼다) - %w", dl, err)
+	}
+	return err
+}
+
+// linkDump 는 다 뜬 덤프를 최종 이름에 게시한다(os.Link). 시험이 게시를 세워 응답을 멈춘 백업 볼륨을 흉내 내는 자리다.
+var linkDump = os.Link
 
 // dumpJob 은 판올림 전 덤프 한 번의 입력이다(backupPG 가 채운다).
 type dumpJob struct {
@@ -667,7 +699,8 @@ type dumpJob struct {
 // 되돌리기(latestDump)가 그것을 최신으로 고른다. 머리도 잰다 - 0으로 끝나고 빈 파일을 낸 실행을 믿지 않고, 머리의 DB
 // 이름이 원장의 실제 이름과 다른 덤프(checkDumpDatabase 의 ★)는 되돌리기가 거절하므로 지금 판올림을 거절한다. 마지막으로
 // seal 을 잰다 - 실행기가 잠금을 잃은 동안 뜬 덤프는 이름이 붙지 않는다(닫힌 실패). 덤프 기한을 넘겨 서버가 연결을 끊은
-// 것도 같은 길이고, 그때는 오류가 기한을 말한다(dumpDeadline).
+// 것도 같은 길이고, 그때는 오류가 기한을 말한다(dumpDeadline). 이 함수의 파일 입출력(게시 · 정리 포함)은 모두 부른 쪽이
+// 연 스냅숏 트랜잭션 안에서 돈다(backupPG 의 ★) - 어디서 서도 덤프 기한에 서버가 연결을 끊는다.
 //
 // ★ 게시는 덮지 않는다(link, 있으면 실패). 봉인 직후 세션이 끊기고 같은 초에 시작한 다음 실행기가 먼저 게시했으면, 늦게
 // 돌아온 이 게시가 rename 이었다면 새 덤프를 말없이 갈아 끼운다.
@@ -729,13 +762,9 @@ func dumpPG(ctx context.Context, t Target, j dumpJob, log *slog.Logger) (string,
 	}
 	if err := j.seal(ctx); err != nil {
 		_ = os.Remove(part)
-		var dl dumpDeadline
-		if c := context.Cause(ctx); errors.As(c, &dl) {
-			err = fmt.Errorf("%w(기한이 지나면 서버가 실행기 연결을 끊고 잠금을 푼다) - %w", dl, err)
-		}
-		return "", fmt.Errorf("덤프에 최종 이름을 붙이지 않는다 - %w. 판을 올리지 않았다. 다시 돌려라", err)
+		return "", fmt.Errorf("덤프에 최종 이름을 붙이지 않는다 - %w. 판을 올리지 않았다. 다시 돌려라", withDumpDeadline(ctx, err))
 	}
-	if err := os.Link(part, dst); err != nil {
+	if err := linkDump(part, dst); err != nil {
 		_ = os.Remove(part)
 		if errors.Is(err, fs.ErrExist) {
 			return "", fmt.Errorf("같은 이름의 덤프가 이미 있다(%q) - 다른 실행기가 먼저 게시했다. 덮지 않는다. 판을 올리지 않았다. 다시 돌려라", clip(dst, 200))

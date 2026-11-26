@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1170,7 +1171,7 @@ func TestPGServerAloneFreesTheRunnersLocks(t *testing.T) {
 	if err := snap.end(); err == nil {
 		t.Fatal("서버가 끊은 스냅숏 트랜잭션이 아무 일 없이 닫혔다")
 	}
-	if err := sealDump(ctx, sess, SchemaVersion); err == nil {
+	if err := sealDump(ctx, sess); err == nil {
 		t.Fatal("서버가 끊은 실행기 세션이 봉인을 지났다")
 	}
 }
@@ -1180,8 +1181,8 @@ func TestPGServerAloneFreesTheRunnersLocks(t *testing.T) {
 // (checkDumpDatabase) 쓰는 쪽이 올 때까지 선다 - 응답을 멈춘 백업 볼륨에서 파일을 읽는 실행기와 같다. 서 있는 동안 잠금이
 // 풀리고 다른 연결의 업무 쓰기가 커밋해야 한다. 이 자리에서는 서버 상한과 실행기 쪽 문맥(끝나면 database/sql 이 스냅숏
 // 트랜잭션을 되감다 연결을 닫는다)이 같은 기한에 함께 움직여 누가 풀었는지 가르지 않는다 - 서버 혼자의 몫은
-// TestPGServerAloneFreesTheRunnersLocks 가 잰다. 풀어 주면 실행기는 판을 다시 재다 끊긴 연결을 만나 덤프에 이름을 안 붙이고
-// 기한을 말하며 실패한다.
+// TestPGServerAloneFreesTheRunnersLocks 가 잰다. 풀어 주면 실행기는 봉인에서 잠금을 다시 재다 끊긴 연결을 만나 덤프에 이름을
+// 안 붙이고 기한을 말하며 실패한다.
 func TestPGServerFreesTheLocksOfAStuckRunner(t *testing.T) {
 	ctx := context.Background()
 	dsn, s := pgMigrated(t)
@@ -1254,6 +1255,83 @@ func TestPGServerFreesTheLocksOfAStuckRunner(t *testing.T) {
 	}
 	if names := dirNames(t, dir); len(names) != 0 {
 		t.Fatalf("연결을 잃은 실행기의 덤프가 남았다: %q", names)
+	}
+}
+
+// TestPGDeadlineCoversAStalledPublish 는 봉인을 지난 뒤 게시(link)가 응답을 멈춘 볼륨에 서도 덤프 기한에 두 잠금이 풀리는지
+// 잰다. 게시 전에 스냅숏 트랜잭션을 닫으면 두 서버 상한도, 문맥이 끝날 때 database/sql 이 연결을 버리는 길도 함께 사라지고
+// 세션 잠금만 남는다 - 그 자리에서 게시가 서면 기한이 지나도 업무 쓰기가 끝없이 막힌다. 게시 자리(linkDump)를 풀어 줄 때까지
+// 세운다. 서 있는 동안 잠금이 풀리고 다른 연결의 업무 쓰기가 커밋해야 한다. 풀어 주면 실행기는 덤프를 게시하지만 트랜잭션을
+// 닫다가 연결을 잃은 것을 알고 기한을 말하며 판을 올리지 않는다. 세운 게시는 60초 뒤 스스로 풀린다 - 시험이 영영 서지 않게.
+func TestPGDeadlineCoversAStalledPublish(t *testing.T) {
+	ctx := context.Background()
+	dsn, s := pgMigrated(t)
+	const limit = 2 * time.Second
+	onPath(t, fakePGDump(t, t.TempDir(), dumpHead(t, dsnDB(t, dsn))))
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	link := linkDump
+	linkDump = func(oldname, newname string) error {
+		close(entered)
+		select {
+		case <-release:
+		case <-time.After(60 * time.Second):
+		}
+		return link(oldname, newname)
+	}
+	t.Cleanup(func() { linkDump = link })
+	dir := t.TempDir()
+	m, run := upgradeRunOpts(t, dsn, MigrateOptions{BackupDir: dir, DumpTimeout: limit})
+	done, ended := make(chan error, 1), make(chan struct{})
+	start := time.Now()
+	go func() { done <- m.migrateTo(ctx, run); close(ended) }()
+	t.Cleanup(func() { // 중간에 실패한 시험이 실행기를 붙들어 두지 않게
+		once.Do(func() { close(release) })
+		select {
+		case <-ended:
+		case <-time.After(10 * time.Second):
+		}
+	})
+
+	select {
+	case <-entered:
+	case err := <-done:
+		t.Fatalf("실행기가 게시 자리에 오지 않고 끝났다: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("실행기가 10초 안에 게시 자리에 오지 않는다")
+	}
+	waitUntil(t, "게시가 선 채로 기한이 지나 실행기 연결이 끊기고 두 잠금이 풀린다", func() bool {
+		return advisoryHolders(t, s, migrateLockKey) == 0 && advisoryHolders(t, s, globalLockKey) == 0
+	})
+	if took := time.Since(start); took < limit {
+		t.Fatalf("잠금이 기한(%s) 전인 %s 에 풀렸다 - 기한 말고 다른 것이 풀었다", limit, took)
+	}
+	if err := businessWrite(t, dsn, "m-while-publish-stalled"); err != nil {
+		t.Fatalf("게시가 서 있는 동안의 업무 쓰기: %v", err)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("실행기가 게시 자리에 서 있지 않았다(판올림: %v)", err)
+	default:
+	}
+
+	once.Do(func() { close(release) })
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("풀어 준 실행기가 10초 안에 끝나지 않는다")
+	}
+	if err == nil || !strings.Contains(err.Error(), "게시 · 정리가 끝나기 전에 실행기 연결을 잃었다") ||
+		!strings.Contains(err.Error(), "덤프 기한("+limit.String()) {
+		t.Fatalf("게시하다 기한에 연결을 잃은 실행기: %v", err)
+	}
+	if v := pgVersion(t, s); v != SchemaVersion || pgTableExists(t, s, "t_after") {
+		t.Fatalf("게시하다 연결을 잃은 실행기가 판을 올렸다: 판 %d, t_after %v", v, pgTableExists(t, s, "t_after"))
+	}
+	// 봉인을 지난 덤프는 잠금이 끊긴 적 없이 뜬 판 그대로라 남는다(backupPG). 임시 이름은 지웠다.
+	if names := dirNames(t, dir); len(names) != 1 || !strings.HasSuffix(names[0], dumpExt) {
+		t.Fatalf("백업 자리: %q", names)
 	}
 }
 

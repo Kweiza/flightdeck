@@ -323,7 +323,8 @@ func TestResolveBackupDir(t *testing.T) {
 }
 
 // FD_DUMP_TIMEOUT 은 Go 시간 표기의 양수만 받는다. 비면 0(store 의 기본값)이다. 못 읽는 값 · 0 이하는 거절한다 - 기본값으로
-// 물러서면 늘렸다고 믿은 기한이 기본값에서 끊기고, 0 은 「기한 없음」이 아니다.
+// 물러서면 늘렸다고 믿은 기한이 기본값에서 끊기고, 0 은 「기한 없음」이 아니다. 범위(1초 이상 · 밀리초 int 최댓값 이하)도 store 와
+// 같은 판정으로 여기서 거절한다.
 func TestResolveDumpTimeout(t *testing.T) {
 	for _, c := range []struct {
 		env  map[string]string
@@ -337,6 +338,10 @@ func TestResolveDumpTimeout(t *testing.T) {
 		{map[string]string{dumpTimeoutEnv: "30"}, 0, false},
 		{map[string]string{dumpTimeoutEnv: "0"}, 0, false},
 		{map[string]string{dumpTimeoutEnv: "-5m"}, 0, false},
+		{map[string]string{dumpTimeoutEnv: "1s"}, time.Second, true},
+		{map[string]string{dumpTimeoutEnv: "30ms"}, 0, false},
+		{map[string]string{dumpTimeoutEnv: "999ms"}, 0, false},
+		{map[string]string{dumpTimeoutEnv: "600h"}, 0, false},
 	} {
 		got, err := resolveDumpTimeout(envOf(c.env))
 		if (err == nil) != c.ok || got != c.want {
@@ -362,5 +367,23 @@ func TestMigrateRefusesAnUnreadableDumpTimeout(t *testing.T) {
 	}
 	if _, err := os.Stat(fresh); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("거절했는데 원장을 만들었다: %v", err)
+	}
+}
+
+// 범위 밖 FD_DUMP_TIMEOUT 도 판이 이미 맞는 날에 거절한다(종료 코드 2). 판이 맞으면 실행기를 열지 않고 끝나므로, 범위를
+// 실행기에만 맡기면 그날은 「이미 맞다」로 지나고 다음 판올림 날에야 실패한다.
+func TestMigrateRefusesAnOutOfRangeDumpTimeoutWhenUpToDate(t *testing.T) {
+	h := newHarness(t)
+	fresh := filepath.Join(t.TempDir(), "new.db")
+	if rc, out := h.run("", "migrate", "--db", fresh); rc != 0 {
+		t.Fatalf("첫 적용 실패(rc=%d): %s", rc, out)
+	}
+	env := map[string]string{dumpTimeoutEnv: "30ms"}
+	for k, v := range h.env {
+		env[k] = v
+	}
+	rc, out := h.runEnv(env, "", "migrate", "--db", fresh)
+	if rc != 2 || !strings.Contains(out, dumpTimeoutEnv) || !strings.Contains(out, "30ms") || strings.Contains(out, "이미 맞다") {
+		t.Fatalf("판이 맞는 날의 범위 밖 덤프 기한(rc=%d): %s", rc, out)
 	}
 }

@@ -1142,7 +1142,7 @@ type migrateRun struct {
 	// steps 는 기준선 위 증분이다(migrations · pgMigrations). 시험이 바꿔 넣는다.
 	steps []Migration
 	// backup 은 판올림 전 백업을 뜨고 그 자리를 낸다. sess 는 실행기 세션(잠금을 쥔 연결)이고 from 은 덤프를 뜨는 판이다 -
-	// 덤프는 최종 이름을 붙이기 전에 그 세션에서 잠금과 판을 다시 잰다(sealDump).
+	// 덤프는 최종 이름을 붙이기 전에 그 세션에서 잠금을 다시 잰다(sealDump).
 	backup func(ctx context.Context, sess *migrateSession, from int) (string, error)
 }
 

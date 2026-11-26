@@ -35,11 +35,13 @@ func resolveBackupDir(env func(string) (string, bool), flag string) string {
 // dumpTimeoutEnv 는 Postgres 원장의 판올림 전 덤프 기한을 주는 환경 변수다(Go 시간 표기, 예: 45m · 2h).
 const dumpTimeoutEnv = "FD_DUMP_TIMEOUT"
 
-// resolveDumpTimeout 은 덤프 기한을 읽는다. 비었으면 0 이고 store 가 기본값(store.DefaultDumpTimeout)을 쓴다. 범위는 store 가
-// 잰다(MigrateOptions.DumpTimeout).
+// resolveDumpTimeout 은 덤프 기한을 읽고 범위를 잰다. 비었으면 0 이고 store 가 기본값(store.DefaultDumpTimeout)을 쓴다.
 //
 // ★ 못 읽는 값과 0 이하는 거절한다. 기본값으로 물러서면 늘렸다고 믿은 기한이 기본값에서 끊기고, 0 은 「기한 없음」이 아니다 -
 // 기한 없는 덤프가 멈추면 업무 쓰기가 끝없이 막힌다.
+//
+// ★ 범위도 여기서 잰다 - store 의 판정 하나(store.CheckDumpTimeout)를 부른다. 판이 맞는 날 runMigrate 는 실행기를 열지 않고
+// 끝나므로, 범위를 실행기에만 맡기면 30ms 같은 값이 그날은 지나고 다음 판올림 날에야 거절된다.
 func resolveDumpTimeout(env func(string) (string, bool)) (time.Duration, error) {
 	v, ok := env(dumpTimeoutEnv)
 	if !ok || strings.TrimSpace(v) == "" {
@@ -49,6 +51,9 @@ func resolveDumpTimeout(env func(string) (string, bool)) (time.Duration, error) 
 	if err != nil || d <= 0 {
 		return 0, fmt.Errorf("%s 를 읽지 못했다(%q) - 45m · 2h 같은 Go 시간 표기의 양수여야 한다(비우면 %s)",
 			dumpTimeoutEnv, clip(v, 40), store.DefaultDumpTimeout)
+	}
+	if err := store.CheckDumpTimeout(d); err != nil {
+		return 0, err
 	}
 	return d, nil
 }
