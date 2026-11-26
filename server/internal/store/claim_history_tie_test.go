@@ -18,38 +18,39 @@ import (
 // `ORDER BY at` 만 쓰면 SQLite 가 같은 `at` 안의 순서를 보장하지 않아 **같은 질의가
 // 선점과 반납 사이를 오간다.** 그 흔들림은 화면에 안 뜬다.
 func TestClaimHolderAtBreaksTimestampTiesByInsertOrder(t *testing.T) {
-	ctx := context.Background()
-	s := newStore(t)
-	seed(t, s, "p")
-	holder := mustSession(t, s, "p", "cc-주인")
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p")
+		holder := mustSession(t, s, "p", "cc-주인")
 
-	// 선점과 반납을 **같은 시각**으로 박는다. 삽입 순서만이 둘을 가른다.
-	at := fmtTime(time.Now().UTC())
-	insertEventAt(t, s, at, "p", holder.ID, `{"item":"fd-x"}`, "item.claim")
-	insertEventAt(t, s, at, "p", holder.ID, `{"item":"fd-x"}`, "item.finish")
+		// 선점과 반납을 **같은 시각**으로 박는다. 삽입 순서만이 둘을 가른다.
+		at := fmtTime(time.Now().UTC())
+		insertEventAt(t, s, at, "p", holder.ID, `{"item":"fd-x"}`, "item.claim")
+		insertEventAt(t, s, at, "p", holder.ID, `{"item":"fd-x"}`, "item.finish")
 
-	got, err := s.ClaimHolderAt(ctx, "p", "fd-x", time.Now().UTC())
-	if err != nil {
-		t.Fatalf("이력 조회 실패: %v", err)
-	}
-	if got != "" {
-		t.Fatalf("같은 시각의 선점·반납에서 점유자를 %q 라 했다 — 기대 \"\"\n"+
-			"반납이 나중에 삽입됐으므로 나중이다. `at` 만으로 정렬하면 이 답이 흔들린다", got)
-	}
+		got, err := s.ClaimHolderAt(ctx, "p", "fd-x", time.Now().UTC())
+		if err != nil {
+			t.Fatalf("이력 조회 실패: %v", err)
+		}
+		if got != "" {
+			t.Fatalf("같은 시각의 선점·반납에서 점유자를 %q 라 했다 — 기대 \"\"\n"+
+				"반납이 나중에 삽입됐으므로 나중이다. `at` 만으로 정렬하면 이 답이 흔들린다", got)
+		}
 
-	// ── 대조: 순서를 뒤집으면 답도 뒤집혀야 한다. 이것이 없으면 위 단정은
-	// "무조건 빈 값을 낸다"로도 초록불이 난다.
-	at2 := fmtTime(time.Now().UTC().Add(time.Second))
-	insertEventAt(t, s, at2, "p", holder.ID, `{"item":"fd-y"}`, "item.finish")
-	insertEventAt(t, s, at2, "p", holder.ID, `{"item":"fd-y"}`, "item.claim")
+		// ── 대조: 순서를 뒤집으면 답도 뒤집혀야 한다. 이것이 없으면 위 단정은
+		// "무조건 빈 값을 낸다"로도 초록불이 난다.
+		at2 := fmtTime(time.Now().UTC().Add(time.Second))
+		insertEventAt(t, s, at2, "p", holder.ID, `{"item":"fd-y"}`, "item.finish")
+		insertEventAt(t, s, at2, "p", holder.ID, `{"item":"fd-y"}`, "item.claim")
 
-	got, err = s.ClaimHolderAt(ctx, "p", "fd-y", time.Now().UTC().Add(2*time.Second))
-	if err != nil {
-		t.Fatalf("이력 조회 실패: %v", err)
-	}
-	if got != holder.ID {
-		t.Fatalf("같은 시각에 반납→선점 순인데 점유자를 %q 라 했다 — 기대 %q", got, holder.ID)
-	}
+		got, err = s.ClaimHolderAt(ctx, "p", "fd-y", time.Now().UTC().Add(2*time.Second))
+		if err != nil {
+			t.Fatalf("이력 조회 실패: %v", err)
+		}
+		if got != holder.ID {
+			t.Fatalf("같은 시각에 반납→선점 순인데 점유자를 %q 라 했다 — 기대 %q", got, holder.ID)
+		}
+	})
 }
 
 // insertEventAt 는 `at` 을 지정해 원장 행 하나를 세운다. **시험 전용**이다 —

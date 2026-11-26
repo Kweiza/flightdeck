@@ -248,7 +248,9 @@ func (t *Tx) RemoveAfter(project, itemID string, a model.After, sessionID string
 	if err := ValidateAfter(a); err != nil {
 		return err
 	}
-	// `IS` 로 비교한다 — 세 칸 중 둘은 NULL 이고 `=` 는 NULL 에 대해 NULL(거짓)을 낸다.
+	// `IS NOT DISTINCT FROM` 으로 비교한다 - 세 칸 중 둘은 NULL 이고 `=` 는 NULL 에 대해 NULL(거짓)을 낸다.
+	// SQLite 의 짧은 꼴 `IS ?` 는 Postgres 에서 문법 오류다(그 엔진의 IS 뒤에는 NULL · TRUE 같은 낱말만 온다).
+	// 표준 꼴은 두 엔진이 같은 뜻으로 받는다.
 	// dep_project 도 대조에 넣는다 — 안 넣으면 같은 id 를 가진 **두 프로젝트의 선행**이
 	// 한 번의 cut 으로 함께 사라진다. 그 손실은 조용하다(둘 다 지워도 RowsAffected 는 양수다).
 	depProject := a.Project
@@ -257,8 +259,9 @@ func (t *Tx) RemoveAfter(project, itemID string, a model.After, sessionID string
 	}
 	res, err := t.tx.ExecContext(t.ctx, `
 		DELETE FROM item_after
-		WHERE project = ? AND item_id = ? AND dep_item IS ? AND dep_job IS ? AND dep_sha IS ?
-		  AND dep_project IS ?`,
+		WHERE project = ? AND item_id = ? AND dep_item IS NOT DISTINCT FROM ?
+		  AND dep_job IS NOT DISTINCT FROM ? AND dep_sha IS NOT DISTINCT FROM ?
+		  AND dep_project IS NOT DISTINCT FROM ?`,
 		project, itemID, nullStr(a.Item), nullStr(a.Job), nullStr(a.SHA), nullStr(depProject))
 	if err != nil {
 		return fmt.Errorf("선행 조건 절단 실패(project=%q item=%q): %w",
@@ -639,6 +642,10 @@ func (s *Store) ListItems(ctx context.Context, project string) ([]model.Item, er
 // 목록이 두 곳에서 갈린다. 칸반 화면의 「끝남」 열이 이 함수의 유일한 소비자라 정렬을
 // 오래된 순(ListItems)이 아니라 closed_at 최근순으로 둔다 — 끝난 것 중 볼 것은 최근 것이다.
 // 전체 수는 그 열의 배지다(더 불러오기와 상관없이 끝난 것이 모두 몇 장인가). 목록과 같은 술어를 쓴다.
+//
+// ★ 닫힌 시각이 없는 행(closed_at NULL - 스키마가 막지 않는다)은 `NULLS LAST` 로 끝에 둔다. 적지 않으면 엔진마다
+// 자리가 갈린다: SQLite 는 NULL 을 가장 작은 값으로 봐서 DESC 의 끝에, Postgres 는 가장 큰 값으로 봐서 DESC 의
+// 처음에 둔다. 처음에 오면 시각 없는 옛 행이 「최근에 닫힌 것」 자리를 차지하고 limit 이 진짜 최근 것을 자른다.
 func (s *Store) ListClosed(ctx context.Context, project string, state model.ItemState, limit int) ([]model.Item, int, error) {
 	where := ` FROM item WHERE project = ? AND state IN ('done','dropped')`
 	args := []any{project}
@@ -650,7 +657,7 @@ func (s *Store) ListClosed(ctx context.Context, project string, state model.Item
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("닫힌 항목 수 조회 실패(project=%q): %w", clip(project, 64), err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+itemCols+where+` ORDER BY closed_at DESC, id LIMIT ?`, append(args, limit)...)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+itemCols+where+` ORDER BY closed_at DESC NULLS LAST, id LIMIT ?`, append(args, limit)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("닫힌 항목 조회 실패(project=%q): %w", clip(project, 64), err)
 	}
@@ -903,7 +910,7 @@ func (t *Tx) closedOrMissing(project, itemID string, want model.ItemState) error
 
 // ClaimItem 은 항목을 선점한다.
 //
-// ★ 원자적이다. 이 트랜잭션은 BEGIN IMMEDIATE 로 열리므로(store.go 의 Tx 주석 참조)
+// ★ 원자적이다. 이 트랜잭션은 BEGIN IMMEDIATE(Postgres 는 첫 문장의 전역 잠금)로 열리므로(store.go 의 Tx 주석 참조)
 // "미선점 확인 → 삽입" 사이에 남이 끼어들 창이 없다.
 // 이미 남의 것이면 **점유자를 담은 오류**(*ClaimHeldError)를 돌려준다 —
 // 불리언 실패로 접으면 누구에게 물어야 하는지 알 수 없고, 그러면 다시 추측이 시작된다.
@@ -933,34 +940,17 @@ func (t *Tx) ClaimItem(project, itemID, sessionID string, at time.Time) (model.C
 		return model.Claim{}, curErr
 	}
 
-	v := JudgeClaim(found, state, holder, sessionID)
-	switch {
-	case v.Resume:
-		return cur, nil
-	case !v.OK && holder != "":
-		return model.Claim{}, &ClaimHeldError{
-			Project: project, ItemID: itemID, Holder: holder, At: cur.At, Reason: v.Reason}
-	case !v.OK:
-		return model.Claim{}, &ClaimRefusedError{Project: project, ItemID: itemID, Reason: v.Reason}
+	if c, done, err := claimAnswer(project, itemID, JudgeClaim(found, state, holder, sessionID), cur, holder); done {
+		return c, err
 	}
 
 	now := atStamp(at)
-	// PK 가 (project, item_id) 라 **반납된 선점 행이 그대로 남아 있다**.
-	// 그래서 단순 INSERT 가 아니라 upsert 여야 한다 — 재선점이 PK 위반으로 죽으면
-	// 한 번 반납한 항목을 아무도 다시 못 집는다.
-	if _, err := t.tx.ExecContext(t.ctx, `
-		INSERT INTO claim(project, item_id, session_id, at, released_at, force_reason)
-		VALUES (?, ?, ?, ?, NULL, NULL)
-		ON CONFLICT(project, item_id) DO UPDATE SET
-		  session_id = excluded.session_id, at = excluded.at, released_at = NULL, force_reason = NULL`,
-		project, itemID, sessionID, fmtTime(now)); err != nil {
-		// 등록 안 된 session_id 로 선점하면 여기서 FK 위반이 난다 — 항목 id 중복과 같은 형태다.
-		return model.Claim{}, writeErr(err, writeTarget{
-			Target: TargetClaim, Project: project, ID: itemID,
-			RefHint: fmt.Sprintf("항목 %s/%s · 세션 %s",
-				clip(project, 64), clip(itemID, 64), clip(sessionID, 64)),
-		}, "선점 기록 실패(project=%q item=%q session=%q)",
-			clip(project, 64), clip(itemID, 64), clip(sessionID, 64))
+	written, err := t.writeClaim(project, itemID, sessionID, now)
+	if err != nil {
+		return model.Claim{}, err
+	}
+	if !written {
+		return t.claimTakenMeanwhile(project, itemID, sessionID, state)
 	}
 	if err := t.SetItemState(project, itemID, model.ItemClaimed, ""); err != nil {
 		return model.Claim{}, err
@@ -977,6 +967,76 @@ func (s *Store) ClaimItem(ctx context.Context, project, itemID, sessionID string
 		return e
 	})
 	return c, err
+}
+
+// writeClaim 은 선점 행을 쓴다. 반납 안 된 행이 키 자리에 있어 안 썼으면 false 다(오류가 아니다).
+func (t *Tx) writeClaim(project, itemID, sessionID string, now time.Time) (bool, error) {
+	// PK 가 (project, item_id) 라 **반납된 선점 행이 그대로 남아 있다**.
+	// 그래서 단순 INSERT 가 아니라 upsert 여야 한다 — 재선점이 PK 위반으로 죽으면
+	// 한 번 반납한 항목을 아무도 다시 못 집는다.
+	//
+	// ★ 덮는 것은 **반납된 행만**이다(DO UPDATE … WHERE). ClaimItem 의 점유자 확인이 살아 있는 선점을 이미
+	//   거절했으므로 쓰기가 한 줄로 서는 동안(SQLite 는 BEGIN IMMEDIATE, Postgres 는 전역 잠금)은 이 조건이 늘 참이다.
+	//   그 직렬성이 어디서 깨져 확인 뒤에 남의 선점이 생기면, 조건 없는 upsert 는 SQLite 에서 그것을 말없이 덮고
+	//   Postgres 에서는 트리거 claim_one_live_holder 의 23505 로 트랜잭션을 버린다 - 그 응답은 「선점 행 중복」이라
+	//   점유자를 못 댄다. 조건을 걸면 두 엔진 모두 0행으로 끝나고 트랜잭션이 살아, ClaimItem 이 점유자를 다시 읽어
+	//   낸다(claimTakenMeanwhile).
+	res, err := t.tx.ExecContext(t.ctx, `
+		INSERT INTO claim(project, item_id, session_id, at, released_at, force_reason)
+		VALUES (?, ?, ?, ?, NULL, NULL)
+		ON CONFLICT(project, item_id) DO UPDATE SET
+		  session_id = excluded.session_id, at = excluded.at, released_at = NULL, force_reason = NULL
+		WHERE claim.released_at IS NOT NULL`,
+		project, itemID, sessionID, fmtTime(now))
+	if err != nil {
+		// 등록 안 된 session_id 로 선점하면 여기서 FK 위반이 난다 — 항목 id 중복과 같은 형태다.
+		return false, writeErr(err, writeTarget{
+			Target: TargetClaim, Project: project, ID: itemID,
+			RefHint: fmt.Sprintf("항목 %s/%s · 세션 %s",
+				clip(project, 64), clip(itemID, 64), clip(sessionID, 64)),
+		}, "선점 기록 실패(project=%q item=%q session=%q)",
+			clip(project, 64), clip(itemID, 64), clip(sessionID, 64))
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("선점 기록 결과 확인 실패(project=%q item=%q): %w",
+			clip(project, 64), clip(itemID, 64), err)
+	}
+	return n > 0, nil
+}
+
+// claimTakenMeanwhile 은 선점 upsert 가 0행으로 끝났을 때의 답이다. 반납 안 된 행이 키 자리에 있어 안 덮었다는
+// 뜻이고, 점유자 확인 뒤에 그 행이 생겼다는 뜻이라 쓰기 직렬성의 결함이다 - 경고로 남긴다. 답은 그 점유자로 같은
+// 판정(JudgeClaim · claimAnswer)을 다시 돌려 낸다: 남이면 점유자를 담은 ClaimHeldError, 자기면 이어 쥐기다.
+func (t *Tx) claimTakenMeanwhile(project, itemID, sessionID string, state model.ItemState) (model.Claim, error) {
+	live, err := t.LiveClaim(project, itemID)
+	if err != nil {
+		return model.Claim{}, fmt.Errorf("선점이 0행으로 끝났는데 살아 있는 점유자를 못 읽었다(project=%q item=%q): %w",
+			clip(project, 64), clip(itemID, 64), err)
+	}
+	t.s.log.Warn("선점 확인 뒤에 살아 있는 선점이 생겼다 - 쓰기가 한 줄로 서지 않았다",
+		"project", clip(project, 64), "item", clip(itemID, 64), "holder", clip(live.SessionID, 64))
+	if c, done, err := claimAnswer(project, itemID, JudgeClaim(true, state, live.SessionID, sessionID), live, live.SessionID); done {
+		return c, err
+	}
+	// 점유자가 있는데 쓰라는 판정은 JudgeClaim 이 내지 않는다 - 나오면 판정 규칙이 바뀐 것이다.
+	return model.Claim{}, fmt.Errorf("선점이 0행으로 끝났는데 판정이 쓰기를 허락했다(project=%q item=%q holder=%q)",
+		clip(project, 64), clip(itemID, 64), clip(live.SessionID, 64))
+}
+
+// claimAnswer 는 선점 판정을 ClaimItem 의 답으로 접는다. 이어 쥐기면 지금 행, 남의 선점이면 점유자를 담은
+// ClaimHeldError, 그 밖의 거절이면 ClaimRefusedError 이고, 셋 다 done 이다. 쓰기로 갈 차례면 done 이 false 다.
+func claimAnswer(project, itemID string, v ClaimVerdict, cur model.Claim, holder string) (model.Claim, bool, error) {
+	switch {
+	case v.Resume:
+		return cur, true, nil
+	case !v.OK && holder != "":
+		return model.Claim{}, true, &ClaimHeldError{
+			Project: project, ItemID: itemID, Holder: holder, At: cur.At, Reason: v.Reason}
+	case !v.OK:
+		return model.Claim{}, true, &ClaimRefusedError{Project: project, ItemID: itemID, Reason: v.Reason}
+	}
+	return model.Claim{}, false, nil
 }
 
 func (t *Tx) claimRow(project, itemID string) (model.Claim, error) {
@@ -1211,15 +1271,22 @@ func (s *Store) ReleasedItems(ctx context.Context, sessionID string, since time.
 // 반대로 짜면 회수된 선점을 살아 있는 것으로 봐서 조용한 오답이 다시 생긴다.
 //
 // ★ 정렬에 `id` 를 함께 쓴다. 같은 마이크로초에 선점과 반납이 들어오면 `at` 만으로는
-// 순서가 안 정해지고, 그 경계에서 답이 뒤집힌다. `id` 는 AUTOINCREMENT 라 삽입 순서다.
+// 순서가 안 정해지고, 그 경계에서 답이 뒤집힌다. `id` 는 삽입 순서다(SQLite 는 AUTOINCREMENT, Postgres 는
+// identity 인데 이벤트 추가가 전역 잠금에서 한 줄로 서서 번호 순서가 곧 커밋 순서다).
+//
+// ★ payload 의 item 은 SQL 이 아니라 Go 가 읽는다(payloadItem). SQL 로 꺼내는 꼴이 두 엔진에 같지 않고
+// (SQLite 의 json_extract 는 Postgres 에 없고, Postgres 의 ->> 는 JSON 형으로 바꾼 뒤에만 서는데 SQLite 에는 그
+// 캐스트가 없다), Postgres 의 JSON 해석은 json · jsonb 둘 다 문서 안 어디든 \u0000 이스케이프가 있으면
+// 22P05 로 질의 전체를 죽인다 - 남의 칸에 든 것이라도 그렇다. 그래서 SQL 은 종류 · 프로젝트 · 시각으로만
+// 거르고, 이 프로젝트의 선점 이력을 다 받아 항목을 가린다. 이 함수는 진단용이라(업무 경로의 호출자가 없다)
+// 더 읽는 행 수보다 한 벌의 SQL 이 앞선다.
 func (s *Store) ClaimHolderAt(ctx context.Context, project, itemID string, at time.Time) (string, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT kind, COALESCE(session_id, '') FROM event
+		SELECT kind, COALESCE(session_id, ''), payload FROM event
 		WHERE kind IN ('item.claim','item.finish','claim.reclaim','web.claim.reclaim')
 		  AND (project = ? OR project IS NULL)
-		  AND json_extract(payload, '$.item') = ?
 		  AND at <= ?
-		ORDER BY at, id`, project, itemID, fmtTime(at))
+		ORDER BY at, id`, project, fmtTime(at))
 	if err != nil {
 		return "", fmt.Errorf("선점 이력 조회 실패(project=%q item=%q): %w",
 			clip(project, 64), clip(itemID, 64), err)
@@ -1228,9 +1295,17 @@ func (s *Store) ClaimHolderAt(ctx context.Context, project, itemID string, at ti
 
 	holder := ""
 	for rows.Next() {
-		var kind, sessionID string
-		if err := rows.Scan(&kind, &sessionID); err != nil {
+		var kind, sessionID, payload string
+		if err := rows.Scan(&kind, &sessionID, &payload); err != nil {
 			return "", fmt.Errorf("선점 이력 행 해석 실패: %w", err)
+		}
+		item, ok, err := payloadItem(payload)
+		if err != nil {
+			return "", fmt.Errorf("선점 이력 payload 해석 실패(project=%q item=%q kind=%s): %w",
+				clip(project, 64), clip(itemID, 64), kind, err)
+		}
+		if !ok || item != itemID {
+			continue
 		}
 		if kind == "item.claim" {
 			holder = sessionID
@@ -1242,6 +1317,31 @@ func (s *Store) ClaimHolderAt(ctx context.Context, project, itemID string, at ti
 		return "", fmt.Errorf("선점 이력 순회 실패: %w", err)
 	}
 	return holder, nil
+}
+
+// payloadItem 은 원장 payload 의 최상위 "item" 이 문자열이면 그 값이다. SQLite 의 `json_extract(payload, '$.item')`
+// 을 글과 견주던 뜻 그대로 읽는다: JSON 이 아니면 오류(json_extract 도 질의를 죽인다), 객체가 아니거나 · item 이
+// 없거나 · null 이거나 · 문자열이 아니면 「이 항목이 아니다」(json_extract 가 NULL 이나 글 아닌 값을 내던 자리)다.
+// 키는 글자 그대로 견준다 - 구조체 꼬리표로 풀면 encoding/json 이 대소문자를 가리지 않아 "Item" 도 잡힌다.
+func payloadItem(payload string) (string, bool, error) {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(payload), &top); err != nil {
+		var shape *json.UnmarshalTypeError
+		if errors.As(err, &shape) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	raw, ok := top["item"]
+	if !ok {
+		return "", false, nil
+	}
+	var item *string
+	// raw 는 이미 맞는 JSON 이라 여기서 나는 오류는 형 불일치(글이 아닌 값)뿐이다.
+	if err := json.Unmarshal(raw, &item); err != nil || item == nil {
+		return "", false, nil
+	}
+	return *item, true, nil
 }
 
 // SiblingClaimedItems 는 **같은 대화의 다른 카드**가 지금 쥔 항목 id 를 낸다.
