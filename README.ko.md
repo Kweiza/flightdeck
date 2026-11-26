@@ -171,10 +171,10 @@ codex                      # 한 번은 TUI 로 띄워 "Hooks need review" 를 �
 | `FD_UID` · `FD_GID` | 서버 | 호스트 사용자 id(기본 1000) |
 | `FD_LEDGER_HOST` | 서버 | 원장 백업 자리(기본 `~/.flightdeck-ledger`) |
 | `FD_BACKUP_DIR` | 서버 | `fd migrate` 가 Postgres 원장의 판을 올리기 전에 뜨는 덤프 자리(`--backup-dir` 가 먼저고, 둘 다 비면 `/backups` 가 있을 때 그곳). **배포마다 따로 둔다**: 물리 복제로 떠 온 시험 시스템은 원래 시스템과 원장 식별(클러스터 식별자 · DB 이름)이 같아서, 한 자리를 나눠 쓰면 되돌리기가 다른 배포의 덤프를 고를 수 있다 |
-| `FD_DUMP_TIMEOUT` | 서버 | `fd migrate` 가 Postgres 원장의 판을 올리기 전에 뜨는 덤프의 기한(Go 시간 표기, 기본 `30m`, 1초 이상). 덤프하는 동안 업무 쓰기가 기다리므로, 덤프가 멈추면(백업 볼륨이 응답을 멈추면) 이 기한이 쓰기가 막히는 가장 긴 시간이다. 기한이 지나면 pg_dump 를 멈추고 서버가 실행기 연결을 끊어 잠금을 풀며, 판은 올리지 않는다. 큰 원장에서 정상 덤프가 더 걸리면 늘린다 |
-| `FD_BACKUP_HOST` | 서버 | Postgres 원장의 매일 덤프 자리(기본 `~/.flightdeck-backups`). compose 의 `db-backup` 서비스가 그 안 `daily/` 에 `pg_dump -Fc` 를 하루 한 번 뜨고 새것 14개만 남긴다. 회전은 덤프가 성공한 뒤에만 한다. 서비스는 profile `postgres` 뒤에 있어 Postgres 로 옮기기 전에는 안 뜬다. 되살릴 때는 역할(`fd_owner` · `fd_app` 과 접속 계정)을 먼저 만들고(클러스터 전역이라 덤프에 없다) `pg_restore -d postgres --create --exit-on-error <덤프>` 로 DB 째 되살린다. `--create` 없이 미리 만든 DB 에 부으면 DB 단위 권한(PUBLIC 의 `TEMPORARY` 회수)이 빠진다 |
-| `FD_PGPASS_HOST` | 서버 | `db-backup` 이 읽는 pgpass 파일(기본 `~/.flightdeck-pgpass`, 권한 `0600`, 줄 `db:5432:<DB>:<역할>:<비밀번호>`). 비밀번호가 들어가는 유일한 자리다. 환경 변수와 명령줄에는 두지 않는다. 권한이 넓으면 libpq 가 파일을 안 읽는다 |
-| `FD_PG_DATABASE` · `FD_PG_BACKUP_USER` | 서버 | `db-backup` 이 붙는 DB 와 역할(기본 `flightdeck` · `fd_backup`). 역할에는 `pg_read_all_data` 가 있어야 한다 |
+| `FD_DUMP_TIMEOUT` | 서버 | Postgres 원장의 덤프 한 번의 기한(Go 시간 표기, 기본 `30m`, 1초 이상). `fd migrate` 가 판을 올리기 전에 뜨는 덤프와 `db-backup` 의 매일 덤프가 같은 값을 쓴다 - 둘 다 「이 원장의 정상 덤프 시간 + 여유」다. 판올림 전 덤프 동안에는 업무 쓰기가 기다리므로, 덤프가 멈추면(백업 볼륨이 응답을 멈추면) 이 기한이 쓰기가 막히는 가장 긴 시간이다. 기한이 지나면 pg_dump 를 멈추고 서버가 실행기 연결을 끊어 잠금을 풀며, 판은 올리지 않는다. 매일 덤프는 기한이 지나면 pg_dump 를 끊고 그날을 실패로 친다(멈춘 덤프가 표 잠금을 쥔 채 서 있으면 `fd migrate` 의 DDL 이 실패한다). 큰 원장에서 정상 덤프가 더 걸리면 늘린다 |
+| `FD_BACKUP_HOST` | 서버 | Postgres 원장의 매일 덤프 자리(기본 `~/.flightdeck-backups`). `db-backup` 서비스가 그 안 `daily/<DB>/` 에 하루 한 번 뜨고 새것 14개만 남긴다. **미리 만들고**(주인 `FD_UID`, 권한 `0700`) **배포마다 따로 둔다**: 같은 DB 이름을 쓰는 두 배포가 한 자리를 나누면 서로의 덤프로 때를 재고 서로의 덤프를 회전한다. 준비와 되살리기는 아래 「Postgres 원장의 매일 덤프」 |
+| `FD_PGPASS_HOST` | 서버 | `db-backup` 이 읽는 pgpass 파일(기본 `~/.flightdeck-pgpass`, 주인 `FD_UID`, 권한 `0600`, 줄 `db:5432:<DB>:<역할>:<비밀번호>`). 비밀번호가 들어가는 유일한 자리다. 환경 변수와 명령줄에는 두지 않는다. 권한이 넓으면 libpq 가 파일을 안 읽는다. **서버 마운트 밖에 둔다** - 기본 자리는 `FD_REPOS` 의 기본값(홈 전체) 안이라 서버가 읽을 수 있다(아래 「Postgres 원장의 매일 덤프」) |
+| `FD_PG_DATABASE` · `FD_PG_BACKUP_USER` | 서버 | `db-backup` 이 붙는 DB 와 역할(기본 `flightdeck` · `fd_backup`). 역할에는 `pg_read_all_data` 가 있어야 한다. 덤프 자리는 DB 마다 따로라(`daily/<DB>/`, 소문자 · 숫자 · `_` · `-` 밖의 바이트는 `%XX`) DB 를 바꿔도 옛 DB 의 덤프를 새 DB 가 세거나 지우지 않는다 |
 | `FD_URL` | 세션 | 서버 주소(기본 `http://127.0.0.1:7420`) |
 | `FD_STATE_DIR` | 세션 | 상태 파일(아웃박스·캐시·머신 id)을 한 자리로 모은다 |
 | `FD_LANG` | 서버 · 세션 | 출력 언어. `en` 이면 영어로 낸다(기본 한국어). 서버 쪽은 대시보드, 세션 쪽은 CLI·훅·MCP 결과다 |
@@ -184,6 +184,81 @@ codex                      # 한 번은 TUI 로 띄워 "Hooks need review" 를 �
 `FD_LANG=en` 은 **출력 경계에서** 옮긴다 — 보드, 대시보드, add·next·pick·note·finish·show, land,
 꼬리, Stop 처방이 1차 범위다. 번역표(`server/internal/lang/catalog.go`)에 없는 줄은 **줄째 한국어로**
 남는다(반쪽 번역을 안 낸다). `fd doctor`·로그인 화면·드문 진단 문구는 아직 한국어다.
+
+### Postgres 원장의 매일 덤프
+
+compose 의 `db-backup` 서비스(profile `postgres`)가 `pg_dump -Fc` 를 하루 한 번
+`$FD_BACKUP_HOST/daily/<DB>/fd-daily-<UTC>.dump` 로 뜨고 새것 14개만 남긴다. Postgres 로 옮기기 전에는 안 뜬다.
+회전은 덤프가 성공한 뒤에만 하고, 한 DB 자리에서는 한 실행만 돈다. 가장 새 덤프가 간격 + 확인 두 번 + 기한(기본
+26시간 30분)보다 낡으면 컨테이너가 unhealthy 다.
+
+**준비** - 서비스를 켜기 전에 한 번. `FD_UID` 인 사용자로 돌린다.
+
+```bash
+# 1. 덤프 자리. 없으면 Linux 의 Docker 가 root 소유 0755 로 만들어 첫 덤프부터 못 쓴다.
+install -d -m 0700 "${FD_BACKUP_HOST:-$HOME/.flightdeck-backups}"
+#    다른 uid 의 자리면: sudo install -d -m 0700 -o "$FD_UID" -g "$FD_GID" <자리>
+
+# 2. pgpass. 주인 FD_UID, 권한 0600, 서버 마운트 밖(아래 ★).
+sudo install -d -m 0700 -o "${FD_UID:-1000}" -g "${FD_GID:-1000}" /etc/flightdeck
+install -m 0600 /dev/null /etc/flightdeck/pgpass
+"${EDITOR:-vi}" /etc/flightdeck/pgpass        # 한 줄: db:5432:flightdeck:fd_backup:<비밀번호>
+export FD_PGPASS_HOST=/etc/flightdeck/pgpass  # compose 를 돌리는 셸이나 .env 에
+```
+
+백업 역할은 읽기만 한다(초사용자로 한 번):
+
+```sql
+CREATE ROLE fd_backup LOGIN PASSWORD '<비밀번호>';
+GRANT pg_read_all_data TO fd_backup;
+```
+
+설정은 `docker compose --profile postgres run --rm db-backup config` 가 한 줄로 낸다. 손으로 한 번 뜨려면 `once` 다
+(0 = 떴거나 아직 때가 아니다, 1 = 실패, 3 = 다른 실행이 같은 자리에서 돌고 있어 아무것도 안 했다).
+
+★ **pgpass 를 서버 마운트 밖에 둔다.** 서버(`flightdeck` 서비스)는 같은 uid 로 `FD_REPOS`(기본 홈 전체)를 읽기 전용으로
+붙인다. 기본 자리 `~/.flightdeck-pgpass` 는 그 안이라 `0600` 이어도 서버가 백업 암호를 읽을 수 있다. 위처럼 홈 밖에
+두거나 `FD_REPOS` 를 저장소 자리로 좁힌다.
+
+**되살리기** - 초사용자로 한다(역할과 DB 를 만든다). 아래 명령은 `db-backup` 서비스 이미지의 `psql` · `pg_restore` 를 쓰고
+(덤프가 `/backups` 에 보인다), 암호를 물으면 그 계정의 것을 넣는다. DB 가 다른 호스트면 `-h <호스트>` 를 더한다.
+
+```bash
+docker compose stop flightdeck db-backup      # 되살릴 DB 에 붙은 연결을 끊는다
+sql() { docker compose --profile postgres run --rm --entrypoint psql db-backup -U postgres -d postgres -v ON_ERROR_STOP=1 "$@"; }
+```
+
+`sql` 을 인자 없이 돌리면 초사용자의 대화형 psql 이 열린다.
+
+1. 같은 이름의 DB 가 이미 있으면 둘 중 하나다. 옛 것을 남기려면 이름을 바꾼다:
+   `sql -c 'ALTER DATABASE flightdeck RENAME TO flightdeck_before_restore'`.
+   버리려면 `sql -c 'DROP DATABASE flightdeck WITH (FORCE)'` 다(되돌릴 수 없다).
+2. 역할을 만들고 멤버십을 준다(`sql` 에서). 역할은 클러스터 전역이라 덤프에 없다. 이미 있는 역할은 건너뛴다(`CREATE` 가 실패한다).
+   멤버십을 빠뜨리면 되살리기는 성공해도 서버가 표를 못 읽는다(`permission denied`).
+
+   ```sql
+   CREATE ROLE fd_owner NOLOGIN;
+   CREATE ROLE fd_app NOLOGIN;
+   CREATE ROLE <앱 계정> LOGIN PASSWORD '<비밀번호>';  GRANT fd_app TO <앱 계정>;
+   CREATE ROLE fd_backup LOGIN PASSWORD '<비밀번호>';  GRANT pg_read_all_data TO fd_backup;
+   -- 이전 실행기가 따로 계정을 쓰면 GRANT fd_owner TO <그 계정>. 원래 DB 의 주인 역할도 있어야 한다.
+   ```
+
+3. DB 째 되살린다. `--create` 가 DB 단위 권한(PUBLIC 의 `TEMPORARY` 회수)까지 되살린다 - 미리 만든 DB 에 부으면 그것이 빠진다.
+
+   ```bash
+   docker compose --profile postgres run --rm --entrypoint pg_restore db-backup \
+     -U postgres -d postgres --create --exit-on-error /backups/daily/flightdeck/fd-daily-<UTC>.dump
+   ```
+
+4. **실제 앱 계정으로** 붙어 확인한다. 표가 읽히고(멤버십), `TEMPORARY` 가 `f` 여야 한다.
+
+   ```bash
+   docker compose --profile postgres run --rm --entrypoint psql db-backup -U <앱 계정> -d flightdeck \
+     -c 'SELECT count(*) FROM judgment' -c "SELECT has_database_privilege(current_database(), 'TEMPORARY')"
+   ```
+
+5. `docker compose --profile postgres up -d` 로 다시 띄운다. 이름을 바꿔 남긴 옛 DB 는 확인이 끝나면 지운다.
 
 ## 여러 저장소
 

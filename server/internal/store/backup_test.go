@@ -126,8 +126,10 @@ func TestPGReadLedgerReadsOneSnapshot(t *testing.T) {
 		got <- result{d, err}
 	}()
 	waitUntil(t, "원장 읽기가 judgment_link 앞에서 선다", func() bool {
+		// 같은 원판에서 복제한 DB 는 표의 OID 가 같다 - 이 DB 의 대기만 센다(나란히 도는 다른 시험 DB 의 대기가 끼지 않게).
 		return pgCount(t, s, `SELECT count(*) FROM pg_locks
-			WHERE locktype = 'relation' AND relation = 'judgment_link'::regclass AND NOT granted`) == 1
+			WHERE locktype = 'relation' AND relation = 'judgment_link'::regclass AND NOT granted
+			  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`) == 1
 	})
 
 	const late = "01ZZZZZZZZZZZZZZZZZZZZZZZZ"

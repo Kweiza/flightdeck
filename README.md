@@ -178,10 +178,10 @@ The server reads environment variables through compose; sessions read `~/.flight
 | `FD_UID` · `FD_GID` | server | Host user and group id (default 1000) |
 | `FD_LEDGER_HOST` | server | Where the ledger backup goes (default `~/.flightdeck-ledger`) |
 | `FD_BACKUP_DIR` | server | Where `fd migrate` writes the dump it takes before upgrading a Postgres ledger (`--backup-dir` wins; when both are empty, `/backups` if it exists). **Give each deployment its own directory**: a test system cloned by physical replication shares the ledger identity (cluster identifier and database name) with its source, so in a shared directory a rollback could pick the other deployment's dump |
-| `FD_DUMP_TIMEOUT` | server | Deadline for the dump `fd migrate` takes before upgrading a Postgres ledger (Go duration, default `30m`, at least 1s). Business writes wait while the dump runs, so if the dump stalls (say the backup volume stops responding) this is the longest they stay blocked. Past the deadline pg_dump is stopped, the server drops the migrator's connection and its locks, and the version is not raised. Raise it if a large ledger's normal dump takes longer |
-| `FD_BACKUP_HOST` | server | Where the daily dumps of a Postgres ledger go (default `~/.flightdeck-backups`). The compose `db-backup` service writes a `pg_dump -Fc` into its `daily/` once a day and keeps the newest 14. It rotates only after a dump succeeds. The service sits behind the `postgres` profile, so it does not start before the move to Postgres. To restore, create the roles (`fd_owner`, `fd_app` and the login accounts) first, since roles are cluster-wide and not in the dump, then restore the whole database with `pg_restore -d postgres --create --exit-on-error <dump>`. Restoring into a database you created yourself, without `--create`, drops the database-level privilege (`TEMPORARY` revoked from PUBLIC) |
-| `FD_PGPASS_HOST` | server | The pgpass file `db-backup` reads (default `~/.flightdeck-pgpass`, mode `0600`, line `db:5432:<db>:<role>:<password>`). It is the only place the password lives; keep it out of environment variables and command lines. libpq ignores the file if its mode is wider |
-| `FD_PG_DATABASE` · `FD_PG_BACKUP_USER` | server | Database and role `db-backup` connects as (default `flightdeck` and `fd_backup`). The role needs `pg_read_all_data` |
+| `FD_DUMP_TIMEOUT` | server | Deadline for one dump of a Postgres ledger (Go duration, default `30m`, at least 1s). The dump `fd migrate` takes before upgrading and the daily dump of `db-backup` use the same value: for both it is "this ledger's normal dump time plus headroom". Business writes wait while the pre-upgrade dump runs, so if the dump stalls (say the backup volume stops responding) this is the longest they stay blocked. Past the deadline pg_dump is stopped, the server drops the migrator's connection and its locks, and the version is not raised. The daily dump stops pg_dump past the deadline and counts the day as failed (a stalled dump holding table locks makes the DDL of `fd migrate` fail). Raise it if a large ledger's normal dump takes longer |
+| `FD_BACKUP_HOST` | server | Where the daily dumps of a Postgres ledger go (default `~/.flightdeck-backups`). The `db-backup` service writes one a day into its `daily/<db>/` and keeps the newest 14. **Create it beforehand** (owner `FD_UID`, mode `0700`) and **give each deployment its own**: two deployments with the same database name sharing one directory would judge freshness by each other's dumps and rotate each other's dumps away. Setup and restore are in "Daily dumps of a Postgres ledger" below |
+| `FD_PGPASS_HOST` | server | The pgpass file `db-backup` reads (default `~/.flightdeck-pgpass`, owner `FD_UID`, mode `0600`, line `db:5432:<db>:<role>:<password>`). It is the only place the password lives; keep it out of environment variables and command lines. libpq ignores the file if its mode is wider. **Keep it outside the server's mounts**: the default sits inside the default `FD_REPOS` (the whole home), so the server can read it (see "Daily dumps of a Postgres ledger" below) |
+| `FD_PG_DATABASE` · `FD_PG_BACKUP_USER` | server | Database and role `db-backup` connects as (default `flightdeck` and `fd_backup`). The role needs `pg_read_all_data`. Each database gets its own dump directory (`daily/<db>/`; bytes other than lowercase letters, digits, `_` and `-` become `%XX`), so after switching databases the new one neither counts nor deletes the old one's dumps |
 | `FD_URL` | session | Server address (default `http://127.0.0.1:7420`) |
 | `FD_STATE_DIR` | session | Put the state files (outbox, caches, machine id) in one place |
 | `FD_LANG` | server · session | Output language. `en` for English (default Korean). The server side covers the dashboard; the session side covers the CLI, hooks and MCP replies |
@@ -192,6 +192,84 @@ The traps behind each one are in [Running the server](docs/server.md).
 finish · show, land, the tail and Stop prescriptions are covered first. A line the table
 (`server/internal/lang/catalog.go`) does not cover stays in Korean as a whole — no half-translated
 lines. `fd doctor`, the login page and rarer diagnostics are still Korean.
+
+### Daily dumps of a Postgres ledger
+
+The compose `db-backup` service (profile `postgres`) writes a `pg_dump -Fc` once a day to
+`$FD_BACKUP_HOST/daily/<db>/fd-daily-<UTC>.dump` and keeps the newest 14. Nothing runs before the move to Postgres.
+It rotates only after a dump succeeds, and only one run works in a database's directory at a time. The container turns
+unhealthy when the newest dump is older than the interval + two checks + the deadline (26h30m by default).
+
+**Setup**: once, before starting the service. Run it as the `FD_UID` user.
+
+```bash
+# 1. The dump directory. If it is missing, Docker on Linux creates it root-owned 0755 and the first dump cannot write.
+install -d -m 0700 "${FD_BACKUP_HOST:-$HOME/.flightdeck-backups}"
+#    For a directory of another uid: sudo install -d -m 0700 -o "$FD_UID" -g "$FD_GID" <dir>
+
+# 2. The pgpass. Owner FD_UID, mode 0600, outside the server's mounts (see the star note below).
+sudo install -d -m 0700 -o "${FD_UID:-1000}" -g "${FD_GID:-1000}" /etc/flightdeck
+install -m 0600 /dev/null /etc/flightdeck/pgpass
+"${EDITOR:-vi}" /etc/flightdeck/pgpass        # one line: db:5432:flightdeck:fd_backup:<password>
+export FD_PGPASS_HOST=/etc/flightdeck/pgpass  # in the shell that runs compose, or in .env
+```
+
+The backup role only reads (once, as a superuser):
+
+```sql
+CREATE ROLE fd_backup LOGIN PASSWORD '<password>';
+GRANT pg_read_all_data TO fd_backup;
+```
+
+`docker compose --profile postgres run --rm db-backup config` prints the settings on one line. `once` takes one dump by
+hand (0 = dumped or not due yet, 1 = failed, 3 = another run is working in the same directory, so nothing was done).
+
+★ **Keep the pgpass outside the server's mounts.** The server (the `flightdeck` service) runs as the same uid and mounts
+`FD_REPOS` (the whole home by default) read-only. The default `~/.flightdeck-pgpass` is inside it, so even at `0600`
+the server can read the backup password. Put it outside the home as above, or narrow `FD_REPOS` to where the repositories live.
+
+**Restore**: as a superuser (it creates roles and a database). The commands below use `psql` and `pg_restore` from the
+`db-backup` service image (the dumps are visible under `/backups`); when asked for a password, give that account's.
+If the database is on another host, add `-h <host>`.
+
+```bash
+docker compose stop flightdeck db-backup      # drop the connections to the database being restored
+sql() { docker compose --profile postgres run --rm --entrypoint psql db-backup -U postgres -d postgres -v ON_ERROR_STOP=1 "$@"; }
+```
+
+`sql` with no arguments opens an interactive superuser psql.
+
+1. If a database of the same name exists, pick one. To keep the old one, rename it:
+   `sql -c 'ALTER DATABASE flightdeck RENAME TO flightdeck_before_restore'`.
+   To throw it away, `sql -c 'DROP DATABASE flightdeck WITH (FORCE)'` (this cannot be undone).
+2. Create the roles and grant the memberships (in `sql`). Roles are cluster-wide, so they are not in the dump. Skip roles
+   that already exist (`CREATE` fails on them). Without the memberships the restore succeeds but the server cannot read
+   the tables (`permission denied`).
+
+   ```sql
+   CREATE ROLE fd_owner NOLOGIN;
+   CREATE ROLE fd_app NOLOGIN;
+   CREATE ROLE <app account> LOGIN PASSWORD '<password>';  GRANT fd_app TO <app account>;
+   CREATE ROLE fd_backup LOGIN PASSWORD '<password>';  GRANT pg_read_all_data TO fd_backup;
+   -- If the migrator uses its own account, GRANT fd_owner TO <that account>. The original database's owner role must exist too.
+   ```
+
+3. Restore the whole database. `--create` also restores the database-level privilege (`TEMPORARY` revoked from PUBLIC);
+   restoring into a database you created beforehand drops it.
+
+   ```bash
+   docker compose --profile postgres run --rm --entrypoint pg_restore db-backup \
+     -U postgres -d postgres --create --exit-on-error /backups/daily/flightdeck/fd-daily-<UTC>.dump
+   ```
+
+4. Connect **as the real app account** to check. The tables must be readable (memberships) and `TEMPORARY` must be `f`.
+
+   ```bash
+   docker compose --profile postgres run --rm --entrypoint psql db-backup -U <app account> -d flightdeck \
+     -c 'SELECT count(*) FROM judgment' -c "SELECT has_database_privilege(current_database(), 'TEMPORARY')"
+   ```
+
+5. Start again with `docker compose --profile postgres up -d`. Drop the renamed old database once the check is done.
 
 ## Several repositories
 

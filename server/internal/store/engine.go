@@ -125,6 +125,10 @@ func sqliteOnly(target, what string) error {
 // DeferredFlushBudget 의 아래쪽 부등식이 이 값이다.
 const lockTimeout = 5 * time.Second
 
+// LockTimeout 은 lockTimeout 을 패키지 밖에 보인다. 서버 밖에서 pg_dump 를 부르는 매일 덤프(deploy/db-backup.sh)가 같은
+// 값을 --lock-wait-timeout 으로 쓰고, 시험이 둘을 맞댄다.
+const LockTimeout = lockTimeout
+
 // idleInTxTimeout 은 Postgres 가 트랜잭션 안에서 노는(문장과 문장 사이) 연결을 끊는 상한이다.
 //
 // ★ 샌 트랜잭션의 마지막 안전망이다. 전역 잠금은 트랜잭션 잠금이라 그 트랜잭션이 끝나야 풀린다 - 클로저가

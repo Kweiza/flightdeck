@@ -174,11 +174,31 @@ services:
   #   pg-test 와 같은 이미지라 시험이 둘을 맞댄다(TestComposeDBBackupMatchesTheLedgerImage).
   #
   # ★ 비밀번호는 pgpass 파일 하나로만 받는다(아래 secrets). 환경 변수 · 명령줄에 안 싣는다 - `docker inspect` 와
-  #   `ps` 에 보인다. 파일 권한은 0600 이어야 한다(libpq 가 그보다 열린 파일을 무시한다). 줄의 꼴은
-  #   `db:5432:<DB>:<역할>:<비밀번호>` 다. 역할은 읽기만 하면 된다(pg_read_all_data 의 구성원).
+  #   `ps` 에 보인다. 파일 권한은 0600 이고 주인은 FD_UID 여야 한다(libpq 가 그보다 열린 파일을 무시하고, 이 서비스는
+  #   FD_UID 로 돈다 - compose 의 파일 시크릿은 호스트 파일을 그대로 붙인다). 줄의 꼴은 `db:5432:<DB>:<역할>:<비밀번호>` 다.
+  #   역할은 읽기만 하면 된다(pg_read_all_data 의 구성원).
   #
-  # ★ 덤프 자리는 /backups/daily 다. /backups 바로 아래는 `fd migrate` 가 판을 올리기 전에 뜨는 덤프 자리라
-  #   (FD_BACKUP_DIR), 회전이 그것을 못 지우게 하위 자리를 쓴다. 되돌리기가 덤프를 고르는 훑기도 하위 자리를 안 본다.
+  # ★★ **pgpass 를 서버 마운트 밖에 둔다.** 위 flightdeck 서비스는 같은 uid 로 FD_REPOS(기본 홈 전체)를 읽기 전용으로
+  #   붙인다. 기본 자리(~/.flightdeck-pgpass)는 그 안이라 0600 이어도 서버가 백업 암호를 읽을 수 있다. FD_PGPASS_HOST 를
+  #   홈 밖(예: /etc/flightdeck/pgpass, 주인 FD_UID, 0600)으로 두거나 FD_REPOS 를 저장소 자리로 좁힌다. 기본값을 홈 밖으로
+  #   옮기지 않은 까닭: root 없이 만들 수 있는 홈 밖 자리가 없고, 서버의 저장소 마운트는 뒤 판에서 걷힌다.
+  #
+  # ★ 덤프 자리는 /backups/daily/<DB> 다(DB 이름은 소문자 · 숫자 · _ · - 밖의 바이트를 %XX 로 옮긴다). /backups 바로
+  #   아래는 `fd migrate` 가 판을 올리기 전에 뜨는 덤프 자리라(FD_BACKUP_DIR), 회전이 그것을 못 지우게 하위 자리를 쓴다.
+  #   되돌리기가 덤프를 고르는 훑기도 하위 자리를 안 본다. DB 마다 따로라 FD_PG_DATABASE 를 바꿔도 옛 DB 의 덤프가 새 DB 의
+  #   때 확인에 쓰이거나 새 DB 의 회전에 지워지지 않는다. 다만 **FD_BACKUP_HOST 는 배포마다 따로 둔다** - 같은 DB 이름을 쓰는
+  #   두 배포가 한 자리를 나누면 서로의 덤프로 때를 재고 서로의 덤프를 회전한다.
+  #
+  # ★ **FD_BACKUP_HOST 는 미리 만든다**(주인 FD_UID, 0700). 없으면 Linux 의 Docker 가 root 소유 0755 로 만들어 이 서비스가
+  #   첫 덤프부터 못 쓴다(스크립트가 그때 고치는 명령을 로그에 낸다).
+  #
+  # ★ 덤프 한 번의 기한은 FD_DUMP_TIMEOUT 이다(기본 30m). `fd migrate` 의 판올림 전 덤프와 **같은 설정 하나**다 - 둘 다
+  #   「이 원장의 정상 덤프가 걸리는 시간 + 여유」라 같은 값이 맞고, 늘릴 때 한 곳만 늘리는 어긋남이 없다. 같은 이름 ·
+  #   같은 Go 시간 표기 · 같은 범위로 읽고 시험이 둘을 맞댄다(TestDBBackupDeadlineReadsLikeFdMigrate). 기한을 넘은 pg_dump 는
+  #   끊고 실패로 친다 - 멈춘 덤프가 스냅숏과 모든 표의 잠금을 쥔 채 서면 그동안 `fd migrate` 의 DDL 이 실패한다.
+  #
+  # ★ 한 DB 자리에서는 한 실행만 돈다(자리의 flock). 정기 덤프가 도는 중에 `docker compose run --rm db-backup once` 를
+  #   돌리면 그 once 는 아무것도 안 하고 3 으로 끝난다.
   #
   # ★ 덤프는 원장 전체라 파일 권한을 0600 으로 쓴다(스크립트의 umask). 이름에는 시각만 있다.
   db-backup:
@@ -202,7 +222,9 @@ services:
       PGPASSFILE: /run/secrets/fd_pgpass
       FD_DB_BACKUP_DIR: /backups/daily
       FD_DB_BACKUP_KEEP: "14"
-    # 가장 새 덤프가 이틀보다 낡으면 unhealthy 다 - 덤프가 조용히 멈춘 것이 `docker compose ps` 에 보인다.
+      FD_DUMP_TIMEOUT: "${FD_DUMP_TIMEOUT:-}"
+    # 가장 새 덤프가 간격 + 확인 두 번 + 기한(기본 26시간 30분)보다 낡으면 unhealthy 다 - 덤프가 조용히 멈춘 것이
+    # `docker compose ps` 에 보인다. 잘 도는 동안 가장 새 덤프의 나이는 간격 + 확인 한 번 + 덤프 시간을 안 넘는다.
     healthcheck:
       test: ["CMD", "sh", "/usr/local/bin/fd-db-backup", "check"]
       interval: 10m
@@ -217,5 +239,6 @@ services:
 
 secrets:
   # db-backup 의 pgpass 파일. 호스트 파일이 없으면 그 서비스만 기동에서 선다(기본 `up` 은 이것을 안 읽는다).
+  # ★ 서버 마운트 밖에 둔다(db-backup 머리말의 ★★) - 기본 자리는 FD_REPOS 의 기본값(홈 전체) 안이라 서버가 읽을 수 있다.
   fd_pgpass:
     file: ${FD_PGPASS_HOST:-${HOME}/.flightdeck-pgpass}
