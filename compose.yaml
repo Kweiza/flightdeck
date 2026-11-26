@@ -52,6 +52,8 @@ services:
       - ~/.flightdeck:/data
     environment:
       FD_LOG: "${FD_LOG:-info}"
+      # 판올림 전 덤프의 기한. db-backup 과 같은 설정 하나라 .env 의 값이 두 서비스에 같이 간다.
+      FD_DUMP_TIMEOUT: "${FD_DUMP_TIMEOUT:-}"
     logging:
       driver: json-file
       options:

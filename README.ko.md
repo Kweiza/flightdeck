@@ -230,9 +230,14 @@ sql() { docker compose --profile postgres run --rm --entrypoint psql db-backup -
 
 `sql` 을 인자 없이 돌리면 초사용자의 대화형 psql 이 열린다.
 
-1. 같은 이름의 DB 가 이미 있으면 둘 중 하나다. 옛 것을 남기려면 이름을 바꾼다:
-   `sql -c 'ALTER DATABASE flightdeck RENAME TO flightdeck_before_restore'`.
-   버리려면 `sql -c 'DROP DATABASE flightdeck WITH (FORCE)'` 다(되돌릴 수 없다).
+1. 덤프가 되살릴 DB 이름을 덤프에서 읽는다. `--create` 는 지금 `FD_PG_DATABASE` 가 아니라 **덤프에 적힌 이름**으로 DB 를 만든다.
+
+   ```bash
+   docker compose --profile postgres run --rm --entrypoint pg_restore db-backup -l /backups/daily/<DB 자리>/fd-daily-<UTC>.dump | grep '^; *dbname:'
+   ```
+
+   그 이름의 DB 가 이미 있으면 지우지 말고 **이름을 바꿔 남긴다**(`<DB>` 는 위에서 읽은 이름):
+   `sql -c 'ALTER DATABASE "<DB>" RENAME TO "<DB>_before_restore"'`. 옛 DB 는 4 의 확인이 끝난 뒤에 지운다.
 2. 역할을 만들고 멤버십을 준다(`sql` 에서). 역할은 클러스터 전역이라 덤프에 없다. 이미 있는 역할은 건너뛴다(`CREATE` 가 실패한다).
    멤버십을 빠뜨리면 되살리기는 성공해도 서버가 표를 못 읽는다(`permission denied`).
 
@@ -248,14 +253,16 @@ sql() { docker compose --profile postgres run --rm --entrypoint psql db-backup -
 
    ```bash
    docker compose --profile postgres run --rm --entrypoint pg_restore db-backup \
-     -U postgres -d postgres --create --exit-on-error /backups/daily/flightdeck/fd-daily-<UTC>.dump
+     -U postgres -d postgres --create --exit-on-error /backups/daily/<DB 자리>/fd-daily-<UTC>.dump
    ```
 
-4. **실제 앱 계정으로** 붙어 확인한다. 표가 읽히고(멤버십), `TEMPORARY` 가 `f` 여야 한다.
+4. **실제 앱 계정으로** 붙어 확인한다. 표가 읽혀야 하고(멤버십), `TEMPORARY` 권한이 없어야 한다. 둘 중 하나라도 어긋나면
+   오류로 멈추고 종료 코드가 0 이 아니다(`ON_ERROR_STOP`, 권한이 남아 있으면 0 으로 나누기 오류를 일부러 낸다).
 
    ```bash
-   docker compose --profile postgres run --rm --entrypoint psql db-backup -U <앱 계정> -d flightdeck \
-     -c 'SELECT count(*) FROM judgment' -c "SELECT has_database_privilege(current_database(), 'TEMPORARY')"
+   docker compose --profile postgres run --rm --entrypoint psql db-backup -U <앱 계정> -d <DB> -v ON_ERROR_STOP=1 \
+     -c 'SELECT count(*) FROM judgment' \
+     -c "SELECT 1 / (NOT has_database_privilege(current_database(), 'TEMPORARY'))::int"
    ```
 
 5. `docker compose --profile postgres up -d` 로 다시 띄운다. 이름을 바꿔 남긴 옛 DB 는 확인이 끝나면 지운다.

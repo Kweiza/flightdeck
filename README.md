@@ -239,9 +239,14 @@ sql() { docker compose --profile postgres run --rm --entrypoint psql db-backup -
 
 `sql` with no arguments opens an interactive superuser psql.
 
-1. If a database of the same name exists, pick one. To keep the old one, rename it:
-   `sql -c 'ALTER DATABASE flightdeck RENAME TO flightdeck_before_restore'`.
-   To throw it away, `sql -c 'DROP DATABASE flightdeck WITH (FORCE)'` (this cannot be undone).
+1. Read the database name from the dump. `--create` creates the database under **the name in the dump**, not the current `FD_PG_DATABASE`.
+
+   ```bash
+   docker compose --profile postgres run --rm --entrypoint pg_restore db-backup -l /backups/daily/<db dir>/fd-daily-<UTC>.dump | grep '^; *dbname:'
+   ```
+
+   If a database of that name already exists, do not drop it, **rename it and keep it** (`<db>` is the name read above):
+   `sql -c 'ALTER DATABASE "<db>" RENAME TO "<db>_before_restore"'`. Drop the old one only after the check in step 4.
 2. Create the roles and grant the memberships (in `sql`). Roles are cluster-wide, so they are not in the dump. Skip roles
    that already exist (`CREATE` fails on them). Without the memberships the restore succeeds but the server cannot read
    the tables (`permission denied`).
@@ -259,14 +264,17 @@ sql() { docker compose --profile postgres run --rm --entrypoint psql db-backup -
 
    ```bash
    docker compose --profile postgres run --rm --entrypoint pg_restore db-backup \
-     -U postgres -d postgres --create --exit-on-error /backups/daily/flightdeck/fd-daily-<UTC>.dump
+     -U postgres -d postgres --create --exit-on-error /backups/daily/<db dir>/fd-daily-<UTC>.dump
    ```
 
-4. Connect **as the real app account** to check. The tables must be readable (memberships) and `TEMPORARY` must be `f`.
+4. Connect **as the real app account** to check. The tables must be readable (memberships) and the `TEMPORARY` privilege
+   must be gone. If either is off, psql stops with an error and a nonzero exit code (`ON_ERROR_STOP`; a remaining privilege
+   deliberately triggers a division by zero).
 
    ```bash
-   docker compose --profile postgres run --rm --entrypoint psql db-backup -U <app account> -d flightdeck \
-     -c 'SELECT count(*) FROM judgment' -c "SELECT has_database_privilege(current_database(), 'TEMPORARY')"
+   docker compose --profile postgres run --rm --entrypoint psql db-backup -U <app account> -d <db> -v ON_ERROR_STOP=1 \
+     -c 'SELECT count(*) FROM judgment' \
+     -c "SELECT 1 / (NOT has_database_privilege(current_database(), 'TEMPORARY'))::int"
    ```
 
 5. Start again with `docker compose --profile postgres up -d`. Drop the renamed old database once the check is done.
