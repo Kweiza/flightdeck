@@ -569,6 +569,42 @@ func TestEmptyPickLedgerSaysSoInsteadOfShowingZeroDistribution(t *testing.T) {
 		"'분포가 0'과 '판정이 한 번도 안 돌았다'는 다른 사실이다")
 }
 
+// TestQueueAndLandingSurviveColumnsTheyDoNotShow 는 ③의 분포와 ④의 이력이 자기가 찍지 않는 칸의 깨진 값에 통째로
+// 사라지지 않는지 잰다. 칸을 고르는 것은 store 의 접근자이고 두 엔진 시험은 그쪽에 있다 - 여기서는 화면이 그 접근자를
+// 쓰는지를 잰다. 항목 전부를 읽는 ListClosed 로 바꾸면 ④가 오류 한 줄이 된다.
+func TestQueueAndLandingSurviveColumnsTheyDoNotShow(t *testing.T) {
+	f := newFixture(t).withRepo("feat")
+	sess := f.openSession("cc-1", "트랙2")
+	ctx := context.Background()
+	closed := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, id := range []string{"t5-kept", "t5-broken"} {
+		if err := f.st.AddItem(ctx, model.Item{Project: testProject, ID: id, Title: "끝난 " + id, Body: "b",
+			State: model.ItemDone, ClosedAt: &closed}); err != nil {
+			t.Fatalf("닫힌 항목 등록 실패(%s): %v", id, err)
+		}
+	}
+	if err := f.st.RecordPickEval(ctx, model.PickEval{Project: testProject, SessionID: sess.ID, Picked: "t5-kept"}); err != nil {
+		t.Fatalf("큐 판정 기록 실패: %v", err)
+	}
+	// 저장 API 는 늘 바른 JSON 을 쓰므로 표에 직접 깨뜨린다. ④는 labels 를, ③은 picked_with 를 안 찍고, 빈 rejected 는 탈락 0줄이다.
+	for _, q := range []string{
+		`UPDATE item SET labels = '{깨짐' WHERE id = 't5-broken'`,
+		`UPDATE pick_eval SET rejected = '', picked_with = '{깨짐'`,
+	} {
+		if _, err := f.st.DB().ExecContext(ctx, q); err != nil {
+			t.Fatalf("준비 문장 실패: %v\n%s", err, q)
+		}
+	}
+
+	_, html := f.get("")
+	landing := sectionOf(t, html, "landing")
+	mustContain(t, landing, `④ 랜딩 이력 <span class="count">2건</span>`, "깨진 labels 한 행에 랜딩 이력이 줄었다")
+	mustContain(t, landing, "끝난 t5-kept", "깨진 labels 한 행에 다른 이력까지 사라졌다")
+	queue := sectionOf(t, html, "queue")
+	mustContain(t, queue, "최근 판정 1회", "빈 rejected · 깨진 picked_with 행이 판정 횟수에서 빠졌다")
+	mustContain(t, queue, "탈락 줄이 0건이다", "빈 rejected 를 탈락 0줄로 세지 않았다")
+}
+
 func TestBlockedPanelShowsNoteResourceAndDiskAxis(t *testing.T) {
 	f := newFixture(t).withRepo("feat")
 	sess := f.openSession("cc-1", "트랙2")

@@ -502,6 +502,72 @@ func TestWriteLedgerRestoresRowsVerbatim(t *testing.T) {
 	}
 }
 
+// supersedesLedger 는 프로젝트 하나와, 적힌 순서대로 되쓰일 판단들의 원장이다. 판단 i 는 parents[i] 를 정정한다(빈 값은 정정 없음).
+// 정정하는 판단이 정정되는 판단보다 **먼저** 오게 짓는다 - 원장의 id 순서가 참조 순서라는 보장은 없다.
+func supersedesLedger(ids, parents []string) LedgerDump {
+	at := fmtTime(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
+	project := "p"
+	d := LedgerDump{Projects: []LedgerProject{{ID: project, Path: "/repo/p", DefaultBranch: "main", CreatedAt: at}}}
+	for i, id := range ids {
+		var sup *string
+		if parents[i] != "" {
+			sup = &parents[i]
+		}
+		d.Judgments = append(d.Judgments, LedgerJudgment{
+			ID: id, Project: &project, At: at, Kind: string(model.JudgmentDecision), Body: "본문 " + id, Supersedes: sup,
+		})
+	}
+	return d
+}
+
+// TestWriteLedgerRestoresChildBeforeParentOnBothEngines 는 부모가 나중에 오는 원장을 두 엔진이 다 되쓰는지 잰다.
+//
+// ★ 판단 FK 는 두 엔진 모두 문장마다 검사한다(Postgres 기준선은 DEFERRABLE INITIALLY IMMEDIATE). 되쓰기가 커밋까지 미루지
+// 않으면 첫 판단의 INSERT 가 없는 부모에 막힌다. 미루는 문장은 엔진마다 다르다(deferForeignKeys).
+func TestWriteLedgerRestoresChildBeforeParentOnBothEngines(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		want := supersedesLedger([]string{"j0-child", "j1-parent"}, []string{"j1-parent", ""})
+		if err := s.WriteLedger(ctx, want); err != nil {
+			t.Fatalf("부모가 나중에 오는 원장을 못 되썼다: %v", err)
+		}
+		got, err := s.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("복원본 읽기 실패: %v", err)
+		}
+		if !reflect.DeepEqual(got.Projects, want.Projects) || !reflect.DeepEqual(got.Judgments, want.Judgments) {
+			t.Fatalf("원본과 복원본이 다르다:\n원본 %+v\n복원 %+v", want, got)
+		}
+	})
+}
+
+// TestWriteLedgerRejectsMissingParentAtCommitOnBothEngines 는 미루기가 검사를 빼는 것이 아니라 커밋으로 옮기는 것인지 두
+// 엔진에서 잰다: 끝까지 없는 부모를 가리키면 커밋이 참조 없음으로 실패하고, 트랜잭션이 통째로 되돌아가 먼저 넣은 행
+// (프로젝트 · 바른 판단)도 남지 않는다.
+func TestWriteLedgerRejectsMissingParentAtCommitOnBothEngines(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		err := s.WriteLedger(ctx, supersedesLedger([]string{"j0-fine", "j1-orphan"}, []string{"", "j9-ghost"}))
+		if err == nil {
+			t.Fatal("끝까지 없는 부모를 가리키는 원장을 받아들였다")
+		}
+		if v := JudgeError(err); v.Kind != ConflictMissingRef {
+			t.Fatalf("참조 없음(%q)이어야 한다: kind=%q (%s) err=%v", ConflictMissingRef, v.Kind, v.Reason, err)
+		}
+		// 문장에서 막혔다면 미루기가 안 걸린 것이다 - 그 갈래는 「원장 판단 되쓰기 실패」로 나온다.
+		if !strings.Contains(err.Error(), "커밋 실패") {
+			t.Fatalf("FK 검사가 커밋까지 미뤄지지 않았다: %v", err)
+		}
+		got, err := s.ReadLedger(ctx)
+		if err != nil {
+			t.Fatalf("재확인 실패: %v", err)
+		}
+		if len(got.Projects) != 0 || len(got.Judgments) != 0 {
+			t.Fatalf("실패한 되쓰기가 남았다(프로젝트 %d · 판단 %d) - 한 트랜잭션이라 0건이어야 한다", len(got.Projects), len(got.Judgments))
+		}
+	})
+}
+
 // 같은 원장을 통째로 두 번 되쓰면 거절한다.
 //
 // ★ 이 시험이 실제로 잡는 지점: 되쓰기는 machine → project → session → judgment 순으로

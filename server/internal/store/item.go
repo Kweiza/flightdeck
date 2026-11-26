@@ -651,17 +651,12 @@ func (s *Store) ListItems(ctx context.Context, project string) ([]model.Item, er
 // HTTP 표면은 자기 기본값 · 상한으로 접은 양수만 넘긴다(handleListClosedItems) - 그것은 표면의 정책이고 이 계약과
 // 겹치지 않는다.
 func (s *Store) ListClosed(ctx context.Context, project string, state model.ItemState, limit int) ([]model.Item, int, error) {
-	where := ` FROM item WHERE project = ? AND state IN ('done','dropped')`
-	args := []any{project}
-	if state != "" {
-		where = ` FROM item WHERE project = ? AND state = ?`
-		args = append(args, string(state))
-	}
+	from, args := closedFrom(project, state)
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+where, args...).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+from, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("닫힌 항목 수 조회 실패(project=%q): %w", clip(project, 64), err)
 	}
-	list, args := withLimit(`SELECT `+itemCols+where+` ORDER BY closed_at DESC NULLS LAST, id`, args, limit)
+	list, args := closedList(itemCols, project, state, limit)
 	rows, err := s.db.QueryContext(ctx, list, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("닫힌 항목 조회 실패(project=%q): %w", clip(project, 64), err)
@@ -680,6 +675,71 @@ func (s *Store) ListClosed(ctx context.Context, project string, state model.Item
 		return nil, 0, fmt.Errorf("닫힌 항목 목록 순회 실패: %w", err)
 	}
 	return out, total, nil
+}
+
+// closedFrom 은 「닫힌 항목」의 거르기(FROM · WHERE)와 그 자리표시 값이다. ListClosed 의 전체 수와 closedList 가 같이 쓴다.
+func closedFrom(project string, state model.ItemState) (string, []any) {
+	if state != "" {
+		return ` FROM item WHERE project = ? AND state = ?`, []any{project, string(state)}
+	}
+	return ` FROM item WHERE project = ? AND state IN ('done','dropped')`, []any{project}
+}
+
+// closedList 는 닫힌 항목을 cols 칸으로, **최근에 닫힌 순**으로 limit 개까지 읽는 질의다(정렬 · limit 의 뜻은 ListClosed 의 ★).
+//
+// ★ 거르기 · 정렬 · limit 은 이 한 곳에 있고 읽는 칸만 부르는 쪽이 고른다. ListClosed(항목 전부)와 ListClosedSummaries
+// (보드의 표시 칸)가 같은 행을 같은 순서로 내야 한다 - 질의를 두 벌 두면 한쪽만 고친 날 「끝남」 열과 랜딩 이력이 갈린다.
+func closedList(cols, project string, state model.ItemState, limit int) (string, []any) {
+	from, args := closedFrom(project, state)
+	return withLimit(`SELECT `+cols+from+` ORDER BY closed_at DESC NULLS LAST, id`, args, limit)
+}
+
+// ClosedSummary 는 닫힌 항목 한 장의 표시 칸이다(보드의 랜딩 이력 표). 본문 · 경로 · 꼬리표 · 선행 조건은 담지 않는다.
+type ClosedSummary struct {
+	ID          string
+	Title       string
+	State       model.ItemState
+	CloseReason string
+	LandedRef   string     // 러너가 실제로 fast-forward 한 sha. 없으면 빈 값
+	ClosedAt    *time.Time // 닫힌 시각이 없는 행은 nil
+}
+
+// closedSummaryCols 는 ClosedSummary 의 칸이다. ListClosedSummaries 가 이 순서로 읽는다.
+const closedSummaryCols = `id, title, state, close_reason, landed_ref, closed_at`
+
+// ListClosedSummaries 는 ListClosed 와 같은 행(done · dropped 둘 다)을 같은 순서로 limit 개까지 내되 **표시 칸만** 읽는다
+// (보드의 랜딩 이력). limit 의 뜻도 ListClosed 와 같다(closedList).
+//
+// ★ 왜 ListClosed 를 쓰지 않나. 그것은 항목 전부(본문 · paths · labels JSON)를 읽고 전체 수까지 센다. 보드는 그것을
+// 다 버리는데, 한 행의 paths · labels JSON 이 깨지면 ListClosed 는 목록 전체를 오류로 내서 이력이 통째로 사라진다.
+// 이 표가 찍는 칸은 그 JSON 과 무관하다. 닫힌 시각이 해석되지 않는 행은 여전히 오류다 - 그 칸은 이 표가 실제로
+// 찍는 칸이고(지어내지 않는다), 옮기기 전 보드 질의도 그랬다.
+func (s *Store) ListClosedSummaries(ctx context.Context, project string, limit int) ([]ClosedSummary, error) {
+	q, args := closedList(closedSummaryCols, project, "", limit)
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("닫힌 항목 조회 실패(project=%q): %w", clip(project, 64), err)
+	}
+	defer rows.Close()
+
+	var out []ClosedSummary
+	for rows.Next() {
+		var c ClosedSummary
+		var state string
+		var reason, landed, closed sql.NullString
+		if err := rows.Scan(&c.ID, &c.Title, &state, &reason, &landed, &closed); err != nil {
+			return nil, fmt.Errorf("닫힌 항목 행 해석 실패(project=%q): %w", clip(project, 64), err)
+		}
+		c.State, c.CloseReason, c.LandedRef = model.ItemState(state), str(reason), str(landed)
+		if c.ClosedAt, err = parseNullTime(closed); err != nil {
+			return nil, fmt.Errorf("닫힌 항목 시각 해석 실패(project=%q id=%q): %w", clip(project, 64), clip(c.ID, 64), err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("닫힌 항목 목록 순회 실패(project=%q): %w", clip(project, 64), err)
+	}
+	return out, nil
 }
 
 // ValidateFinish 는 종료 인자가 성립하는지 본다.
@@ -1572,14 +1632,18 @@ func (s *Store) RecordPickEval(ctx context.Context, e model.PickEval) error {
 	return s.Tx(ctx, func(t *Tx) error { return t.RecordPickEval(e) })
 }
 
-// ListPickEvals 는 프로젝트의 큐 판정 기록을 **최신순**(id 내림차순)으로 limit 개까지 낸다(보드의 탈락 사유 분포).
-// limit 이 음수면 전부다(withLimit).
+// ListPickEvals 는 프로젝트의 큐 판정 기록을 **최신순**(id 내림차순)으로 limit 개까지 낸다. 소비자는 보드의 탈락 사유
+// 분포(web.RejectionDistribution) 하나다. limit 이 음수면 전부다(withLimit).
 //
-// ★ 사유 JSON 이 깨졌으면 삼키지 않는다 - 분포가 조용히 짧아지면 "탈락이 없었다"와 "우리가 못 읽었다"가 같은
-// 화면이 된다. 묶음 구성원(picked_with)도 같다.
+// ★ 분포가 쓰는 칸(session_id · at · picked · rejected)만 읽는다. 묶음 구성원(picked_with)은 읽지 않으므로 PickedWith 는
+// 늘 비어 나온다 - 「단독이었다」는 뜻이 아니다. 분포가 안 쓰는 칸이 깨졌다고 분포 전체가 오류가 되면 안 된다.
+// ★ rejected 가 빈 문자열인 행은 판정 1회 · 탈락 0줄로 센다. RecordPickEval 은 늘 JSON 배열을 쓰지만 스키마는 빈 값을
+// 막지 않고, 옮기기 전 보드 질의도 그 행을 세고 사유만 비웠다. 빈 값은 「읽을 사유가 없다」는 사실 그대로다.
+// ★ 비어 있지 않은데 JSON 이 깨진 행은 오류다(옮기기 전 보드 질의와 같다). 그 행을 빼거나 0줄로 세면 분포가 조용히
+// 짧아져 「탈락이 없었다」와 「우리가 못 읽었다」가 같은 화면이 된다. 보드는 이 오류를 분포 자리에 그대로 찍는다.
 func (s *Store) ListPickEvals(ctx context.Context, project string, limit int) ([]model.PickEval, error) {
 	q, args := withLimit(`
-		SELECT session_id, at, picked, picked_with, rejected
+		SELECT session_id, at, picked, rejected
 		FROM pick_eval WHERE project = ? ORDER BY id DESC`, []any{project}, limit)
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -1591,23 +1655,19 @@ func (s *Store) ListPickEvals(ctx context.Context, project string, limit int) ([
 	for rows.Next() {
 		e := model.PickEval{Project: project}
 		var at, rejected string
-		var picked, with sql.NullString
-		if err := rows.Scan(&e.SessionID, &at, &picked, &with, &rejected); err != nil {
+		var picked sql.NullString
+		if err := rows.Scan(&e.SessionID, &at, &picked, &rejected); err != nil {
 			return nil, fmt.Errorf("큐 판정 행 해석 실패(project=%q): %w", clip(project, 64), err)
 		}
 		e.Picked = str(picked)
 		if e.At, err = parseTime(at); err != nil {
 			return nil, err
 		}
-		if with.Valid {
-			if err := json.Unmarshal([]byte(with.String), &e.PickedWith); err != nil {
-				return nil, fmt.Errorf("묶음 구성원 해석 실패(project=%q session=%q): %w",
+		if rejected != "" {
+			if err := json.Unmarshal([]byte(rejected), &e.Rejected); err != nil {
+				return nil, fmt.Errorf("탈락 사유 해석 실패(project=%q session=%q): %w",
 					clip(project, 64), clip(e.SessionID, 64), err)
 			}
-		}
-		if err := json.Unmarshal([]byte(rejected), &e.Rejected); err != nil {
-			return nil, fmt.Errorf("탈락 사유 해석 실패(project=%q session=%q): %w",
-				clip(project, 64), clip(e.SessionID, 64), err)
 		}
 		out = append(out, e)
 	}

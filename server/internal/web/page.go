@@ -1057,7 +1057,8 @@ func (h *handler) landingPanel(ctx context.Context, proj model.Project, label st
 		"러너가 없는 지금은 비어 있고, 그 자리를 지금 HEAD 로 메우지 않는다."
 
 	st := h.svc.Store()
-	items, _, err := st.ListClosed(ctx, proj.ID, "", 30)
+	// 표시 칸만 읽는다(ListClosedSummaries 의 ★) - 한 행의 꼬리표 · 경로 JSON 이 깨져도 이력 전체가 사라지지 않는다.
+	items, err := st.ListClosedSummaries(ctx, proj.ID, 30)
 	if err != nil {
 		pan.Err = Clip(err.Error(), 400)
 		h.log.ErrorContext(ctx, "종료된 항목 조회 실패", "project", proj.ID, "error", err.Error())

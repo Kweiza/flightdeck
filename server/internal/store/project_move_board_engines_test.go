@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,12 +12,13 @@ import (
 )
 
 // project.go · move.go · amend.go · workspace.go · conversation.go · inbox.go · deploy.go · prescribe_reach.go 와
-// 보드가 읽는 표(선점 · 큐 판정 · 잡)의 업무 SQL 이 두 엔진에서 같은 답을 내는지 잰다. 모든 단정을 SQLite 파일과
-// Postgres 시험 DB 에서 한 번씩 돈다(bothEngines).
+// 보드가 읽는 표(선점 · 큐 판정 · 잡 · 닫힌 항목)의 업무 SQL 이 두 엔진에서 같은 답을 내는지 잰다. 모든 단정을 SQLite
+// 파일과 Postgres 시험 DB 에서 한 번씩 돈다(bothEngines).
 //
 // ★ Postgres 에서 실패하던 자리 셋(이동의 FK 검사 미루기 PRAGMA, 확인율 대화 키의 char(31), 대화 줄 이력의 EXISTS 를
-// 정수로 읽기)과 원장 payload 판독 둘(대화의 done 항목, 마지막 배포 바이너리), 보드 목록의 같은 시각 끝맺음은 아래
-// 시험들이 따로 잠근다. 첫 시험은 범위 파일의 나머지 공개 질의를 실제 호출로 한 번씩 다 지나게 한다.
+// 정수로 읽기)과 원장 payload 판독 둘(대화의 done 항목, 마지막 배포 바이너리), 보드 목록의 같은 시각 끝맺음, 보드 목록이
+// 자기가 안 찍는 칸의 깨진 값을 견디는 것은 아래 시험들이 따로 잠근다. 원장 되쓰기의 FK 미루기는 backup_test.go 가 잰다.
+// 첫 시험은 범위 파일의 나머지 공개 질의를 실제 호출로 한 번씩 다 지나게 한다.
 
 // TestProjectWorkspaceInboxDeploySQLRunsOnBothEngines 는 범위 파일의 공개 질의를 한 줄거리로 부른다.
 func TestProjectWorkspaceInboxDeploySQLRunsOnBothEngines(t *testing.T) {
@@ -402,7 +404,8 @@ func TestBoardListsBreakTiesOnBothEngines(t *testing.T) {
 		if want := []string{"z", "", "a"}; !slices.Equal(picked, want) {
 			t.Fatalf("큐 판정 = %q (%q)", picked, want)
 		}
-		if !slices.Equal(evals[0].PickedWith, []string{"r"}) || len(evals[2].PickedWith) != 0 ||
+		// 묶음 구성원은 안 읽는다(ListPickEvals 의 ★) - 묶음으로 나간 판정도 PickedWith 가 비어 나온다.
+		if len(evals[0].PickedWith) != 0 || evals[0].SessionID != a.ID ||
 			len(evals[2].Rejected) != 1 || evals[2].Rejected[0].Reason != "after" || !evals[2].At.Equal(t0) {
 			t.Fatalf("큐 판정 칸이 안 돌아왔다: %+v", evals)
 		}
@@ -448,6 +451,93 @@ func TestBoardListsBreakTiesOnBothEngines(t *testing.T) {
 		}
 		if one, err := s.UnackedJobs(ctx, "p", 1); err != nil || len(one) != 1 || one[0].ID != "j2" {
 			t.Fatalf("미확인 잡 하나 = %+v %v (j2)", one, err)
+		}
+	})
+}
+
+// TestBoardReadersSkipColumnsTheyDoNotShowOnBothEngines 는 보드의 두 목록(큐 판정 · 닫힌 항목 요약)이 자기가 쓰지 않는
+// 칸의 깨진 값 때문에 목록 전체를 잃지 않는지, 그리고 쓰는 칸의 깨진 값은 삼키지 않는지 두 엔진에서 잰다.
+//
+// ★ 깨진 값은 저장 API 를 거치지 않고 표에 직접 쓴다(RecordPickEval · AddItem 은 늘 바른 JSON 을 쓴다). 두 엔진의
+// 스키마 모두 그 칸을 text 로 두어 막지 않는다.
+func TestBoardReadersSkipColumnsTheyDoNotShowOnBothEngines(t *testing.T) {
+	bothEngines(t, func(t *testing.T, s *Store) {
+		ctx := context.Background()
+		seed(t, s, "p")
+		a := mustSession(t, s, "p", "cc-a")
+		t0 := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+		// ── 큐 판정: 빈 rejected 는 「탈락 0줄」인 판정 1회다. picked_with 는 안 읽으므로 깨져도 상관없다.
+		ins := `INSERT INTO pick_eval(project, session_id, at, picked, picked_with, rejected) VALUES (?, ?, ?, ?, ?, ?)`
+		pgExec(t, s, ins, "p", a.ID, fmtTime(t0), "a", nil, `[{"item":"b","reason_code":"after","detail":"d"}]`)
+		pgExec(t, s, ins, "p", a.ID, fmtTime(t0), nil, nil, "")
+		pgExec(t, s, ins, "p", a.ID, fmtTime(t0), "z", `{깨짐`, `[]`)
+		evals, err := s.ListPickEvals(ctx, "p", -1)
+		if err != nil {
+			t.Fatalf("빈 rejected · 깨진 picked_with 가 섞인 큐 판정을 못 읽었다: %v", err)
+		}
+		var picked []string
+		for _, e := range evals {
+			picked = append(picked, e.Picked)
+		}
+		if want := []string{"z", "", "a"}; !slices.Equal(picked, want) {
+			t.Fatalf("큐 판정 = %q (%q) - 판정 행이 빠지면 분포의 판정 횟수가 줄어든다", picked, want)
+		}
+		if len(evals[0].Rejected) != 0 || len(evals[0].PickedWith) != 0 || len(evals[1].Rejected) != 0 ||
+			len(evals[2].Rejected) != 1 || evals[2].Rejected[0].Item != "b" || evals[2].Rejected[0].Reason != "after" {
+			t.Fatalf("큐 판정 칸 = %+v", evals)
+		}
+		// 비어 있지 않은데 깨진 사유는 오류다 - 그 행을 빼거나 0줄로 세면 분포가 조용히 짧아진다.
+		pgExec(t, s, ins, "p", a.ID, fmtTime(t0), "y", nil, `[{"item":`)
+		if got, err := s.ListPickEvals(ctx, "p", -1); err == nil || !strings.Contains(err.Error(), "탈락 사유 해석 실패") {
+			t.Fatalf("깨진 탈락 사유를 오류 없이 넘겼다: %+v %v", got, err)
+		}
+
+		// ── 닫힌 항목 요약: 한 행의 labels · paths JSON 이 깨져도 나머지 이력이 같은 순서로 나온다.
+		for i, it := range []model.Item{
+			{ID: "c-old", State: model.ItemDone},
+			{ID: "c-labels", State: model.ItemDropped, CloseReason: "접었다"},
+			{ID: "c-paths", State: model.ItemDone},
+			{ID: "c-new", State: model.ItemDone, LandedRef: "abc123"},
+		} {
+			closed := t0.Add(time.Duration(i) * time.Minute)
+			it.Project, it.Title, it.Body, it.ClosedAt = "p", "제목 "+it.ID, "b", &closed
+			if err := s.AddItem(ctx, it); err != nil {
+				t.Fatalf("닫힌 항목 %s 등록 실패: %v", it.ID, err)
+			}
+		}
+		mustItem(t, s, "p", "still-open")
+		pgExec(t, s, `UPDATE item SET labels = ? WHERE project = ? AND id = ?`, `{깨짐`, "p", "c-labels")
+		pgExec(t, s, `UPDATE item SET paths = ? WHERE project = ? AND id = ?`, `{깨짐`, "p", "c-paths")
+		// 전제: 항목 전부를 읽는 ListClosed 는 이 행들에서 멈춘다 - 깨진 값이 실제로 해석 자리에 닿는다.
+		if _, _, err := s.ListClosed(ctx, "p", "", 30); err == nil {
+			t.Fatal("전제 실패 - 깨진 labels · paths 를 ListClosed 가 오류 없이 읽었다")
+		}
+		sums, err := s.ListClosedSummaries(ctx, "p", 30)
+		if err != nil {
+			t.Fatalf("깨진 labels · paths 행 하나에 랜딩 이력 전체를 잃었다: %v", err)
+		}
+		var ids []string
+		for _, c := range sums {
+			ids = append(ids, c.ID)
+		}
+		if want := []string{"c-new", "c-paths", "c-labels", "c-old"}; !slices.Equal(ids, want) {
+			t.Fatalf("닫힌 항목 요약 = %v (%v)", ids, want)
+		}
+		if c := sums[2]; c.Title != "제목 c-labels" || c.State != model.ItemDropped || c.CloseReason != "접었다" ||
+			c.ClosedAt == nil || !c.ClosedAt.Equal(t0.Add(time.Minute)) {
+			t.Fatalf("c-labels 칸이 안 돌아왔다: %+v", c)
+		}
+		if sums[0].LandedRef != "abc123" || sums[3].LandedRef != "" {
+			t.Fatalf("랜딩 sha 칸 = %q %q", sums[0].LandedRef, sums[3].LandedRef)
+		}
+		if two, err := s.ListClosedSummaries(ctx, "p", 2); err != nil || len(two) != 2 || two[0].ID != "c-new" || two[1].ID != "c-paths" {
+			t.Fatalf("닫힌 항목 요약 둘 = %+v %v", two, err)
+		}
+		// 표가 실제로 찍는 칸(닫힌 시각)이 깨지면 여전히 오류다 - 지어내지 않는다.
+		pgExec(t, s, `UPDATE item SET closed_at = ? WHERE project = ? AND id = ?`, "어제", "p", "c-old")
+		if got, err := s.ListClosedSummaries(ctx, "p", 30); err == nil {
+			t.Fatalf("해석 안 되는 닫힌 시각을 오류 없이 넘겼다: %+v", got)
 		}
 	})
 }
