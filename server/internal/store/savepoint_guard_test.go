@@ -190,6 +190,13 @@ func fine(t *Tx) error {
 	} else {
 		return cerr
 	}
+	if c, cerr := t.claimRow(p, id); cerr == nil {
+		use(c)
+	} else if optional && errors.Is(cerr, ErrNotFound) {
+		return nil
+	} else {
+		return cerr
+	}
 	if _, err := t.GetItem(p, id); err == nil {
 		return nil
 	} else {
@@ -688,7 +695,14 @@ func (f *fnScan) present(cond ast.Expr) bool {
 func (f *fnScan) notStatementFailure(cond ast.Expr) bool {
 	switch c := ast.Unparen(cond).(type) {
 	case *ast.BinaryExpr:
-		return c.Op == token.LOR && f.notStatementFailure(c.X) && f.notStatementFailure(c.Y)
+		// ||: 두 쪽 다 표지 · 도메인 오류로 좁혀야 실패가 안 온다. &&: 한쪽만 좁혀도 실패가 안 온다
+		// (optional && errors.Is(e, ErrNotFound) 의 갈래에는 ErrNotFound 만 온다).
+		switch c.Op {
+		case token.LOR:
+			return f.notStatementFailure(c.X) && f.notStatementFailure(c.Y)
+		case token.LAND:
+			return f.notStatementFailure(c.X) || f.notStatementFailure(c.Y)
+		}
 	case *ast.CallExpr:
 		switch f.errorsFunc(c) {
 		case "Is":
