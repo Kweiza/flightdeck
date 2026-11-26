@@ -138,6 +138,13 @@ const lockTimeout = 5 * time.Second
 // 30초 안에 풀린다.
 const idleInTxTimeout = 6 * lockTimeout
 
+// pgLimits 는 Postgres 연결마다 거는 상한이다(pgSessionParams). 운영은 lockTimeout · idleInTxTimeout 이고 시험이 줄인다.
+// 연 Store 가 이것을 지니므로 같은 상한을 다른 도구에 넘기는 자리(pg_dump 의 --lock-wait-timeout)도 이 값 하나를 쓴다.
+type pgLimits struct {
+	lock     time.Duration // lock_timeout
+	idleInTx time.Duration // idle_in_transaction_session_timeout
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 열기
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,6 +159,11 @@ const idleInTxTimeout = 6 * lockTimeout
 // SQLSTATE 만 싣는다 - 해석 실패의 드라이버 문구는 원문을 품고(드라이버 스스로 「깨진 문자열에서는 가리기가
 // 최선일 뿐」이라고 적어 둔 자리다), 접속 실패의 문구는 원문의 조각을 다시 싣는다(pgFault).
 func openPG(t Target, log *slog.Logger, wait time.Duration) (*Store, error) {
+	return openPGWith(t, log, pgLimits{lock: wait, idleInTx: idleInTxTimeout})
+}
+
+// openPGWith 는 openPG 이고 상한 둘을 다 받는다(시험이 유휴 트랜잭션 상한을 줄이는 자리).
+func openPGWith(t Target, log *slog.Logger, lim pgLimits) (*Store, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -161,7 +173,7 @@ func openPG(t Target, log *slog.Logger, wait time.Duration) (*Store, error) {
 		return nil, fmt.Errorf("Postgres 접속 문자열을 해석하지 못했다(%s) - 드라이버 문구는 원문을 품어 싣지 않는다. "+
 			"postgres://<사용자>@<호스트>:<포트>/<DB> 꼴인지, 비밀번호의 / ? @ 를 퍼센트 인코딩했는지 확인하라", shown)
 	}
-	params := pgSessionParams(wait)
+	params := pgSessionParams(lim)
 	for _, p := range params {
 		cfg.RuntimeParams[p.name] = p.ms
 	}
@@ -176,7 +188,7 @@ func openPG(t Target, log *slog.Logger, wait time.Duration) (*Store, error) {
 		return nil, fmt.Errorf("Postgres 접속 실패(%s): %s - 드라이버 문구는 접속 문자열의 조각을 품어 싣지 않는다. "+
 			"비밀번호에 / ? @ 가 있으면 퍼센트 인코딩했는지 확인하라", shown, pgFault(err))
 	}
-	s := &Store{db: &conn{raw: db, eng: enginePG}, path: shown, log: log}
+	s := &Store{db: &conn{raw: db, eng: enginePG}, path: shown, log: log, pgLim: lim}
 	for _, p := range params {
 		var got string
 		if err := s.db.QueryRowContext(ctx, `SELECT setting FROM pg_settings WHERE name = ?`, p.name).Scan(&got); err != nil {
@@ -346,14 +358,16 @@ func (s *Store) Ping(ctx context.Context) error {
 // pgParam 은 연결 시작 인자 하나다. ms 는 밀리초 정수 문자열이다(pg_settings 의 setting 이 같은 단위로 되읽힌다).
 type pgParam struct{ name, ms string }
 
-// pgSessionParams 는 연결마다 거는 상한들이다. wait 는 lock_timeout 이다(시험이 줄인다).
-func pgSessionParams(wait time.Duration) []pgParam {
-	ms := func(d time.Duration) string { return strconv.FormatInt(d.Milliseconds(), 10) }
+// pgSessionParams 는 연결마다 거는 상한들이다.
+func pgSessionParams(lim pgLimits) []pgParam {
 	return []pgParam{
-		{"lock_timeout", ms(wait)},
-		{"idle_in_transaction_session_timeout", ms(idleInTxTimeout)},
+		{"lock_timeout", millis(lim.lock)},
+		{"idle_in_transaction_session_timeout", millis(lim.idleInTx)},
 	}
 }
+
+// millis 는 시간 상한을 밀리초 정수 문자열로 쓴다(Postgres 설정 · SQLite pragma · pg_dump 인자가 같은 꼴로 받는다). 순수 함수다.
+func millis(d time.Duration) string { return strconv.FormatInt(d.Milliseconds(), 10) }
 
 // pgURL 은 접속 URL 의 스킴만 소문자로 맞춘다. 순수 함수다.
 //

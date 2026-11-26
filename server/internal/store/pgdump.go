@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -114,6 +116,10 @@ func parseDumpName(name string) (dumpInfo, bool) {
 // ★ 받아들인 예외: 운영 클러스터를 물리 복제해(pg_basebackup 등) 승격한 독립 시험계는 system_identifier 도 DB 이름도
 // 같아 식별이 같다. 그래서 **배포마다 덤프 자리(--backup-dir · FD_BACKUP_DIR)를 따로 둬야 한다** - 같은 자리를 쓰면
 // 운영의 되돌리기가 시험계의 덤프를 고를 수 있다. 식별로는 둘을 못 가른다(README 의 설정 표).
+//
+// ★ convert_to 는 이름 바이트가 서버 인코딩으로 맞는지 잰다. 공유 카탈로그(pg_database)에는 다른 인코딩의 DB 에서 지은
+// 이름이 그 바이트 그대로 있어, 이 식을 카탈로그 전체에 돌리면 UTF-8 로 못 읽는 남의 이름 하나에 질의가 통째로 실패한다.
+// 그래서 스크립트는 원장 DB 의 OID 로 후보를 먼저 좁히고 그 행에만 이 식을 돌린다(pgRollbackScript).
 func ledgerIDSQL(sysid, name string) string {
 	return `left(encode(sha256(convert_to(` + sysid + `, current_setting('server_encoding')) || decode('00', 'hex') || ` +
 		`convert_to(` + name + `, current_setting('server_encoding'))), 'hex'), ` + strconv.Itoa(ledgerIDLen) + `)`
@@ -132,14 +138,18 @@ func adminDB(database string) string {
 type ledgerFacts struct {
 	ID    string
 	Admin string
-	name  string
+	// OID 는 원장 DB 의 pg_database.oid 다. 되돌리기 스크립트가 카탈로그에서 후보를 좁히는 열쇠다(pgRollbackScript). 복원하면
+	// 새 DB 라 바뀐다 - 스크립트에 싣는 값은 복원 **전** 원장의 것이다.
+	OID  int64
+	name string
 }
 
 // readLedgerFacts 는 q 가 붙은 원장의 ledgerFacts 를 읽는다.
 func readLedgerFacts(ctx context.Context, q Reader) (ledgerFacts, error) {
 	var led ledgerFacts
 	if err := q.QueryRowContext(ctx, `SELECT `+ledgerIDSQL("system_identifier::text", "current_database()::text")+
-		`, current_database() FROM pg_catalog.pg_control_system()`).Scan(&led.ID, &led.name); err != nil {
+		`, current_database(), (SELECT oid::bigint FROM pg_catalog.pg_database WHERE datname = current_database())
+		   FROM pg_catalog.pg_control_system()`).Scan(&led.ID, &led.name, &led.OID); err != nil {
 		return ledgerFacts{}, fmt.Errorf("원장 식별(system_identifier)을 읽지 못했다: %w", err)
 	}
 	led.Admin = adminDB(led.name)
@@ -399,8 +409,12 @@ func libpqEnv(t Target, environ []string) ([]string, error) {
 // --no-password 는 비밀번호가 모자랄 때 프롬프트로 멈추지 않고 실패하게 한다(one-shot 컨테이너에는 터미널이 없다).
 // --snapshot 은 실행기 세션이 내보낸 스냅숏이다(dumpSnapshot) - 다른 서버 · DB 에 붙으면 그것을 못 찾아 실패한다.
 // 스냅숏 식별은 비밀이 아니다(트랜잭션 번호와 차례다).
-func pgDumpArgs(bin, file, snapshot string) []string {
-	return []string{bin, "--format=custom", "--no-password", "--snapshot=" + snapshot, "--file=" + file}
+// --lock-wait-timeout 은 pg_dump 가 덤프 첫머리에 표마다 잡는 잠금을 기다리는 상한이다. 없으면 원장 표에 긴 잠금을 쥔
+// 연결 하나에 덤프가 끝없이 서고, 실행기는 그동안 두 잠금을 쥔 채 업무 쓰기를 모두 lock_timeout 으로 돌려보낸다. 값은
+// 서버 연결의 lock_timeout 과 같은 원천(pgLimits.lock)이다 - 업무 쓰기 하나가 잠금을 기다리는 상한과 같다.
+func pgDumpArgs(bin, file, snapshot string, lockWait time.Duration) []string {
+	return []string{bin, "--format=custom", "--no-password", "--snapshot=" + snapshot,
+		"--lock-wait-timeout=" + millis(lockWait), "--file=" + file}
 }
 
 // pgDumpFault 는 pg_dump 의 실패를 고정 문구로 가른다. 순수 함수다. stderr 는 가르는 데만 쓰고 싣지 않는다.
@@ -415,7 +429,7 @@ func pgDumpFault(runErr error, stderr string) string {
 	case errors.As(runErr, &ee):
 		code = strconv.Itoa(ee.ExitCode())
 	}
-	l := strings.ToLower(stderr)
+	l := strings.ToLower(pgDumpErrorLines(stderr))
 	var why string
 	switch {
 	case strings.Contains(l, "server version mismatch"), strings.Contains(l, "aborting because of server version"):
@@ -426,11 +440,15 @@ func pgDumpFault(runErr error, stderr string) string {
 	// 출력 파일 실패를 권한 거절보다 먼저 가른다 - 백업 자리에 못 쓰는 것도 「Permission denied」로 끝난다.
 	case strings.Contains(l, "could not open output file"), strings.Contains(l, "no space left"):
 		why = "덤프 파일을 쓰지 못했다(백업 자리의 권한 · 여유를 확인하라)"
+	// --lock-wait-timeout 은 표 잠금을 잡는 동안 statement_timeout 으로 걸린다.
+	case strings.Contains(l, "statement timeout"), strings.Contains(l, "lock timeout"):
+		why = "표 잠금을 기다리다 상한(--lock-wait-timeout, 서버 연결의 lock_timeout 과 같은 값)을 넘었다 - 원장 표에 긴 잠금을 쥔 연결이 있다"
+	// 권한 거절을 스냅숏보다 먼저 가른다 - 거절 문구가 인용하는 표 이름이 snapshot 일 수 있다(원장에 그 표가 있다).
+	case strings.Contains(l, "permission denied"):
+		why = "읽을 권한이 없는 객체가 있다(이전 실행기는 소유 역할이나 초사용자로 붙어야 한다)"
 	// 스냅숏을 못 가져왔다: 없는 식별(다른 서버 · 복제본) · 다른 DB · 내보낸 트랜잭션이 끝났다(실행기 세션이 끊겼다).
 	case strings.Contains(l, "snapshot"):
 		why = "실행기가 내보낸 스냅숏을 가져오지 못했다(pg_dump 가 실행기와 다른 서버 · DB 에 붙었거나 실행기 세션이 끊겼다)"
-	case strings.Contains(l, "permission denied"):
-		why = "읽을 권한이 없는 객체가 있다(이전 실행기는 소유 역할이나 초사용자로 붙어야 한다)"
 	case strings.Contains(l, "could not connect"), strings.Contains(l, "connection refused"),
 		strings.Contains(l, "could not translate host name"):
 		why = "서버에 붙지 못했다"
@@ -439,6 +457,21 @@ func pgDumpFault(runErr error, stderr string) string {
 	}
 	return "pg_dump 가 실패했다(종료 코드 " + code + "): " + why +
 		" - pg_dump 의 문구는 접속 세부를 인용해 싣지 않는다"
+}
+
+// pgDumpErrorLines 는 pg_dump stderr 에서 분류에 쓸 줄만 남긴다: detail · hint 줄을 뺀다. 순수 함수다.
+//
+// ★ detail 줄은 실패한 질의를 그대로 인용한다 - LOCK TABLE 은 원장의 표 목록 전부를 싣고, 원장에는 snapshot 이라는 표가
+// 있다. 그 줄까지 보면 표를 잠그다 난 실패(잠금 표 한도 등)가 「스냅숏을 못 가져왔다」로 갈린다.
+func pgDumpErrorLines(stderr string) string {
+	var keep []string
+	for _, ln := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(ln, "pg_dump: detail:") || strings.HasPrefix(ln, "pg_dump: hint:") {
+			continue
+		}
+		keep = append(keep, ln)
+	}
+	return strings.Join(keep, "\n")
 }
 
 // dumpSnapshot 은 판올림 전 덤프가 볼 스냅숏이다: 실행기 세션 연결에서 연 REPEATABLE READ 읽기 전용 트랜잭션이 내보낸
@@ -460,12 +493,30 @@ func (d *dumpSnapshot) end() error {
 	return d.endErr
 }
 
+// snapshotTxUnlimits 는 덤프 스냅숏 트랜잭션이 첫머리에서 푸는 시간 상한이다.
+//
+// ★ pg_dump 를 기다리는 동안 이 트랜잭션은 문장 없이 열려 있다(idle in transaction). 연결 시작 인자의
+// idle_in_transaction_session_timeout(idleInTxTimeout)이 그대로면 그 시간을 넘는 정상 덤프 도중에 Postgres 가 이 연결을
+// 끊고, 세션 잠금 둘도 함께 사라진다 - 덤프를 다 떠도 봉인(sealDump)에서 실패해 판을 못 올린다. 서버 설정의
+// transaction_timeout 도 같은 자리에서 끊는다. pg_dump 는 제 연결에서 둘을 다 끄므로, 스냅숏을 쥔 이 트랜잭션도 끈다.
+//
+// ★ LOCAL 이다 - 이 트랜잭션이 닫히면(dumpSnapshot.end) 연결 시작 인자의 값으로 돌아간다. 실행기 세션 전체(SET)에서
+// 풀지 않는다: 그 연결은 release 뒤 Store 의 풀로 돌아가 업무 트랜잭션을 받을 수 있고, 같은 연결의 증분 트랜잭션은 쉬지
+// 않고 도는 우리 코드라 안전망이 그대로 맞다. 오래 노는 것은 덤프를 기다리는 이 트랜잭션 하나다. 덤프의 길이는 pg_dump 의
+// 표 잠금 대기 상한(--lock-wait-timeout, pgDumpArgs)과 실행기를 부른 문맥(ctx)이 묶는다.
+var snapshotTxUnlimits = []string{
+	`SET LOCAL idle_in_transaction_session_timeout = 0`,
+	`SET LOCAL transaction_timeout = 0`,
+}
+
 // exportSnapshot 은 실행기 세션 연결에서 스냅숏을 내보낸다(pg_export_snapshot). 첫 문장이 내보내기라 내보낸 스냅숏이 곧
 // 이 트랜잭션의 스냅숏이고, 뒤의 원장 식별 · 판 읽기도 그것을 본다 - 덤프 내용과 덤프 이름(식별 · 판)이 한 시점이다.
 //
 // ★ 세션이 쥔 두 잠금(세션 단위 권고 잠금)은 이 트랜잭션과 따로 산다 - 닫아도(ROLLBACK) 안 풀린다. 다만 같은 연결이라
 // 이 트랜잭션이 열린 동안 세션의 다른 질의 · 증분 트랜잭션은 그 안으로 섞인다. 그래서 봉인 전에 닫고(backupPG), 판올림 전
 // 덤프를 나가기 전에 반드시 닫는다.
+//
+// ★ 이 트랜잭션은 시간 상한을 스스로 푼다(snapshotTxUnlimits). 그 까닭과 자리는 그 값의 ★.
 func (s *Store) exportSnapshot(ctx context.Context, sess *migrateSession) (*dumpSnapshot, error) {
 	tx, err := s.begin(ctx, txSpec{kind: txRead, on: sess})
 	if err != nil {
@@ -475,6 +526,12 @@ func (s *Store) exportSnapshot(ctx context.Context, sess *migrateSession) (*dump
 	fail := func(err error) (*dumpSnapshot, error) {
 		_ = snap.end()
 		return nil, err
+	}
+	// SET 은 스냅숏을 잡지 않는다 - 아래 내보내기가 여전히 이 트랜잭션의 스냅숏을 처음 잡는 문장이다.
+	for _, q := range snapshotTxUnlimits {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fail(fmt.Errorf("덤프 스냅숏 트랜잭션의 시간 상한을 풀지 못했다: %w", err))
+		}
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT pg_export_snapshot()`).Scan(&snap.id); err != nil {
 		return fail(fmt.Errorf("덤프 스냅숏을 내보내지 못했다: %w", err))
@@ -493,10 +550,11 @@ func (s *Store) exportSnapshot(ctx context.Context, sess *migrateSession) (*dump
 //
 // 잠금 · 스냅숏 · 증분의 차례(한 연결):
 //  1. 세션 잠금 둘(자기 · 전역 업무)을 잡고 판을 읽는다(migrateTo).
-//  2. RR 읽기 전용 트랜잭션을 열어 스냅숏을 내보내고, 그 안에서 원장 식별과 판을 잰다. 판이 1의 것과 달라야 할 까닭이
-//     없다(잠금 안이다) - 다르면 멈춘다.
+//  2. RR 읽기 전용 트랜잭션을 열어 시간 상한을 풀고(snapshotTxUnlimits) 스냅숏을 내보내고, 그 안에서 원장 식별과 판을
+//     잰다. 판이 1의 것과 달라야 할 까닭이 없다(잠금 안이다) - 다르면 멈춘다.
 //  3. pg_dump --snapshot 이 그 스냅숏을 가져와 뜬다. 내보낸 트랜잭션이 열려 있어야 가져온다.
-//  4. 다 뜨면 트랜잭션을 닫고(봉인) 세션 잠금 둘과 판을 다시 잰다. 그 뒤 덮지 않고 게시한다.
+//  4. 다 뜨면 머리의 DB 이름을 원장의 실제 이름과 맞추고(checkDumpDatabase) 트랜잭션을 닫은 뒤(봉인) 세션 잠금 둘과 판을
+//     다시 잰다. 그 뒤 덮지 않고 게시한다.
 //  5. 증분 트랜잭션은 이 함수가 돌아온 뒤 같은 연결에서 연다 - 2의 트랜잭션은 어느 길로 나가도 닫혀 있다.
 func (s *Store) backupPG(ctx context.Context, t Target, sess *migrateSession, dir string, from int) (string, error) {
 	snap, err := s.exportSnapshot(ctx, sess)
@@ -507,12 +565,13 @@ func (s *Store) backupPG(ctx context.Context, t Target, sess *migrateSession, di
 	if snap.version != from {
 		return "", fmt.Errorf("덤프 스냅숏의 판(%d)이 실행기가 읽은 판(%d)과 다르다 - 판을 올리지 않는다", snap.version, from)
 	}
-	return dumpPG(ctx, t, dir, "pg_dump", snap.ledger.ID, from, snap.id, func(ctx context.Context) error {
-		if err := snap.end(); err != nil {
-			return fmt.Errorf("덤프 스냅숏 트랜잭션을 닫지 못했다(연결이 끊겼으면 잠금도 사라졌다): %w", err)
-		}
-		return sealDump(ctx, sess, from)
-	}, s.log)
+	return dumpPG(ctx, t, dumpJob{dir: dir, bin: "pg_dump", ledger: snap.ledger, from: from, snapshot: snap.id,
+		lockWait: s.pgLim.lock, seal: func(ctx context.Context) error {
+			if err := snap.end(); err != nil {
+				return fmt.Errorf("덤프 스냅숏 트랜잭션을 닫지 못했다(연결이 끊겼으면 잠금도 사라졌다): %w", err)
+			}
+			return sealDump(ctx, sess, from)
+		}}, s.log)
 }
 
 // sealDump 는 덤프에 최종 이름을 붙여도 되는가를 잰다: 실행기 세션이 두 잠금을 아직 쥐고 있고(held), 판이 덤프를 시작할
@@ -531,27 +590,39 @@ func sealDump(ctx context.Context, sess *migrateSession, from int) error {
 	return nil
 }
 
-// dumpPG 는 판올림 전 덤프를 뜬다. 뜬 파일 경로를 낸다. ledger 는 원장 식별(ledgerIDSQL), from 은 덤프를 뜨는 판,
-// snapshot 은 pg_dump 가 볼 스냅숏(dumpSnapshot)이고, bin 은 pg_dump 실행 파일(이름이면 PATH 에서 찾는다)이다. seal 이
-// nil 을 내야 최종 이름을 붙인다.
+// dumpJob 은 판올림 전 덤프 한 번의 입력이다(backupPG 가 채운다).
+type dumpJob struct {
+	dir      string        // 덤프 자리
+	bin      string        // pg_dump 실행 파일(이름이면 PATH 에서 찾는다)
+	ledger   ledgerFacts   // 스냅숏에서 잰 원장: 덤프 이름의 식별(ID)과 덤프 머리에 실려야 할 DB 이름(name)
+	from     int           // 덤프를 뜨는 판
+	snapshot string        // pg_dump 가 볼 스냅숏(dumpSnapshot)
+	lockWait time.Duration // pg_dump 의 표 잠금 대기 상한(pgDumpArgs)
+	// seal 이 nil 을 내야 최종 이름을 붙인다(sealDump).
+	seal func(context.Context) error
+}
+
+// dumpPG 는 판올림 전 덤프를 뜬다. 뜬 파일 경로를 낸다.
 //
 // ★ 임시 이름에 뜨고 다 뜬 뒤에 최종 이름을 붙인다. pg_dump 가 도중에 죽으면 반쪽 파일이 남는데, 그것이 정식 이름이면
-// 되돌리기(latestDump)가 그것을 최신으로 고른다. 머리(PGDMP)도 잰다 - 0으로 끝나고 빈 파일을 낸 실행을 믿지 않는다.
-// 마지막으로 seal 을 잰다 - 실행기가 잠금을 잃은 동안 뜬 덤프는 이름이 붙지 않는다(닫힌 실패).
+// 되돌리기(latestDump)가 그것을 최신으로 고른다. 머리도 잰다 - 0으로 끝나고 빈 파일을 낸 실행을 믿지 않고, 머리의 DB
+// 이름이 원장의 실제 이름과 다른 덤프(checkDumpDatabase 의 ★)는 되돌리기가 거절하므로 지금 판올림을 거절한다. 마지막으로
+// seal 을 잰다 - 실행기가 잠금을 잃은 동안 뜬 덤프는 이름이 붙지 않는다(닫힌 실패).
 //
 // ★ 게시는 덮지 않는다(link, 있으면 실패). 봉인 직후 세션이 끊기고 같은 초에 시작한 다음 실행기가 먼저 게시했으면, 늦게
 // 돌아온 이 게시가 rename 이었다면 새 덤프를 말없이 갈아 끼운다.
-func dumpPG(ctx context.Context, t Target, dir, bin, ledger string, from int, snapshot string, seal func(context.Context) error, log *slog.Logger) (string, error) {
+func dumpPG(ctx context.Context, t Target, j dumpJob, log *slog.Logger) (string, error) {
+	dir := j.dir
 	if strings.TrimSpace(dir) == "" {
 		return "", errors.New("판올림 전 덤프 자리가 없다(--backup-dir) - Postgres 원장은 덤프 없이 판을 올리지 않는다")
 	}
-	if snapshot == "" {
+	if j.snapshot == "" {
 		return "", errors.New("실행기가 내보낸 스냅숏 없이 덤프를 뜨지 않는다 - pg_dump 가 실행기와 같은 서버를 본다는 보장이 없다")
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("백업 자리를 만들지 못했다(%q): %w", clip(dir, 200), err)
 	}
-	dst := filepath.Join(dir, dumpName(ledger, from, time.Now()))
+	dst := filepath.Join(dir, dumpName(j.ledger.ID, j.from, time.Now()))
 	if _, err := os.Stat(dst); err == nil {
 		return "", fmt.Errorf("같은 이름의 덤프가 이미 있다(%q) - 1초 안에 두 번 돌았다. 잠시 뒤 다시 돌려라", clip(dst, 200))
 	}
@@ -559,7 +630,7 @@ func dumpPG(ctx context.Context, t Target, dir, bin, ledger string, from int, sn
 	if err != nil {
 		return "", fmt.Errorf("%w - 덤프 없이 판을 올리지 않는다", err)
 	}
-	path, err := exec.LookPath(bin)
+	path, err := exec.LookPath(j.bin)
 	if err != nil {
 		return "", errors.New(pgDumpFault(err, ""))
 	}
@@ -571,7 +642,7 @@ func dumpPG(ctx context.Context, t Target, dir, bin, ledger string, from int, sn
 	}
 	part := f.Name()
 	_ = f.Close()
-	args := pgDumpArgs(path, part, snapshot)
+	args := pgDumpArgs(path, part, j.snapshot, j.lockWait)
 	cmd := exec.CommandContext(ctx, path, args[1:]...)
 	cmd.Env = env
 	var stderr bytes.Buffer
@@ -584,11 +655,16 @@ func dumpPG(ctx context.Context, t Target, dir, bin, ledger string, from int, sn
 		}
 		return "", errors.New(pgDumpFault(err, stderr.String()))
 	}
-	if err := checkDumpHead(part); err != nil {
+	if err := checkDumpDatabase(part, j.ledger.name); err != nil {
 		_ = os.Remove(part)
+		if errors.Is(err, errDumpNameDiffers) {
+			return "", fmt.Errorf("%w - pg_dump 가 접속에 쓴 DB 이름이 원장의 원래 이름이 아니다(연결 중개기의 DB 별칭 등). "+
+				"이 덤프는 되돌리기가 거절하므로 판을 올리지 않았다. 별칭이 아니라 원장 DB 의 원래 이름으로 접속해 다시 돌려라"+
+				"(이름은 싣지 않는다)", err)
+		}
 		return "", err
 	}
-	if err := seal(ctx); err != nil {
+	if err := j.seal(ctx); err != nil {
 		_ = os.Remove(part)
 		return "", fmt.Errorf("덤프에 최종 이름을 붙이지 않는다 - %w. 판을 올리지 않았다. 다시 돌려라", err)
 	}
@@ -603,20 +679,28 @@ func dumpPG(ctx context.Context, t Target, dir, bin, ledger string, from int, sn
 		// 같은 내용의 두 번째 이름일 뿐이다(.part 는 되돌리기가 안 고른다).
 		log.Warn("덤프의 임시 이름을 지우지 못했다", "part", part, "error", err.Error())
 	}
-	log.Info("판올림 전 덤프 완료", "backup", dst, "from", from, "duration", time.Since(start).Seconds())
+	log.Info("판올림 전 덤프 완료", "backup", dst, "from", j.from, "duration", time.Since(start).Seconds())
 	return dst, nil
 }
 
-// checkDumpHead 는 파일이 pg_dump 사용자 정의 형식으로 시작하는지 잰다.
-func checkDumpHead(path string) error {
-	f, err := os.Open(path)
+// errDumpNameDiffers 는 덤프 머리의 DB 이름이 원장의 실제 이름과 다른 것이다(checkDumpDatabase).
+var errDumpNameDiffers = errors.New("덤프 머리에 실린 DB 이름이 원장의 실제 이름(current_database())과 다르다")
+
+// checkDumpDatabase 는 path 가 pg_dump 사용자 정의 형식이고 그 머리에 실린 DB 이름이 want(원장의 current_database())와
+// 바이트까지 같은지 잰다. 다르면 errDumpNameDiffers 다. 덤프 직후(dumpPG)와 되돌리기(rollbackPG)가 같은 대조를 쓴다.
+//
+// ★ 머리의 이름은 pg_dump 가 **접속에 쓴 이름**(libpq 의 PQdb)이고, pg_restore --create 가 만드는 DB 는 덤프의 DATABASE
+// 항목, 곧 pg_dump 가 붙은 DB 의 **실제 이름**(current_database())이다. 연결 중개기(PgBouncer 등)의 DB 별칭으로 붙으면
+// 머리에는 별칭이, DATABASE 항목에는 원래 이름이 실린다. 덤프 직후의 want 는 실행기 스냅숏에서 잰 current_database() 다 -
+// pg_dump 는 그 스냅숏을 가져왔으므로(같은 DB 에서만 가져온다) 그것이 곧 DATABASE 항목의 이름이다. pg_restore -l 로
+// DATABASE 항목을 읽지 않는 까닭은 dumpDatabase 의 ★.
+func checkDumpDatabase(path, want string) error {
+	got, err := dumpDatabase(path)
 	if err != nil {
-		return fmt.Errorf("덤프를 다시 읽지 못했다(%q): %w", clip(path, 200), err)
+		return err
 	}
-	defer f.Close()
-	head := make([]byte, len(dumpMagic))
-	if _, err := io.ReadFull(f, head); err != nil || string(head) != dumpMagic {
-		return fmt.Errorf("덤프가 pg_dump 사용자 정의 형식이 아니다(%q) - 머리가 %s 가 아니다", clip(path, 200), dumpMagic)
+	if got != want {
+		return errDumpNameDiffers
 	}
 	return nil
 }
@@ -682,16 +766,22 @@ func dumpDatabase(path string) (string, error) {
 }
 
 // rollbackPG 는 지금 원장(t)의 덤프 중 가장 최근 것을 고르고 머리를 잰 뒤 복원 절차를 낸다. 원장에 붙어 식별 · 판 ·
-// 이름만 읽는다 - 바꾸지 않는다.
+// 이름 · OID 만 읽는다 - 바꾸지 않는다.
 //
 // ★ 덤프 뒤로 커밋된 판올림이 있어야 절차를 낸다(덤프를 뜬 판 < 지금 판). 덤프를 뜬 판올림이 실패해 되감겼으면 덤프와
 // 지금 원장이 같은 판이고, 그 덤프로 되돌리면 덤프 뒤의 쓰기만 잃는다.
 //
-// ★ 덤프 머리에 실린 DB 이름이 이 원장 연결의 current_database() 와 바이트까지 같아야 한다. pg_restore --create 는 덤프의
-// 이름으로 DB 를 만든다 - 다르면 되살린 DB 가 원장 자리에 안 선다.
+// ★ 덤프 머리에 실린 DB 이름이 이 원장 연결의 current_database() 와 바이트까지 같아야 한다(checkDumpDatabase). pg_restore
+// --create 는 덤프의 DATABASE 항목 이름으로 DB 를 만든다 - 다르면 되살린 DB 가 원장 자리에 안 선다.
+//
+// ★ 덤프 자리는 절대 경로로 바꿔 싣는다. 스크립트는 사람이 다른 디렉토리에서 돌릴 수 있다.
 func rollbackPG(ctx context.Context, t Target, dir string) (RollbackOutcome, error) {
 	if strings.TrimSpace(dir) == "" {
 		return RollbackOutcome{}, errors.New("덤프 자리(--backup-dir)가 없다 - Postgres 원장의 판올림 전 덤프를 어디서 찾을지 모른다")
+	}
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return RollbackOutcome{}, fmt.Errorf("덤프 자리를 절대 경로로 바꾸지 못했다: %w", err)
 	}
 	s, err := openPG(t, slog.New(slog.DiscardHandler), lockTimeout)
 	if err != nil {
@@ -710,20 +800,37 @@ func rollbackPG(ctx context.Context, t Target, dir string) (RollbackOutcome, err
 	if err != nil {
 		return RollbackOutcome{}, err
 	}
-	dumpDB, err := dumpDatabase(dump)
-	if err != nil {
+	if err := checkDumpDatabase(dump, led.name); err != nil {
+		if errors.Is(err, errDumpNameDiffers) {
+			return RollbackOutcome{}, fmt.Errorf("가장 최근 덤프(%s): %w - 덤프 이름의 원장 식별과 내용이 어긋났다. "+
+				"이 덤프로 복원하면 다른 이름의 DB 가 생긴다(이름은 싣지 않는다)", filepath.Base(dump), err)
+		}
 		return RollbackOutcome{}, fmt.Errorf("가장 최근 덤프가 깨졌다 - 더 옛 덤프로 조용히 넘어가지 않는다: %w", err)
-	}
-	if dumpDB != led.name {
-		return RollbackOutcome{}, fmt.Errorf("가장 최근 덤프(%s)에 실린 DB 이름이 지금 원장의 이름과 다르다 - 덤프 이름의 원장 식별과 "+
-			"내용이 어긋났다. 이 덤프로 복원하면 다른 이름의 DB 가 생긴다(이름은 싣지 않는다)", filepath.Base(dump))
 	}
 	if !has || info.From >= current {
 		return RollbackOutcome{}, fmt.Errorf("되돌릴 판올림이 없다 - 이 원장의 가장 최근 덤프(%s)는 판 %d 에서 떴고 지금 원장은 판 %d 다. "+
 			"그 덤프 뒤로 커밋된 판올림이 없다(판올림이 실패해 되감겼거나 덤프가 실패해 판을 올리지 않았다). "+
 			"그 덤프로 되돌리면 덤프 뒤의 쓰기만 잃는다", filepath.Base(dump), info.From, current)
 	}
-	return RollbackOutcome{Backup: dump, Steps: pgRollbackSteps(info, current), Script: pgRollbackScript(dump, led.Admin, led.ID)}, nil
+	sum, err := fileSHA256(dump)
+	if err != nil {
+		return RollbackOutcome{}, err
+	}
+	return RollbackOutcome{Backup: dump, Steps: pgRollbackSteps(info, current), Script: pgRollbackScript(dump, sum, led)}, nil
+}
+
+// fileSHA256 은 파일 내용의 sha256 16진(소문자 64글자)이다.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("덤프를 다시 읽지 못했다(%q): %w", clip(path, 200), err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("덤프의 sha256 을 재지 못했다(%q): %w", clip(path, 200), err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // pgRollbackSteps 는 복원 스크립트(pgRollbackScript) 앞에 사람에게 내는 설명이다. 순수 함수다.
@@ -732,8 +839,10 @@ func pgRollbackSteps(info dumpInfo, current int) string {
 		"서버와 원장에 붙은 모든 연결을 멈추고, 원장 클러스터에 초사용자로 붙는 접속을 PGHOST · PGPORT · PGUSER 로 둔 셸에서 "+
 		"아래 스크립트를 그대로 돌려라(비밀번호는 PGPASSWORD 나 ~/.pgpass, TLS 는 PGSSLMODE · PGSSLROOTCERT). "+
 		"셋 중 하나라도 비거나 호스트가 여럿이면 아무것도 바꾸지 않고 멈춘다. 대상을 바꾸는 다른 변수(PGHOSTADDR · PGSERVICE 등)는 "+
-		"스크립트가 지운다. 붙은 클러스터에 이 원장(식별 %s)이 없으면, 곧 다른 서버에 붙었으면 아무것도 바꾸지 않고 멈춘다. "+
+		"스크립트가 지운다. 덤프가 그 자리에 스크립트를 낸 때 그대로 있지 않거나(sha256) pg_restore 가 그것을 못 읽으면, "+
+		"또 붙은 클러스터에 이 원장(식별 %s)이 없으면, 곧 다른 서버에 붙었으면 아무것도 바꾸지 않고 멈춘다. "+
 		"망가진 DB 는 <원장 DB>%s 로 남고, 복원이 도중에 실패하면 반쪽 DB 를 지우고 그 이름을 되돌린다. "+
+		"이 스크립트는 지금 원장 DB(OID)에 묶여 한 번만 돈다 - 복원 뒤에 다시 되돌리려면 `fd migrate --rollback` 으로 새로 받아라. "+
 		"복원이 끝나면 판 %d 의 바이너리로 서버를 띄운다",
 		info.From, info.Stamp, current, info.Ledger, brokenSuffix, info.From)
 }
@@ -745,8 +854,8 @@ const (
 	maxRollbackName = 63 - len(brokenSuffix)
 )
 
-// pgRollbackScript 는 Postgres 원장을 판올림 전 덤프로 되돌리는 셸 스크립트다. 순수 함수다. admin 은 붙을 관리 DB(adminDB),
-// ledger 는 되돌릴 원장의 식별(ledgerIDSQL)이다.
+// pgRollbackScript 는 Postgres 원장을 판올림 전 덤프로 되돌리는 셸 스크립트다. 순수 함수다. dump 는 덤프의 절대 경로,
+// sum 은 스크립트를 낼 때 잰 그 내용의 sha256(fileSHA256), led 는 복원 **전** 원장이다(식별 · 관리 DB · OID).
 //
 // ★ 제자리에 덮지 않고 새 DB 로 복원한다. 망가진 DB 는 이름을 바꿔 증거로 남기고, pg_restore --create 가 덤프에 든 DB
 // 정의(로케일 · DB 단위 권한)로 원래 이름의 DB 를 새로 만든다 - 그래서 접속 URL(FD_DB)을 안 바꿔도 된다. 빈 DB 를 손으로
@@ -757,10 +866,15 @@ const (
 // 멈춘다(명령마다 다른 서버에 붙을 수 있다). 그 밖에 대상을 바꾸는 libpq 변수는 첫머리에서 지운다(libpqTargetVars).
 // 이름 바꾸기와 복원은 대상과 다른 관리 DB 에 붙어서 한다(붙은 DB 는 이름을 못 바꾼다).
 //
-// ★ 무엇을 바꾸기 전에 **같은 psql 연결에서** 원장을 대조한다. 그 클러스터의 system_identifier 와 DB 이름으로 잰 식별이
-// ledger 인 DB 를 카탈로그(pg_database)에서 찾아, 있을 때만 그 연결로 이름을 바꾼다. 다른 서버에 붙었으면 그런 DB 가 없어
-// 아무것도 안 바꾸고 멈춘다. 실패 갈래도 같다 - <이름>_broken 가운데 <이름>의 식별이 ledger 인 것을 같은 연결에서 찾아서만
-// 지우고 되돌린다.
+// ★ 첫 ALTER 전에 덤프를 잰다: 그 경로에 파일이 있고, 내용의 sha256 이 스크립트를 낼 때와 같고, pg_restore -l 이 목록을
+// 읽는다. 하나라도 아니면 아무것도 안 바꾸고 멈춘다 - 원장 이름부터 바꾸고 복원에서 덤프가 없다는 것을 알면 그사이 원장이
+// 제 이름에 없다. sha256 도구는 있는 것(sha256sum · shasum · openssl)을 쓰고, 셋 다 없으면 값이 안 맞아 멈춘다.
+//
+// ★ 무엇을 바꾸기 전에 **같은 psql 연결에서** 원장을 대조한다. 카탈로그(pg_database)에서 복원 전 원장의 OID 로 후보를 먼저
+// 좁히고(ledgerIDSQL 의 ★ - 남의 이름을 재지 않는다), 그 행의 식별(클러스터의 system_identifier 와 DB 이름)이 led.ID 일
+// 때만 그 연결로 이름을 바꾼다. 다른 서버에 붙었으면 OID 가 우연히 같아도 식별이 달라 아무것도 안 바꾸고 멈춘다. 복원이
+// 끝나면 원장은 새 OID 의 새 DB 이고 그 OID 는 <이름>_broken 에 남으므로, 같은 스크립트를 다시 돌리면 원장을 못 찾고
+// 멈춘다. 실패 갈래도 같다 - 같은 OID 의 행이 <이름>_broken 이고 <이름>의 식별이 led.ID 일 때만 지우고 되돌린다.
 //
 // ★ DB 이름은 카탈로그에서 psql 변수로 받는다(\gset) - 출력에 싣지 않고(경계가 모호한 접속 URL 에서는 그 이름이 비밀번호
 // 조각일 수 있다 - logPGServer 의 ★), 셸을 거치지 않으며, :"db" 로 인용되어 줄바꿈 · 따옴표 · 공백이 든 이름도 바이트 그대로
@@ -768,11 +882,15 @@ const (
 //
 // ★ 복원이 도중에 실패하면 반쪽 DB 를 지우고 _broken 을 원래 이름으로 되돌린다. 지우는 이름은 이름 바꾸기가 비운 이름이라
 // 그 뒤에 그 이름으로 생긴 것은 pg_restore 가 만든 반쪽 DB 뿐이다.
-func pgRollbackScript(dump, admin, ledger string) string {
+func pgRollbackScript(dump, sum string, led ledgerFacts) string {
 	conn := `-h "$PGHOST" -p "$PGPORT" -U "$PGUSER"`
-	psql := `psql -X -q -v ON_ERROR_STOP=1 ` + conn + ` -d ` + admin + ` -v ledger=` + ledger
+	psql := `psql -X -q -v ON_ERROR_STOP=1 ` + conn + ` -d ` + led.Admin + ` -v ledger=` + led.ID +
+		` -v ledger_oid=` + strconv.FormatInt(led.OID, 10)
 	stop := func(why string) string { return `DO $$BEGIN RAISE EXCEPTION '` + why + `'; END$$;` }
 	n := strconv.Itoa(len(brokenSuffix))
+	// cand 는 복원 전 원장 DB 의 OID 로 좁힌 카탈로그 행(많아야 하나)이다. MATERIALIZED 라 바깥의 식별 식이 그 안으로
+	// 내려가지 않는다 - 남의 이름에는 식별 식이 닿지 않는다.
+	cand := `WITH cand AS MATERIALIZED (SELECT datname::text AS name FROM pg_catalog.pg_database WHERE oid = :'ledger_oid')`
 	return strings.Join([]string{
 		`#!/bin/sh`,
 		`set -eu`,
@@ -780,11 +898,16 @@ func pgRollbackScript(dump, admin, ledger string) string {
 		`: "${PGHOST:?원장 클러스터의 호스트}" "${PGPORT:?원장 클러스터의 포트}" "${PGUSER:?원장 클러스터의 초사용자}"`,
 		`case "$PGHOST$PGPORT" in *,*) echo '원장 클러스터의 호스트 · 포트는 하나씩 적어라 - 여럿이면 명령마다 다른 서버에 붙을 수 있다' >&2; exit 1;; esac`,
 		`dump=` + shellQuote(dump),
+		`digest() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; elif command -v shasum >/dev/null 2>&1; then shasum -a 256; else openssl dgst -sha256 -r; fi; }`,
+		`[ -f "$dump" ] || { echo '덤프가 그 자리에 없다 - 아무것도 바꾸지 않았다' >&2; exit 1; }`,
+		`[ "$(digest < "$dump" | cut -c1-64)" = '` + sum + `' ] || { echo '덤프의 sha256 이 스크립트를 낸 때와 다르다(내용이 바뀌었거나 sha256 도구가 없다) - 아무것도 바꾸지 않았다' >&2; exit 1; }`,
+		`pg_restore -l "$dump" >/dev/null || { echo 'pg_restore 가 덤프의 목록을 읽지 못한다 - 아무것도 바꾸지 않았다' >&2; exit 1; }`,
 		psql + ` <<'SQL'`,
-		`SELECT count(*) = 1 AS found, coalesce(bool_and(octet_length(datname::text) <= ` + strconv.Itoa(maxRollbackName) + `), false) AS fits,`,
-		`       min(datname::text) AS db, min(datname::text) || '` + brokenSuffix + `' AS broken`,
-		`  FROM pg_catalog.pg_database, pg_catalog.pg_control_system()`,
-		` WHERE ` + ledgerIDSQL("system_identifier::text", "datname::text") + ` = :'ledger' \gset`,
+		cand,
+		`SELECT count(*) = 1 AS found, coalesce(bool_and(octet_length(name) <= ` + strconv.Itoa(maxRollbackName) + `), false) AS fits,`,
+		`       min(name) AS db, min(name) || '` + brokenSuffix + `' AS broken`,
+		`  FROM cand, pg_catalog.pg_control_system()`,
+		` WHERE ` + ledgerIDSQL("system_identifier::text", "name") + ` = :'ledger' \gset`,
 		`\if :found`,
 		`\if :fits`,
 		`ALTER DATABASE :"db" RENAME TO :"broken";`,
@@ -792,20 +915,21 @@ func pgRollbackScript(dump, admin, ledger string) string {
 		stop(`원장 DB 이름이 ` + strconv.Itoa(maxRollbackName) + `바이트를 넘어 ` + brokenSuffix + ` 를 붙이면 잘린다 - 아무것도 바꾸지 않았다. 이름을 손으로 바꿔 두고 복원하라`),
 		`\endif`,
 		`\else`,
-		stop(`이 클러스터에 이 원장(식별 ` + ledger + `)의 DB 가 없다 - 다른 서버에 붙었거나 이미 이름을 바꿨다. 아무것도 바꾸지 않았다`),
+		stop(`이 클러스터에 이 원장(식별 ` + led.ID + `)의 DB 가 없다 - 다른 서버에 붙었거나 이미 이름을 바꿨다. 아무것도 바꾸지 않았다`),
 		`\endif`,
 		`SQL`,
-		`if ! pg_restore ` + conn + ` -d ` + admin + ` --create --exit-on-error "$dump"; then`,
+		`if ! pg_restore ` + conn + ` -d ` + led.Admin + ` --create --exit-on-error "$dump"; then`,
 		`  ` + psql + ` <<'SQL'`,
-		`SELECT count(*) = 1 AS found, min(left(datname::text, -` + n + `)) AS db, min(datname::text) AS broken`,
-		`  FROM pg_catalog.pg_database, pg_catalog.pg_control_system()`,
-		` WHERE right(datname::text, ` + n + `) = '` + brokenSuffix + `'`,
-		`   AND ` + ledgerIDSQL("system_identifier::text", "left(datname::text, -"+n+")") + ` = :'ledger' \gset`,
+		cand,
+		`SELECT count(*) = 1 AS found, min(left(name, -` + n + `)) AS db, min(name) AS broken`,
+		`  FROM cand, pg_catalog.pg_control_system()`,
+		` WHERE right(name, ` + n + `) = '` + brokenSuffix + `'`,
+		`   AND ` + ledgerIDSQL("system_identifier::text", "left(name, -"+n+")") + ` = :'ledger' \gset`,
 		`\if :found`,
 		`DROP DATABASE IF EXISTS :"db";`,
 		`ALTER DATABASE :"broken" RENAME TO :"db";`,
 		`\else`,
-		stop(`이 클러스터에 이 원장(식별 ` + ledger + `)의 ` + brokenSuffix + ` DB 가 없다 - 반쪽 DB 를 지우지 않았다. 원장 클러스터에서 손으로 확인하라`),
+		stop(`이 클러스터에 이 원장(식별 ` + led.ID + `)의 ` + brokenSuffix + ` DB 가 없다 - 반쪽 DB 를 지우지 않았다. 원장 클러스터에서 손으로 확인하라`),
 		`\endif`,
 		`SQL`,
 		`  echo '복원이 실패했다 - 반쪽 DB 를 지우고 원래 DB 를 제 이름으로 되돌렸다' >&2`,

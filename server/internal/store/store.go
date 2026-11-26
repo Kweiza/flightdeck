@@ -184,6 +184,8 @@ type Store struct {
 	path  string
 	log   *slog.Logger
 	locks lockMeter
+	// pgLim 은 Postgres 연결에 건 상한이다(openPGWith). SQLite 는 0 값이다.
+	pgLim pgLimits
 
 	// claimGap 은 시험의 끼움 자리다: ClaimItem 의 점유자 확인과 선점 쓰기 사이에 같은 트랜잭션으로 불린다. 운영은
 	// nil 이다. 쓰기가 한 줄로 서는 동안은 그 틈에 남이 못 끼므로, 0행 경로(claimTakenMeanwhile)를 ClaimItem 호출로
@@ -527,7 +529,7 @@ func dsn(path string) string {
 }
 
 // busyTimeoutMS 는 SQLite 의 busy_timeout pragma 값(밀리초)이다. Postgres 의 lock_timeout 과 같은 상한이다.
-var busyTimeoutMS = strconv.FormatInt(lockTimeout.Milliseconds(), 10)
+var busyTimeoutMS = millis(lockTimeout)
 
 // wantPragmas 는 기본 DSN(dsn)이 요청한 pragma 와 기대값이다.
 var wantPragmas = map[string]string{
