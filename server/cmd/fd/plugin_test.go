@@ -1120,9 +1120,9 @@ func TestComposeGuidanceSharesOneHead(t *testing.T) {
 		}
 	}
 	root := pluginRoot(t)
-	mountRead := readmeMountRead(t, "README.ko.md")
-	if en := readmeMountRead(t, "README.md"); en != mountRead {
-		t.Errorf("README 두 판의 fdrepos 마운트 읽기가 다르다:\n  %s\n  %s", mountRead, en)
+	serverRead := readmeServerRead(t, "README.ko.md")
+	if en := readmeServerRead(t, "README.md"); en != serverRead {
+		t.Errorf("README 두 판의 fdwhere · fdrepos 조회 줄이 다르다:\n  %s\n  %s", serverRead, en)
 	}
 	for _, f := range []string{"SKILL.md", "SKILL.ko.md"} {
 		raw, err := os.ReadFile(filepath.Join(root, "skills", "fd-update", f))
@@ -1157,37 +1157,57 @@ func TestComposeGuidanceSharesOneHead(t *testing.T) {
 		}
 		// ★ 새 자리로 옮기기(cd)와 올리기(up)는 내리기와 **한 사슬**이다 - 마운트를 못 읽었거나 관문이 서면 옮기지도 올리지도
 		//   않는다. 따로 두면 서 있는 내리기 줄 다음에 up 이 옛 판 · 빈 마운트로 돈다.
-		// ★ 사슬의 마운트 읽기는 README 「Postgres 로 띄우기」의 fdrepos 와 **같은 글자**다(정본은 README 한 곳). 한때 스킬만
-		//   `readarray` 로 읽어 zsh · macOS 의 bash 3.2 에서 첫 줄이 127 로 섰다.
+		// ★ 사슬의 서버 읽기(라벨 · 마운트)는 README 「Postgres 로 띄우기」의 fdwhere · fdrepos 와 **같은 글자**다(정본은 README 한
+		//   곳). 한때 스킬만 `readarray` 로 읽어 zsh · macOS 의 bash 3.2 에서 첫 줄이 127 로 섰고, 공백으로 가르는 `set -- $(…)` 로
+		//   읽어 공백이 든 경로를 둘로 갈랐고, 라벨을 `cd "$(docker inspect …)"` 로 바로 써 조회가 실패해도 지금 자리에서 내렸다.
 		d, u := strings.Index(down, composeCmd+" down"), strings.Index(down, composeCmd+" up -d")
-		if !strings.HasPrefix(down, mountRead) || u < 0 || !strings.Contains(down[d:u], " &&\ncd ") {
-			t.Errorf("fd-update/%s 의 마운트 읽기(README 의 fdrepos 글자) · 내리기 · 새 자리 cd · 올리기가 한 `&&` 사슬이 아니다:\n  %s\n마운트 읽기:\n  %s", f, down, mountRead)
+		if !strings.HasPrefix(down, serverRead) || u < 0 || !strings.Contains(down[d:u], " &&\ncd ") {
+			t.Errorf("fd-update/%s 의 서버 읽기(README 의 fdwhere · fdrepos 글자) · 내리기 · 새 자리 cd · 올리기가 한 `&&` 사슬이 아니다:\n  %s\n서버 읽기:\n  %s", f, down, serverRead)
+		}
+		if !strings.Contains(down, `cd "$fdw" && COMPOSE_PROJECT_NAME="$fdp" `) {
+			t.Errorf("fd-update/%s 의 내리기가 서버 읽기가 받은 자리 · 프로젝트(fdw · fdp)로 돌지 않는다:\n  %s", f, down)
 		}
 	}
 }
 
-// readmeMountRead 는 README 의 fdrepos 정의에서 마운트를 읽어 export 하는 두 줄(`set -- $(docker inspect …) &&` ·
-// `[ $# -ge 1 ] && export FD_REPOS=… &&`)을 줄 머리 공백을 걷어 낸다 - fd-update 의 갱신 사슬이 이 글자로 시작한다.
-func readmeMountRead(t *testing.T, readme string) string {
+// readmeServerRead 는 README 의 `fdwhere` · `fdrepos` 정의에서 도는 서버를 읽는 조회 줄 셋을 줄 머리 공백을 걷어 낸다: fdwhere 의
+// 라벨 조회(`fdp=$(docker inspect …) && fdw=$(…) && … &&`), fdrepos 의 마운트 조회(`mounts=$(docker inspect …) && … &&`)와 그
+// 줄들을 슬롯에 넣는 export(`export FD_REPOS="$(… sed -n 1p)" … &&`). fd-update 의 갱신 사슬이 이 글자로 시작한다.
+func readmeServerRead(t *testing.T, readme string) string {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(pluginRoot(t), readme))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, def, ok := strings.Cut(string(raw), "\nfdrepos() {\n")
-	def, _, closed := strings.Cut(def, "\n}\n")
-	if !ok || !closed {
-		t.Fatalf("%s 에 fdrepos 정의가 없다", readme)
-	}
-	var keep []string
-	for _, ln := range strings.Split(def, "\n") {
-		ln = strings.TrimSpace(ln)
-		if strings.HasPrefix(ln, "set -- $(docker inspect flightdeck ") || strings.HasPrefix(ln, "[ $# -ge 1 ] && export FD_REPOS=") {
-			keep = append(keep, ln)
+	def := func(name string) string {
+		_, body, ok := strings.Cut(string(raw), "\n"+name+"() {\n")
+		body, _, closed := strings.Cut(body, "\n}\n")
+		if !ok || !closed {
+			t.Fatalf("%s 에 %s 정의가 없다", readme, name)
 		}
+		return body
 	}
-	if len(keep) != 2 || !strings.HasSuffix(keep[0], " &&") || !strings.HasSuffix(keep[1], " &&") {
-		t.Fatalf("%s 의 fdrepos 에서 마운트 읽기 두 줄(각각 && 로 끝난다)을 못 찾았다: %q", readme, keep)
+	pick := func(body string, heads ...string) []string {
+		var keep []string
+		for _, ln := range strings.Split(body, "\n") {
+			ln = strings.TrimSpace(ln)
+			for _, h := range heads {
+				if strings.HasPrefix(ln, h) {
+					keep = append(keep, ln)
+				}
+			}
+		}
+		return keep
+	}
+	keep := append(pick(def("fdwhere"), "fdp=$(docker inspect flightdeck "),
+		pick(def("fdrepos"), "mounts=$(docker inspect flightdeck ", `export FD_REPOS="$(printf `)...)
+	if len(keep) != 3 {
+		t.Fatalf("%s 의 fdwhere · fdrepos 에서 조회 줄 셋을 못 찾았다: %q", readme, keep)
+	}
+	for _, ln := range keep {
+		if !strings.HasSuffix(ln, " &&") {
+			t.Fatalf("%s 의 조회 줄이 && 로 끝나지 않는다 - 사슬이 그 뒤를 잇지 못한다: %q", readme, ln)
+		}
 	}
 	return strings.Join(keep, "\n") + "\n"
 }

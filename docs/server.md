@@ -13,11 +13,12 @@ Starting and connecting the server, the environment variables and their traps, w
 ```bash
 git clone https://github.com/Kweiza/flightdeck.git
 cd flightdeck
-FD_TOKEN="$(cat ~/.flightdeck/token 2>/dev/null)" docker compose up -d
+FD_TOKEN="$(cat ~/.flightdeck/token 2>/dev/null)" docker compose up -d --build
 curl -s localhost:7420/healthz
 ```
 
-`{"ok":true,"api_version":"1","db_ok":true,…}` means you are done.
+`{"ok":true,"api_version":"1","db_ok":true,…}` means you are done. Keep `--build` - the image name is a fixed name that
+does not carry the version (`flightdeck:local`), so without it the server starts from an old image built earlier.
 The screen is at <http://localhost:7420> — one read-only page.
 
 Three things come from the environment:

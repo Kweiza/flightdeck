@@ -83,9 +83,13 @@ on first use) and git.
 ```bash
 git clone https://github.com/Kweiza/flightdeck.git
 cd flightdeck
-docker compose up -d
-curl -s localhost:7420/healthz     # {"ok":true,"api_version":"1","db_ok":true,…}
+docker compose up -d --build
+curl -s localhost:7420/healthz
 ```
+
+`/healthz` printing `{"ok":true,"api_version":"1","db_ok":true,…}` means you are done. `--build` builds the image from the
+version you fetched - the image name is a fixed name that does not carry the version (`flightdeck:local`), so without it the
+server starts from an old image built earlier.
 
 **2. Install the plugin** — on every machine that runs sessions.
 
@@ -225,7 +229,12 @@ these files, rebuild with `--build` (`/fd-update` starts that way).
 The command blocks in this section and in the three procedures below (upgrade, stopped before switching on, going back
 within 72 hours) are meant to be pasted into a terminal as they are. The notes inside a block are `: '…'`, not `#`: an
 interactive zsh (the default shell on macOS) does not read `#` as a comment (`interactivecomments` is off), so it runs a
-`#` line as a command, and a `set -e` block stops on the first one.
+`#` line as a command, and a `set -e` block stops on the first one. A block takes its docker queries (`docker ps`, `docker
+inspect`) as standalone assignments (`x=$(docker …)`): `[ -n "$(docker …)" ]` and `set -- $(docker …)` read the empty output
+of a failed docker as "none" or "stopped" and carry on, while an assignment ends with docker's failure and the block stops
+there. Every `up` builds and starts with `--build`: the image names are fixed names that do not carry the version
+(`flightdeck:local`, `flightdeck-pg:local`), so when an image built in another version's directory is left, `up -d` starts
+from it.
 
 **Setup** - once, as the `FD_UID` user.
 
@@ -267,15 +276,14 @@ fdc() {
 }
 fdrepos() {
   unset FD_REPOS FD_REPOS2 FD_REPOS3 FD_REPOS4
-  set -- $(docker inspect flightdeck --format '{{range .Mounts}}{{if eq .Source .Destination}}{{println .Source}}{{end}}{{end}}') &&
-    [ $# -ge 1 ] && export FD_REPOS="$1" FD_REPOS2="${2:-}" FD_REPOS3="${3:-}" FD_REPOS4="${4:-}" &&
+  mounts=$(docker inspect flightdeck --format '{{range .Mounts}}{{if eq .Source .Destination}}{{println .Source}}{{end}}{{end}}') && nmounts=$(printf '%s\n' "$mounts" | grep -c .) && if [ "$nmounts" -gt 4 ]; then echo "도는 서버의 저장소 마운트가 $nmounts 개다 - 슬롯(FD_REPOS…FD_REPOS4)은 넷이라 다섯째부터 빠진다: 멈추고 묻는다" >&2; false; fi &&
+    export FD_REPOS="$(printf '%s\n' "$mounts" | sed -n 1p)" FD_REPOS2="$(printf '%s\n' "$mounts" | sed -n 2p)" FD_REPOS3="$(printf '%s\n' "$mounts" | sed -n 3p)" FD_REPOS4="$(printf '%s\n' "$mounts" | sed -n 4p)" &&
     echo "repository mounts (give again in a new shell): export FD_REPOS='$FD_REPOS' FD_REPOS2='$FD_REPOS2' FD_REPOS3='$FD_REPOS3' FD_REPOS4='$FD_REPOS4'"
 }
 fdwhere() {
-  unset p w
-  fdrepos && set -- "$(docker inspect flightdeck -f '{{index .Config.Labels "com.docker.compose.project"}}')" \
-    "$(docker inspect flightdeck -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}')" &&
-    [ -n "$1" ] && [ -d "$2" ] && p=$1 && w=$2 && echo "running server (give again in a new shell): p='$p' w='$w'"
+  unset p w FD_REPOS FD_REPOS2 FD_REPOS3 FD_REPOS4
+  fdp=$(docker inspect flightdeck -f '{{index .Config.Labels "com.docker.compose.project"}}') && fdw=$(docker inspect flightdeck -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}') && [ -n "$fdp" ] && [ -d "$fdw" ] &&
+    fdrepos && p=$fdp w=$fdw && echo "running server (give again in a new shell): p='$p' w='$w'"
 }
 ```
 
@@ -295,7 +303,14 @@ fdwhere() {
   not stop the `set -e` block that called a function whose body ends in `if … fi && …` when that function fails (bash does).
 - `fdrepos` and `fdwhere` read only while the server runs. They first clear this shell's values (`FD_REPOS` …, `p`, `w`), and
   when they cannot read (the server is down) they fail and leave them empty: the next block never inherits values read
-  earlier from another server or at another time. Once the server is down, give again what their last line printed.
+  earlier from another server or at another time. `fdwhere` sets the three values only after **every** lookup (project,
+  directory, mounts) has succeeded, all at once - when any one fails, all three stay empty. Once the server is down, give
+  again what their last line printed.
+- The mounts read **one line of docker's output as one path** and fill the slots in order - a path with a space
+  (`/repos/team one`) is one path too. `set -- $(…)`, which splits on blanks, would cut that path in two and mount two paths
+  that do not exist. More than four lines (there are four slots) would drop the fifth on silently, so the read stops
+  instead (the message is in Korean, like the gate). The update chain of `fd-update` uses the lookup lines of these two
+  functions word for word (a test compares them).
 - Passwords must be printable ASCII without spaces, backslashes or colons. The server (pgx) and the daily dump (libpq) read
   the same file and the two parse anything else differently. `db-roles` refuses a line that does not fit and names its line
   number (never the password).
@@ -328,12 +343,12 @@ there without the move marker, `migrate` started this way refuses (a new ledger 
 pg_restore are all there, and it connects as the superuser over the socket. Use `--no-deps` while `db` is up. The version
 and planned steps are `fdc run --rm --no-deps migrate selfcheck`. Keep the three below in your shell config too: `sql` is
 superuser psql, `srvsql` is psql as the server account on the server's ledger (the server's own `FD_DB`; SQL on stdin), and
-`nodump` checks that no `db-backup` container is running.
+`nodump` checks that no `db-backup` container is running (when `docker ps` fails it stops instead of reading "none running").
 
 ```bash
 sql() { fdc run --rm --no-deps --entrypoint psql migrate -X -v ON_ERROR_STOP=1 "$@"; }
 srvsql() { fdc run --rm --no-deps -T --entrypoint sh flightdeck -c 'exec psql -X -v ON_ERROR_STOP=1 -d "$FD_DB" "$@"' sh "$@"; }
-nodump() { set -- $(docker ps --filter label=com.docker.compose.service=db-backup --format '{{.Names}}(once={{.Label "com.docker.compose.oneoff"}})'); [ $# -eq 0 ] || { echo "db-backup containers are running: $* - once=True is a dump started by hand (wait for it to end, then check again); once=False is the service container (stop db-backup in that project, then check again)" >&2; false; }; }
+nodump() { if ! dumps=$(docker ps --filter label=com.docker.compose.service=db-backup --format '{{.Names}}(once={{.Label "com.docker.compose.oneoff"}})'); then echo 'docker ps failed - cannot tell whether a db-backup container is running: check Docker, then check again' >&2; return 1; fi; if [ -n "$dumps" ]; then echo "db-backup containers are running: $dumps - once=True is a dump started by hand (wait for it to end, then check again); once=False is the service container (stop db-backup in that project, then check again)" >&2; return 1; fi; }
 ```
 
 - **Before running `fd migrate`, the export or a restore by hand, stop the daily dump and check that hand-run dumps have
@@ -345,13 +360,13 @@ nodump() { set -- $(docker ps --filter label=com.docker.compose.service=db-backu
   If `nodump` stops, look at the containers it names: wait for a dump started by hand to end, and stop a service container
   in its own project (which may live in another version's directory).
 - **To change the passwords**, edit both pgpass files **in place** (replacing a file with a new one makes it disappear inside
-  the containers that mount it), then `fdc up -d --force-recreate --no-deps db-roles flightdeck db-backup`. The server reads
+  the containers that mount it), then `fdc up -d --build --force-recreate --no-deps db-roles flightdeck db-backup`. The server reads
   its file once at startup.
 
 ★ **One ledger, one override.** After committing, the import leaves a move marker next to the SQLite ledger
 (`~/.flightdeck/fd.db.moved-to-postgres`). Starting the default compose without the selection file after the move runs the
 default path's (SQLite) `migrate`, which sees the marker and neither opens nor creates the ledger, so the server stays down:
-run `docker compose down`, check that the selection file is switched on, and start again with `fdc up -d`. The other way
+run `docker compose down`, check that the selection file is switched on, and start again with `fdc up -d --build`. The other way
 round, `migrate` with the override refuses while an unmarked `fd.db` remains. Only two procedures remove the marker, by hand:
 "Stopped before switching on" below (with both servers down and after the compare) and "Going back within 72 hours".
 
@@ -389,10 +404,12 @@ fdwhere
     if [ ! -e "$mark" ]; then
       : "${p:?run step 1 first}" "${w:?run step 1 first}"
       : '2. Take it down from the directory of the old version and check that no container of that project is left (hand-run
-         ones too).'
+         ones too) and that no project has a server container (flightdeck).'
       (cd "$w" && fdc -p "$p" down)
-      left=$(docker ps -aq --filter label=com.docker.compose.project="$p"); [ -z "$left" ]
-      if docker inspect flightdeck >/dev/null 2>&1; then echo 'the server container (flightdeck) is still there' >&2; exit 1; fi
+      left=$(docker ps -aq --filter label=com.docker.compose.project="$p")
+      if [ -n "$left" ]; then echo "containers of the old version's project ($p) are left - take them down there, then run again" >&2; exit 1; fi
+      names=$(docker ps -a --format '{{.Names}}')
+      if printf '%s\n' "$names" | grep -qx flightdeck; then echo 'the server container (flightdeck) is still there - take it down in its project, then run again' >&2; exit 1; fi
       echo "2 done: it is down"
       : '3. Build the image of this version and raise the SQLite ledger to this version (nothing happens at 18). selfcheck
          must say ok.'
@@ -411,14 +428,16 @@ fdwhere
       if ! fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db --dry-run; then
         echo 'the dry run of step 5 stopped - if it says "대상이 비어 있지 않다" (the target is not empty), an earlier run may have committed (and been cut off before the marker): do not move again, measure with A of "Stopped before switching on"' >&2; exit 1
       fi
-      fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db
+      if ! fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db; then
+        echo "the move of step 5 stopped - if the line above says it committed (커밋했다), first leave the marker on this machine, then paste the block again: touch '$mark' (the /data/… that line names is the place inside the container - it is ~/.flightdeck on this machine). If it was cut off without that line, measure with A of \"Stopped before switching on\" before pasting again. Otherwise fix the cause and paste again" >&2; exit 1
+      fi
       [ -e "$mark" ]
       echo "5 done: moved"
     fi
     : '6. On the switched-off selection file, create and check the login accounts (db-roles), then connect as the server
        account to the ledger of the server: the moved tables must be readable and TEMPORARY must be gone.'
     export FDC_ENV="$off"; [ -f "$FDC_ENV" ]
-    fdc up -d db-roles
+    fdc up -d --build db-roles
     [ "$(docker wait "$(fdc ps -aq db-roles)")" = 0 ]
     srvsql <<'SQL'
 SELECT current_user AS account, current_database() AS ledger, (SELECT count(*) FROM item) AS items, (SELECT count(*) FROM judgment) AS judgments;
@@ -427,13 +446,24 @@ SQL
     echo "6 done: the accounts are right"
   fi
   : '7. Switch on and start only after comparing the Postgres ledger the selection file picks with the SQLite ledger -
-     carrying on in a new shell compares again before starting. If the server was already created here (step 8 created
-     it, then stopped), it is a ledger the server wrote to, so it is not compared. Once on, later updates and restarts
-     start on Postgres.'
-  if [ -z "$(fdc ps -aq flightdeck)" ]; then
+     carrying on in a new shell compares again before starting. A server container that was only created and never ran
+     (the up of step 8 stopped before starting the server) never wrote to the ledger, so it is compared. If the server here
+     has already run (step 8 started it, then stopped), it is a ledger the server wrote to, so it is not compared with
+     SQLite; instead the settings that created that server and db (the config-hash label of compose) must equal the
+     settings rendered now from the selection file and the repository mounts - only then does the up of step 8 start the
+     same volume and the same database without creating them again. Once on, later updates and restarts start on Postgres.'
+  srv=$(fdc ps -aq flightdeck); st=
+  if [ -n "$srv" ]; then st=$(docker inspect -f '{{.State.Status}}' "$srv"); fi
+  if [ -z "$srv" ] || [ "$st" = created ]; then
     fdc run --rm migrate migrate verify --from /data/fd.db
   else
-    echo "7: the server was already created here - it wrote to this ledger, so no compare"
+    for s in db flightdeck; do
+      c=$(fdc ps -aq "$s")
+      if [ -z "$c" ]; then echo "7: the server has run but there is no $s container here - cannot measure the ledger the server wrote to: stop and ask" >&2; exit 1; fi
+      l=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$c"); h=$(fdc config --hash "$s")
+      if [ "$h" != "$s $l" ]; then echo "7: the settings that created the $s container that ran here differ from the settings rendered now from the selection file, the repository mounts and the token - step 8 could create it again on another ledger (volume, database) or other mounts, so it does not start: give the selection file from when that server started and the last two lines of step 1 as they were, then paste again (see what differs with docker inspect $c and fdc config $s)" >&2; exit 1; fi
+    done
+    echo "7: the server here has already run - it wrote to this ledger, so no compare with SQLite, and the settings that created that server and db are the same as now"
   fi
   if [ ! -e "$on" ]; then mv -n "$off" "$on"; [ -e "$on" ]; [ ! -e "$off" ]; fi
   unset FDC_ENV
@@ -453,8 +483,10 @@ curl -s localhost:7420/healthz
   남기지 못했다" ("moved (N rows, committed) - but could not leave the move marker next to the source"), it did commit. If
   step 5's move was cut off **without a result** (no error line and no "5 done": the process, the shell or the machine died
   right after the commit), you do not know whether it committed. No marker does not mean nothing was committed. Either way
-  the SQLite ledger was only read. If it said it committed, first leave the marker with the `touch` that line names, then
-  paste the block again. If you do not know the result, measure the Postgres ledger's rows with A of "Stopped before
+  the SQLite ledger was only read. If it said it committed, first leave the marker **on this machine** with `touch
+  ~/.flightdeck/fd.db.moved-to-postgres`, then paste the block again - the `touch /data/…` the move's line names is the place
+  inside the container (`/data` is `~/.flightdeck` on this machine), not a place on this machine. When it stops, the block
+  names that command again with this machine's place. If you do not know the result, measure the Postgres ledger's rows with A of "Stopped before
   switching on" before pasting again - pasting again by mistake does not move twice: the import only takes an empty
   ledger, so step 5's dry run stops with "대상이 비어 있지 않다" (the target is not empty) and the block points to A. For any
   other cause, fix it and paste the block again. To go back to SQLite, measure first with "Stopped before switching on" and
@@ -462,8 +494,12 @@ curl -s localhost:7420/healthz
 - If it stops **after step 5 left the marker but before step 7 switched the selection file on** (6 or 7), the ledger is
   already in Postgres and no server has written to it yet. Fix the cause and paste the block again: it skips 2-5 and starts
   at 6. To go back to SQLite, see "Stopped before switching on".
-- If it stops **after step 7 switched the selection file on** (8), pasting the block again runs step 7's compare and step 8
-  (only 8 if the server was already created here). To go back to SQLite, follow "Going back within 72 hours". After
+- If it stops **after step 7 switched the selection file on** (8), pasting the block again runs step 7's compare and step 8.
+  A server container being there is not enough to skip the compare: if it was only created and never ran (step 8's up
+  stopped at db or migrate), it is compared; if it already ran, instead of the SQLite ledger the settings that created that
+  server and db (compose's config-hash label) are compared with the settings rendered now (`fdc config --hash`), and step 8
+  runs only when they are the same - if the selection file meanwhile points to another deployment name or database, step
+  8's up would create them again on another volume or database. To go back to SQLite, follow "Going back within 72 hours". After
   "8 done" do not use this block again: once the server is removed with `fdc down`, the ledger the server wrote to no longer
   matches the moved SQLite ledger and step 7 stops. To start again, `fdc up -d --build`.
 - **Which ledger it is lives only in the selection file.** The deployment name (`FD_PG_INSTANCE`: the names of the db
@@ -517,8 +553,10 @@ version's installed plugin).
 ledger has no ledger rows, so choose without measuring A (without step 4's image and baseline, A only ends in "not
 measured"). To go on, fix the cause and paste the upgrade block again. To go back to the SQLite path of this version, run B.
 **If it stopped at step 3** ("2 done" is the last line: this version's image, the SQLite version raise or selfcheck stopped),
-even the SQLite path of this version may not start, so start the old version again: `(cd "$w" && fdc -p "$p" up -d)` (with
-the `p`, `w` and repository mounts step 1 read; in a new shell, give step 1's last two lines again). If the old version
+even the SQLite path of this version may not start, so start the old version again: `(cd "$w" && fdc -p "$p" up -d --build)`
+(with the `p`, `w` and repository mounts step 1 read; in a new shell, give step 1's last two lines again). Keep `--build`:
+the image step 3 built from this version holds the same fixed name (`flightdeck:local`), so without it even the old
+directory starts this version's image. `--build` builds it again from the old version's source. If the old version
 stops with "the database version is higher than this version knows", part of step 3's raise landed: fix the cause and paste
 the upgrade block again (step 3 carries the raise on).
 
@@ -618,12 +656,13 @@ fdwhere
     echo "carrying on after step 5: the selection file is off and $d/fd-back.db is there - comparing again before putting it in place"
     export FDC_ENV="$off"
   else
-    echo "the selection file is off and there is no exported ledger ($d/fd-back.db) - for an upgrade that stopped before switching on, see \"Stopped before switching on\"; if this block stopped after step 6, run only step 7 again: (cd \"$w\" && fdc -p \"$p\" up -d)" >&2
+    echo "the selection file is off and there is no exported ledger ($d/fd-back.db) - for an upgrade that stopped before switching on, see \"Stopped before switching on\"; if this block stopped after step 6, run only step 7 again: (cd \"$w\" && fdc -p \"$p\" up -d --build)" >&2
     exit 1
   fi
   : '4. Measure every time before putting it in place: no server runs, and the exported file matches the Postgres ledger
      as it is now. Only a match goes on.'
-  if [ -n "$(docker ps -q --filter label=com.docker.compose.service=flightdeck)" ]; then
+  up=$(docker ps -q --filter label=com.docker.compose.service=flightdeck)
+  if [ -n "$up" ]; then
     echo 'a server is running - it can write to the ledger even after the compare: take it down in its project, then run again' >&2; exit 1
   fi
   fdc -p "$p" run --rm migrate migrate verify --from /data/fd-back.db
@@ -647,7 +686,7 @@ fdwhere
   echo "6 done: the exported ledger is in place"
   : '7. Start on the default path (SQLite).'
   cd "$w"
-  fdc -p "$p" up -d
+  fdc -p "$p" up -d --build
   fdc -p "$p" ps -a
   echo "7 done: running on the SQLite ledger"
 )
@@ -657,7 +696,7 @@ fdwhere
   dump are stopped; the selection file is still on. If an `fd-back.db` was written, the block stops on it when pasted
   again: move it to a side name (the export does not overwrite an existing file, and this block only puts in place the file
   this run wrote). Find and stop whatever is attached or running and paste the block again. To give up the rollback, start
-  again on the Postgres ledger as it is with `(cd "$w" && fdc -p "$p" up -d)`.
+  again on the Postgres ledger as it is with `(cd "$w" && fdc -p "$p" up -d --build)`.
 - If it stops **after step 5 switched the selection file off** (step 5's down, 6 or 7), pasting the block again runs step 4
   again before putting anything in place: it checks that no server runs, starts `db` again from the switched-off selection
   file and compares the remaining `fd-back.db` with the Postgres ledger now. If the ledger was written in between, or the
@@ -666,7 +705,7 @@ fdwhere
   step 1 reads nothing). If step 6 put the file in place and step 7 stopped, the block says so and stops: run only step 7
   again. To give up the rollback when step 4 stops, switch the selection file on again
   (`mv -n /etc/flightdeck/compose.env.off /etc/flightdeck/compose.env`), start the Postgres ledger again with
-  `(cd "$w" && fdc -p "$p" up -d)`, then move the remaining `fd-back.db` to a side name.
+  `(cd "$w" && fdc -p "$p" up -d --build)`, then move the remaining `fd-back.db` to a side name.
 - **If there is no server container** and step 1 cannot read anything (the upgrade's step 8 stopped before creating the
   server), give `w=$PWD` from where the upgrade ran and that directory's project
   `p=$(docker inspect "$(fdc ps -aq db)" -f '{{index .Config.Labels "com.docker.compose.project"}}')`, and give the repository
@@ -705,7 +744,7 @@ fdc stop flightdeck db-backup && nodump && echo "stopped"
    If a database by that name exists, do not drop it; **rename it and keep it** (`<db>` is the name read above):
    `sql -d postgres -c 'ALTER DATABASE "<db>" RENAME TO "<db>_before_restore"'`. Drop the old one after the check in step 4.
 2. Roles are cluster-wide, so they are not in the dump. Restoring into the same volume (`flightdeck-pgdata`), they already
-   exist. If the volume itself is gone, create a new one, run `fdc up -d db-roles` to create the group roles, the login
+   exist. If the volume itself is gone, create a new one, run `fdc up -d --build db-roles` to create the group roles, the login
    accounts and an empty ledger, then begin with the rename in step 1.
 3. Restore the whole database. `--create` also restores the database-level privileges (`TEMPORARY` revoked from PUBLIC);
    restoring into a database created beforehand loses that.
@@ -721,7 +760,7 @@ fdc stop flightdeck db-backup && nodump && echo "stopped"
    the last event is just before the time in the dump's name.
 
    ```bash
-   fdc up -d db-roles && [ "$(docker wait "$(fdc ps -aq db-roles)")" = 0 ] && srvsql <<'SQL' && echo "4 done: it is the restored ledger"
+   fdc up -d --build db-roles && [ "$(docker wait "$(fdc ps -aq db-roles)")" = 0 ] && srvsql <<'SQL' && echo "4 done: it is the restored ledger"
    SELECT current_database() AS ledger, d.oid, o.oid AS old_oid, (SELECT count(*) FROM item) AS items,
           (SELECT count(*) FROM judgment) AS judgments, (SELECT max(at) FROM event) AS last_event
      FROM pg_database d LEFT JOIN pg_database o ON o.datname = d.datname || '_before_restore' WHERE d.datname = current_database();
@@ -732,7 +771,7 @@ fdc stop flightdeck db-backup && nodump && echo "stopped"
    SQL
    ```
 
-5. Start again with `fdc up -d`. Drop the renamed old database once the check is done
+5. Start again with `fdc up -d --build`. Drop the renamed old database once the check is done
    (`sql -d postgres -c 'DROP DATABASE "<db>_before_restore"'`).
 
 ### Moving a SQLite ledger to Postgres

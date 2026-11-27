@@ -13,11 +13,12 @@
 ```bash
 git clone https://github.com/Kweiza/flightdeck.git
 cd flightdeck
-FD_TOKEN="$(cat ~/.flightdeck/token 2>/dev/null)" docker compose up -d
+FD_TOKEN="$(cat ~/.flightdeck/token 2>/dev/null)" docker compose up -d --build
 curl -s localhost:7420/healthz
 ```
 
-`{"ok":true,"api_version":"1","db_ok":true,…}` 가 나오면 됐다.
+`{"ok":true,"api_version":"1","db_ok":true,…}` 가 나오면 됐다. `--build` 를 빼지 않는다 - 이미지 이름이 판을 안 타는
+고정 이름(`flightdeck:local`)이라 빼면 앞서 지은 옛 이미지로 뜬다.
 화면은 <http://localhost:7420> — 읽기 전용 한 장이다.
 
 세 가지를 환경에서 받는다:
