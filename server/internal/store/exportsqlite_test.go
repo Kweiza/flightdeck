@@ -422,7 +422,7 @@ func TestExportSQLiteMeasuresTheSourceInTheCopySnapshot(t *testing.T) {
 // 연결의 역할 · application_name 을 싣고, 아무것도 남기지 않는다. 그 연결을 닫으면 같은 실행이 지난다.
 func TestTransferRefusesALedgerWithAnotherClient(t *testing.T) {
 	ctx := context.Background()
-	src, dsn, _ := importedPG(t)
+	_, dsn, _ := importedPG(t)
 	attach := func(t *testing.T, dsn string) *Store {
 		t.Helper()
 		u, err := url.Parse(dsn)
@@ -471,6 +471,7 @@ func TestTransferRefusesALedgerWithAnotherClient(t *testing.T) {
 		}
 	})
 	t.Run("이관 대상", func(t *testing.T) {
+		src := importSource(t, importSeed) // 위에서 옮긴 원본은 표지가 있어 다시 옮기지 않는다 - 옮기지 않은 원본으로 잰다
 		to, fresh := importTarget(t)
 		seqs := identityStates(t, fresh)
 		other := attach(t, to)

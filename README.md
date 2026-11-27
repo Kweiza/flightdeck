@@ -262,7 +262,8 @@ curl -s localhost:7420/healthz      # db_ok and db_locale_ok are true
 ```
 
 On an empty ledger `migrate` lays the baseline first. **To bring a SQLite ledger along**, do not start this way; follow
-"Upgrade: SQLite ledger to Postgres" below. Once the server writes to an empty ledger, the import refuses.
+"Upgrade: SQLite ledger to Postgres" below. If `~/.flightdeck/fd.db` is still there without the move marker, `migrate`
+started this way refuses (a new ledger that skipped the move).
 
 **Admin commands** run in the `migrate` service. The ledger (`/data`), the dump directory (`/backups`), psql, pg_dump and
 pg_restore are all there, and it connects as the superuser over the socket. Use `--no-deps` while `db` is up.
@@ -280,10 +281,11 @@ sql() { fdc run --rm --no-deps --entrypoint psql migrate -X -v ON_ERROR_STOP=1 "
   the containers that mount it), then `fdc up -d --force-recreate --no-deps db-roles flightdeck db-backup`. The server reads
   its file once at startup.
 
-★ **One ledger, one override.** After the move, typing `docker compose` instead of `fdc` starts the default path (SQLite).
-The move renames the old SQLite file, so that server starts on an **empty** SQLite ledger; the moved ledger is still in
-Postgres. Take it down with `docker compose down`, remove the new empty `~/.flightdeck/fd.db` (and its `-wal` and `-shm`),
-and start again with `fdc up -d`.
+★ **One ledger, one override.** After committing, the import leaves a move marker next to the SQLite ledger
+(`~/.flightdeck/fd.db.moved-to-postgres`). Typing `docker compose` instead of `fdc` after the move runs the default path's
+(SQLite) `migrate`, which sees the marker and neither opens nor creates the ledger, so the server stays down: run
+`docker compose down`, then start again with `fdc up -d`. The other way round, `migrate` with the override refuses while an
+unmarked `fd.db` remains. Only "Going back within 72 hours" below removes the marker.
 
 ### Upgrade: SQLite ledger to Postgres
 
@@ -306,7 +308,7 @@ docker compose run --rm --no-deps migrate migrate --db /data/fd.db
 docker compose run --rm --no-deps migrate selfcheck --db /data/fd.db
 # 4. Start the Postgres ledger and lay only the baseline (stops at version 18). db starts with it.
 fdc run --rm migrate migrate --to 18
-# 5. Dry run, move, compare.
+# 5. Dry run, move, compare. After committing, the move leaves a move marker (fd.db.moved-to-postgres) next to the source.
 fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db --dry-run
 fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db
 fdc run --rm --no-deps migrate migrate verify --from /data/fd.db
@@ -340,6 +342,7 @@ fdc run --rm --no-deps migrate migrate verify --from /data/fd-back.db
 # 3. Take the Postgres layer down and put the new file in the ledger's place (side files too).
 fdc down
 for s in '' -wal -shm; do [ ! -e ~/.flightdeck/fd-back.db$s ] || mv ~/.flightdeck/fd-back.db$s ~/.flightdeck/fd.db$s; done
+rm ~/.flightdeck/fd.db.moved-to-postgres   # the move marker: left in place, the SQLite migrate will not open this ledger
 # 4. Put away the file that chose Postgres and start on the default path (SQLite). Left in place, the next update would
 #    layer Postgres again.
 mv ~/.flightdeck/compose.env ~/.flightdeck/compose.env.off

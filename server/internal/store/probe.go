@@ -51,6 +51,11 @@ func ProbeMigration(ctx context.Context, path string) (MigrationPlan, error) {
 		defer s.Close()
 		return planOpen(ctx, s.db)
 	}
+	// ★ Postgres 로 옮긴 SQLite 원장(이관 표지가 있다)은 이 바이너리가 열지 않는다 - 파일이 없어도 그렇다(moved.go). 「없는
+	//   파일」 오류보다 먼저 거절로 낸다 - fd selfcheck 가 그것으로 감시기의 재기동을 막고, 기동은 같은 사유로 선다.
+	if err := movedRefusal(path); err != nil {
+		return MigrationPlan{Action: MigrateReject, Reason: err.Error()}, nil
+	}
 	return probeMigrationVia(ctx, path, ledgerDSN(path))
 }
 

@@ -129,7 +129,8 @@ func (r TransferReport) verdict() error {
 	return errors.New("두 원장이 맞지 않는다: " + strings.Join(why, " · ") + "(위 표를 보라)")
 }
 
-// ImportSQLite 는 SQLite 원장 from 을 빈 Postgres 원장 to 로 옮긴다(opt.DryRun 이면 같은 길을 돌고 되감는다).
+// ImportSQLite 는 SQLite 원장 from 을 빈 Postgres 원장 to 로 옮긴다(opt.DryRun 이면 같은 길을 돌고 되감는다). 커밋한 뒤 from
+// 옆에 이관 표지(MovedMarker)를 남긴다 - 그 자리는 옮기기 전에 잡는다(reserveMovedMark, 예행도 잰다).
 func ImportSQLite(ctx context.Context, from, to string, opt TransferOptions, log *slog.Logger) (TransferReport, error) {
 	if log == nil {
 		log = slog.Default()
@@ -141,6 +142,11 @@ func ImportSQLite(ctx context.Context, from, to string, opt TransferOptions, log
 		return rep, err
 	}
 	defer src.Close()
+	mark, err := reserveMovedMark(from)
+	if err != nil {
+		return rep, err
+	}
+	defer mark.release(log)
 	if opt.DryRun && !tt.Postgres() {
 		return rep, src.ReadTx(ctx, func(q Reader) error {
 			sc, err := scanLedger(ctx, q, sideOf(src))
@@ -161,10 +167,14 @@ func ImportSQLite(ctx context.Context, from, to string, opt TransferOptions, log
 	if err := tgt.transferInto(ctx, src, "SQLite 이관", opt.DryRun, &rep); err != nil {
 		return rep, err
 	}
-	if !opt.DryRun {
-		log.Info("SQLite 이관 완료", "from", rep.From, "to", rep.To, "rows", rep.Copied,
-			"duration", time.Since(start).Seconds())
+	if opt.DryRun {
+		return rep, nil
 	}
+	if err := tgt.leaveMovedMark(ctx, mark, rep.Copied); err != nil {
+		return rep, err
+	}
+	log.Info("SQLite 이관 완료", "from", rep.From, "to", rep.To, "rows", rep.Copied, "marker", mark.path,
+		"duration", time.Since(start).Seconds())
 	return rep, nil
 }
 

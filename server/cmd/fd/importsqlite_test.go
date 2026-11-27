@@ -14,7 +14,7 @@ import (
 )
 
 // `fd migrate import-sqlite` · `fd migrate verify` · `fd migrate export-sqlite` 의 표면: 예행은 아무것도 안 쓰고 0, 옮기기 0,
-// 같은 대상에 다시 옮기기는 거절 1, 대조 0, 사용법 오류 2. 역이관은 새 파일을 내고 0(예행은 파일을 안 남긴다), 있는 파일에는
+// 옮긴 원본을 다시 옮기기는 거절 1(이관 표지), 대조 0, 사용법 오류 2. 역이관은 새 파일을 내고 0(예행은 파일을 안 남긴다), 있는 파일에는
 // 거절 1, 낸 파일과 Postgres 원장의 대조 0. 출력에 접속 URL 의 어떤 조각도 없다. 옮기기 · 거절의 뜻은 store 시험이 잰다.
 func TestMigrateImportSQLiteSurface(t *testing.T) {
 	ctx := context.Background()
@@ -55,7 +55,10 @@ func TestMigrateImportSQLiteSurface(t *testing.T) {
 	step(0, "아무것도 쓰지 않았다", "import-sqlite", "--from", src, "--db", dsn, "--dry-run")
 	step(1, "두 원장이 맞지 않는다", "verify", "--from", src, "--db", dsn) // 아직 안 옮겼다 - machine 이 어긋난다
 	step(0, "옮겼다: 1 행", "import-sqlite", "--from", src, "--db", dsn)
-	step(1, "비어 있지 않다", "import-sqlite", "--from", src, "--db", dsn)
+	if !strings.Contains(outs[len(outs)-1], "이관 표지를 남겼다: "+store.MovedMarker(src)) {
+		t.Fatalf("옮긴 뒤 이관 표지를 말하지 않는다:\n%s", outs[len(outs)-1])
+	}
+	step(1, "다시 옮기지 않는다", "import-sqlite", "--from", src, "--db", dsn)
 	step(0, "두 원장이 맞다", "verify", "--from", src, "--db", dsn)
 	step(2, "", "import-sqlite", "--db", dsn) // --from 없음
 	step(2, "", "verify", "--from", src, "extra")

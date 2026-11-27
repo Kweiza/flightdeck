@@ -578,7 +578,8 @@ func (r *dbRolesRig) read(name string) string {
 
 // TestDBRolesKeepsPasswordsOutOfArgvAndEnv 는 계정 맞추기가 psql 을 부를 때 비밀번호를 인자 · 환경 변수 · SQL 본문 어디에도
 // 싣지 않고(psql 이 역따옴표로 이 스크립트의 password 동작을 불러 받는다), 한 트랜잭션 안에서 만들기 · 멤버십 · 재기 · 비밀번호를
-// 하는지 잰다. 실제 서버에서의 동작(거절 갈래 포함)은 배포 리허설이 잰다 - 여기는 psql 에 넘기는 모양이다.
+// 하는지 잰다. 실제 서버에서의 동작(거절 갈래 포함)은 dbroles_pg_test.go 가 이 스크립트를 시험 PG 클러스터에 그대로 돌려 잰다
+// - 여기는 psql 에 넘기는 모양이다.
 func TestDBRolesKeepsPasswordsOutOfArgvAndEnv(t *testing.T) {
 	r := newDBRolesRig(t)
 	out, stderr, rc := r.run(nil)

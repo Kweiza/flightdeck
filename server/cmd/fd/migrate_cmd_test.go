@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -385,5 +386,77 @@ func TestMigrateRefusesAnOutOfRangeDumpTimeoutWhenUpToDate(t *testing.T) {
 	rc, out := h.runEnv(env, "", "migrate", "--db", fresh)
 	if rc != 2 || !strings.Contains(out, dumpTimeoutEnv) || !strings.Contains(out, "30ms") || strings.Contains(out, "이미 맞다") {
 		t.Fatalf("판이 맞는 날의 범위 밖 덤프 기한(rc=%d): %s", rc, out)
+	}
+}
+
+// Postgres 판올림(--db 없이 FD_DB)은 이 환경의 SQLite 원장 자리(가짜 홈의 ~/.flightdeck/fd.db)에 이관 표지 없는 원장이 남아
+// 있으면 기준선을 깔지도 판을 올리지도 않는다 - 기준선만 까는 --to 18 은 받는다. 표지가 있거나 원장이 없으면 받고, --db 로 준
+// 원장은 재지 않는다. 거꾸로 표지가 있으면 SQLite 판올림(compose.yaml 의 `migrate --db /data/fd.db`)이 선다.
+func TestMigratePostgresRefusesBesideAnUnmovedSQLiteLedger(t *testing.T) {
+	if dataVolume() {
+		t.Skip("/data 가 있는 기계다 - 이 환경의 SQLite 원장 자리가 가짜 홈 밖이다")
+	}
+	ctx := context.Background()
+	h := newHarness(t)
+	dsn := storetest.NewBare(t, "")
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := maps.Clone(h.env)
+	env[dbEnv] = dsn
+	lite := filepath.Join(h.home, ".flightdeck", "fd.db")
+	if got := sqliteLedgerPath(envOf(env)); got != lite {
+		t.Fatalf("이 환경의 SQLite 원장 자리가 %q 다 - 가짜 홈의 %q 여야 한다", got, lite)
+	}
+	if err := ensureDBDir(lite); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx, lite, quietLogger()); err != nil {
+		t.Fatal(err)
+	}
+	var outs []string
+	step := func(want int, wantText string, args ...string) {
+		t.Helper()
+		rc, out := h.runEnv(env, "", append([]string{"migrate"}, args...)...)
+		outs = append(outs, out)
+		if rc != want || !strings.Contains(out, wantText) {
+			t.Fatalf("fd migrate %v: rc=%d(기대 %d), %q 가 없다:\n%s", args, rc, want, wantText, out)
+		}
+	}
+	plan := func() store.MigrationAction {
+		t.Helper()
+		p, err := store.ProbeMigration(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p.Action
+	}
+
+	step(1, "이관을 거치지 않은 새 원장")
+	if got := plan(); got != store.MigrateApply {
+		t.Fatalf("거절했는데 빈 클러스터에 무엇을 깔았다: %s", got)
+	}
+	step(0, "올렸다: 스키마 18판", "--to", "18")
+	step(1, "이관을 거치지 않은 새 원장")    // 기준선을 깐 뒤 이관 전에 띄운 up
+	step(0, "이미 맞다", "--db", dsn) // --db 로 준 원장은 재지 않는다
+
+	if err := os.WriteFile(store.MovedMarker(lite), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	step(0, "이미 맞다")
+	step(1, "Postgres 로 옮겼다", "--db", lite) // SQLite 쪽은 표지를 보고 선다
+
+	if err := os.Remove(store.MovedMarker(lite)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(lite, lite+".aside"); err != nil {
+		t.Fatal(err)
+	}
+	step(0, "이미 맞다") // SQLite 원장이 없다
+	for _, out := range outs {
+		if strings.Contains(out, dsn) || strings.Contains(out, u.Host) {
+			t.Fatalf("출력에 접속 URL 조각이 실렸다:\n%s", out)
+		}
 	}
 }

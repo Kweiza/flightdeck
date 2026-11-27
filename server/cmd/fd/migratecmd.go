@@ -118,6 +118,18 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 		return 0
 	}
 
+	// ★ 이 환경의 원장(--db 없이 FD_DB)이 Postgres 면, 같은 환경의 SQLite 원장 자리에 이관 표지 없는 원장이 남았는지 잰다
+	//   (store.UnmovedSQLiteRefusal) - 덮개 파일을 얹고 이관 없이 띄운 compose 가 빈 Postgres 원장을 새로 쓰기 시작하는 길을
+	//   여기서 막는다. 판이 맞아 아무것도 안 하는 날에도 잰다(그날 서버가 뜬다). --db 로 준 원장은 이 환경의 원장인지 모르므로
+	//   재지 않는다.
+	if strings.TrimSpace(*dbPath) == "" && store.ParseTarget(path).Postgres() {
+		if err := store.UnmovedSQLiteRefusal(sqliteLedgerPath(a.env), *to); err != nil {
+			a.log.Error("적용 거절", "path", shown, "error", err.Error())
+			fmt.Fprintf(out, "적용하지 않는다: %s\n", err)
+			return 1
+		}
+	}
+
 	target := store.SchemaVersion
 	if *to != 0 {
 		target = *to

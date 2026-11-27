@@ -1086,6 +1086,52 @@ func TestUpdateSkillDoesNotLoseTheRepoMount(t *testing.T) {
 	}
 }
 
+// 서버를 띄우고 갱신하는 안내 셋(fd setup 의 기동 단계 · 감시기의 컨테이너 사유 · fd-update 스킬)이 compose 를 한 머리
+// (composeCmd)로 부른다. 그 머리는 ~/.flightdeck/compose.env 가 있으면 덮개 파일을 얹는다.
+//
+// ★ 이 시험이 없어서 난 일: 스킬은 compose.env 를 얹는 줄과 안 얹는 줄을 따로 썼고, setup · 감시기는 덮개 없는 `docker compose
+// up` 을 냈다. Postgres 로 옮긴 배포에서 그 안내를 따르면 기본 compose(SQLite)가 뜬다(이관 표지가 그 기동을 막지만, 막힌
+// 기동은 서버가 없는 것으로 보인다).
+// ★ 스킬은 `docker compose` 가 나오는 **모든 자리**를 본다 - 한 줄만 보면 다른 줄이 덮개를 빼도 초록이다.
+func TestComposeGuidanceSharesOneHead(t *testing.T) {
+	if !strings.HasSuffix(composeCmd, " docker compose") || !strings.Contains(composeCmd, "~/.flightdeck/compose.env") {
+		t.Fatalf("compose 머리가 compose.env 를 얹는 docker compose 가 아니다: %s", composeCmd)
+	}
+	p := PlanSetup(state(func(s *SetupState) { s.Reachable = false; s.PluginRoot = "/opt/fd" }))
+	var start string
+	for _, st := range p.Steps {
+		if strings.Contains(st.Command, " up -d") {
+			start = st.Command
+		}
+	}
+	if !strings.Contains(start, composeCmd+" up -d") {
+		t.Errorf("fd setup 의 기동 명령이 compose 머리를 안 쓴다: %q", start)
+	}
+	for _, sig := range [][2]bool{{true, false}, {false, true}} {
+		if _, why := containerVerdict(sig[0], sig[1]); !strings.Contains(why, composeCmd+" up -d --build") {
+			t.Errorf("감시기의 컨테이너 사유가 compose 머리를 안 쓴다: %q", why)
+		}
+	}
+	root := pluginRoot(t)
+	for _, f := range []string{"SKILL.md", "SKILL.ko.md"} {
+		raw, err := os.ReadFile(filepath.Join(root, "skills", "fd-update", f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for i, ln := range strings.Split(string(raw), "\n") {
+			c := strings.Count(ln, "docker compose")
+			n += c
+			if c != strings.Count(ln, composeCmd) {
+				t.Errorf("fd-update/%s %d 줄의 docker compose 가 compose 머리 없이 나온다:\n  %s", f, i+1, strings.TrimSpace(ln))
+			}
+		}
+		if n < 3 {
+			t.Errorf("fd-update/%s 의 compose 자리가 %d 곳이다 - 재기(selfcheck) · 내리기 · 올리기 셋이어야 한다", f, n)
+		}
+	}
+}
+
 // 문서가 세는 MCP 도구 수와 실재하는 수가 어긋나면 여기서 걸린다.
 //
 // ★ 이 시험이 없어서 난 일: §1 머리줄은 스스로를 "수와 이름 목록의 진실 원천"이라

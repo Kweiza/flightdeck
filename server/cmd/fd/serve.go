@@ -40,6 +40,12 @@ func DefaultDBPath(get func(string) (string, bool), home string, dataDirExists b
 		}
 		return filepath.Clean(v)
 	}
+	return defaultSQLitePath(home, dataDirExists)
+}
+
+// defaultSQLitePath 는 FD_DB 가 없을 때의 SQLite 원장 자리다(DefaultDBPath 의 나머지 갈래). 순수 함수다. Postgres 판올림이
+// 이 자리에 이관을 거치지 않은 원장이 남았는지 잰다(store.UnmovedSQLiteRefusal) - FD_DB 가 Postgres 를 가리켜도 이 자리는 그대로다.
+func defaultSQLitePath(home string, dataDirExists bool) string {
 	if dataDirExists {
 		return "/data/fd.db"
 	}

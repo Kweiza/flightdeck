@@ -463,9 +463,15 @@ func OpenWithLogger(path string, log *slog.Logger) (*Store, error) {
 // 적용을 기동에서 분리한 의미가 없어진다 — 누구든 이것으로 열고 스키마를 만질 수 있다.
 //
 // SQLite 파일만 연다. Postgres 는 OpenWithLogger · MigrateWith 가 openPG 로 가른다.
+//
+// ★ 이관 표지가 있는 원장(Postgres 로 옮겼다)은 열지 않는다(movedRefusal). sql.Open 이 없는 파일을 **만들기** 때문에 이 문이
+// 판올림(Migrate)이 빈 원장을 새로 만드는 유일한 자리다 - 덮개 파일을 빼고 띄운 compose 가 여기서 선다.
 func openRaw(path string, log *slog.Logger) (*Store, error) {
 	if log == nil {
 		log = slog.Default()
+	}
+	if err := movedRefusal(path); err != nil {
+		return nil, err
 	}
 	db, err := sql.Open("sqlite", dsn(path))
 	if err != nil {

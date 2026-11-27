@@ -318,20 +318,21 @@ func (w *selfWatcher) shuttingDown() bool {
 //
 // ★ 컨테이너에서는 감시를 **아예 안 켠다.** 이미지는 불변이라 실행 파일이 영원히 안 바뀌고,
 // 그 상태로 "보는 중"이라고 말하면 읽는 쪽은 따라오고 있다고 믿는다. 침묵보다 나쁘다 —
-// 틀린 안심을 준다. 컨테이너의 갱신은 `docker compose up -d --build` 로 사람이 한다.
+// 틀린 안심을 준다. 컨테이너의 갱신은 사람이 compose 로 한다(composeUpdate - 덮개 파일을 얹는 머리가 setup 과 같다).
 //
 // /data 를 신호로 쓰는 것은 이 저장소의 기존 관용구다(DefaultDBPath 가 같은 축을 본다).
 func containerVerdict(hasDockerEnv, hasDataDir bool) (bool, string) {
 	switch {
 	case hasDockerEnv:
-		return true, "이 서버는 컨테이너다(/.dockerenv) — 자기 이미지를 다시 만들 수 없어 자기 갱신을 안 한다. " +
-			"`docker compose up -d --build` 가 갱신 경로다"
+		return true, "이 서버는 컨테이너다(/.dockerenv) — 자기 이미지를 다시 만들 수 없어 자기 갱신을 안 한다. " + composeUpdate
 	case hasDataDir:
-		return true, "이 서버는 컨테이너로 보인다(/data 볼륨) — 자기 갱신을 안 한다. " +
-			"`docker compose up -d --build` 가 갱신 경로다"
+		return true, "이 서버는 컨테이너로 보인다(/data 볼륨) — 자기 갱신을 안 한다. " + composeUpdate
 	}
 	return false, ""
 }
+
+// composeUpdate 는 컨테이너 사유 끝의 갱신 경로다. 저장소 마운트까지 넘기는 전체 절차는 fd-update 스킬이다.
+const composeUpdate = "`" + composeCmd + " up -d --build` 가 갱신 경로다(전체 절차는 /fd-update)"
 
 // detectContainer 는 파일시스템 신호를 읽어 containerVerdict 에 넘긴다.
 //

@@ -632,6 +632,10 @@ func Rollback(ctx context.Context, path, backupDir string, log *slog.Logger) (Ro
 // 이 자리에서 알 방법이 없다. 도는 서버 밑에서 파일을 갈면 그 프로세스는 옛 페이지 캐시
 // 위에서 계속 돌고, 그 상태는 어디에도 안 나타난다.
 func rollbackSQLite(path string, log *slog.Logger) (string, error) {
+	// 옮긴 원장(이관 표지)의 판을 되돌리면 SQLite 원장이 다시 살아난다 - 표지는 72시간 되돌리기만 지운다(moved.go).
+	if err := movedRefusal(path); err != nil {
+		return "", err
+	}
 	backups, err := filepath.Glob(path + ".bak-*")
 	if err != nil {
 		return "", fmt.Errorf("백업을 찾지 못했다(path=%q): %w", clip(path, 200), err)

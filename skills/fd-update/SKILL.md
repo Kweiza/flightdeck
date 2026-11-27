@@ -36,7 +36,7 @@ fd selfcheck --db ~/.flightdeck/fd.db
 
 It answers only **may this be restarted** — does that binary run, is the DB migration plan not a refusal.
 **Ask this first when rolling back too.** If the DB version is higher than that build knows, a refusal comes back.
-(If the build is old enough to print `모르는 명령: selfcheck`, that build's `serve` stops at startup for the same reason.) **On a Postgres ledger** (`~/.flightdeck/compose.env` exists — README "Running on Postgres") ask after the plugin update in step 4, from the new directory: `COMPOSE_ENV_FILES=~/.flightdeck/compose.env docker compose run --rm --build --no-deps migrate selfcheck`. If the running server's `FD_DB` (`docker inspect`) is `postgres://` but that file is missing, **stop and ask** — brought up without it, the server starts on an empty SQLite ledger.
+(If the build is old enough to print `모르는 명령: selfcheck`, that build's `serve` stops at startup for the same reason.) **On a Postgres ledger** (`~/.flightdeck/compose.env` exists — README "Running on Postgres") ask after the plugin update in step 4, from the new directory: `COMPOSE_ENV_FILES="$([ ! -e ~/.flightdeck/compose.env ] || echo ~/.flightdeck/compose.env)" docker compose run --rm --build --no-deps migrate selfcheck`. If the running server's `FD_DB` (`docker inspect`) is `postgres://` but that file is missing, **stop and ask** — brought up without it, the default path (SQLite) tries to start. With the move marker (`~/.flightdeck/fd.db.moved-to-postgres`) migrate refuses and the server stays down; without it the old SQLite ledger gets the writes. The compose prefix here and in step 4 (`COMPOSE_ENV_FILES=…`) is the same single line as the `fd setup` start command and the watcher's container reason: with that file it layers the overlay, without it the value is empty and plain compose runs. Do not rewrite it per place.
 
 ## 4. Update
 
@@ -47,9 +47,9 @@ claude plugin update flightdeck@<marketplace>
 # Read EVERY repo mount BEFORE bringing it down — those values are recorded nowhere else
 readarray -t R < <(docker inspect flightdeck --format '{{range .Mounts}}{{if eq .Source .Destination}}{{println .Source}}{{end}}{{end}}')
 
-C=; [ -e ~/.flightdeck/compose.env ] && C=~/.flightdeck/compose.env; cd ~/.claude/plugins/cache/<marketplace>/flightdeck/<old version> && COMPOSE_ENV_FILES=$C docker compose down
+cd ~/.claude/plugins/cache/<marketplace>/flightdeck/<old version> && COMPOSE_ENV_FILES="$([ ! -e ~/.flightdeck/compose.env ] || echo ~/.flightdeck/compose.env)" docker compose down
 cd ../<new version>
-FD_TOKEN="$(cat ~/.flightdeck/token 2>/dev/null || sed -n 's/.*"token": *"\([^"]*\)".*/\1/p' ~/.flightdeck/config.json)" FD_REPOS="${R[0]}" FD_REPOS2="${R[1]:-}" FD_REPOS3="${R[2]:-}" FD_REPOS4="${R[3]:-}" FD_UID=$(id -u) FD_GID=$(id -g) COMPOSE_ENV_FILES=$C docker compose up -d --build
+FD_TOKEN="$(cat ~/.flightdeck/token 2>/dev/null || sed -n 's/.*"token": *"\([^"]*\)".*/\1/p' ~/.flightdeck/config.json)" FD_REPOS="${R[0]}" FD_REPOS2="${R[1]:-}" FD_REPOS3="${R[2]:-}" FD_REPOS4="${R[3]:-}" FD_UID=$(id -u) FD_GID=$(id -g) COMPOSE_ENV_FILES="$([ ! -e ~/.flightdeck/compose.env ] || echo ~/.flightdeck/compose.env)" docker compose up -d --build
 ```
 
 **Down the old directory first** (compose project name = version directory, or the container name collides).

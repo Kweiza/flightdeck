@@ -35,13 +35,24 @@ import (
 // ★ 플래그 값은 **다듬지 않고** 낸다. 공백만 있으면 빈 것으로 볼 뿐이다. 접속 URL 의 앞뒤 공백은
 // store.ParseTarget 이 가를 때 뺀다. SQLite 파일 이름의 공백(`--db 'fd.db '`)은 이름이라, 여기서 빼면 두 파일이
 // 다 있을 때 오류 없이 다른 원장을 연다.
+//
+// ★ 홈은 env 의 HOME 이다(homeDir). 프로세스 환경(os.UserHomeDir)을 읽으면 가짜 HOME 을 준 시험이 사용자의 진짜 원장 자리를 본다.
 func resolveDBPath(env func(string) (string, bool), dbFlag string) string {
 	if strings.TrimSpace(dbFlag) != "" {
 		return dbFlag
 	}
-	home, _ := os.UserHomeDir()
-	_, derr := os.Stat("/data")
-	return DefaultDBPath(env, home, derr == nil)
+	return DefaultDBPath(env, homeDir(env), dataVolume())
+}
+
+// sqliteLedgerPath 는 FD_DB 를 빼고 고른 이 환경의 SQLite 원장 자리다(resolveDBPath 와 같은 홈 · 볼륨). 컨테이너면 /data/fd.db 다.
+func sqliteLedgerPath(env func(string) (string, bool)) string {
+	return defaultSQLitePath(homeDir(env), dataVolume())
+}
+
+// dataVolume 은 컨테이너의 원장 볼륨(/data)이 붙었는가다(DefaultDBPath 의 축).
+func dataVolume() bool {
+	_, err := os.Stat("/data")
+	return err == nil
 }
 
 // ensureDBDir 는 SQLite 파일의 부모 디렉토리를 만든다. Postgres 접속 URL 이면 아무것도 안 한다.

@@ -217,6 +217,16 @@ func goInstallStep(s SetupState, why string) SetupStep {
 	}
 }
 
+// composeCmd 는 이 기계의 배포가 고른 덮개 파일을 얹어 docker compose 를 부르는 셸 머리다. ~/.flightdeck/compose.env 가
+// 있으면 그것을 compose 의 env 파일로 주고(그 안의 COMPOSE_FILE 이 Postgres 덮개를 얹는다 - README 「Postgres 로 띄우기」),
+// 없으면 빈 값이라 기본 compose(SQLite)다. 빈 COMPOSE_ENV_FILES 는 안 준 것과 같다.
+//
+// ★ 서버를 띄우고 갱신하는 안내가 이 하나를 쓴다(fd setup 의 기동 단계 · 감시기의 컨테이너 사유 · fd-update 스킬 - 스킬은
+// 시험이 이 글자와 맞댄다). 안내마다 따로 쓰면 한 곳이 덮개를 빼고, 덮개를 뺀 `up` 은 Postgres 로 옮긴 배포를 SQLite 로 띄우려
+// 든다(그 길은 이관 표지가 막지만, 막힌 기동은 서버가 없는 것으로 보인다).
+// ★ 홑따옴표 없이 쓴다 - ~ 가 풀려야 한다. sh · bash · zsh 가 같게 푼다.
+const composeCmd = `COMPOSE_ENV_FILES="$([ ! -e ~/.flightdeck/compose.env ] || echo ~/.flightdeck/compose.env)" docker compose`
+
 // serverStartSteps 는 서버를 띄우는 길이다.
 //
 // ★ **둘을 구분해서 낸다.** 이 레포에는 상시 실행의 정식 방법이 없다(systemd·launchd 정의가
@@ -230,7 +240,7 @@ func goInstallStep(s SetupState, why string) SetupStep {
 // 열되 못 쓰고 git 이 소유권을 의심한다(compose.yaml 주석).
 func serverStartSteps(s SetupState) []SetupStep {
 	if s.Docker {
-		const up = "FD_UID=$(id -u) FD_GID=$(id -g) docker compose up -d"
+		const up = "FD_UID=$(id -u) FD_GID=$(id -g) " + composeCmd + " up -d"
 		if s.PluginRoot != "" {
 			return []SetupStep{{
 				What:    "서버 기동(지원되는 상시 실행 경로)",

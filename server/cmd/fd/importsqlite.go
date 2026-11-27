@@ -35,7 +35,7 @@ func (a *App) parseImportFlags(name string, args []string) (importFlags, bool) {
 	fs := newFlagSet("migrate " + name)
 	from := fs.String("from", "", "옮길 SQLite 원장 파일(서버를 내린 원본이나 VACUUM INTO 로 뜬 사본. 읽기 전용으로 연다)")
 	to := fs.String("db", "", "대상 Postgres 접속 URL(비면 "+dbEnv+")")
-	dry := fs.Bool("dry-run", false, "아무것도 쓰지 않고 잰다")
+	dry := fs.Bool("dry-run", false, "원장에 아무것도 쓰지 않고 잰다(원본 디렉토리에 이관 표지를 남길 수 있는지도 잰다)")
 	if err := fs.Parse(args); err != nil || fs.NArg() > 0 || strings.TrimSpace(*from) == "" {
 		fmt.Fprintf(fs.Output(), "쓰는 법: fd migrate %s --from <fd.db> [--db <postgres URL>] [--dry-run]\n", name)
 		return importFlags{}, false
@@ -66,6 +66,8 @@ func (a *App) runImportSQLite(ctx context.Context, args []string, out io.Writer)
 		fmt.Fprintln(out, "\n  옮길 수 있다 - 본 실행과 같은 트랜잭션을 끝까지 돌고 되감았다(아무것도 쓰지 않았다)")
 	default:
 		fmt.Fprintf(out, "\n  옮겼다: %d 행, 대조가 맞았다\n", rep.Copied)
+		fmt.Fprintf(out, "  이관 표지를 남겼다: %s - SQLite 판은 이 원장을 다시 열지 않는다(되돌리기는 README 「72시간 안에 되돌리기」)\n",
+			store.MovedMarker(f.from))
 	}
 	return 0
 }

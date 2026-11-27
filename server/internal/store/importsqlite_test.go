@@ -348,6 +348,8 @@ func TestImportSQLiteDryRunWritesNothing(t *testing.T) {
 	if rep, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil || rep.Copied == 0 {
 		t.Fatalf("예행 뒤 본 실행: %v (옮긴 행 %d)", err, rep.Copied)
 	}
+	// 옮긴 원본은 표지가 있어 다시 옮기지 않는다(TestImportSQLiteLeavesTheMovedMarker) - 옮기지 않은 원본으로 잰다.
+	src = importSource(t, importSeed)
 	other := filepath.Join(t.TempDir(), "not-there.db")
 	rep, err = importLedger(t, ctx, src, other, TransferOptions{DryRun: true})
 	if err != nil || rep.TargetChecked {
@@ -367,6 +369,8 @@ func TestImportSQLiteRefusesATargetThatIsNotEmpty(t *testing.T) {
 		t.Fatalf("첫 이관: %v", err)
 	}
 	before := targetRows(t, dst)
+	// 옮긴 원본은 표지가 있어 다시 옮기지 않는다 - 대상 쪽 거절을 재려고 옮기지 않은 같은 내용의 원본을 쓴다.
+	src = importSource(t, importSeed)
 	for _, dry := range []bool{true, false} {
 		_, err := importLedger(t, ctx, src, dsn, TransferOptions{DryRun: dry})
 		if err == nil || !strings.Contains(err.Error(), "비어 있지 않다") {
@@ -451,7 +455,7 @@ func liteQuery(t *testing.T, path, q string, dest ...any) {
 // 옮긴 뒤 대상의 한 칸 · 한 행 · 순번이 바뀌면 대조가 그 표와 행을 짚어 어긋남으로 낸다. NULL 을 빈 글로 바꾼 것도 잡는다.
 func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 	ctx := context.Background()
-	src := importSource(t, importSeed)
+	// 갈래마다 옮기지 않은 원본을 새로 만든다 - 옮긴 원본은 표지가 있어 다시 옮기지 않는다.
 	for _, c := range []struct {
 		name, change, table, keyHas string
 	}{
@@ -465,6 +469,7 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 			OVERRIDING SYSTEM VALUE VALUES ('p', 'i1', 'i2', 4)`, "item_after", `seq=3`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			src := importSource(t, importSeed)
 			dsn, dst := importTarget(t)
 			if _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil {
 				t.Fatalf("이관: %v", err)
@@ -490,6 +495,7 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 	}
 	// 대상 값이 값 검사에 걸리면 어긋남과 따로 그 칸 · 사유 · 행을 적는다(대상에서 읽은 값을 버리지 않는다).
 	t.Run("대상 값 검사", func(t *testing.T) {
+		src := importSource(t, importSeed)
 		dsn, dst := importTarget(t)
 		if _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil {
 			t.Fatalf("이관: %v", err)
@@ -509,6 +515,7 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 		}
 	})
 	t.Run("순번", func(t *testing.T) {
+		src := importSource(t, importSeed)
 		dsn, dst := importTarget(t)
 		if _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil {
 			t.Fatalf("이관: %v", err)

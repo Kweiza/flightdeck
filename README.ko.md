@@ -249,7 +249,8 @@ curl -s localhost:7420/healthz      # db_ok · db_locale_ok 가 true
 ```
 
 빈 원장이면 `migrate` 가 기준선부터 깐다. **SQLite 원장을 들고 옮기려면** 이렇게 띄우지 말고 아래 「업그레이드: SQLite
-원장을 Postgres 로」를 따른다 - 서버가 먼저 빈 원장에 쓰면 이관이 거절한다.
+원장을 Postgres 로」를 따른다 - `~/.flightdeck/fd.db` 가 이관 표지 없이 남아 있으면 이렇게 띄운 `migrate` 가 거절한다(이관을
+거치지 않은 새 원장).
 
 **관리 명령**은 `migrate` 서비스로 한다. 원장(`/data`) · 덤프 자리(`/backups`) · psql · pg_dump · pg_restore 가 그 안에 있고,
 초사용자로 소켓에 붙는다. `--no-deps` 는 `db` 가 떠 있을 때 쓴다.
@@ -266,9 +267,10 @@ sql() { fdc run --rm --no-deps --entrypoint psql migrate -X -v ON_ERROR_STOP=1 "
 - **비밀번호를 바꾸려면** 두 pgpass 파일을 **제자리에서** 고치고(새 파일로 바꿔 끼우면 붙어 있는 컨테이너에서 파일이
   사라진다) `fdc up -d --force-recreate --no-deps db-roles flightdeck db-backup` 한다. 서버는 기동 때 한 번 읽는다.
 
-★ **원장 하나에 덮개 하나.** Postgres 로 옮긴 뒤 `fdc` 대신 `docker compose` 만 치면 기본 경로(SQLite)로 뜬다. 옮기는
-절차가 옛 SQLite 파일의 이름을 바꿔 두므로 그때 서버는 **빈** SQLite 원장으로 뜬다 - 옮긴 원장은 Postgres 에 그대로 있다.
-`docker compose down` 으로 내리고, 생긴 빈 `~/.flightdeck/fd.db`(와 `-wal` · `-shm`)를 치운 뒤 `fdc up -d` 로 다시 띄운다.
+★ **원장 하나에 덮개 하나.** 이관은 커밋한 뒤 SQLite 원장 옆에 이관 표지(`~/.flightdeck/fd.db.moved-to-postgres`)를 남긴다.
+옮긴 뒤 `fdc` 대신 `docker compose` 만 치면 기본 경로(SQLite)의 `migrate` 가 그 표지를 보고 원장을 열지도 새로 만들지도 않아
+서버가 안 뜬다 - `docker compose down` 뒤 `fdc up -d` 로 다시 띄운다. 거꾸로 덮개를 얹은 `migrate` 는 표지 없는 `fd.db` 가
+남아 있으면 거절한다. 표지는 아래 「72시간 안에 되돌리기」만 지운다.
 
 ### 업그레이드: SQLite 원장을 Postgres 로
 
@@ -290,7 +292,7 @@ docker compose run --rm --no-deps migrate migrate --db /data/fd.db
 docker compose run --rm --no-deps migrate selfcheck --db /data/fd.db
 # 4. Postgres 원장을 띄우고 기준선만 깐다(판 18 에서 멈춘다). db 가 같이 뜬다.
 fdc run --rm migrate migrate --to 18
-# 5. 예행 → 옮기기 → 맞대기.
+# 5. 예행 → 옮기기 → 맞대기. 옮기기가 커밋한 뒤 원본 옆에 이관 표지(fd.db.moved-to-postgres)를 남긴다.
 fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db --dry-run
 fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db
 fdc run --rm --no-deps migrate migrate verify --from /data/fd.db
@@ -324,6 +326,7 @@ fdc run --rm --no-deps migrate migrate verify --from /data/fd-back.db
 # 3. Postgres 겹을 내리고 낸 파일을 원장 자리에 둔다(옆 파일도 같이).
 fdc down
 for s in '' -wal -shm; do [ ! -e ~/.flightdeck/fd-back.db$s ] || mv ~/.flightdeck/fd-back.db$s ~/.flightdeck/fd.db$s; done
+rm ~/.flightdeck/fd.db.moved-to-postgres   # 이관 표지 - 남기면 SQLite 쪽 migrate 가 이 원장을 열지 않는다
 # 4. Postgres 를 고른 파일을 치우고 기본 경로(SQLite)로 띄운다. 남겨 두면 다음 갱신이 다시 Postgres 겹을 얹는다.
 mv ~/.flightdeck/compose.env ~/.flightdeck/compose.env.off
 docker compose up -d

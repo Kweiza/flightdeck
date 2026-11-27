@@ -40,7 +40,7 @@ fd selfcheck --db ~/.flightdeck/fd.db
 **재기동해도 되는가**에만 답한다 — 그 바이너리가 실행되는가, DB 증분 계획이 거절이 아닌가.
 **되돌릴 때도 이걸 먼저 물어라.** DB 버전이 그 판이 아는 것보다 높으면 거절이 나온다.
 (`모르는 명령: selfcheck` 가 나올 만큼 옛 판이면, 그 판의 `serve` 가 기동에서 같은 이유로 멈춘다.)
-**Postgres 원장이면**(`~/.flightdeck/compose.env` 가 있다 — README 「Postgres 로 띄우기」) 4 의 플러그인 갱신 뒤 새 자리에서 `COMPOSE_ENV_FILES=~/.flightdeck/compose.env docker compose run --rm --build --no-deps migrate selfcheck` 로 묻는다. 도는 서버의 `FD_DB`(`docker inspect`)가 `postgres://` 인데 그 파일이 없으면 **멈추고 묻는다** — 없이 올리면 서버가 빈 SQLite 원장으로 뜬다.
+**Postgres 원장이면**(`~/.flightdeck/compose.env` 가 있다 — README 「Postgres 로 띄우기」) 4 의 플러그인 갱신 뒤 새 자리에서 `COMPOSE_ENV_FILES="$([ ! -e ~/.flightdeck/compose.env ] || echo ~/.flightdeck/compose.env)" docker compose run --rm --build --no-deps migrate selfcheck` 로 묻는다. 도는 서버의 `FD_DB`(`docker inspect`)가 `postgres://` 인데 그 파일이 없으면 **멈추고 묻는다** — 없이 올리면 기본 경로(SQLite)로 뜨려 든다. 이관 표지(`~/.flightdeck/fd.db.moved-to-postgres`)가 있으면 migrate 가 거절해 서버가 안 뜨고, 없으면 옛 SQLite 원장에 쓴다. 이 절과 아래 4 의 compose 머리(`COMPOSE_ENV_FILES=…`)는 `fd setup` 의 기동 명령 · 감시기의 컨테이너 사유와 같은 한 줄이다 — 그 파일이 있으면 덮개를 얹고, 없으면 빈 값이라 기본 compose 다. 따로 고쳐 쓰지 않는다.
 
 ## 4. 갱신한다
 
@@ -51,9 +51,9 @@ claude plugin update flightdeck@<마켓플레이스>
 # 내리기 전에 저장소 마운트를 **전부** 읽는다 — 이 값들은 어디에도 안 남는다
 readarray -t R < <(docker inspect flightdeck --format '{{range .Mounts}}{{if eq .Source .Destination}}{{println .Source}}{{end}}{{end}}')
 
-C=; [ -e ~/.flightdeck/compose.env ] && C=~/.flightdeck/compose.env; cd ~/.claude/plugins/cache/<마켓플레이스>/flightdeck/<옛 버전> && COMPOSE_ENV_FILES=$C docker compose down
+cd ~/.claude/plugins/cache/<마켓플레이스>/flightdeck/<옛 버전> && COMPOSE_ENV_FILES="$([ ! -e ~/.flightdeck/compose.env ] || echo ~/.flightdeck/compose.env)" docker compose down
 cd ../<새 버전>
-FD_TOKEN="$(cat ~/.flightdeck/token 2>/dev/null || sed -n 's/.*"token": *"\([^"]*\)".*/\1/p' ~/.flightdeck/config.json)" FD_REPOS="${R[0]}" FD_REPOS2="${R[1]:-}" FD_REPOS3="${R[2]:-}" FD_REPOS4="${R[3]:-}" FD_UID=$(id -u) FD_GID=$(id -g) COMPOSE_ENV_FILES=$C docker compose up -d --build
+FD_TOKEN="$(cat ~/.flightdeck/token 2>/dev/null || sed -n 's/.*"token": *"\([^"]*\)".*/\1/p' ~/.flightdeck/config.json)" FD_REPOS="${R[0]}" FD_REPOS2="${R[1]:-}" FD_REPOS3="${R[2]:-}" FD_REPOS4="${R[3]:-}" FD_UID=$(id -u) FD_GID=$(id -g) COMPOSE_ENV_FILES="$([ ! -e ~/.flightdeck/compose.env ] || echo ~/.flightdeck/compose.env)" docker compose up -d --build
 ```
 
 **옛 자리에서 먼저 내린다.** compose 프로젝트 이름이 **버전 디렉토리**라, 새 자리에서 바로 올리면
