@@ -14,18 +14,23 @@
 #
 # ★ **선택 파일은 서버 마운트 밖에 둔다**(/etc/flightdeck). 서버는 /data(~/.flightdeck)에 쓰고 FD_REPOS(기본 홈 전체)를 읽는다 -
 #   그 안에 두면 서버가 바꾼 덮개 · 시크릿 자리를 다음 갱신(사람이, 때로 root 로 돌린다)이 믿는다. 옛 자리(~/.flightdeck/compose.env)에
-#   파일이 남아 있으면 fd setup 의 기동 · fd-update 가 처방을 내고 멈춘다. 그 파일은 대조가 맞은 뒤에 켜고(compose.env.off →
-#   compose.env) 이관을 거두면 끈다(README 「업그레이드: SQLite 원장을 Postgres 로」).
+#   파일이 남아 있으면 fd setup 의 기동 · fd-update · README 의 fdc 가 처방을 내고 멈춘다. 그 파일은 대조가 맞은 뒤에 켜고
+#   (compose.env.off → compose.env) 이관을 거두면 끈다(README 「업그레이드: SQLite 원장을 Postgres 로」).
 #
 # ★ **원장 하나에 이 파일 하나.** 두 쪽 migrate 가 갈린 원장을 막는다. 이관(`fd migrate import-sqlite`)은 커밋한 뒤 SQLite 원장
 #   옆에 이관 표지(`fd.db.moved-to-postgres`)를 남기고, 옮긴 뒤 이 파일을 빼고 `up` 하면 SQLite 쪽 migrate 가 그 표지를 보고
 #   원장을 열지도 새로 만들지도 않는다. 거꾸로 이 파일을 얹은 migrate 는 /data 에 표지 없는 fd.db 가 남아 있으면 거절한다
-#   (이관을 거치지 않은 새 원장 - 기준선만 까는 `--to 18` 은 받는다). 표지는 72시간 되돌리기만 지운다(README 「72시간 안에
-#   되돌리기」).
+#   (이관을 거치지 않은 새 원장 - 기준선만 까는 `--to 18` 은 받는다). 표지는 README 의 두 절차만 손으로 지운다(「켜기 전에
+#   섰을 때」 · 「72시간 안에 되돌리기」).
 #
 # ★ **시크릿은 접속 계정 둘의 pgpass 파일뿐이다.** 초사용자(postgres)는 비밀번호가 없다: 아무도 모르는 난수로 만들고(아래 db
 #   의 POSTGRES_PASSWORD_FILE), 접속 규칙(deploy/pg_hba.conf)이 그 TCP 접속을 IPv4 · IPv6 모두 거절한다. 소켓 볼륨(pgrun)을 붙인
 #   관리 컨테이너(migrate · db-roles)만 소켓의 trust 로 붙는다. 서버와 매일 덤프는 그 볼륨이 없다.
+#
+# ★ **판 디렉토리를 붙이지 않는다.** db · db-roles · db-backup 은 이 겹의 이미지(deploy/Dockerfile - postgres:17 에 접속 규칙 ·
+#   계정 스크립트 · 덤프 스크립트를 굽는다) 하나로 돈다. compose 를 부르는 디렉토리는 플러그인 설치본의 판 디렉토리라 정리로
+#   지워질 수 있는데, restart: unless-stopped 인 db · db-backup 이 거기서 bind 하면 재부팅 · 크래시 뒤 다시 뜨지 못한다. 이미지는
+#   그 컨테이너가 붙드는 동안 남는다. 시험(TestComposeServicesDoNotBindThePluginDirectory)이 렌더한 마운트를 잰다.
 #
 # ★ **이름과 덤프 자리는 배포마다 따로다.** db 컨테이너와 두 볼륨의 이름은 배포 이름 FD_PG_INSTANCE(기본 flightdeck) 하나에서
 #   나오고, 덤프 자리 FD_BACKUP_HOST 는 기본값이 없다. 같은 소켓 볼륨을 쓰는 다른 프로젝트(예행 · 시험)의 migrate 는 이 원장
@@ -40,11 +45,14 @@ services:
   #   못 막고 원장이 깨진다. 이름이 같으면 둘째가 이름 충돌로 선다. 컨테이너 이름과 두 볼륨 이름이 FD_PG_INSTANCE 하나에서
   #   나오므로, 하나만 바꿔 이름이 다른 둘이 한 볼륨에 붙는 일이 없다.
   db:
-    image: postgres:17
+    build:
+      context: ./deploy
+    image: flightdeck-pg:local
     container_name: ${FD_PG_INSTANCE:-flightdeck}-db
-    # ★ **접속 규칙은 deploy/pg_hba.conf 하나다**(hba_file). 데이터 볼륨 안의 pg_hba.conf(첫 초기화의 initdb 인자와 이미지
-    #   진입점이 쓴 것)는 읽지 않는다 - initdb 인자는 기존 볼륨에 다시 먹지 않으므로, 볼륨 안 파일에 기대면 그 볼륨을 처음 만든 날의
-    #   규칙으로 뜬다. 이 줄은 기동마다 먹어 이미 있는 볼륨도 같은 규칙이다. 그 파일은 db 의 postgres 사용자가 읽는다(0644).
+    # ★ **접속 규칙은 deploy/pg_hba.conf 하나다**(hba_file). 이미지에 0644 로 구워져 있다(deploy/Dockerfile - 판 디렉토리를 bind
+    #   하지 않는다, 머리말). 데이터 볼륨 안의 pg_hba.conf(첫 초기화의 initdb 인자와 이미지 진입점이 쓴 것)는 읽지 않는다 - initdb
+    #   인자는 기존 볼륨에 다시 먹지 않으므로, 볼륨 안 파일에 기대면 그 볼륨을 처음 만든 날의 규칙으로 뜬다. 이 줄은 기동마다 먹어
+    #   이미 있는 볼륨도 같은 규칙이다.
     command: ["postgres", "-c", "hba_file=/etc/postgresql/fd_hba.conf"]
     restart: unless-stopped
     # 끝내기 검사점(checkpoint)을 기다린다. 기본 10초를 넘기면 SIGKILL 이고, 다음 기동이 WAL 되감기(복구)부터 한다.
@@ -67,7 +75,6 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - pgrun:/var/run/postgresql
-      - ./deploy/pg_hba.conf:/etc/postgresql/fd_hba.conf:ro
     healthcheck:
       # ★ TCP(127.0.0.1)로 잰다. 첫 초기화 동안 진입점이 띄우는 임시 서버는 소켓만 듣는다 - 소켓으로 재면 초기화가 끝나기
       #   전에 healthy 가 되어 migrate 가 임시 서버에 붙는다. pg_isready 는 인증 요청까지만 보고 로그인하지 않는다.
@@ -108,14 +115,16 @@ services:
       PGUSER: postgres
       PGDATABASE: "${FD_PG_DATABASE:-flightdeck}"
 
-  # ★ 접속 계정을 맞추는 one-shot(deploy/db-roles.sh). 스키마를 올린 뒤, 서버와 매일 덤프가 뜨기 전에 돈다.
+  # ★ 접속 계정을 맞추는 one-shot(deploy/db-roles.sh - 이미지에 구워져 있다). 스키마를 올린 뒤, 서버와 매일 덤프가 뜨기 전에 돈다.
   #   서버 계정(FD_PG_SERVER_USER)은 fd_app 의 구성원, 덤프 계정(FD_PG_BACKUP_USER)은 pg_read_all_data 의 구성원이고, 둘 다
   #   특권 속성이 없다. 없으면 만들고, 있으면 속성 · 구성원 자격을 재어 어긋나면 고치지 않고 멈춘다(누가 왜 그렇게 만들었는지는
   #   사람이 본다). 비밀번호는 돌 때마다 pgpass 파일의 값으로 둔다. 바꾸는 법: 두 파일을 **제자리에서** 고치고(새 파일로 바꿔
   #   끼우면 붙어 있는 컨테이너에서 그 파일이 사라진다) `docker compose up -d --force-recreate --no-deps db-roles flightdeck
   #   db-backup`. 서버는 기동 때 한 번 읽으므로 다시 만들어야 새 값으로 붙는다.
   db-roles:
-    image: postgres:17
+    build:
+      context: ./deploy
+    image: flightdeck-pg:local
     restart: "no"
     user: "${FD_UID:-1000}:${FD_GID:-1000}"
     entrypoint: ["sh", "/usr/local/bin/fd-db-roles"]
@@ -123,7 +132,6 @@ services:
       migrate:
         condition: service_completed_successfully
     volumes:
-      - ./deploy/db-roles.sh:/usr/local/bin/fd-db-roles:ro
       - pgrun:/var/run/postgresql
     secrets:
       - fd_pg_server_pgpass
@@ -161,8 +169,8 @@ services:
   # ★ Postgres 원장의 매일 덤프(재설계 스펙의 백업 절: 매일 `pg_dump -Fc`, 14개 보관). 매시간 판단 원장(/ledger)과 다른
   #   겹이다 - 그것은 여섯 표의 결정적 산출물이고, 이것은 원장 전체를 새 DB 로 되살리는 복원 수단이다.
   #
-  # ★ 이미지는 db 와 **같은 주판**의 postgres 다. pg_dump 는 자기보다 높은 서버를 거절한다. compose.test.yaml 의 pg-test 와도
-  #   같은 이미지다(TestComposePostgresImagesMatchTheTestServer 가 셋을 맞댄다).
+  # ★ 이미지는 db 와 **같은 이미지**다(deploy/Dockerfile - 스크립트가 구워져 있다). pg_dump 는 자기보다 높은 서버를 거절한다.
+  #   그 FROM 은 compose.test.yaml 의 pg-test 와 같은 이미지다(TestComposePostgresImagesMatchTheTestServer 가 맞댄다).
   #
   # ★ **`fd migrate` 가 돌기 전에 멈춘다(depends_on 의 restart: true).** pg_dump 는 끝날 때까지 모든 표의 ACCESS SHARE 잠금을
   #   쥐고, 판을 올리는 증분의 DDL 은 그 잠금을 lock_timeout(5초) 안에 못 얻으면 실패한다 - 갱신이 마침 덤프 시각에 걸리면
@@ -201,7 +209,9 @@ services:
   #
   # ★ 덤프는 원장 전체라 파일 권한을 0600 으로 쓴다(스크립트의 umask). 이름에는 시각만 있다.
   db-backup:
-    image: postgres:17
+    build:
+      context: ./deploy
+    image: flightdeck-pg:local
     restart: unless-stopped
     # 호스트 사용자로 돈다. 다르면 쌓인 덤프를 호스트에서 못 지우고, 자리를 못 만든다.
     user: "${FD_UID:-1000}:${FD_GID:-1000}"
@@ -214,7 +224,6 @@ services:
       db-roles:
         condition: service_completed_successfully
     volumes:
-      - ./deploy/db-backup.sh:/usr/local/bin/fd-db-backup:ro
       - ${FD_BACKUP_HOST:?덤프 자리 - 서버 마운트(FD_REPOS 기본 홈 전체 · ~/.flightdeck) 밖에 미리 만든다(README 「Postgres 로 띄우기」)}:/backups
     secrets:
       - fd_pg_backup_pgpass

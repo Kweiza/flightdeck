@@ -168,7 +168,8 @@ REST 가 없으면 서버를 만지는 순간 전 세션의 조정이 끊기고,
                                  /ledger/journal.git  (세대 역사, bare)
 
   + compose.postgres.yaml — 선택 파일(/etc/flightdeck/compose.env)이 얹을 때만. 원장은 Postgres 17, 시크릿 = 접속 계정 둘의 pgpass 파일
-    db           postgres:17. 이름은 배포 이름(FD_PG_INSTANCE, 기본 flightdeck)에서: 컨테이너 flightdeck-db,
+    db           flightdeck-pg:local(deploy/Dockerfile - postgres:17 에 접속 규칙 · 계정 · 덤프 스크립트를 굽는다, db-roles ·
+                 db-backup 과 같은 이미지). 이름은 배포 이름(FD_PG_INSTANCE, 기본 flightdeck)에서: 컨테이너 flightdeck-db,
                  볼륨 flightdeck-pgdata(원장) · flightdeck-pgrun(소켓). 포트를 안 낸다, 접속 규칙 deploy/pg_hba.conf
     migrate      초사용자 · 소켓(trust). 손으로 하는 관리 명령(이관 · 역이관 · 되살리기 · psql)도 여기
     db-roles     one-shot. 서버 계정(fd_app 의 구성원) · 덤프 계정(pg_read_all_data 의 구성원)을 맞춘다
@@ -194,7 +195,14 @@ REST 가 없으면 서버를 만지는 순간 전 세션의 조정이 끊기고,
   만 붙인다 — 서버와 매일 덤프는 초사용자로 못 붙는다. 비밀번호를 모르는 것에 기대지 않는다: 접속 규칙
   (`deploy/pg_hba.conf`)이 초사용자의 TCP 를 IPv4 · IPv6(복제까지) 모두 `reject` 한다. 그 파일은 `hba_file` 로 기동마다
   읽어, 볼륨 안 pg_hba.conf(첫 초기화의 initdb 인자가 쓴 것 - 다른 길로 만든 볼륨이면 trust 일 수 있다)를 안 탄다. 실제
-  Postgres 로 두 볼륨(새 볼륨 · trust 로 만든 볼륨)을 재는 시험이 그 거절을 잠근다(`TestPGHBARejectsSuperuserOverTCP`).
+  Postgres 로 두 볼륨(새 볼륨 · trust 로 만든 볼륨)을 재는 시험이 그 거절을 잠근다(`TestPGHBARejectsSuperuserOverTCP` -
+  umask 077 로 뜬 체크아웃에서 지은 이미지로 잰다).
+- **겹이 읽는 파일은 이미지에 굽고 판 디렉토리에서 bind 하지 않는다.** compose 를 부르는 자리는 플러그인 설치본의 판
+  디렉토리라 갱신 뒤 정리로 지워질 수 있다. `restart: unless-stopped` 인 `db` · `db-backup` 이 거기서 bind 하면 재부팅 ·
+  크래시 뒤 Docker 가 원천 없는 마운트로 다시 띄우려다 서고, 원장 DB 가 안 뜨면 서버도 안 뜬다. 접속 규칙 · 계정 스크립트 ·
+  덤프 스크립트를 `deploy/Dockerfile` 이 `COPY --chmod=0644` 로 굽는다 - 모드가 체크아웃의 umask 를 안 탄다(0600 이면
+  postgres 사용자가 규칙을 못 읽어 `db` 가 안 뜬다). 렌더한 두 compose 에 판 디렉토리 아래의 bind 가 없음을 시험
+  (`TestComposeServicesDoNotBindThePluginDirectory`)이 잰다.
   빈 DB 의 준비(역할 · 스키마 권한 · pg_trgm)가 초사용자를 요구해 `migrate` 는 소유 역할이 아니라 초사용자로 돈다.
 - **볼륨은 프로젝트 밖의 고정 이름이고 external 이다.** compose 프로젝트 이름은 디렉토리 이름인데 플러그인 설치본은
   판마다 디렉토리가 다르다 — 프로젝트 볼륨이면 갱신 한 번에 빈 원장이 뜬다. external 이라 `down -v` 가 못 지우고, 없으면
@@ -2283,11 +2291,20 @@ YAML 전체를 들이면 그 파서가 읽는 모든 것(앵커·별칭·태그�
   있든 없든 열지도 새로 만들지도 않고(덮개 파일을 빼고 띄운 compose), Postgres 쪽 `fd migrate` 는 이 환경의 SQLite 원장
   자리에 표지 없는 원장이 남아 있으면 거절한다(덮개 파일만 얹고 이관 없이 띄운 compose - 기준선만 까는 `--to 18` 은
   받는다). 원본 디렉토리에 표지를 못 남기면 옮기기 전에 거절한다. 판정은 표지가 있는가뿐이고, 재지 못한 표지는 두 쪽 다
-  거절이다. 표지를 지우는 길은 72시간 되돌리기 하나다(손으로 `rm`). 예전에는 옮긴 파일의 이름을 바꾸는 것이 이 관문이었는데,
-  그때 덮개 파일을 뺀 서버는 빈 SQLite 원장을 새로 만들어 쓰기 시작했다.
+  거절이다. 표지를 지우는 길은 README 의 두 절차뿐이다(손으로 `rm`): 선택 파일을 켜기 전에 선 업그레이드를 거둘 때
+  (「켜기 전에 섰을 때」 - 양쪽 서버를 내린 채 Postgres 원장을 맞대 본 뒤)와 72시간 되돌리기. 표지는 커밋 **뒤에** 쓰므로
+  표지가 없다고 커밋 전이 아니다 - 그래서 거두는 절차는 표지가 아니라 대조로 고른다. 사본을 옮겼어도 표지는 원장 자리에
+  남긴다. 예전에는 옮긴 파일의 이름을 바꾸는 것이 이 관문이었는데, 그때 덮개 파일을 뺀 서버는 빈 SQLite 원장을 새로 만들어
+  쓰기 시작했다.
+- **절차는 첫 실패에서 통째로 선다.** 업그레이드 · 켜기 전 거두기 · 72시간 되돌리기의 명령은 README 에 `set -eu` 부분 셸
+  하나씩이다 - 단계마다 `&&` 사슬로 두면 앞 단계가 서도 다음 단계가 돌았다. 다시 붙여 넣으면 상태(표지 · 선택 파일 · 낸
+  파일)로 된 단계를 건너뛴다. 되돌리기는 시작에서 앞 실행이 남긴 `fd-back.db` 를 거절해 이번 실행이 낸 파일만 놓는다. 셸
+  함수가 실제로 그렇게 서는지 README 의 덩이를 그대로 떼어 대역 docker 로 돌리는 시험(`TestREADMEProceduresStopWhole`)이
+  잰다.
 - **72시간 되돌리기 창.** `fd migrate export-sqlite` 가 Postgres 원장을 판 18 의 **새** SQLite 파일로 옮기고 같은 대조로
   맞춘 뒤에만 이름을 붙인다 — 옮긴 뒤 Postgres 에 쌓인 쓰기도 같이 돌아온다. 그 창 동안은 Postgres 스키마를 18 위로
-  올리지 않는다(역이관은 판 18 만 받는다). 절차는 README 「업그레이드: SQLite 원장을 Postgres 로」.
+  올리지 않는다(역이관은 판 18 만 받는다). 절차는 README 「업그레이드: SQLite 원장을 Postgres 로」 · 「72시간 안에
+  되돌리기」.
 - **배포 정의와 운영 전환은 다른 일이다.** 덮개 파일 · 계정 스크립트 · 절차는 코드와 함께 나가고, 살아 있는 원장을
   옮기는 것은 소유자가 확인하고 하는 한 번의 작업이다.
 

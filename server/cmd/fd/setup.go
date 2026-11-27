@@ -224,17 +224,23 @@ func goInstallStep(s SetupState, why string) SetupStep {
 // (TestDeploySettingsSitOutsideServerMounts)이 렌더한 마운트와 이 자리를 맞댄다.
 const composeEnvPath = "/etc/flightdeck/compose.env"
 
+// composeEnvSel 은 선택 파일이 켜져 있으면(composeEnvPath 가 있으면) 그 자리를, 꺼져 있으면 빈 값을 내는 셸 한 마디다. compose
+// 머리(composeCmd)와 README 의 fdc(꺼 둔 파일을 FDC_ENV 로 대신 줄 수 있다)가 이 글자 하나로 고른다 - 시험이 둘을 맞댄다.
+const composeEnvSel = `$([ ! -e ` + composeEnvPath + ` ] || echo ` + composeEnvPath + `)`
+
 // composeCmd 는 이 기계의 배포가 고른 덮개 파일을 얹어 docker compose 를 부르는 셸 머리다. composeEnvPath 가 있으면 그것을
 // compose 의 env 파일로 주고(그 안의 COMPOSE_FILE 이 Postgres 덮개를 얹는다), 없으면 빈 값이라 기본 compose(SQLite)다. 빈
 // COMPOSE_ENV_FILES 는 안 준 것과 같다.
 //
-// ★ 서버를 띄우고 갱신하는 안내가 이 하나를 쓴다(fd setup 의 기동 단계 · 감시기의 컨테이너 사유 · fd-update 스킬 - 스킬은
-// 시험이 이 글자와 맞댄다). 안내마다 따로 쓰면 한 곳이 덮개를 빼고, 덮개를 뺀 `up` 은 Postgres 로 옮긴 배포를 SQLite 로 띄우려
-// 든다(그 길은 이관 표지가 막지만, 막힌 기동은 서버가 없는 것으로 보인다).
-const composeCmd = `COMPOSE_ENV_FILES="$([ ! -e ` + composeEnvPath + ` ] || echo ` + composeEnvPath + `)" docker compose`
+// ★ 서버를 띄우고 갱신하는 안내가 이 하나를 쓴다(fd setup 의 기동 단계 · fd-update 스킬 - 스킬은 시험이 이 글자와 맞댄다 ·
+// README 의 fdc 는 composeEnvSel 을 쓴다). 안내마다 따로 쓰면 한 곳이 덮개를 빼고, 덮개를 뺀 `up` 은 Postgres 로 옮긴 배포를
+// SQLite 로 띄우려 든다(그 길은 이관 표지가 막지만, 막힌 기동은 서버가 없는 것으로 보인다).
+// ★ 이 머리를 부르는 명령 사슬은 composeEnvLegacyGuard 로 시작한다(아래).
+const composeCmd = `COMPOSE_ENV_FILES="` + composeEnvSel + `" docker compose`
 
 // composeEnvLegacyGuard 는 선택 파일의 옛 자리(~/.flightdeck/compose.env)에 파일이 남아 있으면 처방을 내고 거짓으로 끝나는 셸
-// 한 마디다. composeCmd 를 부르는 안내(fd setup 의 기동 · fd-update 스킬)가 그 앞에 `&&` 로 문다.
+// 한 마디다. compose 머리를 부르는 모든 안내(fd setup 의 기동 · fd-update 스킬의 모든 사슬 · README 의 fdc)가 그 앞에 `&&` 로
+// 문다 - 시험(TestComposeGuidanceSharesOneHead · TestDeploySettingsSitOutsideServerMounts)이 그 글자를 맞댄다.
 //
 // ★ 옛 자리는 서버가 쓰는 /data 안이라 읽지 않는다(composeEnvPath 의 ★). 다만 말없이 건너뛰면 그 파일로 고른 Postgres 배포가
 // 기본 compose(SQLite)로 뜨려 들어(이관 표지가 막는다) 서버가 없는 것으로만 보인다 - 그래서 멈추고 옮기는 법을 낸다. 서버가

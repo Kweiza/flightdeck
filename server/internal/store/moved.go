@@ -27,8 +27,10 @@ import (
 // ★ 판정은 표지가 **있는가**뿐이다. 내용(movedNote)은 사람과 거절 문구를 위한 것이라 못 읽어도 표지다 - 손으로 `touch` 한 빈
 // 파일도 표지다(이관이 커밋 뒤 표지를 못 남겼을 때의 처방).
 // ★ 표지 자리를 재지 못한 것(없음 말고 - 권한 · 입출력)은 두 관문 다 거절이다. 옮겼는지 모르는 채로 어느 쪽 원장도 열지 않는다.
-// ★ 지우는 길은 하나다: 72시간 되돌리기에서 `fd migrate export-sqlite` 가 낸 파일을 원장 자리에 둔 뒤 손으로 지운다(rm, README
-// 「72시간 안에 되돌리기」). 표지를 넘는 플래그는 두지 않는다 - 관문을 넘는 길이 둘이면 하나는 절차에서 잊힌다.
+// ★ 지우는 길은 README 절차의 손 `rm` 뿐이고, 그 절차는 둘이다: 「72시간 안에 되돌리기」(`fd migrate export-sqlite` 가 낸 파일을
+// 원장 자리에 둔 뒤), 그리고 선택 파일을 켜기 전에 선 업그레이드를 거둘 때(「켜기 전에 섰을 때」 - 양쪽 서버를 내린 채 Postgres
+// 원장이 이 SQLite 원장과 맞을 때만. 서버가 Postgres 에 쓴 적이 없으니 이 원장이 곧 Postgres 의 것이다). 표지를 넘는 플래그는 두지
+// 않는다 - 관문을 넘는 길이 코드에 하나 더 있으면 그 길은 절차의 대조를 건너뛴다.
 // ★ 읽기만 하는 길(이관 원본 · `fd migrate verify` 의 원본)은 표지를 보지 않는다. 옮긴 뒤의 맞대기가 바로 그 원장을 읽는다.
 
 // movedSuffix 는 표지 이름의 꼬리다.
@@ -76,7 +78,8 @@ func movedRefusal(path string) error {
 	}
 	return fmt.Errorf("SQLite 원장 %s 은 Postgres 로 옮겼다(이관 표지 %s%s) - 이 원장을 열지도 새로 만들지도 않는다. 옮긴 원장은 "+
 		"Postgres 덮개 파일을 얹어 띄운다(README 「Postgres 로 띄우기」). 72시간 안에 SQLite 판으로 되돌릴 때만 "+
-		"`fd migrate export-sqlite` 가 낸 파일을 이 자리에 두고 이 표지를 지운(rm) 뒤 띄운다(README 「72시간 안에 되돌리기」)",
+		"`fd migrate export-sqlite` 가 낸 파일을 이 자리에 두고 이 표지를 지운(rm) 뒤 띄운다(README 「72시간 안에 되돌리기」 - "+
+		"선택 파일을 켜기 전에 선 업그레이드라면 「켜기 전에 섰을 때」)",
 		clip(path, 200), clip(mark, 200), describeMoved(mark, fi))
 }
 
@@ -223,7 +226,7 @@ func (s *Store) movedNoteFor(ctx context.Context, rows int) movedNote {
 		Schema:  pg.ImportVersion,
 		Rows:    rows,
 		Undo: "72시간 안에 되돌리려면 README 「72시간 안에 되돌리기」: fd migrate export-sqlite 가 낸 파일을 이 원장 자리에 두고 " +
-			"이 파일을 지운다(rm).",
+			"이 파일을 지운다(rm). 선택 파일을 켜기 전에 선 업그레이드를 거두려면 README 「켜기 전에 섰을 때」.",
 	}
 	if err := s.ReadTx(ctx, func(q Reader) error {
 		led, err := readLedgerFacts(ctx, q)

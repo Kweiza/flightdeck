@@ -35,7 +35,11 @@ type composeModel struct {
 }
 
 type composeSvc struct {
-	Image         string             `json:"image"`
+	Image string `json:"image"`
+	Build *struct {
+		Context    string `json:"context"`
+		Dockerfile string `json:"dockerfile"`
+	} `json:"build"`
 	ContainerName string             `json:"container_name"`
 	Command       []string           `json:"command"`
 	Entrypoint    []string           `json:"entrypoint"`
@@ -234,13 +238,11 @@ func TestComposePostgresLayerWiring(t *testing.T) {
 	db, mig, roles, srv, bak := m.Services["db"], m.Services["migrate"], m.Services["db-roles"], m.Services["flightdeck"], m.Services["db-backup"]
 
 	// 원장 DB. 이름(컨테이너 · 두 볼륨)은 TestComposePostgresNamesFollowOneInstance 가 잰다.
-	// 접속 규칙: 볼륨 안 pg_hba.conf 가 아니라 저장소의 파일 하나를 기동마다 읽는다(실제 거절은 TestPGHBARejectsSuperuserOverTCP).
+	// 접속 규칙: 볼륨 안 pg_hba.conf 가 아니라 이미지에 구운 파일 하나를 기동마다 읽는다(실제 거절은 TestPGHBARejectsSuperuserOverTCP).
 	if !slices.Equal(db.Command, []string{"postgres", "-c", "hba_file=" + pgHBATarget}) {
 		t.Errorf("db 의 command 가 %q 다 - hba_file 로 deploy/pg_hba.conf 만 읽어야 이미 있는 볼륨도 초사용자의 TCP 를 거절한다", db.Command)
 	}
-	if src, ro, ok := db.mount(pgHBATarget); !ok || !ro || src != filepath.Join(pluginRoot(t), "deploy", "pg_hba.conf") {
-		t.Errorf("db 의 접속 규칙 마운트가 %q(ro=%v) 다 - 저장소의 deploy/pg_hba.conf 를 읽기 전용으로 붙인다", src, ro)
-	}
+	wantBaked(t, "db", db, pgHBATarget, "pg_hba.conf")
 	if hc := db.Healthcheck.Test; !slices.Contains(hc, "pg_isready") || hc[slices.Index(hc, "-U")+1] == "postgres" {
 		t.Errorf("db 의 healthcheck 가 %q 다 - 초사용자로 재면 접속 규칙이 10초마다 거절 줄을 로그에 남긴다", hc)
 	}
@@ -287,9 +289,7 @@ func TestComposePostgresLayerWiring(t *testing.T) {
 	if !slices.Equal(roles.Entrypoint, []string{"sh", "/usr/local/bin/fd-db-roles"}) || roles.Restart != "no" {
 		t.Errorf("db-roles 의 entrypoint · restart 가 %q · %q 다", roles.Entrypoint, roles.Restart)
 	}
-	if src, ro, ok := roles.mount("/usr/local/bin/fd-db-roles"); !ok || !ro || src != filepath.Join(pluginRoot(t), "deploy", "db-roles.sh") {
-		t.Errorf("db-roles 의 스크립트 마운트가 %q(ro=%v) 다", src, ro)
-	}
+	wantBaked(t, "db-roles", roles, "/usr/local/bin/fd-db-roles", "db-roles.sh")
 	if got := roles.secretNames(); !slices.Equal(got, []string{"fd_pg_backup_pgpass", "fd_pg_server_pgpass"}) {
 		t.Errorf("db-roles 의 시크릿이 %v 다 - 두 계정의 pgpass 둘이어야 한다", got)
 	}
@@ -344,9 +344,7 @@ func TestComposePostgresLayerWiring(t *testing.T) {
 	if got := bak.secretNames(); !slices.Equal(got, []string{"fd_pg_backup_pgpass"}) {
 		t.Errorf("db-backup 의 시크릿이 %v 다 - 덤프 계정의 pgpass 하나여야 한다", got)
 	}
-	if src, ro, ok := bak.mount("/usr/local/bin/fd-db-backup"); !ok || !ro || src != filepath.Join(pluginRoot(t), "deploy", "db-backup.sh") {
-		t.Errorf("db-backup 의 스크립트 마운트가 %q(ro=%v) 다", src, ro)
-	}
+	wantBaked(t, "db-backup", bak, "/usr/local/bin/fd-db-backup", "db-backup.sh")
 	if src, _, _ := bak.mount("/backups"); src != migBackups {
 		t.Errorf("db-backup 의 /backups(%q)가 migrate 의 것(%q)과 다르다 - 판올림 전 덤프와 매일 덤프는 한 자리의 뿌리 · 하위다", src, migBackups)
 	}
@@ -383,6 +381,7 @@ func TestComposePostgresLayerWiring(t *testing.T) {
 // TestComposePostgresImagesMatchTheTestServer 는 원장 DB · 계정 · 덤프의 postgres 이미지와 initdb 인자가 시험 DB(compose.test.yaml
 // 의 pg-test)와 같은지 잰다. 원장의 주판을 올리는 사람이 시험 DB 만 올리면(또는 그 반대) pg_dump 가 더 높은 서버를 거절해 매일
 // 덤프가 조용히 멈추고, 로케일 인자가 갈리면 시험이 잰 한글 검색이 운영 DB 에서 0건이 된다 - 그 자리가 여기서 빨갛다.
+// ★ 셋은 한 이미지(pgLayerImage)를 같은 build 로 짓는다 - 그 주판은 deploy/Dockerfile 의 FROM 이다.
 func TestComposePostgresImagesMatchTheTestServer(t *testing.T) {
 	m := renderPG(t)
 	test := mustRender(t, nil, nil, "compose.test.yaml").Services["pg-test"]
@@ -390,9 +389,12 @@ func TestComposePostgresImagesMatchTheTestServer(t *testing.T) {
 		t.Fatalf("pg-test 의 이미지가 %q 다", test.Image)
 	}
 	for _, name := range []string{"db", "db-roles", "db-backup"} {
-		if got := m.Services[name].Image; got != test.Image {
-			t.Errorf("%s 의 이미지(%s)가 시험 DB 의 이미지(%s)와 다르다 - 같은 주판이어야 한다", name, got, test.Image)
+		if got := m.Services[name].Image; got != pgLayerImage {
+			t.Errorf("%s 의 이미지(%s)가 Postgres 겹의 이미지(%s)가 아니다 - 셋이 한 이미지를 쓴다", name, got, pgLayerImage)
 		}
+	}
+	if from := pgLayerBase(t); from != test.Image {
+		t.Errorf("Postgres 겹의 주판(deploy/Dockerfile 의 FROM %s)이 시험 DB 의 이미지(%s)와 다르다 - 같은 주판이어야 한다", from, test.Image)
 	}
 	want, _ := test.env("POSTGRES_INITDB_ARGS")
 	got, _ := m.Services["db"].env("POSTGRES_INITDB_ARGS")
@@ -439,7 +441,18 @@ func TestDeploySettingsSitOutsideServerMounts(t *testing.T) {
 			t.Fatal(err)
 		}
 		body := string(raw)
-		if want := `COMPOSE_ENV_FILES="${FDC_ENV:-$([ ! -e ` + composeEnvPath + ` ] || echo ` + composeEnvPath + `)}" docker compose`; !strings.Contains(body, want) {
+		// fdc 는 fd setup · fd-update 와 같은 관문으로 시작하고(composeEnvLegacyGuard - 글자째), 같은 판정(composeEnvSel)으로 선택
+		// 파일을 고른다. 꺼 둔 파일은 FDC_ENV 로만 대신 준다. 관문 뒤는 `|| return` 이다 - zsh 는 몸이 `if … fi && …` 로 끝난
+		// 함수가 실패해도 부른 쪽 `set -e` 덩이를 안 세운다(TestREADMEProceduresStopWhole 이 zsh 로 잰다).
+		_, fdc, ok := strings.Cut(body, "\nfdc() {\n")
+		fdc, _, closed := strings.Cut(fdc, "\n}\n")
+		if !ok || !closed {
+			t.Fatalf("%s 에 fdc 정의(fdc() { … })가 없다", readme)
+		}
+		if !strings.HasPrefix(strings.TrimSpace(fdc), composeEnvLegacyGuard+" || return\n") {
+			t.Errorf("%s 의 fdc 가 옛 자리 관문(composeEnvLegacyGuard)으로 시작하지 않는다:\n%s", readme, fdc)
+		}
+		if want := `COMPOSE_ENV_FILES="${FDC_ENV:-` + composeEnvSel + `}" docker compose "$@"`; !strings.HasSuffix(fdc, want) {
 			t.Errorf("%s 의 fdc 가 선택 파일 %s 을 fd setup · fd-update 와 같은 판정으로 안 본다(%s)", readme, composeEnvPath, want)
 		}
 		_, rest, ok := strings.Cut(body, head+"\n")
@@ -481,8 +494,84 @@ func TestDeploySettingsSitOutsideServerMounts(t *testing.T) {
 	}
 }
 
-// pgHBATarget 은 db 컨테이너 안에서 접속 규칙 파일(deploy/pg_hba.conf)이 붙는 자리다(compose.postgres.yaml 의 db).
+// pgHBATarget 은 db 컨테이너 안에서 접속 규칙 파일(deploy/pg_hba.conf)이 놓이는 자리다(deploy/Dockerfile · compose.postgres.yaml 의 db).
 const pgHBATarget = "/etc/postgresql/fd_hba.conf"
+
+// pgLayerImage 는 Postgres 겹의 셋(db · db-roles · db-backup)이 함께 짓고 쓰는 이미지다(compose.postgres.yaml).
+const pgLayerImage = "flightdeck-pg:local"
+
+// pgLayerDockerfile 은 deploy/Dockerfile 의 글자다.
+func pgLayerDockerfile(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(pluginRoot(t), "deploy", "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+// pgLayerBase 는 Postgres 겹 이미지의 주판(deploy/Dockerfile 의 하나뿐인 FROM)이다.
+func pgLayerBase(t *testing.T) string {
+	t.Helper()
+	from := regexp.MustCompile(`(?m)^FROM\s+(\S+)\s*$`).FindAllStringSubmatch(pgLayerDockerfile(t), -1)
+	if len(from) != 1 {
+		t.Fatalf("deploy/Dockerfile 의 FROM 이 %d 개다 - 하나여야 주판이 하나다", len(from))
+	}
+	return from[0][1]
+}
+
+// wantBaked 는 서비스 svc 가 Postgres 겹의 이미지를 deploy 에서 짓고, 컨테이너 자리 target 의 파일을 bind 하지 않고 그 이미지에
+// 구운 deploy/<src> 로 받는지 잰다. 굽는 줄은 모드를 COPY 가 정한다(--chmod=0644) - 체크아웃의 umask 를 안 탄다.
+func wantBaked(t *testing.T, name string, svc composeSvc, target, src string) {
+	t.Helper()
+	if svc.Image != pgLayerImage || svc.Build == nil || filepath.Clean(svc.Build.Context) != filepath.Join(pluginRoot(t), "deploy") {
+		t.Errorf("%s 가 Postgres 겹의 이미지(%s, build deploy)로 안 뜬다: image %q build %+v", name, pgLayerImage, svc.Image, svc.Build)
+	}
+	if s, _, ok := svc.mount(target); ok {
+		t.Errorf("%s 가 %s 를 %s 에서 붙인다 - 판 디렉토리가 지워지면 원천이 없다, 이미지에 굽는다", name, target, s)
+	}
+	if line := "COPY --chmod=0644 " + src + " " + target; !slices.Contains(strings.Split(pgLayerDockerfile(t), "\n"), line) {
+		t.Errorf("deploy/Dockerfile 에 `%s` 가 없다 - %s 의 %s 가 그 이미지에 0644 로 있어야 한다", line, name, target)
+	}
+}
+
+// TestComposeServicesDoNotBindThePluginDirectory 는 렌더한 두 compose(기본 · Postgres 겹)의 어느 서비스도 플러그인 디렉토리(compose
+// 를 부르는 판 디렉토리) 아래를 bind 하지 않고, 시크릿 파일도 그 아래에 두지 않는지 잰다.
+//
+// ★ 이 시험이 없어서 난 일: db 가 ./deploy/pg_hba.conf 를 판 디렉토리에서 bind 했다. 갱신 뒤 정리가 옛 판 디렉토리를 지우면
+//
+//	restart: unless-stopped 인 db 가 재부팅 · 크래시 뒤 원천 없는 마운트로 다시 뜨지 못한다 - 원장 DB 가 안 뜨면 서버도 안 뜬다.
+//	이미지는 컨테이너가 붙드는 동안 남는다(그 이미지로 디렉토리 없이 뜨는 것은 TestPGHBARejectsSuperuserOverTCP 가 잰다).
+func TestComposeServicesDoNotBindThePluginDirectory(t *testing.T) {
+	root := pluginRoot(t)
+	under := func(p string) bool {
+		p = filepath.Clean(p)
+		return p == root || strings.HasPrefix(p, root+string(filepath.Separator))
+	}
+	for _, files := range [][]string{{"compose.yaml"}, {"compose.yaml", "compose.postgres.yaml"}} {
+		m := mustRender(t, pgLayerEnv(), nil, files...)
+		binds := 0
+		for _, name := range m.serviceNames() {
+			for _, v := range m.Services[name].Volumes {
+				if v.Type != "bind" {
+					continue
+				}
+				binds++
+				if under(v.Source) {
+					t.Errorf("%v 의 %s 가 판 디렉토리 아래 %s 를 %s 에 붙인다 - 이미지에 굽는다", files, name, v.Source, v.Target)
+				}
+			}
+		}
+		if binds == 0 {
+			t.Fatalf("%v 에서 bind 를 하나도 못 읽었다 - 렌더의 모양이 바뀌었다(서버의 /data 는 bind 다)", files)
+		}
+		for name, sec := range m.Secrets {
+			if sec.File != "" && under(sec.File) {
+				t.Errorf("%v 의 시크릿 %s 가 판 디렉토리 아래 %s 다", files, name, sec.File)
+			}
+		}
+	}
+}
 
 // TestComposePostgresNamesFollowOneInstance 는 db 컨테이너와 두 external 볼륨의 이름이 배포 이름(FD_PG_INSTANCE) 하나를 따라
 // 함께 바뀌는지 잰다.
@@ -523,7 +612,7 @@ func TestPostgresClientMatchesTheLedgerServer(t *testing.T) {
 		t.Fatal("서버 이미지의 마지막 단에 `apk add … postgresqlNN-client` 가 없다 - 판올림 전 덤프 · 되돌리기 · 되살리기가 그 도구를 쓴다")
 	}
 	client, _ := strconv.Atoi(pkg[1])
-	image := renderPG(t).Services["db"].Image
+	image := pgLayerBase(t)
 	server, err := strconv.Atoi(strings.SplitN(strings.TrimPrefix(image, "postgres:"), ".", 2)[0])
 	if err != nil {
 		t.Fatalf("db 이미지 %q 에서 큰 판을 못 읽었다", image)

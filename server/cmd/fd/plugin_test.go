@@ -1086,14 +1086,16 @@ func TestUpdateSkillDoesNotLoseTheRepoMount(t *testing.T) {
 	}
 }
 
-// 서버를 띄우고 갱신하는 안내 셋(fd setup 의 기동 단계 · 감시기의 컨테이너 사유 · fd-update 스킬)이 compose 를 한 머리
-// (composeCmd)로 부른다. 그 머리는 선택 파일(composeEnvPath)이 있으면 덮개 파일을 얹는다. 선택 파일의 옛 자리
-// (~/.flightdeck/compose.env)에 파일이 남았으면 기동 · 갱신이 그 앞에서 처방을 내고 멈춘다(composeEnvLegacyGuard).
+// 서버를 띄우고 갱신하는 안내(fd setup 의 기동 단계 · fd-update 스킬)가 compose 를 한 머리(composeCmd)로 부른다. 그 머리는 선택
+// 파일(composeEnvPath)이 있으면 덮개 파일을 얹는다. 선택 파일의 옛 자리(~/.flightdeck/compose.env)에 파일이 남았으면 기동 ·
+// 갱신이 그 앞에서 처방을 내고 멈춘다(composeEnvLegacyGuard). 감시기의 컨테이너 사유는 명령을 내지 않고 fd-update 를 가리킨다.
 //
 // ★ 이 시험이 없어서 난 일: 스킬은 compose.env 를 얹는 줄과 안 얹는 줄을 따로 썼고, setup · 감시기는 덮개 없는 `docker compose
 // up` 을 냈다. Postgres 로 옮긴 배포에서 그 안내를 따르면 기본 compose(SQLite)가 뜬다(이관 표지가 그 기동을 막지만, 막힌
-// 기동은 서버가 없는 것으로 보인다).
-// ★ 스킬은 `docker compose` 가 나오는 **모든 자리**를 본다 - 한 줄만 보면 다른 줄이 덮개를 빼도 초록이다.
+// 기동은 서버가 없는 것으로 보인다). 그 뒤에도 감시기의 사유는 관문 · 저장소 마운트 없는 `up -d --build` 한 줄을 냈고, 스킬은
+// 관문을 문 내리기 줄 다음의 cd · up 을 따로 두어 내리기 줄이 서도 올리기가 돌았다.
+// ★ 스킬은 `docker compose` 가 나오는 **모든 자리**를 사슬(줄 끝 `&&` 로 이은 줄들) 단위로 본다 - 한 줄만 보면 다른 줄이
+// 덮개를 빼도 초록이고, 줄 단위로만 보면 관문이 앞 줄에 있어도 뒷줄이 따로 돈다.
 func TestComposeGuidanceSharesOneHead(t *testing.T) {
 	if !strings.HasSuffix(composeCmd, " docker compose") || strings.Count(composeCmd, composeEnvPath) != 2 {
 		t.Fatalf("compose 머리가 선택 파일(%s)을 얹는 docker compose 가 아니다: %s", composeEnvPath, composeCmd)
@@ -1109,8 +1111,8 @@ func TestComposeGuidanceSharesOneHead(t *testing.T) {
 		t.Errorf("fd setup 의 기동 명령이 옛 자리 관문 · compose 머리를 안 쓴다: %q", start)
 	}
 	for _, sig := range [][2]bool{{true, false}, {false, true}} {
-		if _, why := containerVerdict(sig[0], sig[1]); !strings.Contains(why, composeCmd+" up -d --build") {
-			t.Errorf("감시기의 컨테이너 사유가 compose 머리를 안 쓴다: %q", why)
+		if _, why := containerVerdict(sig[0], sig[1]); strings.Contains(why, "docker compose") || !strings.Contains(why, "/fd-update") {
+			t.Errorf("감시기의 컨테이너 사유가 compose 명령을 내거나 /fd-update 를 안 가리킨다 - 갱신 경로는 fd-update 하나다: %q", why)
 		}
 	}
 	root := pluginRoot(t)
@@ -1120,26 +1122,60 @@ func TestComposeGuidanceSharesOneHead(t *testing.T) {
 			t.Fatal(err)
 		}
 		n, down := 0, ""
-		for i, ln := range strings.Split(string(raw), "\n") {
-			c := strings.Count(ln, "docker compose")
-			n += c
-			if c != strings.Count(ln, composeCmd) {
-				t.Errorf("fd-update/%s %d 줄의 docker compose 가 compose 머리 없이 나온다:\n  %s", f, i+1, strings.TrimSpace(ln))
+		for _, chain := range shellChains(string(raw)) {
+			c := strings.Count(chain, "docker compose")
+			if c == 0 {
+				continue
 			}
-			if strings.Contains(ln, composeCmd+" down") {
-				down = ln
+			n += c
+			if c != strings.Count(chain, composeCmd) {
+				t.Errorf("fd-update/%s 의 docker compose 가 compose 머리 없이 나온다:\n  %s", f, chain)
+			}
+			if g := strings.Index(chain, composeEnvLegacyGuard+" && "); g < 0 || g > strings.Index(chain, composeCmd) {
+				t.Errorf("fd-update/%s 의 compose 사슬이 옛 자리 관문으로 시작하지 않는다:\n  %s", f, chain)
+			}
+			if strings.Contains(chain, composeCmd+" down") {
+				down = chain
 			}
 		}
 		if n < 3 {
 			t.Errorf("fd-update/%s 의 compose 자리가 %d 곳이다 - 재기(selfcheck) · 내리기 · 올리기 셋이어야 한다", f, n)
 		}
-		// ★ 내리기 전에 두 관문을 같은 줄에 `&&` 로 문다 - 옛 자리의 선택 파일, 그리고 도는 서버의 FD_DB 와 선택 파일의 두 방향
+		// ★ 내리기 전에 두 관문을 같은 사슬에 `&&` 로 문다 - 옛 자리의 선택 파일, 그리고 도는 서버의 FD_DB 와 선택 파일의 두 방향
 		//   맞대기(postgres:// 인데 파일이 없거나, SQLite 인데 파일이 있다). 다른 줄에 두면 앞 줄이 서도 다음 줄의 down 이 돈다.
 		if !strings.Contains(down, composeEnvLegacyGuard+" && ") || !strings.Contains(down, "FD_DB=") ||
 			strings.Count(down, composeEnvPath) <= strings.Count(composeCmd, composeEnvPath) {
-			t.Errorf("fd-update/%s 의 내리기 줄이 옛 자리 관문 · FD_DB 맞대기를 먼저 묻지 않는다:\n  %s", f, strings.TrimSpace(down))
+			t.Errorf("fd-update/%s 의 내리기 사슬이 옛 자리 관문 · FD_DB 맞대기를 먼저 묻지 않는다:\n  %s", f, down)
+		}
+		// ★ 새 자리로 옮기기(cd)와 올리기(up)는 내리기와 **한 사슬**이다 - 마운트를 못 읽었거나(readarray) 관문이 서면 옮기지도
+		//   올리지도 않는다. 따로 두면 서 있는 내리기 줄 다음에 up 이 옛 판 · 빈 마운트로 돈다.
+		d, u := strings.Index(down, composeCmd+" down"), strings.Index(down, composeCmd+" up -d")
+		if !strings.HasPrefix(down, "readarray ") || u < 0 || !strings.Contains(down[d:u], " &&\ncd ") {
+			t.Errorf("fd-update/%s 의 마운트 읽기 · 내리기 · 새 자리 cd · 올리기가 한 `&&` 사슬이 아니다:\n  %s", f, down)
 		}
 	}
+}
+
+// shellChains 는 글(body)의 셸 사슬을 낸다 - 줄 끝이 `&&` 이면 다음 줄과 이어 한 사슬이다(사이의 줄바꿈은 둔다). 코드 블록 밖의
+// 산문 줄도 한 줄 사슬로 나온다(산문 안의 인라인 명령을 같이 잰다).
+func shellChains(body string) []string {
+	var out []string
+	cur := ""
+	for _, ln := range strings.Split(body, "\n") {
+		if cur != "" {
+			cur += "\n"
+		}
+		cur += ln
+		if strings.HasSuffix(strings.TrimRight(ln, " \t"), "&&") {
+			continue
+		}
+		out = append(out, cur)
+		cur = ""
+	}
+	if cur != "" {
+		out = append(out, cur)
+	}
+	return out
 }
 
 // 문서가 세는 MCP 도구 수와 실재하는 수가 어긋나면 여기서 걸린다.
