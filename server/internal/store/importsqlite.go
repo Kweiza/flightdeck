@@ -55,14 +55,20 @@ type TransferOptions struct {
 	DryRun bool
 }
 
-// FaultGroup 은 사전 검사에 걸린 한 갈래(표 · 칸 · 사유)다.
-type FaultGroup struct {
+// CellGroup 은 칸 검사의 한 갈래(표 · 칸 · 사유)와 그 행들이다. 사유가 거절(pg.Fault)이면 사전 검사 · 대상 값 검사에 걸린
+// 것이고(FaultGroup), 바꿔 넣은 규칙(pg.Rewrite)이면 원본에서 옮기며 바꾼 칸이다(RewriteGroup).
+type CellGroup[R ~string] struct {
 	Table, Column string
-	Fault         pg.Fault
+	Reason        R
 	Count         int
-	// Keys 는 걸린 행의 좌표다(pg.Table.KeyLabel). 앞쪽 pg.MaxListed 개만 싣는다.
+	// Keys 는 그 행의 좌표다(pg.Table.KeyLabel). 앞쪽 pg.MaxListed 개만 싣는다.
 	Keys []string
 }
+
+type (
+	FaultGroup   = CellGroup[pg.Fault]
+	RewriteGroup = CellGroup[pg.Rewrite]
+)
 
 // TableRows 는 원본 표 하나의 행 수다.
 type TableRows struct {
@@ -79,8 +85,13 @@ type TransferReport struct {
 	TargetChecked bool
 	// Faults 는 원본의 사전 검사에 걸린 것이다.
 	Faults []FaultGroup
-	// TargetFaults 는 대상에서 읽은 값이 값 검사(pg.TargetCell - 원본의 검사에 저장 갈래까지)에 걸린 것이다. 대조가 대상 값을 읽을 때 잰다.
+	// TargetFaults 는 대상에서 읽은 값이 값 검사(pg.SettledCell - 원본의 검사에 바꿔 넣을 값 · 저장 갈래까지)에 걸린 것이다.
+	// 대조가 대상 값을 읽을 때 잰다.
 	TargetFaults []FaultGroup
+	// Rewrites 는 원본 값을 정해진 규칙으로 바꿔 옮긴 칸이다(pg.Rewrite - SQLite 원본의 NUL). 이관은 그 값을 넣고, 대조는 같은
+	// 규칙을 건 원본 값으로 맞댄다. RewrittenRows 는 그런 칸이 하나라도 있는 원본 행의 수다. 역이관에는 늘 비었다(SettledCell).
+	Rewrites      []RewriteGroup
+	RewrittenRows int
 	// Rows 는 원본 표마다 행 수다(pg.Tables 순서).
 	Rows      []TableRows
 	Tables    []pg.TableCheck
@@ -117,10 +128,10 @@ func (r TransferReport) Matched() bool {
 // 그 행은 이관으로 생긴 것일 수 없다.
 func (r TransferReport) verdict() error {
 	var why []string
-	if n := faultCount(r.Faults); n > 0 {
+	if n := groupCount(r.Faults); n > 0 {
 		why = append(why, fmt.Sprintf("원본 사전 검사에 %d 건(%d 갈래)이 걸렸다", n, len(r.Faults)))
 	}
-	if n := faultCount(r.TargetFaults); n > 0 {
+	if n := groupCount(r.TargetFaults); n > 0 {
 		why = append(why, fmt.Sprintf("대상 값 검사에 %d 건(%d 갈래)이 걸렸다", n, len(r.TargetFaults)))
 	}
 	if !r.Matched() {
@@ -182,8 +193,8 @@ func ImportSQLite(ctx context.Context, from, to string, opt TransferOptions, log
 		return rep, fmt.Errorf("옮겼고 이관 표지도 남겼다 - 원본 옆의 판올림 전 사본(%s.bak-*)을 치우지 못했다. 남은 것을 손으로 "+
 			"%s.pre-import-<시각>.bak/ 같은 새 디렉토리로 옮긴다: %w", clip(from, 200), clip(from, 200), err)
 	}
-	log.Info("SQLite 이관 완료", "from", rep.From, "to", rep.To, "rows", rep.Copied, "marker", mark.path,
-		"duration", time.Since(start).Seconds())
+	log.Info("SQLite 이관 완료", "from", rep.From, "to", rep.To, "rows", rep.Copied, "rewritten_rows", rep.RewrittenRows,
+		"marker", mark.path, "duration", time.Since(start).Seconds())
 	return rep, nil
 }
 
@@ -485,7 +496,7 @@ func targetReady(ctx context.Context, q dbtx, to ledgerSide) error {
 
 // ledgerSide 는 옮기기의 한쪽 원장이 엔진마다 달리 하는 몫이다. 이관(SQLite → Postgres)과 역이관(Postgres → SQLite)이 같은
 // 길(transferInto)을 타고 엔진에 따라 다른 것만 여기서 가른다 - 같은 엔진은 원본이든 대상이든 같은 몫을 쓴다. 원본으로는
-// shape · alone · held · orphans 를, 대상으로는 alone · issued · align · settle · held · next 를 부른다.
+// shape · alone · held · orphans 를, 대상으로는 alone · issued · align · settle · held · next · intake 를 부른다.
 type ledgerSide interface {
 	// sqlite 는 표를 읽고 넣는 문장의 갈래다(pg.Table.SelectSQL · InsertSQL).
 	sqlite() bool
@@ -496,7 +507,7 @@ type ledgerSide interface {
 	// held 는 identity 가 있는 표마다 원장이 행과 따로 기억하는 발급 번호다(pg.Floor 의 held).
 	held(ctx context.Context, q Reader) (map[string]int64, error)
 	// orphans 는 원본에서 부모가 없는 행을 사전 검사(ft)에 싣는다.
-	orphans(ctx context.Context, q Reader, ft *faultTally) error
+	orphans(ctx context.Context, q Reader, ft *tally[pg.Fault]) error
 	// issued 는 대상에서 이미 번호를 낸 순번을 늘어놓는다(빈 원장 검사 targetReady 의 한 축). 비면 하나도 안 냈다.
 	issued(ctx context.Context, q Reader) ([]string, error)
 	// align 은 대상의 순번을 원본에서 발급된 번호(floors - pg.Floor) 다음으로 맞춘다.
@@ -505,8 +516,10 @@ type ledgerSide interface {
 	settle(ctx context.Context, tx *txConn) error
 	// next 는 대상이 표 t 에서 다음에 낼 번호다. maxID · held 는 대상에서 잰 identity 최고값 · 발급 번호다.
 	next(t pg.Table, maxID, held int64) int64
-	// intake 는 이 원장으로 옮겨 넣을 원본 값을 재는 사전 검사 규칙이다. Postgres 는 인덱스 키 상한까지 잰다(pg.ImportCell),
-	// SQLite 는 상한이 없다(pg.Cell - 역이관은 원문 그대로 낸다).
+	// intake 는 이 원장으로 옮겨 넣을 원본 값에 칸마다 거는 규칙이다 - 사전 검사 · 행 표지 · 옮길 값이 이것 하나를 지난다.
+	// 옮기는 길은 받는 엔진마다 하나라(이관 SQLite → Postgres, 역이관 Postgres → SQLite) 받는 쪽이 원본의 엔진도 정한다:
+	// Postgres 는 SQLite 원본을 바꿔 넣고 인덱스 키 상한까지 잰다(pg.ImportCell), SQLite 는 Postgres 값을 그대로 받는다
+	// (pg.SettledCell). 옮긴 대상의 값은 엔진과 무관하게 pg.SettledCell 로 잰다(checkTarget).
 	intake() cellRule
 }
 
@@ -523,7 +536,11 @@ type sqliteSide struct{}
 
 func (sqliteSide) sqlite() bool { return true }
 
-func (sqliteSide) intake() cellRule { return pg.Cell }
+// intake 는 pg.SettledCell 이다(역이관이 받는 Postgres 원본의 값). 역이관은 Postgres 값을 그대로 낸다 - 이관이 넣은 `\x00` 를
+// NUL 로 되돌리지 않고, 바꿔 넣어야 할 값(JSON 안의 \u0000)이 든 원본은 바꾸지 않고 거절한다. 낸 파일이 Postgres 원장과
+// 바이트로 맞아야 되돌리기의 대조가 그 파일을 그 원장의 사본이라고 말할 수 있다. 인덱스 키 상한은 재지 않는다 - 이미 원장에
+// 있는 원문이다.
+func (sqliteSide) intake() cellRule { return pg.SettledCell }
 
 // shape 는 표 · 칸만 잰다. 판은 열 때 쟀다(openImportSource) - 원본은 -wal 이 빈 읽기 전용 파일이라 연 뒤에 판이 안 바뀐다.
 func (sqliteSide) shape(ctx context.Context, q Reader) error { return checkShape(ctx, q, engineSQLite) }
@@ -536,7 +553,7 @@ func (sqliteSide) held(ctx context.Context, q Reader) (map[string]int64, error) 
 	return sqliteSequences(ctx, q)
 }
 
-func (sqliteSide) orphans(ctx context.Context, q Reader, ft *faultTally) error {
+func (sqliteSide) orphans(ctx context.Context, q Reader, ft *tally[pg.Fault]) error {
 	return foreignKeyFaults(ctx, q, ft)
 }
 
@@ -609,6 +626,8 @@ type pgSide struct{}
 
 func (pgSide) sqlite() bool { return false }
 
+// intake 는 pg.ImportCell 이다(이관이 받는 SQLite 원본의 값). SQLite 는 Postgres 가 못 담는 값(NUL)을 담으므로 정해진 규칙으로
+// 바꿔 옮기고 그 칸을 보고에 싣는다(pg.Cell). 인덱스 키 상한까지 잰다.
 func (pgSide) intake() cellRule { return pg.ImportCell }
 
 // shape 는 원본(역이관)의 판이 이관 판 범위(transferPlan)이고 표 · 칸이 그 범위의 모양인지 잰다. 원본은 살아 있는 서버의 원장이라 연 때가
@@ -646,7 +665,7 @@ func (pgSide) held(ctx context.Context, q Reader) (map[string]int64, error) {
 }
 
 // orphans 는 잴 것이 없다. 기준선이 FK 를 늘 재므로 부모 없는 행은 커밋되지 못했다.
-func (pgSide) orphans(context.Context, Reader, *faultTally) error { return nil }
+func (pgSide) orphans(context.Context, Reader, *tally[pg.Fault]) error { return nil }
 
 // issued 는 번호를 낸 identity 시퀀스다.
 func (pgSide) issued(ctx context.Context, q Reader) ([]string, error) {
@@ -752,53 +771,69 @@ func soleClient(ctx context.Context, q Reader, what string) error {
 
 // ledgerScan 은 원본 1차 훑기의 결과다.
 type ledgerScan struct {
-	faults faultTally
-	rows   []TableRows
-	marks  map[string][]pg.RowMark
+	cells cellTally
+	rows  []TableRows
+	marks map[string][]pg.RowMark
 	// floors 는 identity 가 있는 표마다 원본에서 발급된 가장 큰 번호다(pg.Floor).
 	floors map[string]int64
 }
 
-// faultTally 는 값 검사(cellRule 의 Fault)에 걸린 칸을 갈래(표 · 칸 · 사유)마다 센다. 원본의 사전 검사와 대조가 읽은 대상
-// 값이 같은 셈을 쓴다.
-type faultTally struct {
-	groups []FaultGroup
-	at     map[faultAt]int // groups 안의 자리
+// cellTally 는 훑기 한 번이 칸 규칙(cellRule)에서 센 것이다: 걸린 칸(faults), 바꿔 넣은 칸(rewrites), 바꿔 넣은 칸이 하나라도
+// 있는 행의 수(rewrittenRows). 원본의 사전 검사와 대조가 읽은 대상 값이 같은 셈을 쓴다.
+type cellTally struct {
+	faults        tally[pg.Fault]
+	rewrites      tally[pg.Rewrite]
+	rewrittenRows int
 }
 
-type faultAt struct {
-	table, column string
-	fault         pg.Fault
-}
-
-func (ft *faultTally) add(table, column string, f pg.Fault, key string) {
-	at := faultAt{table, column, f}
-	i, ok := ft.at[at]
-	if !ok {
-		if ft.at == nil {
-			ft.at = map[faultAt]int{}
+// row 는 표 t 의 행 하나에서 걸린 칸(faults)과 바꿔 넣은 칸(rewrites - 둘 다 칸 선언 순서)을 센다. key 는 그 행의 좌표다.
+func (ct *cellTally) row(t pg.Table, faults []pg.Fault, rewrites []pg.Rewrite, key string) {
+	rewritten := false
+	for i, c := range t.Cols {
+		if f := faults[i]; f != "" {
+			ct.faults.add(t.Name, c.Name, f, key)
 		}
-		i = len(ft.groups)
-		ft.at[at] = i
-		ft.groups = append(ft.groups, FaultGroup{Table: table, Column: column, Fault: f})
+		if r := rewrites[i]; r != "" {
+			ct.rewrites.add(t.Name, c.Name, r, key)
+			rewritten = true
+		}
 	}
-	g := &ft.groups[i]
+	if rewritten {
+		ct.rewrittenRows++
+	}
+}
+
+// tally 는 칸을 갈래(표 · 칸 · 사유)마다 센다.
+type tally[R ~string] struct {
+	groups []CellGroup[R]
+	at     map[tallyAt[R]]int // groups 안의 자리
+}
+
+type tallyAt[R ~string] struct {
+	table, column string
+	reason        R
+}
+
+func (tl *tally[R]) add(table, column string, r R, key string) {
+	at := tallyAt[R]{table, column, r}
+	i, ok := tl.at[at]
+	if !ok {
+		if tl.at == nil {
+			tl.at = map[tallyAt[R]]int{}
+		}
+		i = len(tl.groups)
+		tl.at[at] = i
+		tl.groups = append(tl.groups, CellGroup[R]{Table: table, Column: column, Reason: r})
+	}
+	g := &tl.groups[i]
 	g.Count++
 	if len(g.Keys) < pg.MaxListed {
 		g.Keys = append(g.Keys, key)
 	}
 }
 
-// cells 는 표 t 의 행 하나에서 걸린 칸(faults - 칸 선언 순서)을 센다. key 는 그 행의 좌표다.
-func (ft *faultTally) cells(t pg.Table, faults []pg.Fault, key string) {
-	for i, f := range faults {
-		if f != "" {
-			ft.add(t.Name, t.Cols[i].Name, f, key)
-		}
-	}
-}
-
-func faultCount(groups []FaultGroup) int {
+// groupCount 는 갈래들에 든 칸의 수다.
+func groupCount[R ~string](groups []CellGroup[R]) int {
 	n := 0
 	for _, g := range groups {
 		n += g.Count
@@ -807,7 +842,8 @@ func faultCount(groups []FaultGroup) int {
 }
 
 func (sc *ledgerScan) report(rep *TransferReport) {
-	rep.Faults, rep.Rows = sc.faults.groups, sc.rows
+	rep.Faults, rep.Rewrites, rep.RewrittenRows, rep.Rows = sc.cells.faults.groups, sc.cells.rewrites.groups,
+		sc.cells.rewrittenRows, sc.rows
 }
 
 // refusal 은 사전 검사에 걸린 것이 있으면 그 수와 다음 수를 담은 오류다.
@@ -815,13 +851,13 @@ func (sc *ledgerScan) report(rep *TransferReport) {
 // ★ 인덱스 키 상한(pg.FaultTooLong)에 걸린 행은 고치라고 하지 않는다. 그 칸은 추가 전용 감사 원장(event)의 것이라 행을 자르면
 // 원본과 옮긴 원장이 달라진다 - 표 · 칸 · 기본키를 실어 이슈로 알려 달라고 한다.
 func (sc *ledgerScan) refusal() error {
-	n := faultCount(sc.faults.groups)
+	n := groupCount(sc.cells.faults.groups)
 	if n == 0 {
 		return nil
 	}
 	tooLong, other := 0, 0
-	for _, g := range sc.faults.groups {
-		if g.Fault == pg.FaultTooLong {
+	for _, g := range sc.cells.faults.groups {
+		if g.Reason == pg.FaultTooLong {
 			tooLong += g.Count
 		} else {
 			other += g.Count
@@ -835,12 +871,14 @@ func (sc *ledgerScan) refusal() error {
 		next = append(next, fmt.Sprintf("인덱스 키 상한을 넘는 %d 건은 행을 고치지 말고(추가 전용 감사 원장이다 - 자르면 원본과 "+
 			"달라진다) 위 표 · 칸 · 행 좌표를 실어 이슈로 알려 달라", tooLong))
 	}
-	return fmt.Errorf("사전 검사에 %d 건(%d 갈래)이 걸렸다 - 아무것도 쓰지 않는다. %s", n, len(sc.faults.groups), strings.Join(next, ". "))
+	return fmt.Errorf("사전 검사에 %d 건(%d 갈래)이 걸렸다 - 아무것도 쓰지 않는다. %s", n, len(sc.cells.faults.groups),
+		strings.Join(next, ". "))
 }
 
-// scanLedger 는 원본을 한 번 훑는다: 판 · 모양과 붙은 다른 연결을 재고, 표마다 행을 읽어 칸마다 사전 검사(cell)를 하고,
-// 행 표지와 발급 번호를 모은다. 끝에 부모 없는 행을 잰다. q 는 원본의 읽기 트랜잭션, from 은 원본의 몫이다. cell 은 옮겨 넣을
-// 쪽의 규칙이다(ledgerSide.intake - 이관은 인덱스 키 상한까지 잰다). 대조는 pg.Cell 이다 - 이미 두 원장에 있는 원문을 맞댄다.
+// scanLedger 는 원본을 한 번 훑는다: 판 · 모양과 붙은 다른 연결을 재고, 표마다 행을 읽어 칸마다 규칙 cell(사전 검사 · 바꿔
+// 넣기)을 걸고, 행 표지와 발급 번호를 모은다. 끝에 부모 없는 행을 잰다. q 는 원본의 읽기 트랜잭션, from 은 원본의 몫이다. cell 은
+// 옮겨 넣을 쪽이 원본 값에 거는 규칙이다(ledgerSide.intake - 이관은 NUL 을 바꿔 넣고 인덱스 키 상한까지 잰다). 대조는 pg.Cell
+// 이다 - 이미 두 원장에 있는 원문을 맞댄다.
 func scanLedger(ctx context.Context, q Reader, from ledgerSide, cell cellRule) (*ledgerScan, error) {
 	if err := from.shape(ctx, q); err != nil {
 		return nil, err
@@ -854,7 +892,7 @@ func scanLedger(ctx context.Context, q Reader, from ledgerSide, cell cellRule) (
 	}
 	sc := &ledgerScan{marks: map[string][]pg.RowMark{}, floors: map[string]int64{}}
 	for _, t := range pg.Tables() {
-		marks, maxID, err := scanTable(ctx, q, t, from.sqlite(), cell, &sc.faults)
+		marks, maxID, err := scanTable(ctx, q, t, from.sqlite(), cell, &sc.cells)
 		if err != nil {
 			return nil, err
 		}
@@ -864,25 +902,25 @@ func scanLedger(ctx context.Context, q Reader, from ledgerSide, cell cellRule) (
 		sc.marks[t.Name] = marks
 		sc.rows = append(sc.rows, TableRows{Table: t.Name, Rows: len(marks)})
 	}
-	if err := from.orphans(ctx, q, &sc.faults); err != nil {
+	if err := from.orphans(ctx, q, &sc.cells.faults); err != nil {
 		return nil, err
 	}
 	return sc, nil
 }
 
-// scanTable 은 표 t 를 읽어 행 표지(칸 선언 순서 · cell 을 지난 값)와 identity 칸의 최고값을 내고, 값 검사에 걸린 칸과
-// 지문 기본키가 겹치는 행을 ft 에 센다. 원본 훑기(받는 쪽의 ledgerSide.intake, 대조는 pg.Cell)와 대상 대조(pg.TargetCell)가 이
-// 하나로 읽는다 - 대조의 두 쪽이 같은 규칙으로 잰다.
-func scanTable(ctx context.Context, q Reader, t pg.Table, sqlite bool, cell cellRule, ft *faultTally) (marks []pg.RowMark, maxID int64, err error) {
+// scanTable 은 표 t 를 읽어 행 표지(칸 선언 순서 · cell 을 지난 값)와 identity 칸의 최고값을 내고, 칸 규칙에 걸리거나 바뀐
+// 칸과 지문 기본키가 겹치는 행을 ct 에 센다. 원본 훑기(받는 쪽의 ledgerSide.intake, 대조는 pg.Cell)와 대상 대조(pg.SettledCell)가
+// 이 하나로 읽는다 - 대조의 두 쪽이 같은 꼴을 잰다. 원본 쪽 값은 바꿔 넣은 값이라 행 표지 · 지문 기본키도 옮긴 값으로 잰다.
+func scanTable(ctx context.Context, q Reader, t pg.Table, sqlite bool, cell cellRule, ct *cellTally) (marks []pg.RowMark, maxID int64, err error) {
 	id, hasID := t.Identity()
 	idAt := t.Index(id.Name)
 	pks := map[string]bool{} // 지문 기본키(pg.Table.DigestPK) - 지문 칸이 있는 표만 찬다
-	err = eachCells(ctx, q, t, sqlite, cell, func(vals []any, faults []pg.Fault) error {
+	err = eachCells(ctx, q, t, sqlite, cell, func(vals []any, faults []pg.Fault, rewrites []pg.Rewrite) error {
 		m := t.Mark(vals)
-		ft.cells(t, faults, m.Key)
+		ct.row(t, faults, rewrites, m.Key)
 		if pk, ok := t.DigestPK(vals); ok {
 			if pks[pk] {
-				ft.add(t.Name, t.DigestKey, pg.FaultDigest, m.Key)
+				ct.faults.add(t.Name, t.DigestKey, pg.FaultDigest, m.Key)
 			}
 			pks[pk] = true
 		}
@@ -952,7 +990,7 @@ func sqliteSequences(ctx context.Context, q Reader) (map[string]int64, error) {
 
 // foreignKeyFaults 는 SQLite 원본에서 부모가 없는 행을 사전 검사에 싣는다(PRAGMA foreign_key_check). 기준선은 커밋 때 그
 // 행을 거절한다. 좌표는 rowid 다(그 표를 `WHERE rowid = N` 으로 찾는다).
-func foreignKeyFaults(ctx context.Context, q Reader, ft *faultTally) error {
+func foreignKeyFaults(ctx context.Context, q Reader, ft *tally[pg.Fault]) error {
 	type miss struct {
 		table, parent string
 		rowid         sql.NullInt64
@@ -997,15 +1035,17 @@ func strings1(ctx context.Context, q Reader, query string, args ...any) ([]strin
 	return out, err
 }
 
-// cellRule 은 읽은 칸 하나를 기준선 값으로 옮기고 거절 사유를 내는 규칙이다: 원본은 pg.Cell(Postgres 로 옮겨 넣을 때는 키 상한까지
-// 재는 pg.ImportCell - ledgerSide.intake), 옮긴 대상은 pg.TargetCell.
-type cellRule func(pg.Column, any) (any, pg.Fault)
+// cellRule 은 읽은 칸 하나를 기준선 값으로 옮기고 거절 사유나 바꿔 넣은 갈래를 내는 규칙이다: 이관의 SQLite 원본은 pg.Cell
+// (Postgres 로 옮겨 넣을 때는 키 상한까지 재는 pg.ImportCell - ledgerSide.intake), 이미 기준선 꼴이어야 하는 쪽(옮긴 대상,
+// 역이관의 Postgres 원본)은 pg.SettledCell.
+type cellRule func(pg.Column, any) (any, pg.Fault, pg.Rewrite)
 
-// eachCells 는 표 t 의 행을 차례로 읽어 칸마다 기준선 값으로 옮긴 것(cell)과 그 검사 사유를 fn 에 준다. sqlite 면 rowid 자리
-// 칸을 rowid 로 읽는다. 두 원장이 이 하나로 읽는다 - 대조의 두 쪽이 같은 꼴을 잰다.
+// eachCells 는 표 t 의 행을 차례로 읽어 칸마다 기준선 값으로 옮긴 것(cell)과 그 거절 사유 · 바꿔 넣은 갈래를 fn 에 준다.
+// sqlite 면 rowid 자리 칸을 rowid 로 읽는다. 두 원장이 이 하나로 읽는다 - 대조의 두 쪽이 같은 꼴을 잰다.
 //
 // ★ vals 는 행마다 새로 만든다. fn 이 그것을 붙들어도(묶음 INSERT) 다음 행이 덮지 않는다.
-func eachCells(ctx context.Context, q Reader, t pg.Table, sqlite bool, cell cellRule, fn func(vals []any, faults []pg.Fault) error) error {
+func eachCells(ctx context.Context, q Reader, t pg.Table, sqlite bool, cell cellRule,
+	fn func(vals []any, faults []pg.Fault, rewrites []pg.Rewrite) error) error {
 	raw := make([]any, len(t.Cols))
 	ptrs := make([]any, len(t.Cols))
 	for i := range raw {
@@ -1017,10 +1057,11 @@ func eachCells(ctx context.Context, q Reader, t pg.Table, sqlite bool, cell cell
 		}
 		vals := make([]any, len(t.Cols))
 		faults := make([]pg.Fault, len(t.Cols))
+		rewrites := make([]pg.Rewrite, len(t.Cols))
 		for i, c := range t.Cols {
-			vals[i], faults[i] = cell(c, raw[i])
+			vals[i], faults[i], rewrites[i] = cell(c, raw[i])
 		}
-		return fn(vals, faults)
+		return fn(vals, faults, rewrites)
 	})
 }
 
@@ -1036,9 +1077,10 @@ const (
 	maxPlaceArgs = 32766
 )
 
-// copyTables 는 원본 q(from)의 표 전부를 대상 트랜잭션 tx(to)에 FK 순서로 넣고 넣은 행 수를 낸다. 값은 원본 그대로다
-// (identity 칸도 옛 번호 그대로 - Postgres 대상이면 pg.Table.InsertSQL 이 그 구절을 붙이고, SQLite 대상이면 item_after.seq
-// 가 rowid 로 돌아간다). 이관과 역이관이 이 하나로 옮긴다.
+// copyTables 는 원본 q(from)의 표 전부를 대상 트랜잭션 tx(to)에 FK 순서로 넣고 넣은 행 수를 낸다. 값은 받는 쪽의 규칙
+// (to.intake - 1차 훑기와 같은 규칙)을 지난 값이다 - 원본 그대로이고, SQLite 원본의 NUL 만 정해진 규칙으로 바뀐다(pg.Rewrite).
+// identity 칸도 옛 번호 그대로다(Postgres 대상이면 pg.Table.InsertSQL 이 그 구절을 붙이고, SQLite 대상이면 item_after.seq 가
+// rowid 로 돌아간다). 이관과 역이관이 이 하나로 옮긴다.
 func copyTables(ctx context.Context, q Reader, from ledgerSide, tx *txConn, to ledgerSide) (int, error) {
 	total := 0
 	for _, t := range pg.Tables() {
@@ -1056,7 +1098,7 @@ func copyTables(ctx context.Context, q Reader, from ledgerSide, tx *txConn, to l
 			args, rows, size = args[:0], 0, 0
 			return nil
 		}
-		err := eachCells(ctx, q, t, from.sqlite(), pg.Cell, func(vals []any, _ []pg.Fault) error {
+		err := eachCells(ctx, q, t, from.sqlite(), to.intake(), func(vals []any, _ []pg.Fault, _ []pg.Rewrite) error {
 			args = append(args, vals...)
 			rows++
 			for _, v := range vals {
@@ -1083,8 +1125,9 @@ func copyTables(ctx context.Context, q Reader, from ledgerSide, tx *txConn, to l
 }
 
 // checkTarget 은 대상 r(to)을 원본 훑기 sc 와 맞대 rep 에 싣는다: 표마다 행 지문의 다중집합(pg.Compare), identity 마다 다음
-// 번호(to.next), 그리고 읽은 대상 값이 값 검사(pg.TargetCell - 저장 갈래까지 칸 타입이어야 한다)에 걸린 것(rep.TargetFaults).
-// 판정은 rep.verdict 다. 이관 · 역이관의 커밋 전 대조와 `fd migrate verify` 가 이 하나를 쓴다.
+// 번호(to.next), 그리고 읽은 대상 값이 값 검사(pg.SettledCell - 바꿔 넣을 값이 없고 저장 갈래까지 칸 타입이어야 한다)에 걸린
+// 것(rep.TargetFaults). 원본 쪽 표지는 원본의 규칙을 지난 값이라, NUL 을 바꿔 넣은 행도 옮긴 값끼리 맞댄다. 판정은
+// rep.verdict 다. 이관 · 역이관의 커밋 전 대조와 `fd migrate verify` 가 이 하나를 쓴다.
 func checkTarget(ctx context.Context, r Reader, to ledgerSide, sc *ledgerScan, rep *TransferReport) error {
 	held, err := to.held(ctx, r)
 	if err != nil {
@@ -1092,9 +1135,9 @@ func checkTarget(ctx context.Context, r Reader, to ledgerSide, sc *ledgerScan, r
 	}
 	var tables []pg.TableCheck
 	var seqs []pg.SequenceCheck
-	var faults faultTally
+	var cells cellTally
 	for _, t := range pg.Tables() {
-		marks, maxID, err := scanTable(ctx, r, t, to.sqlite(), pg.TargetCell, &faults)
+		marks, maxID, err := scanTable(ctx, r, t, to.sqlite(), pg.SettledCell, &cells)
 		if err != nil {
 			return fmt.Errorf("대상 %w", err)
 		}
@@ -1104,7 +1147,7 @@ func checkTarget(ctx context.Context, r Reader, to ledgerSide, sc *ledgerScan, r
 				Next: to.next(t, maxID, held[t.Name])})
 		}
 	}
-	rep.Tables, rep.Sequences, rep.TargetFaults = tables, seqs, faults.groups
+	rep.Tables, rep.Sequences, rep.TargetFaults = tables, seqs, cells.faults.groups
 	return nil
 }
 

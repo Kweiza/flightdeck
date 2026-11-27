@@ -15,7 +15,9 @@ import (
 
 // `fd migrate import-sqlite` · `fd migrate verify` · `fd migrate export-sqlite` 의 표면: 예행은 아무것도 안 쓰고 0, 옮기기 0,
 // 옮긴 원본을 다시 옮기기는 거절 1(이관 표지), 대조 0, 사용법 오류 2. 역이관은 새 파일을 내고 0(예행은 파일을 안 남긴다), 있는 파일에는
-// 거절 1, 낸 파일과 Postgres 원장의 대조 0. 출력에 접속 URL 의 어떤 조각도 없다. 옮기기 · 거절의 뜻은 store 시험이 잰다.
+// 거절 1, 낸 파일과 Postgres 원장의 대조 0. 원본의 NUL 을 바꿔 옮긴 칸은 예행 · 이관 · 대조가 칸 · 규칙 · 행 수로 말하고(판정 줄
+// 아래에도 한 번 더), 바꿀 것 없는 역이관 · 그 파일의 대조는 말하지 않는다. 출력에 접속 URL 의 어떤 조각도 없다. 옮기기 · 거절의
+// 뜻은 store 시험이 잰다.
 func TestMigrateImportSQLiteSurface(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t)
@@ -27,7 +29,7 @@ func TestMigrateImportSQLiteSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpsertMachine(ctx, model.Machine{ID: "m1", Hostname: "host"}); err != nil {
+	if err := s.UpsertMachine(ctx, model.Machine{ID: "m1", Hostname: "ho\x00st"}); err != nil {
 		t.Fatalf("원본 행: %v", err)
 	}
 	s.Close()
@@ -52,14 +54,26 @@ func TestMigrateImportSQLiteSurface(t *testing.T) {
 			t.Fatalf("fd migrate %v: rc=%d(기대 %d), %q 가 없다:\n%s", args, rc, want, wantText, out)
 		}
 	}
+	// 원본의 NUL 을 바꿔 옮겼다는 말(표 · 칸 · 규칙 · 행 좌표, 판정 줄 아래의 행 수)이 있는가.
+	rewrote := func(out string) bool {
+		return strings.Contains(out, "옮기며 바꾼 원본 칸 - 1 행") && strings.Contains(out, "machine.hostname  NUL 바이트 → \\x00  1건") &&
+			strings.Contains(out, `id="m1"`) && strings.Contains(out, "그중 1 행은 원본의 NUL 을 \\x00 표기로 바꾼 값이다")
+	}
+	last := func() string { return outs[len(outs)-1] }
 	step(0, "아무것도 쓰지 않았다", "import-sqlite", "--from", src, "--db", dsn, "--dry-run")
+	if !rewrote(last()) {
+		t.Fatalf("예행이 바꿔 옮길 칸을 말하지 않는다:\n%s", last())
+	}
 	step(1, "두 원장이 맞지 않는다", "verify", "--from", src, "--db", dsn) // 아직 안 옮겼다 - machine 이 어긋난다
 	step(0, "옮겼다: 1 행", "import-sqlite", "--from", src, "--db", dsn)
-	if !strings.Contains(outs[len(outs)-1], "이관 표지를 남겼다: "+store.MovedMarker(src)) {
-		t.Fatalf("옮긴 뒤 이관 표지를 말하지 않는다:\n%s", outs[len(outs)-1])
+	if !strings.Contains(last(), "이관 표지를 남겼다: "+store.MovedMarker(src)) || !rewrote(last()) {
+		t.Fatalf("옮긴 뒤 이관 표지나 바꿔 옮긴 칸을 말하지 않는다:\n%s", last())
 	}
 	step(1, "다시 옮기지 않는다", "import-sqlite", "--from", src, "--db", dsn)
 	step(0, "두 원장이 맞다", "verify", "--from", src, "--db", dsn)
+	if !rewrote(last()) {
+		t.Fatalf("대조가 바꿔 옮긴 칸을 말하지 않는다:\n%s", last())
+	}
 	step(2, "", "import-sqlite", "--db", dsn) // --from 없음
 	step(2, "", "verify", "--from", src, "extra")
 
@@ -69,8 +83,14 @@ func TestMigrateImportSQLiteSurface(t *testing.T) {
 		t.Fatalf("역이관 예행이 파일을 남겼다: %v %v", entries, err)
 	}
 	step(0, "옮겼다: 1 행", "export-sqlite", "--to", back, "--db", dsn)
+	exported := last()
 	step(1, "이미 있다", "export-sqlite", "--to", back, "--db", dsn)
 	step(0, "두 원장이 맞다", "verify", "--from", back, "--db", dsn)
+	for _, out := range []string{exported, last()} {
+		if strings.Contains(out, "바꾼") {
+			t.Fatalf("바꿀 것 없는 역이관 · 대조가 바꾼 칸을 말한다:\n%s", out)
+		}
+	}
 	step(1, "Postgres 접속 URL", "export-sqlite", "--to", filepath.Join(t.TempDir(), "x.db"), "--db", src)
 	step(2, "", "export-sqlite", "--db", dsn) // --to 없음
 	for _, out := range outs {

@@ -314,13 +314,17 @@ func TestExportSQLiteRefusesAnExistingTarget(t *testing.T) {
 }
 
 // 옮길 수 없는 원본은 파일을 남기지 않고 거절한다: Postgres 가 아닌 원본, 빈 DB, 이관 판이 아닌 원장, 그리고 이관의 사전 검사가
-// 받지 않을 값(깨진 JSON)이 든 원장 - 낸 파일을 다시 이관할 수 없게 되므로 역이관도 받지 않는다.
+// 받지 않을 값(깨진 JSON)이 든 원장 - 낸 파일을 다시 이관할 수 없게 되므로 역이관도 받지 않는다. 이관이라면 바꿔 넣었을
+// 값(JSON 의 \u0000)도 거절한다 - 역이관은 Postgres 값을 그대로 내므로, 바꿔 낸 파일은 원장과 같지 않다.
 func TestExportSQLiteRefusesASourceItCannotMove(t *testing.T) {
 	ctx := context.Background()
 	newer, newerStore := importTarget(t)
 	stamp(t, newerStore, pg.ImportVersion+1)
 	_, broken, brokenStore := importedPG(t)
 	pgExec(t, brokenStore, `UPDATE item SET paths = '[깨진' WHERE id = 'i1'`)
+	_, nul, nulStore := importedPG(t)
+	pgExec(t, nulStore, `UPDATE item SET labels = '["\u0000"]' WHERE id = 'i1'`)
+	faults := map[string]pg.Fault{"깨진 JSON": pg.FaultJSON, "JSON 의 \\u0000": pg.FaultJSONNUL}
 	for _, c := range []struct {
 		name, from, want string
 	}{
@@ -328,6 +332,7 @@ func TestExportSQLiteRefusesASourceItCannotMove(t *testing.T) {
 		{"빈 DB", storetest.NewBare(t, ""), "빈 DB"},
 		{"판이 오른 원장", newer, "판 " + transferRange() + " 이 아니다"},
 		{"깨진 JSON", broken, "사전 검사"},
+		{"JSON 의 \\u0000", nul, "사전 검사"},
 	} {
 		for _, dry := range []bool{true, false} {
 			back := exportBack(t)
@@ -338,8 +343,9 @@ func TestExportSQLiteRefusesASourceItCannotMove(t *testing.T) {
 			if got := dirNames(t, filepath.Dir(back)); len(got) != 0 {
 				t.Fatalf("%s(예행 %v) 거절 뒤 %v 가 남았다", c.name, dry, got)
 			}
-			if c.name == "깨진 JSON" && (len(rep.Faults) != 1 || rep.Faults[0].Table != "item" || rep.Faults[0].Column != "paths") {
-				t.Fatalf("걸린 갈래: %+v", rep.Faults)
+			if f, ok := faults[c.name]; ok && (len(rep.Faults) != 1 || rep.Faults[0].Table != "item" || rep.Faults[0].Reason != f ||
+				len(rep.Rewrites) != 0) {
+				t.Fatalf("%s: 걸린 갈래 %+v, 바꾼 칸 %+v", c.name, rep.Faults, rep.Rewrites)
 			}
 		}
 	}
@@ -529,37 +535,47 @@ func TestSoleClientCountsAConnectionWhoseKindIsHidden(t *testing.T) {
 	}
 }
 
-// 커밋 전 대조는 대상에서 읽은 값의 저장 갈래까지 잰다(pg.TargetCell). 옮긴 SQLite 의 글 칸에 같은 바이트의 BLOB 이 남으면
-// 원본의 검사(pg.Cell)로는 같은 값이지만, 옮기기가 칸 타입으로 넣지 않은 것이라 커밋하지 않는다.
+// 커밋 전 대조는 대상에서 읽은 값을 이미 기준선 꼴이어야 하는 값으로 잰다(pg.SettledCell). 옮긴 SQLite 의 글 칸에 같은 바이트의
+// BLOB 이 남거나, Postgres 의 \x00 표기가 대상에서 NUL 바이트로 돌아가면 원본의 검사(pg.Cell)로는 받을 값이지만, 옮기기가 그렇게
+// 넣지 않은 것이라 커밋하지 않는다 - 대상의 NUL 을 같은 규칙으로 접어 맞다고 하지 않는다.
 func TestExportSQLiteRefusesAValueInTheWrongStorage(t *testing.T) {
 	ctx := context.Background()
-	_, dsn, _ := importedPG(t)
+	_, dsn, dst := importedPG(t)
+	pgExec(t, dst, `UPDATE item SET title = 'a\x00b' WHERE id = 'i1'`)
 	src, err := openExportSource(ParseTarget(dsn), quietLog())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer src.Close()
-	for _, dry := range []bool{true, false} {
-		tmp, err := newExportFile(ctx, exportBack(t), quietLog())
-		if err != nil {
-			t.Fatal(err)
-		}
-		liteExec(t, tmp, `CREATE TRIGGER t_blob_title AFTER INSERT ON item BEGIN
-			UPDATE item SET title = CAST(title AS BLOB) WHERE rowid = new.rowid; END`)
-		var rep TransferReport
-		storetest.SettleClients(t, dsn, 1)
-		err = exportInto(ctx, src, tmp, dry, &rep, quietLog())
-		if err == nil || !strings.Contains(err.Error(), "대상 값 검사") {
-			t.Fatalf("예행 %v: 글 칸의 BLOB 을 지나쳤다: %v", dry, err)
-		}
-		if len(rep.TargetFaults) != 1 || rep.TargetFaults[0].Table != "item" || rep.TargetFaults[0].Column != "title" ||
-			rep.TargetFaults[0].Fault != pg.FaultStorage {
-			t.Fatalf("예행 %v: 대상 값 검사 갈래 %+v", dry, rep.TargetFaults)
-		}
-		var n int64
-		liteQuery(t, tmp, `SELECT count(*) FROM item`, &n)
-		if n != 0 {
-			t.Fatalf("예행 %v: 커밋하지 않았는데 임시 원장에 %d 행", dry, n)
+	for _, c := range []struct {
+		name, trigger string
+		fault         pg.Fault
+	}{
+		{"글 칸의 BLOB", `UPDATE item SET title = CAST(title AS BLOB) WHERE rowid = new.rowid`, pg.FaultStorage},
+		{"\\x00 이 NUL 로", `UPDATE item SET title = CAST(X'610062' AS TEXT) WHERE rowid = new.rowid AND new.title = 'a\x00b'`,
+			pg.FaultNUL},
+	} {
+		for _, dry := range []bool{true, false} {
+			tmp, err := newExportFile(ctx, exportBack(t), quietLog())
+			if err != nil {
+				t.Fatal(err)
+			}
+			liteExec(t, tmp, `CREATE TRIGGER t_bend_title AFTER INSERT ON item BEGIN `+c.trigger+`; END`)
+			var rep TransferReport
+			storetest.SettleClients(t, dsn, 1)
+			err = exportInto(ctx, src, tmp, dry, &rep, quietLog())
+			if err == nil || !strings.Contains(err.Error(), "대상 값 검사") {
+				t.Fatalf("%s(예행 %v): 지나쳤다: %v", c.name, dry, err)
+			}
+			if len(rep.TargetFaults) != 1 || rep.TargetFaults[0].Table != "item" || rep.TargetFaults[0].Column != "title" ||
+				rep.TargetFaults[0].Reason != c.fault {
+				t.Fatalf("%s(예행 %v): 대상 값 검사 갈래 %+v", c.name, dry, rep.TargetFaults)
+			}
+			var n int64
+			liteQuery(t, tmp, `SELECT count(*) FROM item`, &n)
+			if n != 0 {
+				t.Fatalf("%s(예행 %v): 커밋하지 않았는데 임시 원장에 %d 행", c.name, dry, n)
+			}
 		}
 	}
 }

@@ -479,6 +479,11 @@ curl -s localhost:7420/healthz
 
 `/healthz` must have `db_ok` and `db_locale_ok` true.
 
+- **NUL becomes `\x00`.** SQLite holds NUL bytes (0x00) in text columns; Postgres cannot. Step 5's dry run and move and step
+  7's comparison do not refuse such a column: they move it with NUL written as the four characters `\x00`, list the changed
+  columns under "옮기며 바꾼 원본 칸" ("source columns changed in the move") by table · column · rule · row key, and repeat the
+  number of changed rows under the verdict line. There is no hand-editing step. The SQLite ledger file is left as it is. The
+  rule and how to reverse it are in "Moving a SQLite ledger to Postgres" below.
 - If it stops **before step 5 leaves the marker** (a refusal or failure in 2-5), nothing is committed (the import is one
   transaction), **with two exceptions**. If step 5's move stops with "옮겼다(N 행, 커밋했다) - 그런데 원본 옆에 이관 표지를
   남기지 못했다" ("moved (N rows, committed) - but could not leave the move marker next to the source"), it did commit. If
@@ -875,16 +880,37 @@ fd migrate verify --from fd-copy.db --db <URL>
 - If any connection other than this run is attached to the target database (a server, psql, ...), the dry run and the real
   import both refuse and list each remaining connection's pid · role · application_name. Some writes of an attached server
   (observation records) do not take the migration lock and would interleave with the moving transaction.
-- Pre-checks: NUL bytes and broken UTF-8 in text columns, broken JSON and `\u0000` in JSON columns, a storage type that does
-  not match the column, NULL primary keys, colliding snapshot key digests, foreign keys pointing at missing rows, and text over
-  the limit of an index key column (event's project 2048 bytes, kind 512 bytes - the Postgres B-tree cannot take that row). If
-  anything hits, nothing is written and each hit is listed by table · column · reason · primary key. Fix those rows in the
-  copy and run it again. Rows over the key limit are the exception: do not fix them - they belong to the append-only audit
-  ledger (event), and cutting a value makes it differ from the source. Report the coordinates in an issue. `fd migrate verify`
-  does not report a match for a source that fails the pre-checks either (except the key limit - the comparison checks the
-  original values already in both ledgers).
+- Pre-checks: broken UTF-8 in text columns, broken JSON in JSON columns (a JSON column with a raw NUL byte inside a string
+  is not a JSON document either and lands here), a storage type that does not match the column, NULL primary keys,
+  colliding snapshot key digests, foreign keys pointing at missing rows, and text over the limit of an index key column
+  (event's project 2048 bytes, kind 512 bytes - the Postgres B-tree cannot take that row). If anything hits, nothing is
+  written and each hit is listed by table · column · reason · primary key. Fix those rows in the copy and run it again. Rows
+  over the key limit are the exception: do not fix them - they belong to the append-only audit ledger (event), and cutting a
+  value makes it differ from the source. Report the coordinates in an issue. `fd migrate verify` does not report a match for
+  a source that fails the pre-checks either (except the key limit - the comparison checks the original values already in
+  both ledgers).
 - New values cannot pass the same limit: the server refuses a project over 2048 bytes or a kind over 512 bytes with a 400
   (`key_too_long`) on both engines.
+- **NUL becomes `\x00`.** Postgres text cannot hold a NUL byte (0x00), and jsonb refuses a document with U+0000 (`\u0000`)
+  in a string. Such columns are not refused; they are moved with the rule below. The rule works on one column value at a
+  time and can be reversed.
+  - Text columns: in a value that holds a NUL, each NUL becomes the four characters `\x00`, and a run of backslashes directly
+    followed by a NUL or by `x00` is doubled - a `\x00` notation already in the same value becomes `\\x00` and stays
+    apart from the NUL positions. Every other byte (including other notations such as `\n` or `\x1f`) and every value
+    without a NUL is left byte for byte.
+  - JSON columns: in a document with U+0000, the same rule is applied to the decoded value of each string (keys included).
+    Only the changed strings are written again (the document shows `\\x00`, which decodes to the four characters `\x00`);
+    numbers, whitespace, order and unchanged strings keep their original bytes.
+  - Reversing: in a changed value, a run of backslashes directly before `x00` that is odd (2k+1) was k backslashes + NUL,
+    and one that is even (2k) was k backslashes + `x00`. Everything else is unchanged. The report's row keys say which values
+    were changed - a `\x00` in a value that never held a NUL has always been those four characters.
+  - Nothing is changed silently: the dry run, the move and `fd migrate verify` list the changed columns under "옮기며 바꾼
+    원본 칸" by table · column · rule · count · row key (the first 20 per group) and repeat the number of changed rows under
+    the verdict line. The comparison applies the same rule to the source values, so changed rows match. If the target still
+    holds something to change (a NUL or `\u0000` in the target), it is not folded by the rule but flagged by the target value
+    check.
+  - If a changed primary key becomes equal to another row's key (one key holds a NUL and another holds `\x00` in that
+    place), the target refuses that INSERT. The dry run refuses it the same way and nothing is left behind.
 - After moving and leaving the moved marker, the import moves the source's pre-upgrade copies (`<source>.bak-*`, with their
   side files) into a new directory `<source>.pre-import-<time>.bak/` (it does not delete them). That file is no longer the
   ledger, and those copies are not copies of whatever ledger is put there later. A dry run, a refusal, or a failure moves
@@ -931,6 +957,10 @@ fd migrate verify --from fd-back.db --db <URL>
   file could not be imported again. The index key limit is not checked: the original values already in the Postgres ledger are
   exported as they are, and `fd migrate verify` compares those originals. Importing that file again stops at the import's
   pre-checks, which name the row.
+- Postgres values are written as they are. The `\x00` the import wrote in place of a NUL is not turned back into a NUL - the
+  exported file holds no NUL, and its comparison with the Postgres ledger (step 4) matches with nothing changed. A Postgres
+  source holding a value the import would have changed (`\u0000` in a JSON string) is refused rather than changed - a file
+  written with changed values is not the same as the ledger.
 - If pre-upgrade copies (`<to>.bak-*`, with their side files) sit next to `--to`, they are moved into a new directory
   `<to>.pre-export-<time>.bak/` before the name is given (not deleted) - they are not copies of the new ledger, so they are
   kept out of the place where `fd migrate --rollback` picks. A dry run moves nothing.

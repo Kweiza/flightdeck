@@ -156,7 +156,8 @@ func TestImportCatalogMatchesBothEngines(t *testing.T) {
 	}
 }
 
-// Cell 은 Postgres 가 거절할 값을 사유와 함께 거르고, 바이트를 바꾸지 않는 저장 갈래는 받는다.
+// Cell 은 Postgres 가 거절할 값을 사유와 함께 거르고, 바이트를 바꾸지 않는 저장 갈래는 받고, NUL 은 정해진 규칙으로 바꿔
+// 넣으며 그 갈래를 낸다.
 func TestCellFaults(t *testing.T) {
 	text := pg.Column{Name: "t", Kind: pg.Text}
 	notNull := pg.Column{Name: "n", Kind: pg.Text, NotNull: true}
@@ -171,73 +172,167 @@ func TestCellFaults(t *testing.T) {
 		in    any
 		want  any
 		fault pg.Fault
+		rw    pg.Rewrite
 	}{
-		{"NULL 은 받는다", text, nil, nil, ""},
-		{"빈 글은 NULL 이 아니다", notNull, "", "", ""},
-		{"NOT NULL 칸의 NULL", notNull, nil, nil, pg.FaultNull},
-		{"기본키의 NULL", key, nil, nil, pg.FaultKeyNull},
-		{"글의 NUL", text, "a\x00b", "a\x00b", pg.FaultNUL},
-		{"깨진 UTF-8", text, "\xff", "\xff", pg.FaultUTF8},
-		{"글 칸의 BLOB 은 같은 바이트의 글이다", text, []byte("한글"), "한글", ""},
-		{"글 칸의 BLOB 도 NUL 을 잰다", text, []byte{'a', 0}, "a\x00", pg.FaultNUL},
-		{"글 칸의 정수", text, int64(1), int64(1), pg.FaultStorage},
-		{"정수 칸의 글", num, "abc", "abc", pg.FaultStorage},
-		{"정수 칸의 실수", num, 1.5, 1.5, pg.FaultStorage},
-		{"정수는 받는다", num, int64(-7), int64(-7), ""},
-		{"bytea 칸의 TEXT 는 같은 바이트다", blob, "x", []byte("x"), ""},
-		{"bytea 는 NUL 을 받는다", blob, []byte{0, 1}, []byte{0, 1}, ""},
-		{"깨진 JSON", doc, "[", "[", pg.FaultJSON},
-		{"JSON 글 안의 \\u0000", doc, `{"a":"x\u0000"}`, `{"a":"x\u0000"}`, pg.FaultJSONNUL},
-		{"JSON 키 안의 \\u0000", doc, `{"\u0000":1}`, `{"\u0000":1}`, pg.FaultJSONNUL},
-		{"이스케이프된 백슬래시 뒤 u0000 은 글자다", doc, `["\\u0000"]`, `["\\u0000"]`, ""},
+		{"NULL 은 받는다", text, nil, nil, "", ""},
+		{"빈 글은 NULL 이 아니다", notNull, "", "", "", ""},
+		{"NOT NULL 칸의 NULL", notNull, nil, nil, pg.FaultNull, ""},
+		{"기본키의 NULL", key, nil, nil, pg.FaultKeyNull, ""},
+		{"글의 NUL 은 \\x00 이 된다", text, "a\x00b", `a\x00b`, "", pg.RewriteNUL},
+		{"기본키의 NUL 도 같은 규칙이다", key, "k\x00", `k\x00`, "", pg.RewriteNUL},
+		{"NUL 이 든 칸의 \\x00 표기는 백슬래시가 두 배다", text, `\x00` + "\x00", `\\x00\x00`, "", pg.RewriteNUL},
+		{"NUL 이 없는 칸의 \\x00 표기는 그대로다", text, `a\x00\\`, `a\x00\\`, "", ""},
+		{"깨진 UTF-8", text, "\xff", "\xff", pg.FaultUTF8, ""},
+		{"깨진 UTF-8 은 NUL 보다 먼저 걸린다", text, "\xff\x00", "\xff\x00", pg.FaultUTF8, ""},
+		{"글 칸의 BLOB 은 같은 바이트의 글이다", text, []byte("한글"), "한글", "", ""},
+		{"글 칸의 BLOB 의 NUL 도 바꿔 넣는다", text, []byte{'a', 0}, `a\x00`, "", pg.RewriteNUL},
+		{"글 칸의 정수", text, int64(1), int64(1), pg.FaultStorage, ""},
+		{"정수 칸의 글", num, "abc", "abc", pg.FaultStorage, ""},
+		{"정수 칸의 실수", num, 1.5, 1.5, pg.FaultStorage, ""},
+		{"정수는 받는다", num, int64(-7), int64(-7), "", ""},
+		{"bytea 칸의 TEXT 는 같은 바이트다", blob, "x", []byte("x"), "", ""},
+		{"bytea 는 NUL 을 받는다", blob, []byte{0, 1}, []byte{0, 1}, "", ""},
+		{"깨진 JSON", doc, "[", "[", pg.FaultJSON, ""},
+		{"날 NUL 이 든 JSON 은 문서가 아니다", doc, "[\"\x00\"]", "[\"\x00\"]", pg.FaultJSON, ""},
+		{"JSON 글 안의 \\u0000", doc, `{"a":"x\u0000"}`, `{"a":"x\\x00"}`, "", pg.RewriteJSONNUL},
+		{"JSON 키 안의 \\u0000", doc, `{"\u0000":1}`, `{"\\x00":1}`, "", pg.RewriteJSONNUL},
+		{"이스케이프된 백슬래시 뒤 u0000 은 글자다", doc, `["\\u0000"]`, `["\\u0000"]`, "", ""},
 		// float64 로 못 옮기는 수 뒤에 있어도 \u0000 을 잰다(수를 글 그대로 읽는다).
-		{"범위 밖 수 뒤의 \\u0000", doc, `[1e400,"\u0000"]`, `[1e400,"\u0000"]`, pg.FaultJSONNUL},
-		{"범위 밖 수는 받는다", doc, `{"n":1e400,"s":"\\u0000"}`, `{"n":1e400,"s":"\\u0000"}`, ""},
-		{"JSON 은 받는다", doc, `{"a":[1,"b"]}`, `{"a":[1,"b"]}`, ""},
+		{"범위 밖 수 뒤의 \\u0000", doc, `[1e400,"\u0000"]`, `[1e400,"\\x00"]`, "", pg.RewriteJSONNUL},
+		{"범위 밖 수는 받는다", doc, `{"n":1e400,"s":"\\u0000"}`, `{"n":1e400,"s":"\\u0000"}`, "", ""},
+		// 바꾼 문서는 바뀐 글만 다시 쓴다: 다른 글의 이스케이프 · 공백 · 수는 원래 바이트다.
+		{"바뀌지 않은 글은 원래 바이트다", doc, `{ "h":"\u003c", "n": "\u0000", "f": 1.50 }`, `{ "h":"\u003c", "n": "\\x00", "f": 1.50 }`, "", pg.RewriteJSONNUL},
+		// U+0000 이 든 문서는 글 전부에 같은 규칙을 건다 - 다른 글의 \x00 표기도 백슬래시가 두 배다(되돌릴 단위가 칸이다).
+		{"같은 문서의 \\x00 표기", doc, `["\u0000","\\x00"]`, `["\\x00","\\\\x00"]`, "", pg.RewriteJSONNUL},
+		{"U+0000 없는 문서의 \\x00 표기는 그대로다", doc, `["\\x00"]`, `["\\x00"]`, "", ""},
+		{"JSON 은 받는다", doc, `{"a":[1,"b"]}`, `{"a":[1,"b"]}`, "", ""},
 		// 상한은 Cell 이 재지 않는다 - 대조 · 역이관은 원문 그대로 옮기고 맞댄다(ImportCell 만 잰다).
-		{"Cell 은 상한을 재지 않는다", capped, "abcde", "abcde", ""},
+		{"Cell 은 상한을 재지 않는다", capped, "abcde", "abcde", "", ""},
 	} {
-		got, fault := pg.Cell(c.col, c.in)
-		if fault != c.fault || pg.RowHash([]any{got}) != pg.RowHash([]any{c.want}) {
-			t.Errorf("%s: Cell(%v) = (%#v, %q), 기대 (%#v, %q)", c.name, c.in, got, fault, c.want, c.fault)
+		got, fault, rw := pg.Cell(c.col, c.in)
+		if fault != c.fault || rw != c.rw || pg.RowHash([]any{got}) != pg.RowHash([]any{c.want}) {
+			t.Errorf("%s: Cell(%q) = (%#v, %q, %q), 기대 (%#v, %q, %q)", c.name, c.in, got, fault, rw, c.want, c.fault, c.rw)
 		}
 	}
 }
 
-// 인덱스 키 상한(Column.MaxBytes)은 Postgres 로 옮겨 넣을 값의 규칙(ImportCell)에만 있다. 대조 · 역이관이 지나는 Cell · TargetCell 은
-// 같은 값을 받는다. ImportCell 은 Cell 의 다른 검사를 그대로 한다.
+// 인덱스 키 상한(Column.MaxBytes)은 Postgres 로 옮겨 넣을 값의 규칙(ImportCell)에만 있다. 대조 · 역이관이 지나는 Cell · SettledCell
+// 은 같은 값을 받는다. ImportCell 은 Cell 의 다른 검사 · 바꿔 넣기를 그대로 하고, 상한은 바꿔 넣은 값(옮겨 넣을 바이트)으로 잰다.
 func TestImportCellAloneCapsTheIndexKey(t *testing.T) {
 	capped := pg.Column{Name: "p", Kind: pg.Text, MaxBytes: 4}
 	for _, c := range []struct {
 		name  string
 		in    any
 		fault pg.Fault
+		rw    pg.Rewrite
 	}{
-		{"상한까지는 받는다", "abcd", ""},
-		{"상한을 넘는 글", "abcde", pg.FaultTooLong},
-		{"상한은 글자가 아니라 바이트다", "가나", pg.FaultTooLong},
-		{"상한 칸의 BLOB 도 바이트로 잰다", []byte("abcde"), pg.FaultTooLong},
-		{"다른 검사가 먼저다", "a\x00bcde", pg.FaultNUL},
-		{"NULL 은 받는다", nil, ""},
+		{"상한까지는 받는다", "abcd", "", ""},
+		{"상한을 넘는 글", "abcde", pg.FaultTooLong, ""},
+		{"상한은 글자가 아니라 바이트다", "가나", pg.FaultTooLong, ""},
+		{"상한 칸의 BLOB 도 바이트로 잰다", []byte("abcde"), pg.FaultTooLong, ""},
+		{"다른 검사가 먼저다", "\xffbcde", pg.FaultUTF8, ""},
+		{"바꿔 넣은 값이 상한 안이면 받는다", "\x00", "", pg.RewriteNUL},
+		{"바꿔 넣은 값으로 잰다", "a\x00", pg.FaultTooLong, ""},
+		{"NULL 은 받는다", nil, "", ""},
 	} {
-		got, fault := pg.ImportCell(capped, c.in)
-		want, _ := pg.Cell(capped, c.in)
-		if fault != c.fault || pg.RowHash([]any{got}) != pg.RowHash([]any{want}) {
-			t.Errorf("%s: ImportCell(%v) = (%#v, %q), 기대 (%#v, %q)", c.name, c.in, got, fault, want, c.fault)
+		got, fault, rw := pg.ImportCell(capped, c.in)
+		want, _, _ := pg.Cell(capped, c.in)
+		if fault != c.fault || rw != c.rw || pg.RowHash([]any{got}) != pg.RowHash([]any{want}) {
+			t.Errorf("%s: ImportCell(%q) = (%#v, %q, %q), 기대 (%#v, %q, %q)", c.name, c.in, got, fault, rw, want, c.fault, c.rw)
 		}
-		if c.fault == pg.FaultTooLong {
-			if _, f := pg.Cell(capped, c.in); f != "" {
-				t.Errorf("%s: Cell 이 상한을 쟀다(%q)", c.name, f)
-			}
-			if _, f := pg.TargetCell(capped, c.in); f != "" && c.name != "상한 칸의 BLOB 도 바이트로 잰다" {
-				t.Errorf("%s: TargetCell 이 상한을 쟀다(%q)", c.name, f)
-			}
+	}
+	for _, in := range []string{"abcde", "가나"} {
+		if _, f, _ := pg.Cell(capped, in); f != "" {
+			t.Errorf("Cell(%q) 이 상한을 쟀다(%q)", in, f)
+		}
+		if _, f, _ := pg.SettledCell(capped, in); f != "" {
+			t.Errorf("SettledCell(%q) 이 상한을 쟀다(%q)", in, f)
 		}
 	}
 	// 상한이 없는 칸은 Cell 과 같다.
-	if _, f := pg.ImportCell(pg.Column{Name: "t", Kind: pg.Text}, strings.Repeat("a", 10000)); f != "" {
+	if _, f, _ := pg.ImportCell(pg.Column{Name: "t", Kind: pg.Text}, strings.Repeat("a", 10000)); f != "" {
 		t.Fatalf("상한이 없는 칸을 쟀다: %q", f)
 	}
+}
+
+// EscapeNUL 은 되돌릴 수 있고(단사), 결과에 NUL 이 없고, NUL 도 「x00」도 없는 글은 그대로 둔다(NUL 이 없는 칸을 그대로 두는
+// 것은 Cell 의 몫이다 - TestCellFaults). 「x00」 앞 백슬래시 묶음의 홀짝으로 되돌리는 규칙(unescapeNUL - README 가 사람에게
+// 적은 것)으로 짧은 글 전부를 맞댄다.
+func TestEscapeNULIsReversible(t *testing.T) {
+	alphabet := []byte{'\\', 'x', '0', 0, 'a'}
+	seen := map[string]string{}
+	var walk func(prefix []byte)
+	n := 0
+	walk = func(prefix []byte) {
+		s := string(prefix)
+		e := pg.EscapeNUL(s)
+		n++
+		switch {
+		case strings.IndexByte(e, 0) >= 0:
+			t.Fatalf("EscapeNUL(%q) = %q 에 NUL 이 남았다", s, e)
+		case unescapeNUL(e) != s:
+			t.Fatalf("EscapeNUL(%q) = %q 를 되돌리니 %q 다", s, e, unescapeNUL(e))
+		case strings.IndexByte(s, 0) < 0 && !strings.Contains(s, "x00") && e != s:
+			t.Fatalf("NUL 도 x00 도 없는 %q 를 %q 로 바꿨다", s, e)
+		}
+		if prev, ok := seen[e]; ok {
+			t.Fatalf("%q 와 %q 가 같은 %q 가 된다", prev, s, e)
+		}
+		seen[e] = s
+		if len(prefix) == 7 {
+			return
+		}
+		for _, c := range alphabet {
+			walk(append(prefix[:len(prefix):len(prefix)], c))
+		}
+	}
+	walk(nil)
+	if want := (78125*5 - 1) / 4; n != want { // 5^0 + … + 5^7
+		t.Fatalf("잰 글 %d 개, 기대 %d 개", n, want)
+	}
+	for in, want := range map[string]string{
+		"\x00":           `\x00`,
+		`\` + "\x00":     `\\\x00`,
+		`\x00` + "\x00":  `\\x00\x00`,
+		`\\x00` + "\x00": `\\\\x00\x00`,
+		"\x00" + `\x01`:  `\x00\x01`,
+		`\n` + "\x00":    `\n\x00`,
+	} {
+		if got := pg.EscapeNUL(in); got != want {
+			t.Errorf("EscapeNUL(%q) = %q, 기대 %q", in, got, want)
+		}
+	}
+}
+
+// unescapeNUL 은 EscapeNUL 의 역이다(README 「SQLite 원장을 Postgres 로 옮기기」의 되돌리는 규칙): 「x00」 바로 앞의 백슬래시
+// 묶음이 홀수 개(2k+1)면 k 개 백슬래시 + NUL, 짝수 개(2k)면 k 개 백슬래시 + 「x00」. 그 밖의 바이트는 그대로다.
+func unescapeNUL(e string) string {
+	var b strings.Builder
+	for i := 0; i < len(e); {
+		if e[i] != '\\' {
+			b.WriteByte(e[i])
+			i++
+			continue
+		}
+		j := i
+		for j < len(e) && e[j] == '\\' {
+			j++
+		}
+		n := j - i
+		if !strings.HasPrefix(e[j:], "x00") {
+			b.WriteString(e[i:j])
+			i = j
+			continue
+		}
+		b.WriteString(strings.Repeat(`\`, n/2))
+		if n%2 == 1 {
+			b.WriteByte(0)
+		} else {
+			b.WriteString("x00")
+		}
+		i = j + 3
+	}
+	return b.String()
 }
 
 // 행 지문은 NULL 과 빈 글을 가르고, 칸 경계가 밀린 행을 가르고, 바이트 하나의 차이를 가르고, 바이트가 같은 다른 저장
@@ -260,7 +355,7 @@ func TestRowHashSeparates(t *testing.T) {
 			t.Errorf("%#v 와 %#v 의 지문이 같다", p[0], p[1])
 		}
 	}
-	if got, fault := pg.Cell(pg.Column{Name: "b", Kind: pg.Bytes, NotNull: true}, []byte(nil)); fault != "" || got.([]byte) == nil {
+	if got, fault, _ := pg.Cell(pg.Column{Name: "b", Kind: pg.Bytes, NotNull: true}, []byte(nil)); fault != "" || got.([]byte) == nil {
 		t.Errorf("길이 0 BLOB(nil 조각)이 빈 bytea 가 아니다: (%#v, %q) - pgx 는 nil 조각을 NULL 로 보낸다", got, fault)
 	}
 	// 바이트가 그대로인 두 갈래는 Cell 이 칸 타입으로 옮긴 뒤 대상에서 읽은 값과 지문이 같다.
@@ -272,7 +367,7 @@ func TestRowHashSeparates(t *testing.T) {
 		{pg.Column{Name: "t", Kind: pg.Text}, []byte("x"), "x"},
 		{pg.Column{Name: "b", Kind: pg.Bytes}, "x", []byte("x")},
 	} {
-		got, fault := pg.Cell(c.col, c.src)
+		got, fault, _ := pg.Cell(c.col, c.src)
 		if fault != "" || pg.RowHash([]any{got}) != pg.RowHash([]any{c.target}) {
 			t.Errorf("%s 칸의 %#v: Cell 뒤 (%#v, %q) 가 대상 값 %#v 와 지문이 다르다", c.col.Kind, c.src, got, fault, c.target)
 		}
@@ -307,7 +402,7 @@ func TestCellKeepsTheColumnType(t *testing.T) {
 			}
 			col := pg.Column{Name: "c", Kind: kind, JSON: json}
 			for _, v := range stored {
-				got, fault := pg.Cell(col, v)
+				got, fault, _ := pg.Cell(col, v)
 				switch {
 				case fault == "" && got != nil && typeName(got) != goType[kind]:
 					t.Errorf("%s 칸(JSON %v)이 %#v 를 받아 %s 로 냈다 - 칸 타입(%s)이 아니다", kind, json, v, typeName(got), goType[kind])
@@ -321,10 +416,12 @@ func TestCellKeepsTheColumnType(t *testing.T) {
 	}
 }
 
-// TargetCell 은 Cell 이 받는 두 갈래(글 칸의 BLOB, bytea 칸의 TEXT)를 저장 갈래 오류로 걸고 값을 받은 그대로 둔다. 칸
-// 타입 그대로 저장된 값과 NULL 은 Cell 과 같이 잰다.
-func TestTargetCellRefusesTheOtherStorage(t *testing.T) {
+// SettledCell 은 Cell 이 받는 두 갈래(글 칸의 BLOB, bytea 칸의 TEXT)를 저장 갈래 오류로, Cell 이 바꿔 넣었을 값(NUL ·
+// JSON 의 \u0000)을 그 거절 사유로 걸고 값을 받은 그대로 둔다 - 바꿔 넣지 않는다. 칸 타입 그대로 저장된 바꿀 것 없는 값과
+// NULL 은 Cell 과 같이 잰다.
+func TestSettledCellRefusesWhatCellWouldChange(t *testing.T) {
 	text, bytes := pg.Column{Name: "c", Kind: pg.Text}, pg.Column{Name: "c", Kind: pg.Bytes}
+	doc := pg.Column{Name: "c", Kind: pg.Text, JSON: true}
 	for _, c := range []struct {
 		col  pg.Column
 		v    any
@@ -332,19 +429,26 @@ func TestTargetCellRefusesTheOtherStorage(t *testing.T) {
 	}{
 		{text, []byte("x"), pg.FaultStorage},
 		{bytes, "x", pg.FaultStorage},
+		{text, "a\x00b", pg.FaultNUL},
+		{text, []byte("a\x00b"), pg.FaultNUL},
+		{doc, `["\u0000"]`, pg.FaultJSONNUL},
+		{doc, "[\"\x00\"]", pg.FaultJSON},
+		{text, `a\x00b`, ""},
+		{doc, `["\\x00"]`, ""},
 		{text, "x", ""},
 		{bytes, []byte("x"), ""},
+		{bytes, []byte{0}, ""},
 		{pg.Column{Name: "c", Kind: pg.Int}, int64(1), ""},
 		{text, nil, ""},
 	} {
-		got, fault := pg.TargetCell(c.col, c.v)
-		if fault != c.want {
-			t.Errorf("%s 칸의 %#v: 사유 %q, 기대 %q", c.col.Kind, c.v, fault, c.want)
+		got, fault, rw := pg.SettledCell(c.col, c.v)
+		if fault != c.want || rw != "" {
+			t.Errorf("%s 칸의 %q: (%q, %q), 기대 (%q, \"\")", c.col.Kind, c.v, fault, rw, c.want)
 		}
-		if fault == pg.FaultStorage && fmt.Sprintf("%T", got) != fmt.Sprintf("%T", c.v) {
-			t.Errorf("%s 칸이 걸린 %#v 를 %T 로 바꿨다", c.col.Kind, c.v, got)
+		if fault != "" && pg.RowHash([]any{got}) != pg.RowHash([]any{c.v}) {
+			t.Errorf("%s 칸이 걸린 %q 를 %#v 로 바꿨다", c.col.Kind, c.v, got)
 		}
-		if want, wantFault := pg.Cell(c.col, c.v); c.want == "" && (wantFault != "" || fmt.Sprint(got) != fmt.Sprint(want)) {
+		if want, wantFault, _ := pg.Cell(c.col, c.v); c.want == "" && (wantFault != "" || fmt.Sprint(got) != fmt.Sprint(want)) {
 			t.Errorf("%s 칸의 %#v: Cell 과 다르다(%#v · %#v)", c.col.Kind, c.v, got, want)
 		}
 	}

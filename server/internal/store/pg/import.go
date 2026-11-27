@@ -3,8 +3,6 @@ package pg
 import (
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
-	"io"
 	"strings"
 	"unicode/utf8"
 )
@@ -93,7 +91,7 @@ type Column struct {
 	// 대조에서 어긋난 행을 이 칸들의 값으로 적는다.
 	Key bool
 	// JSON 은 서버가 JSON 문서로 쓰는 칸이다(json.Marshal). Postgres 에서는 text 그대로지만 jsonb 로 읽힐 수 있는 칸이라
-	// 깨진 문서와 \u0000 을 거절한다.
+	// 깨진 문서는 거절하고 글 안의 \u0000 은 바꿔 넣는다(RewriteJSONNUL).
 	JSON bool
 	// Identity 는 기준선에서 GENERATED ALWAYS AS IDENTITY 다. 옛 번호를 그대로 넣으려면 소유 역할로 OVERRIDING SYSTEM
 	// VALUE 를 붙이고, 넣은 뒤 같은 트랜잭션에서 `ALTER SEQUENCE … RESTART WITH` 로 번호를 맞춘다(Sequence).
@@ -245,7 +243,8 @@ func rowid(c Column) Column   { c.Rowid = true; return c }
 func capped(n int, c Column) Column { c.MaxBytes = n; return c }
 
 // Fault 는 사전 검사가 칸 하나를 거절한 갈래다. 하나라도 걸리면 이관은 아무것도 안 쓰고, 걸린 행을 표 · 행 좌표 · 칸으로 낸다.
-// 고치는 것은 원본 사본에서 사람이 한다 - 이관이 값을 바꿔 넣으면 전 칸 대조가 설 자리가 없다.
+// 고치는 것은 원본 사본에서 사람이 한다. 이관이 스스로 바꿔 넣는 것은 되돌릴 수 있는 규칙이 정해진 갈래(Rewrite - NUL)뿐이고,
+// 대조는 원본 값에 같은 규칙을 건 뒤 맞댄다 - 그 밖의 값을 짐작으로 고쳐 넣으면 전 칸 대조가 설 자리가 없다.
 type Fault string
 
 const (
@@ -253,16 +252,18 @@ const (
 	FaultKeyNull Fault = "기본키 NULL"
 	// FaultNull: NOT NULL 칸의 NULL.
 	FaultNull Fault = "NOT NULL 칸의 NULL"
-	// FaultNUL: SQLite 는 글 칸의 0x00 을 보존하지만 Postgres text 는 못 받는다.
+	// FaultNUL: 이미 기준선 꼴이어야 하는 값(SettledCell - 옮긴 대상, 역이관의 Postgres 원본)의 글 칸에 NUL 바이트가 있다.
+	// SQLite 원본의 NUL 은 거절하지 않고 바꿔 넣는다(RewriteNUL).
 	FaultNUL Fault = "NUL 바이트"
 	// FaultUTF8: UTF8 DB 의 text 는 깨진 바이트열을 거절한다(SQLite 는 그대로 둔다).
 	FaultUTF8 Fault = "깨진 UTF-8"
 	// FaultStorage: 선언 타입으로 옮길 수 없는 값(정수 칸의 글, 글 칸의 실수 등). SQLite 는 칸 타입을 강제하지 않는다.
 	FaultStorage Fault = "저장 갈래가 칸 타입과 다르다"
-	// FaultJSON: JSON 칸이 JSON 문서가 아니다.
+	// FaultJSON: JSON 칸이 JSON 문서가 아니다. 날 NUL 바이트가 든 JSON 칸도 여기다 - 글 안의 제어 문자는 이스케이프해야 하므로
+	// 그 칸은 처음부터 문서가 아니었고, 그 바이트를 `\x00` 로 바꿔도 문서가 되지 않는다(`\x` 는 JSON 이스케이프가 아니다).
 	FaultJSON Fault = "깨진 JSON"
-	// FaultJSONNUL: JSON 문서 안 글에 U+0000(\u0000)이 있다. jsonb 는 그 문서를 거절하고(22P05), jsonb 로 읽는 질의는 남의
-	// 행에 든 것이라도 통째로 죽는다.
+	// FaultJSONNUL: 이미 기준선 꼴이어야 하는 값(SettledCell)의 JSON 문서 안 글에 U+0000(\u0000)이 있다. jsonb 는 그 문서를
+	// 거절하고(22P05), jsonb 로 읽는 질의는 남의 행에 든 것이라도 통째로 죽는다. SQLite 원본이면 바꿔 넣는다(RewriteJSONNUL).
 	FaultJSONNUL Fault = `JSON 안의 \u0000`
 	// FaultDigest: 기준선의 기본키는 snapshot 키의 sha256 이다. 같은 프로젝트에서 지문이 같은 다른 키는 들어가지 못한다.
 	FaultDigest Fault = "snapshot 키 지문 겹침"
@@ -273,88 +274,118 @@ const (
 	FaultTooLong Fault = "인덱스 키 상한을 넘는 글"
 )
 
-// Cell 은 한 원장에서 읽은 값 v 를 칸 c 의 기준선 값으로 옮긴다. 옮긴 값은 nil · int64 · string · []byte 중 하나다.
-// 옮길 수 없는 값이면 Fault 를 함께 낸다 - 그때도 값은 받은 그대로(글이면 그 바이트) 돌려줘 행 해시는 잴 수 있다.
+// Rewrite 는 이관이 SQLite 원본의 칸 하나를 Postgres 가 받는 꼴로 정해진 규칙에 따라 바꿔 넣은 갈래다(Cell). 거절이 아니라
+// 보고다 - 이관 · 대조가 표 · 칸 · 규칙 · 행 좌표와 바꾼 행 수를 낸다(조용히 바꾸지 않는다). 원본 파일은 바꾸지 않는다.
+type Rewrite string
+
+const (
+	// RewriteNUL: 글 칸의 NUL 바이트(0x00). Postgres text 는 NUL 을 못 담는다 - EscapeNUL 로 `\x00` 네 글자로 옮긴다.
+	RewriteNUL Rewrite = `NUL 바이트 → \x00`
+	// RewriteJSONNUL: JSON 칸의 글(키 포함)에 든 U+0000(문서의 `\u0000`). 디코드한 글에 글 칸과 같은 규칙(EscapeNUL)을 건다 -
+	// 문서에는 `\\x00` 로 쓰인다(디코드하면 `\x00` 네 글자).
+	RewriteJSONNUL Rewrite = `JSON 안의 \u0000 → \x00`
+)
+
+// fault 는 바꿔 넣기 갈래 r 을 이미 기준선 꼴이어야 하는 값에서 만났을 때의 거절 사유다(SettledCell).
+func (r Rewrite) fault() Fault {
+	if r == RewriteJSONNUL {
+		return FaultJSONNUL
+	}
+	return FaultNUL
+}
+
+// Cell 은 SQLite 원본에서 읽은 값 v 를 칸 c 의 기준선 값으로 옮긴다. 옮긴 값은 nil · int64 · string · []byte 중 하나다.
+// 옮길 수 없는 값이면 Fault 를 함께 낸다 - 그때도 값은 받은 그대로(글이면 그 바이트) 돌려줘 행 해시는 잴 수 있다. 정해진
+// 규칙으로 바꿔 넣은 값이면 바꾼 값과 그 갈래(Rewrite)를 낸다. 셋째 값과 둘째 값은 함께 차지 않는다.
 //
-// ★ Postgres 에서 읽은 값도 이것을 지난다. 이미 그 꼴이라 그대로 나온다 - 그래서 두 엔진의 행 해시(RowHash)가 같은 값을 잰다.
+// ★ 이관의 원본 훑기 · 옮기기, `fd migrate verify` 의 원본 쪽이 이것 하나로 읽는다 - 옮긴 값과 대조가 맞대는 원본 값이 같은
+// 규칙을 지난다. 이미 기준선 꼴이어야 하는 쪽(옮긴 대상, 역이관의 원본)은 SettledCell 이다.
 //
 // ★ 값을 바꾸지 않고 옮기는 갈래 둘을 받는다: 글 칸에 든 BLOB(같은 바이트가 UTF-8 이면 글이다)과 bytea 칸에 든 TEXT.
 // 바이트가 그대로이고, 옮긴 값의 타입이 칸 타입이라 대상에서 읽은 값과 행 해시의 표지까지 같다. 바이트가 바뀌어야 하는
 // 갈래(정수 ↔ 글, 실수)는 거절하고 원래 타입을 그대로 둔다 - 그 값의 행 해시는 대상과 표지가 다르다.
+// ★ 바이트를 바꿔 넣는 갈래는 NUL 하나다(Rewrite). Postgres 가 받을 길이 없고 되돌릴 수 있는 규칙(EscapeNUL)이 있다.
 //
 // ★ 사전 검사를 지난 값(Fault 가 빈)의 타입은 언제나 nil 이거나 칸 타입의 꼴이다(Text → string, Int → int64, Bytes →
 // []byte). 행 해시가 이것에 기댄다(RowHash 의 ★).
-func Cell(c Column, v any) (any, Fault) {
+func Cell(c Column, v any) (any, Fault, Rewrite) {
 	switch x := v.(type) {
 	case nil:
 		switch {
 		case c.Key:
-			return nil, FaultKeyNull
+			return nil, FaultKeyNull, ""
 		case c.NotNull:
-			return nil, FaultNull
+			return nil, FaultNull, ""
 		}
-		return nil, ""
+		return nil, "", ""
 	case int64:
 		if c.Kind != Int {
-			return x, FaultStorage
+			return x, FaultStorage, ""
 		}
-		return x, ""
+		return x, "", ""
 	case string:
 		switch c.Kind {
 		case Int:
-			return x, FaultStorage
+			return x, FaultStorage, ""
 		case Bytes:
-			return []byte(x), ""
+			return []byte(x), "", ""
 		}
-		return x, textFault(c, x)
+		return textCell(c, x)
 	case []byte:
 		switch c.Kind {
 		case Int:
-			return x, FaultStorage
+			return x, FaultStorage, ""
 		case Bytes:
 			// ★ 길이 0 BLOB 은 빈 값이지 NULL 이 아니다. SQLite 드라이버는 그것을 nil 조각으로 주고, pgx 는 nil 조각을
 			//   NULL 로 보낸다(NOT NULL 칸이면 23502). 비지 않은 조각으로 바꿔 빈 bytea 로 넣는다.
 			if x == nil {
 				x = []byte{}
 			}
-			return x, ""
+			return x, "", ""
 		}
-		s := string(x)
-		return s, textFault(c, s)
+		return textCell(c, string(x))
 	}
-	return v, FaultStorage
+	return v, FaultStorage, ""
 }
 
-// TargetCell 은 옮긴 대상에서 읽은 값 v 를 잰다: Cell 의 검사에 더해, 저장 갈래가 칸 타입 그대로여야 한다(Text → 글,
-// Int → 정수, Bytes → BLOB). 걸리면 값은 받은 그대로 돌려줘 행 해시의 표지도 원본과 갈린다.
+// SettledCell 은 이미 기준선 꼴이어야 하는 값 v 를 잰다: 옮긴 대상(이관 · 역이관의 커밋 전 대조, `fd migrate verify` 의
+// Postgres 쪽)과 역이관의 원본(Postgres)이다. Cell 의 검사에 더해 둘을 거절한다 - Cell 이라면 바꿔 넣었을 값(FaultNUL ·
+// FaultJSONNUL)과 저장 갈래가 칸 타입과 다른 값(FaultStorage, Text → 글 · Int → 정수 · Bytes → BLOB 이어야 한다). 걸리면
+// 값은 받은 그대로 돌려줘 행 해시의 표지도 원본과 갈린다. 바꿔 넣지 않으므로 셋째 값은 늘 비었다.
 //
-// ★ Cell 이 받는 두 갈래(글 칸의 BLOB, bytea 칸의 TEXT)는 원본의 사정이다 - SQLite 원본은 칸 타입을 강제하지 않아 그렇게
-// 쌓였을 수 있고, 바이트가 그대로라 옮겨도 된다. 대상은 옮기기가 칸 타입의 값으로 넣은 원장이라 다른 갈래로 남았으면 넣은
-// 뒤에 무엇이 바꾼 것이다. 바이트가 같아 지문으로는 안 갈리므로 여기서 잰다. SQLite 대상(역이관)의 자리다 - Postgres 대상은
-// 엔진이 칸 타입을 강제해 늘 맞는다.
-func TargetCell(c Column, v any) (any, Fault) {
-	out, f := Cell(c, v)
-	if f == "" && v != nil && !storedAs(c.Kind, v) {
-		return v, FaultStorage
+// ★ 바꿔 넣기는 SQLite 원본만의 사정이다 - SQLite 는 NUL 을 담고 jsonb 를 모른다. 옮긴 대상은 옮기기가 바꾼 값을 넣은
+// 원장이라 바꿀 것이 남았으면 넣은 뒤에 무엇이 바꾼 것이다. 그것을 같은 규칙으로 접어 맞대면 `\x00` 를 NUL 로 되돌린 대상을
+// 맞다고 한다. 역이관은 Postgres 값을 그대로 낸다 - 바꿔 넣어야 할 값이 든 Postgres 원본은 거절한다(낸 파일이 원본과 다르다).
+// ★ Cell 이 받는 두 저장 갈래(글 칸의 BLOB, bytea 칸의 TEXT)도 원본의 사정이다 - SQLite 원본은 칸 타입을 강제하지 않아
+// 그렇게 쌓였을 수 있고, 바이트가 그대로라 옮겨도 된다. 대상에 다른 갈래로 남았으면 넣은 뒤에 무엇이 바꾼 것이다. 바이트가
+// 같아 지문으로는 안 갈리므로 여기서 잰다. SQLite 대상(역이관)의 자리다 - Postgres 는 엔진이 칸 타입을 강제해 늘 맞는다.
+func SettledCell(c Column, v any) (any, Fault, Rewrite) {
+	out, f, rw := Cell(c, v)
+	switch {
+	case rw != "":
+		return v, rw.fault(), ""
+	case f == "" && v != nil && !storedAs(c.Kind, v):
+		return v, FaultStorage, ""
 	}
-	return out, f
+	return out, f, ""
 }
 
-// ImportCell 은 SQLite 원본에서 읽어 Postgres 로 **옮겨 넣을** 값 v 를 잰다: Cell 의 검사에 더해, 칸 상한(Column.MaxBytes)을
-// 넘는 글이면 FaultTooLong 이다. 이관의 사전 검사가 이것을 쓴다.
+// ImportCell 은 SQLite 원본에서 읽어 Postgres 로 **옮겨 넣을** 값 v 를 잰다: Cell 의 검사 · 바꿔 넣기에 더해, 칸 상한
+// (Column.MaxBytes)을 넘는 글이면 FaultTooLong 이다. 상한은 옮겨 넣을 바이트(바꿔 넣은 값)로 잰다. 이관의 사전 검사 · 옮기기가
+// 이것을 쓴다.
 //
-// ★ 상한은 Cell 에 두지 않는다. Cell 은 대조(verify)와 역이관(Postgres → SQLite)도 지나는데, 그 길의 값은 이미 원장에 있는
-// 원문이다 - 상한에 걸려 그 길이 막히면 남는 처방이 감사 행을 자르는 것뿐이고, 그러면 두 원장이 달라진다. Postgres 의 인덱스가
-// 이미 받은 값(짧은 kind 옆의 2048 바이트 넘는 project)도 칸별 상한에는 걸린다.
-func ImportCell(c Column, v any) (any, Fault) {
-	out, f := Cell(c, v)
+// ★ 상한은 Cell 에 두지 않는다. Cell 은 대조(verify)도 지나고 역이관(Postgres → SQLite)은 그 위의 SettledCell 을 지나는데, 그
+// 길의 값은 이미 원장에 있는 원문이다 - 상한에 걸려 그 길이 막히면 남는 처방이 감사 행을 자르는 것뿐이고, 그러면 두 원장이
+// 달라진다. Postgres 의 인덱스가 이미 받은 값(짧은 kind 옆의 2048 바이트 넘는 project)도 칸별 상한에는 걸린다.
+func ImportCell(c Column, v any) (any, Fault, Rewrite) {
+	out, f, rw := Cell(c, v)
 	if f != "" || c.MaxBytes == 0 {
-		return out, f
+		return out, f, rw
 	}
 	if s, ok := out.(string); ok && len(s) > c.MaxBytes {
-		return out, FaultTooLong
+		return out, FaultTooLong, ""
 	}
-	return out, ""
+	return out, "", rw
 }
 
 // storedAs 는 읽은 값 v 의 Go 타입이 칸 타입 k 의 저장 갈래인가다(드라이버가 저장 갈래마다 정한 타입으로 준다).
@@ -370,46 +401,129 @@ func storedAs(k Kind, v any) bool {
 	return false
 }
 
-func textFault(c Column, s string) Fault {
+// textCell 은 글 칸에 든 글 s 를 잰다: 깨진 UTF-8 은 거절하고, JSON 칸은 jsonCell 이 재고, NUL 이 든 글은 EscapeNUL 로
+// 바꿔 넣는다(RewriteNUL). NUL 이 없는 글은 한 바이트도 안 바뀐다.
+func textCell(c Column, s string) (string, Fault, Rewrite) {
 	switch {
-	case strings.IndexByte(s, 0) >= 0:
-		return FaultNUL
 	case !utf8.ValidString(s):
-		return FaultUTF8
+		return s, FaultUTF8, ""
 	case c.JSON:
-		return jsonFault(s)
+		return jsonCell(s)
+	case strings.IndexByte(s, 0) >= 0:
+		return EscapeNUL(s), "", RewriteNUL
 	}
-	return ""
+	return s, "", ""
 }
 
-// jsonFault 는 JSON 칸 하나를 잰다. 글 바이트의 NUL · 깨진 UTF-8 은 textFault 가 먼저 걸렀다.
+// nulMark 는 EscapeNUL 이 NUL 자리에 쓰는 표기의 백슬래시 뒤 글자다. 표기는 `\` + nulMark - 바이트 이스케이프를 읽는 사람이
+// NUL 로 알아보는 꼴이다.
+const nulMark = "x00"
+
+// EscapeNUL 은 NUL 바이트가 든 칸의 글 s 를 NUL 없는 글로 옮긴다. NUL 은 `\x00` 네 글자가 되고, 원래 있던 백슬래시 묶음(연달은
+// 백슬래시)은 바로 뒤가 NUL 이나 「x00」일 때만 두 배가 된다. 그 밖의 바이트는 그대로다. 순수 함수다. 칸 단위로 건다 - 글 칸은
+// NUL 이 든 칸에만(textCell), JSON 칸은 U+0000 이 든 문서의 글 전부에(jsonCell). NUL 이 없는 칸은 한 바이트도 안 바뀐다.
 //
-// ★ \u0000 은 디코드해서 잰다. 글자 `\u0000` 이 보여도 앞 백슬래시가 이스케이프된 것(`\\u0000`)이면 글은 백슬래시와
-// 「u0000」이고 jsonb 가 받는다. 그 글자가 없으면 디코드한 글에도 U+0000 이 없다(빠른 길).
+// ★ 되돌릴 수 있다(단사): 바뀐 칸에서 「x00」 바로 앞의 백슬래시 묶음이 홀수 개(2k+1)면 원래 k 개 백슬래시 + NUL 이었고,
+// 짝수 개(2k)면 k 개 백슬래시 + 글자 「x00」이었다. 그 밖의 백슬래시 묶음은 그대로다. 되돌리는 쪽은 이관이 쓰지 않는다 -
+// 역이관은 Postgres 값을 그대로 낸다. 규칙은 README 「SQLite 원장을 Postgres 로 옮기기」가 사람에게 적고, import_test.go 가
+// 그 규칙으로 되돌려 맞댄다.
+// ★ NUL 만 `\x00` 로 바꾸면 원래 그 네 글자가 있던 칸에서 어느 것이 NUL 이었는지 잃는다. NUL 을 인용하는 글은 `\x00` 표기도
+// 함께 쓰기 쉬워 그런 칸이 드물지 않다 - 그 칸을 거절하면 바로 그런 칸 때문에 손 SQL 단계가 다시 생긴다. 백슬래시를 전부 두 배로
+// 하는 흔한 이스케이프도 되돌릴 수 있지만 NUL 과 무관한 표기(`\n` · `\x1f`)까지 바꾼다. 그래서 갈릴 자리의 백슬래시만 두 배다.
+func EscapeNUL(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 3*strings.Count(s, "\x00"))
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case 0:
+			b.WriteString(`\` + nulMark)
+			i++
+		case '\\':
+			j := i
+			for j < len(s) && s[j] == '\\' {
+				j++
+			}
+			n := j - i
+			if j < len(s) && (s[j] == 0 || strings.HasPrefix(s[j:], nulMark)) {
+				n *= 2
+			}
+			b.WriteString(strings.Repeat(`\`, n))
+			i = j
+		default:
+			b.WriteByte(s[i])
+			i++
+		}
+	}
+	return b.String()
+}
+
+// jsonCell 은 JSON 칸 하나를 잰다(글 바이트의 깨진 UTF-8 은 textCell 이 먼저 걸렀다): 문서가 아니면 FaultJSON, 글(키 포함)에
+// U+0000 이 있으면 그 문서의 글마다 EscapeNUL 을 건 문서와 RewriteJSONNUL 이다.
 //
-// ★ 수는 글 그대로 받는다(UseNumber). float64 로 옮기면 범위 밖 수(1e400)에서 토큰이 오류로 끝나 그 뒤의 글을 못 잰다.
-// 끝은 io.EOF 하나다 - 그 밖의 오류는 json.Valid 를 지난 문서에서 날 자리가 없지만, 나면 끝으로 읽지 않고 깨진 문서로 낸다.
-func jsonFault(s string) Fault {
+// ★ U+0000 은 문서에 `\u0000` 로만 쓰인다(날 NUL 은 문서가 아니다 - FaultJSON). 그 글자가 없으면 디코드한 글에도 U+0000 이
+// 없다(빠른 길). 보여도 앞 백슬래시가 이스케이프된 것(`\\u0000`)이면 글은 백슬래시와 「u0000」이라 바꾸지 않는다 - 그래서
+// 글마다 디코드해서 잰다.
+// ★ 바꿀 때는 그 문서의 글 전부에 EscapeNUL 을 건다 - 글 칸이 칸 전체에 거는 것과 같은 단위(칸 하나)라 바뀐 문서의 글마다 같은
+// 규칙으로 되돌린다. EscapeNUL 이 그대로 둔 글은 원래 바이트를 두고, 바뀐 글만 json.Marshal 로 다시 쓴다(서버가 쓰는 꼴이다 -
+// 그 글의 다른 이스케이프는 디코드한 값이 같은 서버의 꼴로 바뀔 수 있다). 수 · 공백 · 순서는 손대지 않는다.
+func jsonCell(s string) (string, Fault, Rewrite) {
 	if !json.Valid([]byte(s)) {
-		return FaultJSON
+		return s, FaultJSON, ""
 	}
 	if !strings.Contains(s, `\u0000`) {
-		return ""
+		return s, "", ""
 	}
-	dec := json.NewDecoder(strings.NewReader(s))
-	dec.UseNumber()
-	for {
-		tok, err := dec.Token()
-		switch {
-		case errors.Is(err, io.EOF):
-			return ""
-		case err != nil:
-			return FaultJSON
+	spans := jsonStrings(s)
+	text := make([]string, len(spans))
+	nul := false
+	for i, sp := range spans {
+		// json.Valid 를 지난 문서의 글 토큰이라 실패할 자리가 없다. 실패하면 문서로 읽지 않는다.
+		if err := json.Unmarshal([]byte(s[sp[0]:sp[1]]), &text[i]); err != nil {
+			return s, FaultJSON, ""
 		}
-		if str, ok := tok.(string); ok && strings.IndexByte(str, 0) >= 0 { // 키도 글 토큰으로 온다
-			return FaultJSONNUL
-		}
+		nul = nul || strings.IndexByte(text[i], 0) >= 0
 	}
+	if !nul {
+		return s, "", ""
+	}
+	var b strings.Builder
+	at := 0
+	for i, sp := range spans {
+		e := EscapeNUL(text[i])
+		if e == text[i] {
+			continue
+		}
+		enc, err := json.Marshal(e)
+		if err != nil { // 글의 Marshal 은 실패하지 않는다
+			return s, FaultJSON, ""
+		}
+		b.WriteString(s[at:sp[0]])
+		b.Write(enc)
+		at = sp[1]
+	}
+	b.WriteString(s[at:])
+	return b.String(), "", RewriteJSONNUL
+}
+
+// jsonStrings 는 JSON 문서 s(json.Valid 를 지났다) 안의 글 토큰(키 포함)마다 [시작, 끝) 바이트 자리를 낸다(따옴표 포함). 올바른
+// 문서에서 글 밖의 따옴표는 글을 여는 것뿐이고, 글 안의 백슬래시는 뒤 한 바이트와 이스케이프 하나다.
+func jsonStrings(s string) [][2]int {
+	var out [][2]int
+	for i := 0; i < len(s); i++ {
+		if s[i] != '"' {
+			continue
+		}
+		j := i + 1
+		for s[j] != '"' {
+			if s[j] == '\\' {
+				j++
+			}
+			j++
+		}
+		out = append(out, [2]int{i, j + 1})
+		i = j
+	}
+	return out
 }
 
 // KeyDigest 는 snapshot 키의 지문이다. 기준선의 fd_key_digest(sha256(convert_to(key, 'UTF8')))와 같은 값이다.

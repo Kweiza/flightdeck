@@ -64,8 +64,10 @@ func (a *App) runImportSQLite(ctx context.Context, args []string, out io.Writer)
 		fmt.Fprintf(out, "\n  원본은 옮길 수 있다. 대상은 재지 않았다(%s 는 Postgres 접속 URL 이 아니다)\n", rep.To)
 	case f.dryRun:
 		fmt.Fprintln(out, "\n  옮길 수 있다 - 본 실행과 같은 트랜잭션을 끝까지 돌고 되감았다(아무것도 쓰지 않았다)")
+		printRewritten(out, rep)
 	default:
 		fmt.Fprintf(out, "\n  옮겼다: %d 행, 대조가 맞았다\n", rep.Copied)
+		printRewritten(out, rep)
 		fmt.Fprintf(out, "  이관 표지를 남겼다: %s - SQLite 판은 이 원장을 다시 열지 않는다(되돌리기는 README 「72시간 안에 되돌리기」)\n",
 			store.MovedMarker(f.from))
 	}
@@ -86,14 +88,26 @@ func (a *App) runVerifySQLite(ctx context.Context, args []string, out io.Writer)
 		return 1
 	}
 	fmt.Fprintln(out, "\n  두 원장이 맞다")
+	printRewritten(out, rep)
 	return 0
+}
+
+// printRewritten 은 판정 줄 아래에 원본에서 바꿔 넣은 행의 수를 한 번 더 말한다 - 맞았다는 말이 바꾼 값을 덮지 않게.
+func printRewritten(out io.Writer, rep store.TransferReport) {
+	if rep.RewrittenRows > 0 {
+		fmt.Fprintf(out, "  그중 %d 행은 원본의 NUL 을 %s 표기로 바꾼 값이다(위 「옮기며 바꾼 원본 칸」) - 원본 파일은 그대로다\n",
+			rep.RewrittenRows, `\x00`)
+	}
 }
 
 // printTransferReport 는 이관 · 역이관 · 대조 보고를 사람 말로 낸다. 접속 URL 원문은 보고에 없다(표시값뿐이다).
 func printTransferReport(out io.Writer, head string, rep store.TransferReport) {
 	fmt.Fprintf(out, "%s · %s → %s\n", head, rep.From, rep.To)
-	printFaults(out, "사전 검사에 걸린 원본 행", rep.Faults)
-	printFaults(out, "값 검사에 걸린 대상 행", rep.TargetFaults)
+	printCells(out, "사전 검사에 걸린 원본 행(표 · 칸 · 사유 · 수 · 행 좌표)", rep.Faults)
+	if len(rep.Rewrites) > 0 {
+		printCells(out, fmt.Sprintf("옮기며 바꾼 원본 칸 - %d 행(표 · 칸 · 규칙 · 수 · 옮긴 행 좌표)", rep.RewrittenRows), rep.Rewrites)
+	}
+	printCells(out, "값 검사에 걸린 대상 행(표 · 칸 · 사유 · 수 · 행 좌표)", rep.TargetFaults)
 	if len(rep.Tables) == 0 {
 		if len(rep.Rows) > 0 {
 			fmt.Fprintln(out, "\n  원본 행 수:")
@@ -139,14 +153,15 @@ func printQuarantined(out io.Writer, rep store.TransferReport) {
 		rep.Quarantined)
 }
 
-// printFaults 는 값 검사에 걸린 갈래를 늘어놓는다. 원본의 사전 검사와 대조가 읽은 대상 값이 같은 꼴로 나온다.
-func printFaults(out io.Writer, title string, groups []store.FaultGroup) {
+// printCells 는 칸 규칙이 센 갈래(걸린 칸 · 바꿔 넣은 칸)를 늘어놓는다. 원본의 사전 검사 · 바꿔 넣기와 대조가 읽은 대상 값이
+// 같은 꼴로 나온다.
+func printCells[R ~string](out io.Writer, title string, groups []store.CellGroup[R]) {
 	if len(groups) == 0 {
 		return
 	}
-	fmt.Fprintf(out, "\n  %s(표 · 칸 · 사유 · 수 · 행 좌표):\n", title)
+	fmt.Fprintf(out, "\n  %s:\n", title)
 	for _, g := range groups {
-		fmt.Fprintf(out, "    %s.%s  %s  %d건\n", g.Table, g.Column, g.Fault, g.Count)
+		fmt.Fprintf(out, "    %s.%s  %s  %d건\n", g.Table, g.Column, g.Reason, g.Count)
 		for _, k := range g.Keys {
 			fmt.Fprintf(out, "      %s\n", k)
 		}
