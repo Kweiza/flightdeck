@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -60,6 +62,11 @@ func ExportSQLite(ctx context.Context, from, to string, opt TransferOptions, log
 	if err := exportInto(ctx, src, tmp, opt.DryRun, &rep, log); err != nil {
 		rep.Copied = 0
 		return rep, err
+	}
+	// 취소(신호)가 왔으면 이름을 붙이지 않는다 - 임시 DB 를 닫는 사이에 온 취소는 exportInto 가 못 볼 수 있다.
+	if err := ctx.Err(); err != nil {
+		rep.Copied = 0
+		return rep, fmt.Errorf("역이관이 취소됐다 - 파일을 내지 않는다: %w", err)
 	}
 	if err := nameExport(tmp, to, opt.DryRun); err != nil {
 		rep.Copied = 0
@@ -121,22 +128,18 @@ func exportSourceRefusal(plan MigrationPlan) error {
 
 // newExportFile 은 to 와 같은 디렉토리에 임시 SQLite 파일을 만들어 판 pg.ImportVersion 스키마를 깐다. 실패하면 남기지 않는다.
 //
-// ★ 모드는 0644 다(exportFileMode). os.CreateTemp 는 0600 으로 만든다 - 그대로 이름을 붙이면 새 원장만 SQLite 가 만든 원장
-// (0644)과 달리 다른 사용자 · 백업이 못 읽는다. 스키마를 깔기 전에 바꾼다 - SQLite 는 옆 파일(-wal · -shm)을 본 파일의
-// 모드로 만든다.
+// ★ 모드는 SQLite 가 새 원장을 만들 때와 같다 - exportFileMode(0644)를 만들 때 주고 umask 가 거른다(createExclusive).
+// os.CreateTemp 는 0600 고정이라 서버가 다른 uid 면 못 읽고, 만든 뒤 Chmod 하면 umask(예: 077)를 무시하고 넓힌다.
+// 스키마를 깔기 전에 정해진다 - SQLite 는 옆 파일(-wal · -shm)을 본 파일의 모드로 만든다.
 func newExportFile(ctx context.Context, to string, log *slog.Logger) (string, error) {
-	f, err := os.CreateTemp(filepath.Dir(to), "."+filepath.Base(to)+".export-*")
+	f, err := createExclusive(filepath.Dir(to), "."+filepath.Base(to)+".export-", exportFileMode)
 	if err != nil {
 		return "", fmt.Errorf("역이관 임시 파일을 만들지 못했다(대상 디렉토리가 있고 쓸 수 있어야 한다): %w", err)
 	}
 	tmp := f.Name()
-	err = f.Chmod(exportFileMode)
-	if cerr := f.Close(); cerr != nil && err == nil {
-		err = cerr
-	}
-	if err != nil {
+	if err := f.Close(); err != nil {
 		removeLedgerFiles(tmp, log)
-		return "", fmt.Errorf("역이관 임시 파일의 모드를 맞추거나 닫지 못했다: %w", err)
+		return "", fmt.Errorf("역이관 임시 파일을 닫지 못했다: %w", err)
 	}
 	if err := MigrateTo(ctx, tmp, pg.ImportVersion, log); err != nil {
 		removeLedgerFiles(tmp, log)
@@ -145,8 +148,25 @@ func newExportFile(ctx context.Context, to string, log *slog.Logger) (string, er
 	return tmp, nil
 }
 
-// exportFileMode 는 역이관이 내는 원장 파일의 모드다 - SQLite 가 새 원장을 만들 때의 모드(0644)와 같다.
+// exportFileMode 는 역이관이 내는 원장 파일을 만들 때 주는 모드다 - SQLite 가 새 원장을 만들 때와 같다(0644, umask 가 거른다).
 const exportFileMode fs.FileMode = 0o644
+
+// createExclusive 는 dir 안에 prefix 로 시작하는 겹치지 않는 이름의 새 파일을 mode 로 만든다(O_EXCL - 있는 파일은 안 연다).
+// os.CreateTemp 와 같지만 모드를 받는다 - 프로세스 umask 가 그 모드를 거른다.
+func createExclusive(dir, prefix string, mode fs.FileMode) (*os.File, error) {
+	var b [8]byte
+	for range 10000 {
+		if _, err := rand.Read(b[:]); err != nil {
+			return nil, err
+		}
+		f, err := os.OpenFile(filepath.Join(dir, prefix+hex.EncodeToString(b[:])), os.O_RDWR|os.O_CREATE|os.O_EXCL, mode)
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		return f, err
+	}
+	return nil, fmt.Errorf("%s 에 겹치지 않는 임시 이름을 못 찾았다", dir)
+}
 
 // exportInto 는 임시 파일 tmp 를 열어 src 를 옮기고(transferInto) 닫는다. 본 실행이면 닫은 뒤 커밋이 본 파일에 다 옮았는지
 // 잰다(exportSettled).

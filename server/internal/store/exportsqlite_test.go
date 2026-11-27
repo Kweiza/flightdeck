@@ -7,6 +7,7 @@ package store
 
 import (
 	"context"
+	"io/fs"
 	"maps"
 	"net/url"
 	"os"
@@ -275,8 +276,8 @@ func TestExportSQLiteDryRunLeavesNoFile(t *testing.T) {
 	}
 	if fi, err := os.Stat(back); err != nil {
 		t.Fatal(err)
-	} else if fi.Mode().Perm() != exportFileMode {
-		t.Fatalf("낸 원장의 모드 %v - SQLite 가 만든 원장과 같은 %v 여야 한다", fi.Mode().Perm(), exportFileMode)
+	} else if want := umaskedMode(t, filepath.Dir(back)); fi.Mode().Perm() != want {
+		t.Fatalf("낸 원장의 모드 %v - 같은 디렉토리에 %v 로 만든 파일(umask 적용)과 같은 %v 여야 한다", fi.Mode().Perm(), exportFileMode, want)
 	}
 	if targetRows(t, dst) != rows || !maps.Equal(identityStates(t, dst), seqs) {
 		t.Fatalf("역이관이 원본을 바꿨다")
@@ -635,5 +636,42 @@ func TestNameExportDryRunProbesTheLink(t *testing.T) {
 	}
 	if _, err := os.Lstat(to); err == nil {
 		t.Fatal("예행이 대상 이름을 붙였다")
+	}
+}
+
+// umaskedMode 는 dir 에 exportFileMode 로 새 파일을 만들었을 때 실제로 얻는 모드다(이 프로세스의 umask 가 거른 값).
+func umaskedMode(t *testing.T, dir string) fs.FileMode {
+	t.Helper()
+	p := filepath.Join(dir, ".umask-probe")
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_EXCL, exportFileMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(p)
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Mode().Perm()
+}
+
+// 넓은 umask 를 무시하고 모드를 넓히지 않는다 - umask 077 이면 낸 원장도 남이 못 읽는다.
+func TestCreateExclusiveRespectsUmask(t *testing.T) {
+	dir := t.TempDir()
+	f, err := createExclusive(dir, ".x.export-", exportFileMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := umaskedMode(t, dir); fi.Mode().Perm() != want {
+		t.Fatalf("임시 파일 모드 %v - umask 를 거친 %v 여야 한다", fi.Mode().Perm(), want)
+	}
+	if fi.Mode().Perm()&^exportFileMode != 0 {
+		t.Fatalf("임시 파일 모드 %v 가 %v 보다 넓다", fi.Mode().Perm(), exportFileMode)
 	}
 }
