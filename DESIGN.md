@@ -296,9 +296,11 @@ GHE push 도 이 구현 어디에도 없고, 그 셋을 어떻게 쪼갤지는 �
 | **Q — 큐** | 항목·의존·선점·판정이력 | 사람은 `title`·`body`·`reason` 만. 나머지는 서버가 채운다 |
 | **J — 판단** | 핸드오프·결정·기각·스냅숏 | 사람만. **추가 전용**(UPDATE·DELETE 트리거로 차단) |
 
-정본은 Postgres 기준선 `server/internal/store/pg/001_baseline.sql`(빈 DB 의 준비는 `pg/bootstrap.sql`)이다.
-SQLite 판(`server/internal/store/schema.sql` + 증분)은 기준선이 접어 넣은 판 18 과 같은 뜻이고 — 두 판이 어긋나면
-`TestPGBaselineFoldsTheLastSQLiteVersion` 이 빨갛다 — 옮기는 동안만 산다. 원장은 배포마다 둘 중 하나다(「배치」 절의
+정본은 Postgres 기준선 `server/internal/store/pg/001_baseline.sql`(빈 DB 의 준비는 `pg/bootstrap.sql`)과 그 위 증분
+(`pg.Steps`, 019 부터)이다. 기준선은 SQLite 판 18 을 접어 넣고 그 판에서 얼었다. 옮기는 동안 SQLite 에 오르는 증분은
+같은 뜻 · 같은 판 번호의 PG 증분을 함께 둔다 — 짝이 없으면 `TestPGStepsFollowTheSQLiteVersion` 이, 뜻이 갈리면
+`TestBaselineHasTheSameShapeAsSQLite`(두 엔진의 카탈로그를 맞댄다)가 빨갛다. SQLite 판(`server/internal/store/schema.sql` +
+증분)은 옮기는 동안만 산다. 원장은 배포마다 둘 중 하나다(「배치」 절의
 Tier A). 아래는 그 요지와 **각 제약이 막는 사고**다.
 
 **★ 26 은 세는 축을 밝혀 둔다 — 안 밝히면 다음 사람이 다른 축을 세고 어긋났다고 판단한다.**
@@ -562,6 +564,12 @@ PG 기준선이 선언한 것 = `pg/001_baseline.sql` 의 `CREATE TABLE` 26. SQL
   규약(`<종류>:<이름>`)을 안 따르는 이름이 섞였지만 자원은 프로젝트 스코프라 실해는 가독성뿐이다 —
   열거를 만들지 않는다는 위 판단을 뒤집을 근거가 아니다.
 - `event` — 추가 전용 감사·계측 원장. 반납이 `rm -rf` 로 흔적을 지우던 구조가 사라진다.
+  인덱스는 읽는 꼴마다 하나다: `(kind, at)` · `(session_id, at)` · `(project, kind, id)`(증분 019). 셋째는 「이 프로젝트의
+  이 종류를 id 순으로」 읽는 문장(종료 선언 조회 — `pick` 마다 돈다 · 재생산율)의 자리다. 그 전에는 Postgres 의 일반
+  계획(문 캐시가 여섯 번째 실행부터 쓸 수 있는, project 값을 모르는 계획)이 기본키를 거꾸로 훑으며 걸렀고, 그 프로젝트의
+  마무리가 LIMIT 보다 적으면 표 전체를 읽었다 — 원장과 함께 `pick` 이 느려졌다. 세션 전역 `plan_cache_mode` 로 덮지 않은
+  까닭은 원인이 맞는 인덱스의 부재라서다. 그 꼴의 문장 목록과 두 엔진의 계획(PG 는 일반 계획을 강제해서)은
+  `store/event_project_kind_plan_test.go` 가 잠근다.
 
 ---
 
@@ -2285,14 +2293,14 @@ YAML 전체를 들이면 그 파서가 읽는 모든 것(앵커·별칭·태그�
 
 - **기본은 그대로다.** 이 판까지 기본 배포는 SQLite 파일 원장이고, Postgres 는 소유자가 덮개 파일을 얹어 고를 때만
   켜진다(「배치」 절의 Tier A). 갱신이 원장을 바꾸지 않는다.
-- **옮기기는 한 트랜잭션이고 맞댄 뒤에만 커밋한다.** `fd migrate import-sqlite` 가 판 18 의 SQLite 원장을 **빈**
+- **옮기기는 한 트랜잭션이고 맞댄 뒤에만 커밋한다.** `fd migrate import-sqlite` 가 이관 판(19)의 SQLite 원장을 **빈**
   Postgres 원장으로 옮기고, 같은 트랜잭션 안에서 표마다 행 수 · 전 칸 지문 · identity 순번을 맞대 어긋나면 되감는다.
-  `--dry-run` 이 같은 길을 끝까지 돌고 되감는다. `fd migrate verify` 가 그 대조만 다시 한다. 판 18 보다 옛 원장은 먼저
+  `--dry-run` 이 같은 길을 끝까지 돌고 되감는다. `fd migrate verify` 가 그 대조만 다시 한다. 이관 판보다 옛 원장은 먼저
   SQLite 판에서 올린다 — 옛 판을 건너 옮기는 길은 만들지 않는다(옮기는 코드가 판 하나만 안다).
 - **옮긴 SQLite 파일은 지우지 않는다.** 이관이 커밋한 뒤 그 옆에 이관 표지(`<원장>.moved-to-postgres`)를 남긴다. 한
   원장이 두 갈래로 쓰이는 길(갈린 원장)을 두 쪽 판올림이 막는다 - SQLite 쪽(`fd migrate` · `fd serve`)은 표지가 있으면 파일이
   있든 없든 열지도 새로 만들지도 않고(덮개 파일을 빼고 띄운 compose), Postgres 쪽 `fd migrate` 는 이 환경의 SQLite 원장
-  자리에 표지 없는 원장이 남아 있으면 거절한다(덮개 파일만 얹고 이관 없이 띄운 compose - 기준선만 까는 `--to 18` 은
+  자리에 표지 없는 원장이 남아 있으면 거절한다(덮개 파일만 얹고 이관 없이 띄운 compose - 이관 판까지만 까는 `--to 19` 는
   받는다). 원본 디렉토리에 표지를 못 남기면 옮기기 전에 거절한다. 판정은 표지가 있는가뿐이고, 재지 못한 표지는 두 쪽 다
   거절이다. 표지를 지우는 길은 README 의 두 절차뿐이다(손으로 `rm`): 선택 파일을 켜기 전에 선 업그레이드를 거둘 때
   (「켜기 전에 섰을 때」 - 양쪽 서버를 내린 채 Postgres 원장을 맞대 본 뒤)와 72시간 되돌리기. 표지는 커밋 **뒤에** 쓰므로
@@ -2316,9 +2324,9 @@ YAML 전체를 들이면 그 파서가 읽는 모든 것(앵커·별칭·태그�
   셸 함수가 실제로 그렇게 서는지 README 의 덩이를 그대로 떼어 대역 docker 로 사람이 붙여 넣는 셸(대화형 zsh · macOS 의 bash
   3.2)에서 돌리는 시험(`TestREADMEProceduresStopWhole`)이 잰다. fd-update 의 갱신 사슬도 README 의 `fdwhere` · `fdrepos` 와 같은
   글자로 서버 · 마운트를 읽고 같은 셸들에서 돌려 잰다(`TestUpdateSkillChainRunsInEveryShell`).
-- **72시간 되돌리기 창.** `fd migrate export-sqlite` 가 Postgres 원장을 판 18 의 **새** SQLite 파일로 옮기고 같은 대조로
-  맞춘 뒤에만 이름을 붙인다 — 옮긴 뒤 Postgres 에 쌓인 쓰기도 같이 돌아온다. 그 창 동안은 Postgres 스키마를 18 위로
-  올리지 않는다(역이관은 판 18 만 받는다). 절차는 README 「업그레이드: SQLite 원장을 Postgres 로」 · 「72시간 안에
+- **72시간 되돌리기 창.** `fd migrate export-sqlite` 가 Postgres 원장을 이관 판(19)의 **새** SQLite 파일로 옮기고 같은 대조로
+  맞춘 뒤에만 이름을 붙인다 — 옮긴 뒤 Postgres 에 쌓인 쓰기도 같이 돌아온다. 그 창 동안은 Postgres 스키마를 SQLite 의
+  마지막 판 위로 올리지 않는다(역이관은 자기 이관 판만 받는다). 절차는 README 「업그레이드: SQLite 원장을 Postgres 로」 · 「72시간 안에
   되돌리기」.
 - **배포 정의와 운영 전환은 다른 일이다.** 덮개 파일 · 계정 스크립트 · 절차는 코드와 함께 나가고, 살아 있는 원장을
   옮기는 것은 소유자가 확인하고 하는 한 번의 작업이다.

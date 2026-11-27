@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kweiza/flightdeck/internal/store"
+	"github.com/kweiza/flightdeck/internal/store/pg"
 	"github.com/kweiza/flightdeck/internal/store/storetest"
 )
 
@@ -390,7 +391,7 @@ func TestMigrateRefusesAnOutOfRangeDumpTimeoutWhenUpToDate(t *testing.T) {
 }
 
 // Postgres 판올림(--db 없이 FD_DB)은 이 환경의 SQLite 원장 자리(가짜 홈의 ~/.flightdeck/fd.db)에 이관 표지 없는 원장이 남아
-// 있으면 기준선을 깔지도 판을 올리지도 않는다 - 기준선만 까는 --to 18 은 받는다. 표지가 있거나 원장이 없으면 받고, --db 로 준
+// 있으면 기준선을 깔지도 판을 올리지도 않는다 - 이관 판까지만 까는 --to pg.ImportVersion 은 받는다. 표지가 있거나 원장이 없으면 받고, --db 로 준
 // 원장은 재지 않는다. 거꾸로 표지가 있으면 SQLite 판올림(compose.yaml 의 `migrate --db /data/fd.db`)이 선다.
 func TestMigratePostgresRefusesBesideAnUnmovedSQLiteLedger(t *testing.T) {
 	if dataVolume() {
@@ -437,7 +438,7 @@ func TestMigratePostgresRefusesBesideAnUnmovedSQLiteLedger(t *testing.T) {
 	if got := plan(); got != store.MigrateApply {
 		t.Fatalf("거절했는데 빈 클러스터에 무엇을 깔았다: %s", got)
 	}
-	step(0, "올렸다: 스키마 18판", "--to", "18")
+	step(0, fmt.Sprintf("올렸다: 스키마 %d판", pg.ImportVersion), "--to", fmt.Sprint(pg.ImportVersion))
 	step(1, "이관을 거치지 않은 새 원장")    // 기준선을 깐 뒤 이관 전에 띄운 up
 	step(0, "이미 맞다", "--db", dsn) // --db 로 준 원장은 재지 않는다
 

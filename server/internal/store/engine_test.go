@@ -714,9 +714,9 @@ func TestStoreSQLHasNoJSONBQuestionOperators(t *testing.T) {
 		}
 		sqlFiles = append(sqlFiles, m...)
 	}
-	// 증분 17 + SQLite 스키마 1 + Postgres 둘. 덜 세면 아래 단정이 그냥 초록이다.
-	if len(sqlFiles) < 20 || !slices.Contains(sqlFiles, filepath.Join("pg", "001_baseline.sql")) {
-		t.Fatalf("store 의 .sql 파일을 %d개만 찾았다(pg 기준선 포함 20개 이상이어야 한다): %v", len(sqlFiles), sqlFiles)
+	// SQLite 증분 18 + SQLite 스키마 1 + Postgres 셋(준비 · 기준선 · 증분 019). 덜 세면 아래 단정이 그냥 초록이다.
+	if len(sqlFiles) < 22 || !slices.Contains(sqlFiles, filepath.Join("pg", "001_baseline.sql")) {
+		t.Fatalf("store 의 .sql 파일을 %d개만 찾았다(pg 기준선 포함 22개 이상이어야 한다): %v", len(sqlFiles), sqlFiles)
 	}
 	for _, f := range sqlFiles {
 		b, err := os.ReadFile(f)

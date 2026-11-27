@@ -72,7 +72,8 @@ func (s schema) fill(ctx context.Context, db *sql.DB) error {
 	return err
 }
 
-// fd 는 New 가 복제하는 원판이다. 내용은 PG 기준선 전부(준비 + 소유 역할로 기준선)다.
+// fd 는 New 가 복제하는 원판이다. 내용은 PG 스키마 전부(준비 + 소유 역할로 기준선과 그 위 증분, pg.Latest)다 - 판 행만
+// 빼고 지금 판(SchemaVersion)의 모양이다.
 //
 // ★ 준비가 역할 둘(클러스터 전역)을 만든다. 원판 만들기는 프로세스 사이에서 한 줄로 서므로(buildLock)
 // 겹치지 않고, 준비 자체도 이미 있는 역할을 그대로 둔다. 판 행은 비어 있다 — 그것은 이전 실행기의 몫이다.
@@ -81,7 +82,7 @@ func (s schema) fill(ctx context.Context, db *sql.DB) error {
 // ★ 준비는 복제한 DB 마다 다시 돈다(everyDB). 준비는 DB 하나에 한 번 도는 것이고, 그 안의 DB 단위 권한
 // (PUBLIC 의 TEMPORARY 회수)은 템플릿 복제로 안 따라온다 — 빠뜨리면 시험 DB 에서만 앱 역할이 임시 표로 원장을
 // 가릴 수 있다. 준비는 몇 번 돌려도 같다.
-var fd = &template{prefix: "fd_tmpl", schema: schema{content: []byte(pg.Fresh())}, everyDB: pg.Bootstrap}
+var fd = &template{prefix: "fd_tmpl", schema: schema{content: []byte(pg.Latest())}, everyDB: pg.Bootstrap}
 
 // New 는 이 시험만의 새 DB 를 만들어 그 접속 URL 을 돌려준다. 시험이 끝나면 DB 를 지운다.
 // FD_TEST_PG 가 없거나 서버에 못 붙으면 시험을 실패시킨다.

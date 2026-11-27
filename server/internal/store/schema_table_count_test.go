@@ -32,10 +32,14 @@ func declaredTables(t *testing.T) []string {
 	return declaredIn(t, sources)
 }
 
-// pgDeclaredTables 는 PG 기준선(준비 + 001_baseline.sql)이 선언하는 표 이름을 정렬해 낸다.
+// pgDeclaredTables 는 PG 사다리(준비 + 001_baseline.sql + 기준선 위 증분)가 선언하는 표 이름을 정렬해 낸다.
 func pgDeclaredTables(t *testing.T) []string {
 	t.Helper()
-	return declaredIn(t, map[string]string{"pg/bootstrap.sql": pg.Bootstrap, "pg/001_baseline.sql": pg.Baseline})
+	sources := map[string]string{"pg/bootstrap.sql": pg.Bootstrap, "pg/001_baseline.sql": pg.Baseline}
+	for _, st := range pg.Steps {
+		sources["pg 증분 "+st.Name] = st.SQL
+	}
+	return declaredIn(t, sources)
 }
 
 // declaredIn 은 SQL 묶음(이름 → 본문)이 선언하는 표 이름을 정렬해 낸다.
@@ -135,7 +139,7 @@ func TestDeclaredTablesMatchDesign(t *testing.T) {
 		engine    string
 		got, want []string
 	}{
-		{"PG 기준선", pgDeclaredTables(t), wantTables},
+		{"PG", pgDeclaredTables(t), wantTables},
 		{"SQLite", declaredTables(t), sqliteWant},
 	} {
 		if !slices.Equal(c.got, c.want) {
@@ -147,14 +151,29 @@ func TestDeclaredTablesMatchDesign(t *testing.T) {
 	}
 }
 
-// TestPGBaselineFoldsTheLastSQLiteVersion 은 PG 기준선이 접어 넣은 SQLite 판이 지금 SQLite 판과 같은지 본다.
+// TestPGStepsFollowTheSQLiteVersion 은 PG 사다리(기준선 + pg.Steps)가 지금 판까지 빈칸 없이 닿고, 기준선 위의 SQLite
+// 증분마다 같은 판 번호의 PG 증분이 있는지 본다.
 //
-// ★ 옮기는 동안 SQLite 에 증분이 오르면 기준선은 그 증분을 모른 채 「판 18 과 같은 뜻」이라고 말하게 된다.
-// 그 자리에서 빨갛게 한다 — SQLite 쪽 증분을 PG 기준선(또는 PG 증분)에도 실어야 한다.
-func TestPGBaselineFoldsTheLastSQLiteVersion(t *testing.T) {
-	if pg.BaselineVersion != SchemaVersion {
-		t.Fatalf("PG 기준선은 SQLite 판 %d 을 접었는데 지금 SQLite 판은 %d 다 — 그 사이 증분의 뜻을 PG 에도 실어라",
-			pg.BaselineVersion, SchemaVersion)
+// ★ 옮기는 동안 SQLite 에 증분이 오르면 PG 는 그 증분을 모른 채 같은 판 번호를 말하게 된다 - 판 재기 · 이관 · 역이관의
+// 「같은 판」 관문이 모양이 다른 두 원장을 같다고 받는다. 그 자리에서 빨갛게 한다. 두 증분이 **같은 뜻**인지(표 · 칸 ·
+// 인덱스 …)는 pg 패키지의 TestBaselineHasTheSameShapeAsSQLite 가 두 엔진의 카탈로그를 맞대 잰다 - 여기는 판 번호의 축이다.
+func TestPGStepsFollowTheSQLiteVersion(t *testing.T) {
+	if _, err := UpgradeSteps(pg.BaselineVersion, SchemaVersion, pgMigrations); err != nil {
+		t.Fatalf("PG 기준선(%d)에서 지금 판(%d)으로 가는 PG 증분이 없다 - SQLite 증분의 뜻을 pg.Steps 에도 실어라: %v",
+			pg.BaselineVersion, SchemaVersion, err)
+	}
+	pgHas := map[int]bool{}
+	for _, m := range pgMigrations {
+		if m.To <= pg.BaselineVersion || m.To > SchemaVersion || pgHas[m.To] {
+			t.Errorf("PG 증분 %d(%s)이 기준선 %d 위 지금 판 %d 안의 한 칸이 아니다(겹치거나 넘었다)",
+				m.To, m.Name, pg.BaselineVersion, SchemaVersion)
+		}
+		pgHas[m.To] = true
+	}
+	for _, m := range migrations {
+		if m.To > pg.BaselineVersion && !pgHas[m.To] {
+			t.Errorf("SQLite 증분 %d(%s)에 짝인 PG 증분이 없다", m.To, m.Name)
+		}
 	}
 }
 

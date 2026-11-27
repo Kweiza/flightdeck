@@ -3,6 +3,7 @@ package service_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -45,6 +47,11 @@ import (
 //
 // 시간으로 두면 빠른 엔진일수록 표본과 원장이 커져 두 엔진이 다른 것을 잰다. 지연은 요청 종류마다
 // p50 · p95 · p99(ms, 가까운 순위)로 낸다. 두 출력은 benchstat 으로 맞댄다.
+//
+// ★ 전 크기 원장 모양(BenchmarkRESTLifecycleFullLedger)은 두 엔진을 한 번에 잰다. Postgres 쪽은 시험 PG 가 있어야 한다
+// (FD_TEST_PG - 없으면 실패한다):
+//
+//	FD_TEST_PG=… go test ./internal/service -run '^$' -bench FullLedger -benchtime 200x -count 3
 
 const benchProject = "bench"
 
@@ -58,8 +65,14 @@ type restBench struct {
 	keys      atomic.Int64 // Idempotency-Key 발번. 모든 쓰기에 필요하다
 }
 
-// newRESTBench 는 프로젝트 하나에 워크트리 n 개를 둔다. 클라이언트 k 가 워크트리 k 를 쓴다.
+// newRESTBench 는 빈 원장(freshstore.Open) 위의 newRESTBenchOn 이다.
 func newRESTBench(tb testing.TB, n int) *restBench {
+	tb.Helper()
+	return newRESTBenchOn(tb, n, freshstore.Open(tb))
+}
+
+// newRESTBenchOn 은 원장 st 위에 프로젝트 하나와 워크트리 n 개를 둔다. 클라이언트 k 가 워크트리 k 를 쓴다.
+func newRESTBenchOn(tb testing.TB, n int, st *store.Store) *restBench {
 	tb.Helper()
 	base := tb.TempDir()
 	repo := filepath.Join(base, "repo")
@@ -75,7 +88,6 @@ func newRESTBench(tb testing.TB, n int) *restBench {
 	}
 	git := newStillGit(repo, worktrees)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	st := freshstore.Open(tb)
 	svc := service.New(st, log, service.WithGitFactory(func(string) service.GitReader { return git }))
 	srv := httptest.NewServer(api.NewServer(svc, api.Options{Log: log}))
 	tb.Cleanup(srv.Close) // 저장소 닫기보다 먼저 돈다(정리는 거꾸로 돈다)
@@ -202,14 +214,13 @@ func BenchmarkRESTLifecycle(b *testing.B) {
 		for _, n := range []int{1, 8} {
 			shape := map[bool]string{true: "fresh", false: "shared"}[fresh]
 			b.Run(fmt.Sprintf("session=%s/clients=%d", shape, n), func(b *testing.B) {
-				benchLifecycle(b, n, fresh)
+				benchLifecycle(b, newRESTBench(b, n), n, fresh)
 			})
 		}
 	}
 }
 
-func benchLifecycle(b *testing.B, n int, fresh bool) {
-	r := newRESTBench(b, n)
+func benchLifecycle(b *testing.B, r *restBench, n int, fresh bool) {
 	var shared []string
 	if !fresh {
 		shared = r.openSessions(b)
@@ -235,6 +246,97 @@ func benchLifecycle(b *testing.B, n int, fresh bool) {
 	}
 	r.mustAllDone(b)
 	lat.report(b, "pick", "note", "finish")
+}
+
+// BenchmarkRESTLifecycleFullLedger 는 fresh/1 한살이를 **전 크기 원장 모양** 위에서 두 엔진으로 잰다.
+//
+// ★ 왜 따로 두나: 위 벤치는 op 마다 빈 원장에서 시작해 event 표가 작다. 원장 크기를 따라 자라는 비용(pick 마다 도는
+// 종료 선언 조회 - event 를 project + kind 로 걸러 id 순으로 읽는다)은 거기서 안 보인다. Postgres 는 문 캐시의 일반 계획이
+// 맞는 인덱스 없이 표 전체를 훑었고(증분 019 가 고쳤다), 그 퇴행은 작은 원장에서 0 에 가깝다.
+// ★ 원장은 합성이다(seedFullLedger). 운영 원장의 값은 쓰지 않는다 - 모양(행 수 · 종류 비율 · 프로젝트 수)만 닮게 둔다.
+func BenchmarkRESTLifecycleFullLedger(b *testing.B) {
+	for _, e := range []freshstore.Engine{freshstore.SQLite, freshstore.Postgres} {
+		b.Run("engine="+string(e), func(b *testing.B) {
+			st, at := freshstore.OpenOn(b, e, nil)
+			seedFullLedger(b, e, at)
+			benchLifecycle(b, newRESTBenchOn(b, 1, st), 1, true)
+		})
+	}
+}
+
+// 전 크기 원장 모양: 이벤트 수십만 행이 남의 프로젝트 스물과 세션 수백에 걸쳐 있고, 대부분은 처방 · 박동이며 항목 마무리는
+// 드물다(프로젝트마다 LIMIT 보다 훨씬 적다). 벤치 프로젝트는 비어서 시작한다 - 종료 선언 조회가 채울 것이 없는 쪽이다.
+const (
+	fullLedgerEvents   = 300_000
+	fullLedgerProjects = 20
+	fullLedgerSessions = 900
+	fullLedgerBatch    = 1000
+)
+
+// fullLedgerKind 는 i 번째 합성 이벤트의 종류다. 비율만 닮게 둔다.
+func fullLedgerKind(i int) string {
+	switch {
+	case i%160 == 0:
+		return "item.finish"
+	case i%150 == 0:
+		return "item.add"
+	case i%40 == 0:
+		return "item.claim"
+	case i%50 == 0:
+		return "landing"
+	case i%5 == 0:
+		return "prescribe"
+	}
+	return "session.beat"
+}
+
+// seedFullLedger 는 엔진 e 의 원장 자리 at 에 합성 이벤트를 넣는다. 값은 이 파일의 상수뿐이라 문장에 그대로 싣는다
+// (엔진마다 다른 자리표 문법을 피한다). Postgres 는 계획이 통계로 고르므로 넣은 뒤 ANALYZE 한다.
+func seedFullLedger(tb testing.TB, e freshstore.Engine, at string) {
+	tb.Helper()
+	driver := map[freshstore.Engine]string{freshstore.SQLite: "sqlite", freshstore.Postgres: "pgx"}[e]
+	db, err := sql.Open(driver, at)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer tx.Rollback()
+	// 시각은 store 의 저장 표기(폭 고정, timeLayout)를 따른다 - 사전순이 시간순이어야 한다. 벤치가 쓰는 행보다 앞선다.
+	base := time.Now().Add(-90 * 24 * time.Hour)
+	var q strings.Builder
+	for i := 1; i <= fullLedgerEvents; i++ {
+		if q.Len() == 0 {
+			q.WriteString(`INSERT INTO event(at, project, session_id, kind, payload) VALUES `)
+		} else {
+			q.WriteByte(',')
+		}
+		fmt.Fprintf(&q, `('%s', 'p%02d', 's%03d', '%s', '{"item":"s-%d","mode":"done"}')`,
+			base.Add(time.Duration(i)*10*time.Second).UTC().Format("2006-01-02T15:04:05.000000Z"),
+			i%fullLedgerProjects, i%fullLedgerSessions, fullLedgerKind(i), i)
+		if i%fullLedgerBatch == 0 || i == fullLedgerEvents {
+			if _, err := tx.ExecContext(ctx, q.String()); err != nil {
+				tb.Fatalf("합성 이벤트 넣기: %v", err)
+			}
+			q.Reset()
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		tb.Fatal(err)
+	}
+	if e == freshstore.Postgres {
+		if _, err := db.ExecContext(ctx, `ANALYZE event`); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM event`).Scan(&n); err != nil || n < fullLedgerEvents {
+		tb.Fatalf("합성 원장의 이벤트가 %d 행이다(기대 %d 이상): %v", n, fullLedgerEvents, err)
+	}
 }
 
 // mustAllDone 은 한살이 b.N 번이 원장에서도 다 끝났는지 본다. 2xx 인데 다른 갈래(재개 · 거절을

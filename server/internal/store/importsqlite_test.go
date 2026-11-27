@@ -85,7 +85,7 @@ INSERT INTO item_revision(project, item_id, rev, at, session_id, title, body, pa
 INSERT INTO session_inbox(session_id, machine_id, socket, mode, seen_at) VALUES ('s1', 'm', '/run/s.sock', '', ` + importAt + `);
 `
 
-// importSource 는 판 18 SQLite 원장 파일을 만들고 seed 를 넣는다. 파일 경로를 낸다.
+// importSource 는 이관 판 SQLite 원장 파일을 만들고 seed 를 넣는다. 파일 경로를 낸다.
 func importSource(t *testing.T, seed string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fd.db")
@@ -409,30 +409,31 @@ func TestImportSQLiteRefusesATargetThatIsNotEmpty(t *testing.T) {
 	}
 
 	bare := storetest.NewBare(t, "")
-	if _, err := importLedger(t, ctx, src, bare, TransferOptions{}); err == nil || !strings.Contains(err.Error(), "--to 18") {
+	if _, err := importLedger(t, ctx, src, bare, TransferOptions{}); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("--to %d", pg.ImportVersion)) {
 		t.Fatalf("빈 DB 에 옮겼거나 처방이 없다: %v", err)
 	}
 }
 
-// 판 18 보다 낮은 원본은 먼저 올리라는 안내와 함께 거절한다(예행도). 이 명령은 옛 증분을 갖지 않는다.
+// 이관 판보다 낮은 원본은 먼저 올리라는 안내와 함께 거절한다(예행도). 이 명령은 옛 증분을 갖지 않는다.
 func TestImportSQLiteRefusesAnOlderSource(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "old.db")
 	mustMigrateTo(t, path, pg.ImportVersion-1)
 	dsn, dst := importTarget(t)
+	older := fmt.Sprintf("판 %d", pg.ImportVersion-1)
 	for _, dry := range []bool{true, false} {
 		_, err := importLedger(t, ctx, path, dsn, TransferOptions{DryRun: dry})
-		if err == nil || !strings.Contains(err.Error(), "판 17") || !strings.Contains(err.Error(), "fd migrate --db") {
-			t.Fatalf("예행 %v: 판 17 원본을 받았거나 안내가 없다: %v", dry, err)
+		if err == nil || !strings.Contains(err.Error(), older) || !strings.Contains(err.Error(), "fd migrate --db") {
+			t.Fatalf("예행 %v: %s 원본을 받았거나 안내가 없다: %v", dry, older, err)
 		}
 	}
-	if _, err := VerifySQLite(ctx, path, dsn, quietLog()); err == nil || !strings.Contains(err.Error(), "판 17") {
-		t.Fatalf("대조가 판 17 원본을 받았다: %v", err)
+	if _, err := VerifySQLite(ctx, path, dsn, quietLog()); err == nil || !strings.Contains(err.Error(), older) {
+		t.Fatalf("대조가 %s 원본을 받았다: %v", older, err)
 	}
 	if n := targetRows(t, dst); n != 0 {
 		t.Fatalf("거절했는데 대상에 %d 행", n)
 	}
-	// 원본을 바꾸지 않았다 - 여전히 17 이다.
+	// 원본을 바꾸지 않았다 - 여전히 이관 판 아래다.
 	var v int
 	liteQuery(t, path, `SELECT max(version) FROM schema_version`, &v)
 	if v != pg.ImportVersion-1 {

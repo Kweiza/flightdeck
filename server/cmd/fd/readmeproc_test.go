@@ -15,12 +15,15 @@ package main
 //   자리로 준다.
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/kweiza/flightdeck/internal/store/pg"
 )
 
 // readmeProcs 는 README 하나에서 뗀 절차 덩이다.
@@ -371,7 +374,7 @@ func checkUpgrade(t *testing.T, shell procShell, procs readmeProcs) {
 		for _, want := range []struct{ args, pwd, env string }{
 			{"-p oldp down", r.old, ""},
 			{"run --rm --no-deps migrate migrate --db /data/fd.db", r.work, ""},
-			{"run --rm migrate migrate --to 18", r.work, r.off()},
+			{fmt.Sprintf("run --rm migrate migrate --to %d", pg.ImportVersion), r.work, r.off()},
 			{"run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db", r.work, r.off()},
 			{"run --rm migrate migrate verify --from /data/fd.db", r.work, r.off()},
 			{"up -d --build", r.work, r.on()},

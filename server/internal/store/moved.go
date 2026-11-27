@@ -112,7 +112,7 @@ func describeMoved(mark string, fi fs.FileInfo) string {
 // ★ 판(빈 클러스터의 기준선 · 그 위 증분)과 상관없이 잰다. 덮개 파일만 얹고 이관 없이 띄운 compose 가 빈 클러스터에 기준선을
 // 까는 날이 본체지만, 기준선을 깐 뒤 이관 전에 띄운 `up` 도, 사본을 옮겨(--from 사본) 원본에 표지가 없는 것도 같은 갈림이다 -
 // 그 SQLite 원장이 다시 열리면 두 원장에 따로 쓰인다.
-// ★ 기준선만 까는 단계(--to pg.ImportVersion)는 받는다. 이관이 그 위에서만 돌고(README 「업그레이드: SQLite 원장을 Postgres
+// ★ 이관 판까지만 까는 단계(--to pg.ImportVersion - 기준선과 그 위 증분)는 받는다. 이관이 그 위에서만 돌고(README 「업그레이드: SQLite 원장을 Postgres
 // 로」), 그 단계는 서버를 띄우지 않는다.
 func UnmovedSQLiteRefusal(sqlite string, to int) error {
 	if to == pg.ImportVersion {
@@ -137,7 +137,7 @@ func UnmovedSQLiteRefusal(sqlite string, to int) error {
 	}
 	return fmt.Errorf("SQLite 원장 %s 이 이관 표지(%s) 없이 남아 있다 - 이관을 거치지 않은 새 원장이다. 이대로 Postgres 원장을 "+
 		"올려 띄우면 두 원장에 따로 쓰이므로 올리지 않는다. SQLite 원장을 들고 옮기려면 README 「업그레이드: SQLite 원장을 "+
-		"Postgres 로」를 따른다(기준선만 까는 `fd migrate --to %d` 는 받는다). 그 원장을 버리고 Postgres 로 새로 시작하려면 그 "+
+		"Postgres 로」를 따른다(이관 판까지만 까는 `fd migrate --to %d` 는 받는다). 그 원장을 버리고 Postgres 로 새로 시작하려면 그 "+
 		"파일을 원장 자리 밖으로 옮긴다. 이미 옮겼는데 표지만 없으면(사본을 옮겼거나 이관이 표지를 못 남겼다) "+
 		"`fd migrate verify --from %s` 로 맞는지 본 뒤 표지를 남긴다(touch). 두 원장에 이미 따로 쓰였으면 두 서버를 다 내리고 "+
 		"두 원장을 지우지 말고 맞대 본다",

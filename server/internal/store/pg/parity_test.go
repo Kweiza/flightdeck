@@ -1,6 +1,6 @@
 package pg_test
 
-// 기준선이 SQLite 판 18 과 **같은 뜻**인지를 두 축으로 잰다.
+// PG 사다리(기준선 + 그 위 증분, storetest 의 템플릿)가 SQLite 의 마지막 판과 **같은 뜻**인지를 두 축으로 잰다.
 //   - 모양: 표 · 칼럼(이름 · 순서 · 타입 · NOT NULL · 기본값 · identity · 계산식) · 기본키 · FK(ON UPDATE ·
 //     ON DELETE · 미루기) · 인덱스 · CHECK 수 · 트리거를 두 엔진의 카탈로그에서 읽어 맞댄다. 일부러 다른 것은
 //     pgOnly · pgOnlyTriggers 에 까닭과 함께 적는다.
@@ -30,7 +30,7 @@ import (
 	"github.com/kweiza/flightdeck/internal/store"
 )
 
-// openSQLite 는 판 18 까지 올린 새 SQLite 원장을 FK 를 켜고 열고 seedSQL 을 넣는다.
+// openSQLite 는 마지막 판까지 올린 새 SQLite 원장을 FK 를 켜고 열고 seedSQL 을 넣는다.
 func openSQLite(t *testing.T) *sql.DB {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fd.db")
@@ -363,7 +363,7 @@ func sqliteOnly(name string) bool {
 	return strings.HasPrefix(name, "sqlite_") || strings.HasPrefix(name, "judgment_fts")
 }
 
-// SQLite 의 살아 있는 스키마(판 18)를 PG 말로 옮긴 기대가, 기준선을 깐 PG 의 카탈로그와 같다.
+// SQLite 의 살아 있는 스키마(마지막 판)를 PG 말로 옮긴 기대가, 사다리를 다 깐 PG 의 카탈로그와 같다.
 func TestBaselineHasTheSameShapeAsSQLite(t *testing.T) {
 	lite, pgdb := openSQLite(t), openPG(t)
 	want, wantTrig := sqliteShapes(t, lite)

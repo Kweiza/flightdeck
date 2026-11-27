@@ -171,7 +171,7 @@ func must(t *testing.T, err error) {
 	}
 }
 
-// Postgres 판올림 관문의 갈래 전부: 원장이 없거나 표지가 있으면 받고, 표지 없는 원장이 남았으면 기준선만 까는 단계(--to 18)
+// Postgres 판올림 관문의 갈래 전부: 원장이 없거나 표지가 있으면 받고, 표지 없는 원장이 남았으면 이관 판까지만 까는 단계(--to pg.ImportVersion)
 // 말고는 거절하며, 원장 자리를 재지 못하면 거절한다.
 func TestUnmovedSQLiteRefusal(t *testing.T) {
 	dir := t.TempDir()
@@ -188,7 +188,7 @@ func TestUnmovedSQLiteRefusal(t *testing.T) {
 		}
 	}
 	if err := UnmovedSQLiteRefusal(path, pg.ImportVersion); err != nil {
-		t.Fatalf("기준선만 까는 단계(--to %d)를 거절했다: %v", pg.ImportVersion, err)
+		t.Fatalf("이관 판까지만 까는 단계(--to %d)를 거절했다: %v", pg.ImportVersion, err)
 	}
 	touchMarker(t, path)
 	if err := UnmovedSQLiteRefusal(path, 0); err != nil {

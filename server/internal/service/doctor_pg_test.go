@@ -9,41 +9,16 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/kweiza/flightdeck/internal/store"
 	"github.com/kweiza/flightdeck/internal/store/storetest"
+	"github.com/kweiza/flightdeck/internal/store/storetest/freshstore"
 )
-
-// openPGLedger 는 판 행을 적은 새 시험 DB 를 store 로 연다. 둘째 값은 그 DB 의 접속 URL 이다.
-//
-// 판 행은 시험이 적는다 - 운영에서 그것을 적는 것은 Postgres 이전 실행기의 몫이다.
-func openPGLedger(t *testing.T, log *slog.Logger) (*store.Store, string) {
-	t.Helper()
-	dsn := storetest.New(t)
-	raw, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = raw.Exec(`INSERT INTO schema_version(version, applied_at) VALUES ($1, $2)`,
-		store.SchemaVersion, time.Now().UTC().Format(time.RFC3339))
-	raw.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	st, err := store.OpenWithLogger(dsn, log)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	return st, dsn
-}
 
 // TestHealthDoesNotMeasureDiskForPostgres 는 Postgres 원장이면 디스크 여유를 재지 않고 「원격 DB, 재지 않음」으로
 // 내는지 잰다. Path 는 파일 경로가 아닌 표시값이라 그 「상위 디렉토리」를 statfs 하면 현재 폴더를 잰다.
 func TestHealthDoesNotMeasureDiskForPostgres(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	st, _ := openPGLedger(t, log)
+	st, _ := freshstore.OpenOn(t, freshstore.Postgres, log)
 
 	h := New(st, log).Health(context.Background())
 	if !h.OK || !h.DBOK || !h.DBLocaleOK {
@@ -64,7 +39,7 @@ func TestHealthDoesNotMeasureDiskForPostgres(t *testing.T) {
 func TestHealthCarriesNoDSNPieceAfterReconnectFails(t *testing.T) {
 	var logs bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&logs, nil))
-	st, dsn := openPGLedger(t, log)
+	st, dsn := freshstore.OpenOn(t, freshstore.Postgres, log)
 	u, err := url.Parse(dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +79,7 @@ func TestHealthCarriesNoDSNPieceAfterReconnectFails(t *testing.T) {
 func TestHealthTurnsOffWhenTheLocaleGateFails(t *testing.T) {
 	var logs bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&logs, nil))
-	st, dsn := openPGLedger(t, log)
+	st, dsn := freshstore.OpenOn(t, freshstore.Postgres, log)
 	raw, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatal(err)

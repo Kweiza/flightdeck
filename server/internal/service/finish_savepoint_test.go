@@ -10,6 +10,7 @@ import (
 
 	"github.com/kweiza/flightdeck/internal/model"
 	"github.com/kweiza/flightdeck/internal/store"
+	"github.com/kweiza/flightdeck/internal/store/storetest/freshstore"
 )
 
 // 트랜잭션 안에서 DB 오류를 받고 이어 가는 자리를 실제 호출 경로(Finish · Land)로 두 엔진에서 잰다. Postgres 는 실패한
@@ -33,7 +34,7 @@ func bothLedgers() []ledgerEngine {
 func newPGSvc(t *testing.T, opts ...Option) (*Service, *store.Store) {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	st, _ := openPGLedger(t, log)
+	st, _ := freshstore.OpenOn(t, freshstore.Postgres, log)
 	return New(st, log, opts...), st
 }
 

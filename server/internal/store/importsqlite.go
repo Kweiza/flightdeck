@@ -23,7 +23,7 @@ import (
 //
 // 옮기기 한 번의 길(transferInto - 이관 · 역이관이 같다):
 //
-//	원본 열기(SQLite: -wal 이 비었나 · 읽기 전용 · 판 18 인가) → 대상 열기
+//	원본 열기(SQLite: -wal 이 비었나 · 읽기 전용 · 이관 판인가) → 대상 열기
 //	→ 원본 스냅숏 하나에서: 판(Postgres) · 표 · 칸 모양, 붙은 다른 연결(Postgres), 1차 훑기(사전 검사 · 행 표지 · 행 수 ·
 //	  발급 번호)
 //	→ 실행기 세션(Postgres 대상이면 잠금 둘) → 대상 트랜잭션 하나에서: 판 · 붙은 다른 연결(Postgres) · 소유 역할 · FK 미루기 ·
@@ -289,8 +289,8 @@ func VerifySQLite(ctx context.Context, from, to string, log *slog.Logger) (Trans
 // openImportSource 는 이관 · 대조의 원본을 읽기 전용으로 연다(importSourceDSN). 옆의 -wal 이 비어 있어야 하고
 // (sourceWALRefusal), 판이 이관 판(pg.ImportVersion)이어야 한다. 파일을 바꾸지 않는다.
 //
-// ★ 더 낮은 판은 이 명령이 올리지 않는다. SQLite 증분은 판 18 에서 멈췄고, SQLite 실행 경로가 빠진 뒤의 fd 는 그 증분을
-// 갖지 않는다 - 그 판을 아는 fd 로 사본을 먼저 올리라고 안내한다.
+// ★ 더 낮은 판은 이 명령이 올리지 않는다. 이관이 읽는 SQLite 판은 이관 판 하나이고, SQLite 실행 경로가 빠진 뒤의 fd 는 그
+// 아래 증분을 갖지 않는다 - 그 판을 아는 fd 로 사본을 먼저 올리라고 안내한다.
 func openImportSource(ctx context.Context, path string, log *slog.Logger) (*Store, error) {
 	if err := sqliteOnly(path, "이관 원본(--from)"); err != nil {
 		return nil, err
@@ -382,7 +382,7 @@ func targetVersion(ctx context.Context, q dbtx) error {
 	case MigrateNone:
 		return nil
 	case MigrateApply:
-		return fmt.Errorf("대상이 빈 DB 다 - 먼저 기준선을 깔아라: 초사용자나 소유 역할(%s)로 `fd migrate --db <대상> --to %d`",
+		return fmt.Errorf("대상이 빈 DB 다 - 먼저 이관 판까지 깔아라: 초사용자나 소유 역할(%s)로 `fd migrate --db <대상> --to %d`",
 			pg.OwnerRole, pg.ImportVersion)
 	}
 	return fmt.Errorf("대상이 이관 판(%d)이 아니다: %s", pg.ImportVersion, plan.Reason)
@@ -392,7 +392,7 @@ func targetVersion(ctx context.Context, q dbtx) error {
 // 타고(Postgres), FK 검사를 미루고, 대상이 받을 수 있는지 잰다(targetReady). to 는 대상의 몫이다. 본 실행과 예행, 이관과
 // 역이관이 이 하나를 지난다.
 //
-// ★ 판은 역할을 바꾸기 전에 잰다. 기준선을 안 깐 DB 에는 소유 역할이 없을 수 있고, 그때의 처방은 「기준선을 깔아라」다.
+// ★ 판은 역할을 바꾸기 전에 잰다. 기준선을 안 깐 DB 에는 소유 역할이 없을 수 있고, 그때의 처방은 「이관 판까지 깔아라」다.
 // ★ 붙은 연결도 역할을 바꾸기 전에 잰다. 초사용자로 붙었으면 그때는 남의 연결의 종류까지 보인다(soleClient).
 // ★ 소유 역할이어야 하는 까닭: identity 시퀀스를 다시 시작하는 것(ALTER SEQUENCE)은 시퀀스의 주인만 하고, 순번을 읽는
 // 권한(SELECT)도 앱 역할에는 없다. 앱 역할로 붙으면 여기서 거절한다 - 예행도 같다.
@@ -571,7 +571,7 @@ type pgSide struct{}
 
 func (pgSide) sqlite() bool { return false }
 
-// shape 는 원본(역이관)의 판이 이관 판(18)이고 표 · 칸이 그 판의 모양인지 잰다. 원본은 살아 있는 서버의 원장이라 연 때가
+// shape 는 원본(역이관)의 판이 이관 판(pg.ImportVersion)이고 표 · 칸이 그 판의 모양인지 잰다. 원본은 살아 있는 서버의 원장이라 연 때가
 // 아니라 옮기는 스냅숏에서 잰다 - 이관의 prepareTarget 이 대상의 판을 옮기기 트랜잭션 안에서 다시 재는 것과 같은 꼴이다.
 func (pgSide) shape(ctx context.Context, q Reader) error {
 	hasTable, v, objects, err := readMigrationState(ctx, onEngine{q, enginePG})
@@ -838,7 +838,7 @@ func scanTable(ctx context.Context, q Reader, t pg.Table, sqlite bool, cell cell
 	return marks, maxID, err
 }
 
-// checkShape 는 원본(엔진 eng)의 표 · 칸이 이관 카탈로그(pg.Tables)와 같은지 잰다. 판 18 이면 같아야 한다 - 다르면 손으로
+// checkShape 는 원본(엔진 eng)의 표 · 칸이 이관 카탈로그(pg.Tables)와 같은지 잰다. 이관 판이면 같아야 한다 - 다르면 손으로
 // 고친 원장이고, 모르는 칸을 버리거나 없는 칸을 지어내지 않으려고 거절한다. 카탈로그를 읽는 질의는 엔진마다 하나(tablesQuery ·
 // columnsQuery)이고 맞대는 규칙은 한 벌이다.
 func checkShape(ctx context.Context, q Reader, eng engine) error {

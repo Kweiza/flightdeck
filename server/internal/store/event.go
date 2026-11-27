@@ -491,10 +491,7 @@ func (s *Store) QueueReproduction(ctx context.Context, project string, n int) (R
 	if n <= 0 {
 		return out, nil
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, payload FROM event
-		WHERE project = ? AND kind = 'item.finish'
-		ORDER BY id DESC LIMIT ?`, project, n)
+	rows, err := s.db.QueryContext(ctx, reproFinishesSQL, project, n)
 	if err != nil {
 		return out, fmt.Errorf("마무리 이벤트 조회 실패(project=%q): %w", clip(project, 64), err)
 	}
@@ -539,9 +536,7 @@ func (s *Store) QueueReproduction(ctx context.Context, project string, n int) (R
 	// ★ count(*) 를 못 쓰는 이유가 결말이 payload 안에 있기 때문이다. 조인 조건에
 	// json_extract 를 넣는 선례가 이 저장소에 0건이라 Go 로 읽는다 — 창이 최근 n회라
 	// 훑는 행 수가 원래 작다.
-	addRows, err := s.db.QueryContext(ctx, `
-		SELECT payload FROM event
-		WHERE project = ? AND kind = 'item.add' AND id >= ?`, project, sinceID)
+	addRows, err := s.db.QueryContext(ctx, reproAddsSQL, project, sinceID)
 	if err != nil {
 		return Reproduction{}, fmt.Errorf("추가 이벤트 조회 실패(project=%q): %w", clip(project, 64), err)
 	}
@@ -576,12 +571,37 @@ func (s *Store) QueueReproduction(ctx context.Context, project string, n int) (R
 // 정확한 현재값이 아니라 **자릿수**다 — 5000 이 384 든 388 이든 여유가 크다는 논지는
 // 안 바뀐다.
 //
-// ★ **성능 손잡이가 아니다.** EXPLAIN QUERY PLAN 은 event_by_kind(kind=?) 를 타고
-// kind='item.finish' 행 전부를 훑은 뒤 project 로 거른다 — 훑는 양은 LIMIT 이 아니라 원장의
-// 크기가 정한다(위와 같은 시각·같은 사본에서 실측 388행에 0.9ms, LIMIT 500~20000 사이에
-// 차이가 없다). LIMIT 이 실제로 무는 것은 정렬 버퍼와 JSON 파싱 횟수뿐이다. 그래서 넉넉히
-// 잡되, 이 수가 실제로 물리기 시작하는 때(원장이 지금의 13배)를 상한을 다시 잴 신호로 남긴다.
+// ★ **성능 손잡이가 아니다.** 이 문장은 event_by_project_kind(project, kind, id) 범위를 id 순으로 읽는다(증분 019,
+// closeDeclarationsSQL 묶음의 ★) — 훑는 양은 그 프로젝트의 마무리 행 수와 이 상한 중 작은 쪽이고, 다른 프로젝트 · 다른 종류의
+// 행은 안 읽는다. 그 전에는 (kind, at) 으로 모든 프로젝트의 마무리를 다 읽고 정렬했고, Postgres 의 일반 계획은 기본키를
+// 거꾸로 훑으며 표 전체를 걸렀다 — 훑는 양을 원장의 크기가 정했다. 상한이 무는 것은 한 프로젝트의 마무리가 이 수를
+// 넘을 때뿐이다. 그래서 넉넉히 잡되, 그때를 상한을 다시 잴 신호로 남긴다.
 const closeDeclarationScanLimit = 5000
+
+// 아래 묶음은 「이 프로젝트의 이 종류 이벤트를 id 순으로」 읽는 문장 셋이다.
+//
+// ★ 셋 다 event_by_project_kind(project, kind, id) 범위 하나를 탄다(migrations/019 · pg/019). 그 인덱스가 없던 때
+// SQLite 는 (kind, at) 으로 그 종류를 다 읽고 거른 뒤 정렬했고, Postgres 는 문 캐시가 여섯 번째 실행부터 돌리는 일반
+// 계획(generic plan)에서 기본키를 거꾸로 훑으며 표 전체를 걸렀다(그 프로젝트의 행이 LIMIT 보다 적으면 끝까지 본다).
+// 두 엔진이 이 문장을 그 인덱스로 도는지 — Postgres 는 일반 계획을 강제해서 — event_project_kind_plan_test.go 가 이
+// 상수를 그대로 EXPLAIN 해 잰다. 글을 바꾸면(칸을 더하거나 거름을 바꾸면) 그 시험이 다시 잰다. 같은 꼴의 문장을 새로
+// 쓰면 여기에 두고 그 시험의 목록에 더한다.
+const (
+	// closeDeclarationsSQL 은 CloseDeclarationsByItem 의 창이다: 이 프로젝트의 마무리 선언을 최신부터 limit 개.
+	closeDeclarationsSQL = `
+		SELECT at, session_id, payload FROM event
+		WHERE project = ? AND kind = 'item.finish'
+		ORDER BY id DESC LIMIT ?`
+	// reproFinishesSQL 은 QueueReproduction 의 분모 창이다: 이 프로젝트의 마무리를 최신부터 n 개.
+	reproFinishesSQL = `
+		SELECT id, payload FROM event
+		WHERE project = ? AND kind = 'item.finish'
+		ORDER BY id DESC LIMIT ?`
+	// reproAddsSQL 은 QueueReproduction 의 분자다: 창의 아래 끝 id 부터의 이 프로젝트 추가.
+	reproAddsSQL = `
+		SELECT payload FROM event
+		WHERE project = ? AND kind = 'item.add' AND id >= ?`
+)
 
 // CloseDeclarationsByItem 은 이 프로젝트에서 "이 항목을 닫는다"고 선언된 이력을 항목별로 접는다.
 //
@@ -619,13 +639,10 @@ func (s *Store) closeDeclarationsByItem(ctx context.Context, project string, lim
 	if limit <= 0 {
 		return map[string]model.CloseDeclaration{}, nil
 	}
-	// ★ 창을 id 로 자른다. event 인덱스는 (kind,at)·(session_id,at) 뿐이고, at 은 마이크로초
-	// 해상도라 한 턴에 몰린 이벤트가 같은 값을 가질 수 있다. id 는 AUTOINCREMENT 라 단조이고
-	// 유일하다 — QueueReproduction 이 같은 이유로 같은 선택을 했다.
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT at, session_id, payload FROM event
-		WHERE project = ? AND kind = 'item.finish'
-		ORDER BY id DESC LIMIT ?`, project, limit)
+	// ★ 창을 id 로 자른다. at 은 마이크로초 해상도라 한 턴에 몰린 이벤트가 같은 값을 가질 수 있다. id 는 삽입 순서라
+	// 단조이고 유일하다 — QueueReproduction 이 같은 이유로 같은 선택을 했다. (project, kind, id) 인덱스가 그 순서를
+	// 그대로 준다(closeDeclarationsSQL 묶음의 ★).
+	rows, err := s.db.QueryContext(ctx, closeDeclarationsSQL, project, limit)
 	if err != nil {
 		return nil, fmt.Errorf("종료 선언 조회 실패(project=%q): %w", clip(project, 64), err)
 	}

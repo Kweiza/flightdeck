@@ -179,12 +179,54 @@ func TestPGMigrateLaysBaselineOnEmptyDB(t *testing.T) {
 		t.Fatalf("판 재기: %+v, %v", plan, err)
 	}
 
-	// 다시 돌리면 판이 맞다 - 판 행이 늘지 않는다.
+	// 판 행은 기준선 하나와 그 위 증분마다 하나다. 다시 돌리면 판이 맞다 - 판 행이 늘지 않는다.
+	want := int64(1 + len(pgMigrations))
+	if n := pgCount(t, s, `SELECT count(*) FROM schema_version`); n != want {
+		t.Fatalf("판 행 %d개(기대 %d)", n, want)
+	}
 	if err := Migrate(ctx, dsn, quietLog()); err != nil {
 		t.Fatalf("다시 돌리기: %v", err)
 	}
-	if n := pgCount(t, s, `SELECT count(*) FROM schema_version`); n != 1 {
-		t.Fatalf("판 행 %d개(기대 1)", n)
+	if n := pgCount(t, s, `SELECT count(*) FROM schema_version`); n != want {
+		t.Fatalf("다시 돌린 뒤 판 행 %d개(기대 %d)", n, want)
+	}
+}
+
+// TestPGStepsUpgradeALedgerWithRows 는 기준선(판 18)에서 멈춘 채 행이 쌓인 원장을 실제 증분(pg.Steps)으로 올린다: 판은 지금
+// 판이고, 판올림 전 덤프를 기준선 판에서 한 번 뜨고, 증분이 만든 인덱스의 주인은 소유 역할이고, 쌓인 행은 그대로다.
+// 증분 019 를 옛 원장에 얹는 길이다(빈 DB 에 한 번에 까는 길은 위 시험).
+func TestPGStepsUpgradeALedgerWithRows(t *testing.T) {
+	ctx := context.Background()
+	dsn := storetest.NewBare(t, "")
+	m, run := pgMigrator(t, dsn, MigrateOptions{Target: pg.BaselineVersion})
+	run.backup = failingBackup(t)
+	if err := m.migrateTo(ctx, run); err != nil {
+		t.Fatalf("기준선까지: %v", err)
+	}
+	s := pgOpen(t, dsn)
+	pgExec(t, s, `INSERT INTO event(at, project, kind) VALUES ('a', 'p', 'item.finish'), ('b', 'p', 'item.add')`)
+
+	m, run = pgMigrator(t, dsn, MigrateOptions{BackupDir: t.TempDir()})
+	var dumped []int
+	run.backup = func(_ context.Context, _ *migrateSession, from int) (string, error) {
+		dumped = append(dumped, from)
+		return "시험 덤프", nil
+	}
+	if err := m.migrateTo(ctx, run); err != nil {
+		t.Fatalf("증분 올리기: %v", err)
+	}
+	if v := pgVersion(t, s); v != SchemaVersion {
+		t.Fatalf("판 %d, 기대 %d", v, SchemaVersion)
+	}
+	if len(dumped) != 1 || dumped[0] != pg.BaselineVersion {
+		t.Fatalf("판올림 전 덤프가 %v 다(기대: 판 %d 에서 한 번)", dumped, pg.BaselineVersion)
+	}
+	if n := pgCount(t, s, `SELECT count(*) FROM pg_class WHERE relname = 'event_by_project_kind' AND relkind = 'i'
+		AND pg_get_userbyid(relowner) = ?`, pg.OwnerRole); n != 1 {
+		t.Fatalf("소유 역할(%s)의 event_by_project_kind 가 %d개다", pg.OwnerRole, n)
+	}
+	if n := pgCount(t, s, `SELECT count(*) FROM event WHERE project = 'p'`); n != 2 {
+		t.Fatalf("쌓인 이벤트가 %d 행이다(기대 2)", n)
 	}
 }
 
@@ -208,7 +250,7 @@ func TestPGLocaleGateRefusesEverywhere(t *testing.T) {
 	}
 
 	// 판이 맞게 손으로 깐 원장 - 판만 보면 뜰 수 있는 DB 다.
-	pgExec(t, s, pg.Fresh())
+	pgExec(t, s, pg.Latest())
 	stamp(t, s, SchemaVersion)
 	if _, err := OpenWithLogger(dsn, quietLog()); err == nil || !strings.Contains(err.Error(), "DB 로케일") {
 		t.Fatalf("기동이 로케일로 거절하지 않았다: %v", err)

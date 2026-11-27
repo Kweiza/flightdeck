@@ -137,6 +137,8 @@ func undoNonIdempotentMigrations(t *testing.T, exec func(string) (sql.Result, er
 		// 018 · session_inbox(표 + 인덱스). 014 와 같은 순서로 인덱스를 먼저 걷는다.
 		`DROP INDEX IF EXISTS session_inbox_socket`,
 		`DROP TABLE IF EXISTS session_inbox`,
+		// 019 · event_by_project_kind(인덱스 하나)
+		`DROP INDEX IF EXISTS event_by_project_kind`,
 		// 011 · item_dependents 를 **되살린다**(schema.sql 의 v1 정의 그대로).
 		`CREATE TABLE IF NOT EXISTS item_dependents (
   project TEXT NOT NULL,

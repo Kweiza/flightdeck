@@ -4,7 +4,9 @@
 //   - Bootstrap(bootstrap.sql): 초사용자가 DB 하나에 한 번 — 역할 둘, 스키마 public · DB 의 권한, pg_trgm,
 //     그리고 이미 있던 앱 역할이 행만 읽고 쓰는 역할인지 재기(아니면 멈춘다).
 //   - Baseline(001_baseline.sql): 소유 역할로 — 표 · 인덱스 · 추가 전용 트리거 · 앱 역할의 권한.
-//     SQLite 판 18 과 같은 뜻이고 판 번호도 18 이다(BaselineVersion). 다음 증분은 19 부터 PG 에만 쓴다.
+//     SQLite 판 18 과 같은 뜻이고 판 번호도 18 이다(BaselineVersion).
+//   - Steps(019_*.sql …): 기준선 위 증분. 소유 역할로 하나씩 돈다. SQLite 원장이 운영 원장인 동안은 SQLite 에 오르는
+//     증분을 같은 판 번호 · 같은 뜻으로 여기에도 싣는다(019 가 그 첫째다) - 두 판이 갈리면 store 의 시험이 빨갛다.
 //
 // ★ 판(schema_version 행)을 적는 것은 이 SQL 이 아니라 이전 실행기다 — SQLite 의 schema.sql 이 판 행을 안
 // 적고 실행기가 적는 것과 같다.
@@ -28,7 +30,10 @@
 // 패키지 안 시험이 storetest 를 부른다 — store 를 import 하면 순환이다.
 package pg
 
-import _ "embed"
+import (
+	_ "embed"
+	"strings"
+)
 
 // Bootstrap 은 기준선보다 먼저 초사용자가 돌리는 준비 SQL 이다. 몇 번 돌려도 같다.
 //
@@ -40,8 +45,23 @@ var Bootstrap string
 //go:embed 001_baseline.sql
 var Baseline string
 
-// BaselineVersion 은 Baseline 이 만드는 판이다. 접어 넣은 SQLite 의 마지막 판과 같다.
+// BaselineVersion 은 Baseline 이 만드는 판이다. 기준선이 접어 넣은 SQLite 판(18)과 같다.
 const BaselineVersion = 18
+
+//go:embed 019_event_by_project_kind.sql
+var stepEventByProjectKind string
+
+// Step 은 기준선 위 증분 하나다. 이전 실행기(store 의 pgMigrations)와 시험 원판(Latest)이 같은 목록을 싣는다.
+type Step struct {
+	To   int    // 적용 뒤의 판
+	Name string // 로그에 남길 이름
+	SQL  string // 소유 역할로 한 트랜잭션 안에서 돈다. 판 행은 적지 않는다(실행기의 몫)
+}
+
+// Steps 는 기준선 위에 순서대로 얹는 증분 전부다. 판 번호는 BaselineVersion 바로 위부터 빈칸 없이 오른다.
+var Steps = []Step{
+	{To: 19, Name: "event 를 (project, kind, id) 로 찾는다", SQL: stepEventByProjectKind},
+}
 
 // 역할 이름. SQL 파일이 이 이름을 그대로 쓴다.
 const (
@@ -52,8 +72,23 @@ const (
 )
 
 // Fresh 는 빈 DB 하나를 기준선까지 올리는 SQL 전부다 — 초사용자 연결 하나로 한 번에 돈다.
-// 준비는 초사용자로, 기준선은 소유 역할로 돈다(그래야 표의 주인이 소유 역할이다).
-// 시험 원판(storetest)이 이것을 그대로 싣는다.
+// 준비는 초사용자로, 기준선은 소유 역할로 돈다(그래야 표의 주인이 소유 역할이다). 이전 실행기의 기준선 단이 이것이다.
 func Fresh() string {
-	return Bootstrap + "\nSET ROLE " + OwnerRole + ";\n" + Baseline + "\nRESET ROLE;\n"
+	return prepared(Baseline)
+}
+
+// Latest 는 빈 DB 하나를 기준선과 그 위 증분 전부(Steps)까지 올리는 SQL 이다 — Fresh 처럼 초사용자 연결 하나로 돌고,
+// 증분도 소유 역할로 돈다. 판 행은 적지 않는다. 시험 원판(storetest)이 이것을 그대로 싣는다: 원판이 기준선에서 멈추면
+// 지금 판(SchemaVersion)을 적은 시험 DB 가 증분이 만든 것 없이 돈다.
+func Latest() string {
+	parts := []string{Baseline}
+	for _, s := range Steps {
+		parts = append(parts, s.SQL)
+	}
+	return prepared(parts...)
+}
+
+// prepared 는 준비(초사용자) 뒤에 parts 를 소유 역할로 차례로 돌리는 SQL 하나로 잇는다.
+func prepared(parts ...string) string {
+	return Bootstrap + "\nSET ROLE " + OwnerRole + ";\n" + strings.Join(parts, "\n") + "\nRESET ROLE;\n"
 }

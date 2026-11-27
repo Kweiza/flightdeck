@@ -14,18 +14,21 @@ import (
 // store 의 importsqlite.go 다. 거꾸로 옮기는 역이관(`fd migrate export-sqlite`)도 같은 표 목록 · 값 검사 · 행 지문을 쓰고,
 // 그쪽에만 있는 규칙은 export.go 다.
 //
-// ★ 표 목록(tables)은 SQLite 판 18 = 기준선 18 의 모양을 손으로 적은 것이다. 그 판은 더 안 바뀐다 - SQLite 쪽 증분은
-// 18 에서 멈췄고 이후 증분은 Postgres 에만 쓴다. 그래서 이관의 모양은 이 판 하나로 굳는다. 손으로 적은 목록이 두 엔진의
-// 살아 있는 카탈로그와 같은지는 import_test.go 가 잰다(칼럼 이름 · 순서 · 타입 · NOT NULL · 기본키 · identity).
+// ★ 표 목록(tables)은 이관 판(ImportVersion)의 표 · 칸을 손으로 적은 것이다. 이관은 그 판 하나만 안다 - 두 원장이 같은
+// 판이어야 받는다. 판 18 위의 증분(019 인덱스)은 표 · 칸을 안 바꿨으므로 목록은 기준선 18 의 것 그대로다. 표나 칸을 바꾸는
+// 증분이 두 엔진에 함께 오르면 이 목록도 같이 고친다. 손으로 적은 목록이 두 엔진의 살아 있는 카탈로그와 같은지는
+// import_test.go 가 잰다(칼럼 이름 · 순서 · 타입 · NOT NULL · 기본키 · identity).
 //
 // ★ 옮기지 않는 것은 LeftBehind 다. 그 밖의 표는 전부 옮긴다 - idempotency 도다(재기동 너머로 판단 · 발번 · 항목
 // 만들기 · 종료를 한 번만 처리하려는 기록이라, 버리면 전환 직전 응답을 잃은 기기의 아웃박스 재전송이 판단을 두 건
 // 만든다). 만료된 행도 옮긴다 - 만료는 서버의 보존 기한(설정값)이 정하는 것이라 이관이 시계를 보고 거를 자리가 아니고,
 // 서버가 다음 기록 때 그 기한으로 청소한다.
 
-// ImportVersion 은 이관이 읽는 SQLite 원장의 판이다. SQLite 의 마지막 판이고 기준선이 그 판을 접어 넣었다 - 대상
-// Postgres 원장도 이 판이어야 받는다. 더 낮은 원장은 먼저 그 판을 아는 fd 로 올려야 한다(이 명령은 옛 증분을 갖지 않는다).
-const ImportVersion = BaselineVersion
+// ImportVersion 은 이관 · 역이관 · 대조가 받는 판이다. 두 엔진이 함께 오른 마지막 판이다(SQLite 의 마지막 판 = 기준선과
+// 그 위 Steps 가 같은 뜻으로 닿는 판) - 원본 SQLite 와 대상 Postgres 가 둘 다 이 판이어야 받는다. 더 낮은 원장은 먼저 이
+// 판을 아는 fd 로 올린다(이 명령은 증분을 스스로 적용하지 않는다). 빈 Postgres 원장은 `fd migrate --to ImportVersion` 이
+// 이 판까지만 깐다. 이 수가 store.SchemaVersion 과 같은지는 import_test.go 가 잰다.
+const ImportVersion = 19
 
 // Kind 는 칸이 기준선에서 갖는 타입이다. SQLite 는 칸 타입을 강제하지 않으므로 읽은 값이 이 타입으로 옮겨지는지를
 // 사전 검사가 잰다(Cell).
@@ -98,7 +101,7 @@ func LeftBehind(name string) bool {
 
 // leftBehind 는 옮기지 않는 표를 이름 그대로 적은 것이다. judgment_fts 는 외부 내용 FTS5 표(content='judgment')라 그림자
 // 표가 넷이다(_content 가 없다). 접두어로 거르면 그 이름으로 시작하는 다른 표(손으로 만든 표 · 다음 판의 표)를 말없이 버린다.
-// 이 목록이 판 18 원본의 실제 표와 같은지는 import_test.go 가 잰다.
+// 이 목록이 이관 판 원본의 실제 표와 같은지는 import_test.go 가 잰다.
 var leftBehind = map[string]bool{
 	"schema_version":       true,
 	"judgment_fts":         true,

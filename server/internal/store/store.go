@@ -88,9 +88,13 @@ var migrationItemRevisionFollowsMove string
 //go:embed migrations/018_session_inbox.sql
 var migrationSessionInbox string
 
-// SchemaVersion 은 **이 바이너리가 아는** 스키마 버전이다.
+//go:embed migrations/019_event_by_project_kind.sql
+var migrationEventByProjectKind string
+
+// SchemaVersion 은 **이 바이너리가 아는** 스키마 버전이다. 두 엔진이 같은 수를 쓴다(SQLite 는 migrations, Postgres 는
+// 기준선 위 pgMigrations 로 닿는다).
 // DB 가 이보다 높으면 연다는 것 자체가 조용히 망가지는 경로이므로 거절한다.
-const SchemaVersion = 18
+const SchemaVersion = 19
 
 // BaseSchemaVersion 은 schema.sql 하나가 만드는 버전이다.
 //
@@ -133,6 +137,7 @@ var migrations = []Migration{
 	{To: 16, Name: "항목 본문의 개정 이력 표를 만든다", SQL: migrationItemRevision},
 	{To: 17, Name: "개정 이력이 항목을 따라 옮겨 간다", SQL: migrationItemRevisionFollowsMove},
 	{To: 18, Name: "세션이 받는 곳(inbox 소켓)을 싣는다", SQL: migrationSessionInbox},
+	{To: 19, Name: "event 를 (project, kind, id) 로 찾는다", SQL: migrationEventByProjectKind},
 }
 
 // pgBaseline 은 빈 Postgres DB 에 까는 기준선 단이다. 준비(초사용자) · 기준선(소유 역할) · 판 행이 한 트랜잭션이다 -
@@ -140,9 +145,19 @@ var migrations = []Migration{
 // 기준선이 SQLite 18판을 접어 넣은 것이다(pg/schema.go).
 var pgBaseline = Migration{To: pg.BaselineVersion, Name: "Postgres 기준선(준비 · 표 · 권한)", SQL: pg.Fresh(), base: true}
 
-// pgMigrations 는 Postgres 기준선 위에 순서대로 얹는 증분이다. 다음 판(19)부터 Postgres 에만 쓴다(pg/schema.go).
-// 한 단이 한 트랜잭션이고 소유 역할로 돈다(engine.stepRole).
-var pgMigrations []Migration
+// pgMigrations 는 Postgres 기준선 위에 순서대로 얹는 증분이다. 목록의 정본은 pg.Steps 다 - 시험 원판(storetest)이 같은
+// 목록을 싣는다(store 를 import 못 하므로 목록이 pg 에 산다). 한 단이 한 트랜잭션이고 소유 역할로 돈다(engine.stepRole).
+// SQLite 에 오르는 증분은 같은 판 번호로 여기에도 실린다(pg/schema.go 머리말, schema_table_count_test.go 가 잰다).
+var pgMigrations = pgStepMigrations(pg.Steps)
+
+// pgStepMigrations 는 pg 의 증분 목록을 이전 실행기의 단으로 옮긴다. 순수 함수다.
+func pgStepMigrations(steps []pg.Step) []Migration {
+	out := make([]Migration, 0, len(steps))
+	for _, st := range steps {
+		out = append(out, Migration{To: st.To, Name: st.Name, SQL: st.SQL})
+	}
+	return out
+}
 
 // timeLayout 은 저장용 시각 표기다.
 //

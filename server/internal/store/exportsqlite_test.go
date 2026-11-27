@@ -7,6 +7,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"maps"
 	"net/url"
@@ -312,7 +313,7 @@ func TestExportSQLiteRefusesAnExistingTarget(t *testing.T) {
 	}
 }
 
-// 옮길 수 없는 원본은 파일을 남기지 않고 거절한다: Postgres 가 아닌 원본, 빈 DB, 판 18 이 아닌 원장, 그리고 이관의 사전 검사가
+// 옮길 수 없는 원본은 파일을 남기지 않고 거절한다: Postgres 가 아닌 원본, 빈 DB, 이관 판이 아닌 원장, 그리고 이관의 사전 검사가
 // 받지 않을 값(깨진 JSON)이 든 원장 - 낸 파일을 다시 이관할 수 없게 되므로 역이관도 받지 않는다.
 func TestExportSQLiteRefusesASourceItCannotMove(t *testing.T) {
 	ctx := context.Background()
@@ -325,7 +326,7 @@ func TestExportSQLiteRefusesASourceItCannotMove(t *testing.T) {
 	}{
 		{"SQLite 원본", importSource(t, importSeed), "Postgres 접속 URL"},
 		{"빈 DB", storetest.NewBare(t, ""), "빈 DB"},
-		{"판 19", newer, "판 18 이 아니다"},
+		{"판이 오른 원장", newer, fmt.Sprintf("판 %d 이 아니다", pg.ImportVersion)},
 		{"깨진 JSON", broken, "사전 검사"},
 	} {
 		for _, dry := range []bool{true, false} {
@@ -381,11 +382,12 @@ func TestExportSQLiteDoesNotCommitAMismatch(t *testing.T) {
 }
 
 // 원본의 판 · 모양은 옮기는 스냅숏 안에서 잰다: 연 뒤에 판이 오르거나 표 · 칸이 붙은 원본은 예행 · 본 실행 모두 거절하고
-// 임시 원장에 아무것도 넣지 않는다. 열 때 쟀다면 연 때의 판 18 로 지나 붙은 칸을 버리고 옮긴다.
+// 임시 원장에 아무것도 넣지 않는다. 열 때 쟀다면 연 때의 이관 판으로 지나 붙은 칸을 버리고 옮긴다.
 func TestExportSQLiteMeasuresTheSourceInTheCopySnapshot(t *testing.T) {
 	ctx := context.Background()
 	for _, c := range []struct{ name, change, want string }{
-		{"판이 오른 원본", `INSERT INTO schema_version(version, applied_at) VALUES (19, 'x')`, "판 18 이 아니다"},
+		{"판이 오른 원본", fmt.Sprintf(`INSERT INTO schema_version(version, applied_at) VALUES (%d, 'x')`, pg.ImportVersion+1),
+			fmt.Sprintf("판 %d 이 아니다", pg.ImportVersion)},
 		{"칸이 붙은 원본", `ALTER TABLE item ADD COLUMN t_extra text`, "item 의 칸"},
 		{"표가 붙은 원본", `CREATE TABLE t_extra(id bigint)`, "모르는 표 t_extra"},
 	} {

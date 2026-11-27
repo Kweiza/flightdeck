@@ -1,8 +1,9 @@
 -- flightdeck Postgres 기준선 스키마 — SQLite 판 18 과 같은 뜻
 --
 -- ★ 무엇: SQLite 의 store/schema.sql(판 1) 위에 증분 002~018 을 다 얹은 모양을 이 한 파일로 접었다.
---   이 파일이 만드는 판은 18 이다(pg.BaselineVersion). 이 뒤의 증분은 PG 에만 쓰고 19 부터 센다.
---   SQLite 쪽에 증분이 더 오르면 이 파일과 뜻이 갈린다 — store 의 시험이 그 자리에서 빨개진다.
+--   이 파일이 만드는 판은 18 이다(pg.BaselineVersion). 이 파일은 그 판에서 얼린다 - 그 위는 pg.Steps 의 증분(019 부터)이
+--   얹고, 옮기는 동안은 SQLite 증분과 같은 뜻 · 같은 판 번호다. SQLite 쪽에 증분이 오르고 PG 짝이 없으면 store 의
+--   시험(TestPGStepsFollowTheSQLiteVersion)이 그 자리에서 빨개진다.
 --
 -- ★ 어떻게 도나: 준비(bootstrap.sql, 초사용자)를 마친 빈 DB 에서 **소유 역할(fd_owner)로** 돈다.
 --   표 · 함수 · 트리거의 주인이 소유 역할이어야 앱 역할(fd_app)이 맨 끝의 GRANT 만 받는다.

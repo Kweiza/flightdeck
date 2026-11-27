@@ -347,7 +347,7 @@ nodump() { if ! dumps=$(docker ps --filter label=com.docker.compose.service=db-b
 SQLite 판에서 쌓은 원장을 들고 Postgres 원장으로 넘어가는 절차다. 옮기는 동안 서버는 내려가 있다. 옮긴 뒤 72시간은
 Postgres 에 쌓인 것까지 들고 SQLite 로 되돌릴 수 있다(아래 「72시간 안에 되돌리기」).
 
-**원장이 판 18 이어야 한다.** 이관은 마지막 SQLite 판(18)만 받는다. 더 옛 판이면 이 판의 기본 경로로 먼저 판을 올린다 -
+**원장이 이관 판(19)이어야 한다.** 이관은 마지막 SQLite 판(19)만 받는다. 더 옛 판이면 이 판의 기본 경로로 먼저 판을 올린다 -
 아래 3 이 그것이다.
 
 **0 은 준비, 1 은 이 셸에 값을 읽고, 2-8 은 덩이 하나다.** 0 은 「Postgres 로 띄우기」의 준비 1-5(볼륨 · 자리 · pgpass · 꺼 둔
@@ -380,16 +380,16 @@ fdwhere
       names=$(docker ps -a --format '{{.Names}}')
       if printf '%s\n' "$names" | grep -qx flightdeck; then echo '서버 컨테이너(flightdeck)가 남았다 - 그 프로젝트에서 내린 뒤 다시 돈다' >&2; exit 1; fi
       echo "2 끝: 내렸다"
-      : '3. 이 판의 이미지를 짓고 SQLite 원장을 이 판으로 올린다(이미 18 이면 아무것도 안 한다). selfcheck 가 ok 를 내야 한다.'
+      : '3. 이 판의 이미지를 짓고 SQLite 원장을 이 판으로 올린다(이미 19 면 아무것도 안 한다). selfcheck 가 ok 를 내야 한다.'
       fdc build
       fdc run --rm --no-deps migrate migrate --db /data/fd.db
       fdc run --rm --no-deps migrate selfcheck --db /data/fd.db
       echo "3 끝: SQLite 원장이 이 판이다"
-      : '4. 꺼 둔 선택 파일로 Postgres 겹의 이미지를 짓고 기준선만 깐다(판 18 에서 멈춘다). db 가 같이 뜬다.'
+      : '4. 꺼 둔 선택 파일로 Postgres 겹의 이미지를 짓고 이관 판까지만 깐다(기준선과 그 위 증분 - 판 19 에서 멈춘다). db 가 같이 뜬다.'
       export FDC_ENV="$off"; [ -f "$FDC_ENV" ]
       fdc build
-      fdc run --rm migrate migrate --to 18
-      echo "4 끝: 기준선을 깔았다"
+      fdc run --rm migrate migrate --to 19
+      echo "4 끝: 이관 판까지 깔았다"
       : '5. 예행 → 옮기기. 옮기기가 커밋한 뒤 원본 옆에 이관 표지(fd.db.moved-to-postgres)를 남긴다. 표지가 없으면 선다.'
       if ! fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db --dry-run; then
         echo '5 의 예행이 섰다 - 「대상이 비어 있지 않다」면 앞 실행이 커밋했을 수 있다(표지 없이 끊겼다): 다시 옮기지 말고 「켜기 전에 섰을 때」의 가 로 잰다' >&2; exit 1
@@ -554,10 +554,11 @@ SQLite 판올림 · selfcheck 가 섰다) 이 판으로는 SQLite 판도 못 뜰
 
 #### 72시간 안에 되돌리기
 
-옮긴 뒤 72시간을 되돌리기 창으로 둔다. `export-sqlite` 가 Postgres 원장을 판 18 의 **새** SQLite 파일로 옮기므로, 옮긴 뒤
-Postgres 에 쌓인 항목 · 선점 · 판단도 같이 돌아온다. 이 창 동안은 Postgres 스키마를 18 위로 올리는 flightdeck 판으로
-갱신하지 않는다 - `export-sqlite` 는 판 18 의 원장만 받는다. **선택 파일을 켠 배포만** 이 길로 되돌린다 - 켜기 전에 선
-업그레이드는 위 「켜기 전에 섰을 때」다. 업그레이드처럼 1 은 이 셸에 값을 읽고(`fdwhere` - 5 가 서버를 내린 뒤에는 못 읽으므로
+옮긴 뒤 72시간을 되돌리기 창으로 둔다. `export-sqlite` 가 Postgres 원장을 이관 판(19)의 **새** SQLite 파일로 옮기므로, 옮긴 뒤
+Postgres 에 쌓인 항목 · 선점 · 판단도 같이 돌아온다. 이 창 동안은 Postgres 스키마를 SQLite 의 마지막 판 위로 올리는 flightdeck
+판으로 갱신하지 않는다 - `export-sqlite` 는 자기 이관 판의 원장만 받는다. 판 18 에서 옮긴 뒤 창 안에 이 판으로 올렸으면
+Postgres 원장도 19 로 오르고, 되돌리기는 이 판의 `export-sqlite` 로 한다(옛 판의 것은 19 를 거절한다). **선택 파일을 켠
+배포만** 이 길로 되돌린다 - 켜기 전에 선 업그레이드는 위 「켜기 전에 섰을 때」다. 업그레이드처럼 1 은 이 셸에 값을 읽고(`fdwhere` - 5 가 서버를 내린 뒤에는 못 읽으므로
 끝 두 줄이 새 셸에서 다시 줄 값이다) 2-7 은 덩이 하나다(첫 실패에서 덩이째 선다). 덩이의 compose 명령은 모두 1 이 읽은 자리 ·
 프로젝트로 돈다 - 다른 판의 디렉토리에서 돌린 `stop` · `down` 은 다른 프로젝트를 재고 아무것도 안 멈춘다.
 
@@ -703,7 +704,7 @@ fdc stop flightdeck db-backup && nodump && echo "내렸다"
 compose 배포는 위 「업그레이드: SQLite 원장을 Postgres 로」의 절차로 옮긴다. 이 절은 명령 자체의 동작과 거절 갈래이고,
 아래 `<URL>` 은 초사용자나 `fd_owner` 의 구성원으로 붙는 접속 URL 이다(compose 의 `migrate` 서비스에서는 `FD_DB` 가 그것이라 `--db` 를 뺀다).
 
-`fd migrate import-sqlite` 는 마지막 SQLite 판(18)의 원장을 **빈** Postgres 원장으로 트랜잭션 하나에 옮긴다. 옮긴 뒤 같은
+`fd migrate import-sqlite` 는 마지막 SQLite 판(19)의 원장을 **빈** Postgres 원장으로 트랜잭션 하나에 옮긴다. 옮긴 뒤 같은
 트랜잭션 안에서 두 원장을 맞대고, 어긋나면 커밋하지 않는다. `fd migrate verify` 는 그 대조만 다시 한다(쓰지 않는다).
 대조는 표마다 행 수 · 전 칸 지문과 identity 순번(다음 번호가 원본에서 발급된 최고 번호보다 크다)이고, 어긋난 행은
 기본키로 적는다. 종료 코드는 0 = 옮겼다 · 맞다, 1 = 거절 · 어긋남 · 실패, 2 = 사용법이다.
@@ -712,8 +713,8 @@ compose 배포는 위 「업그레이드: SQLite 원장을 Postgres 로」의 �
 : '1. 원본에 쓰는 서버를 내린다. 원장 파일을 그대로 --from 에 주거나, 사본을 남기려면 VACUUM INTO 로 뜬다.
    cp 로 복사하지 않는다(아래).'
 sqlite3 fd.db "VACUUM INTO 'fd-copy.db'"
-: '2. 대상 DB 에 기준선을 깐다. 이관 판(18)에서 멈춘다.'
-fd migrate --db <URL> --to 18
+: '2. 대상 DB 에 이관 판까지 깐다(기준선과 그 위 증분). 판 19 에서 멈춘다.'
+fd migrate --db <URL> --to 19
 : '3. 예행: 본 실행과 같은 트랜잭션을 끝까지 돌고 커밋 대신 되감는다. 아무것도 남지 않는다.'
 fd migrate import-sqlite --from fd-copy.db --db <URL> --dry-run
 : '4. 옮긴다. 성공하면 대조표와 함께 「옮겼다: N 행, 대조가 맞았다」를 낸다.'
@@ -730,9 +731,9 @@ fd migrate verify --from fd-copy.db --db <URL>
 - 접속 계정은 초사용자나 `fd_owner` 의 멤버여야 한다. 시퀀스를 원본의 최고 번호 위로 다시 시작하는데(지워진 최고 번호도
   다시 내지 않는다), 이것은 소유 역할만 한다. 앱 역할로 붙으면 예행도 본 실행과 같이 거절한다.
 - `fd migrate verify` 도 같은 계정으로 돌린다. 앱 역할은 identity 시퀀스를 읽을 권한(SELECT)이 없어 순번을 대조하지 못한다.
-- 원본이 판 18 보다 옛 판이면 거절한다. 먼저 이 판의 fd 로 사본을 판올림한다(`fd migrate --db <사본>`).
-- 원본의 표 · 칸이 판 18 과 다르면(손으로 고친 원장) 거절한다.
-- 대상의 업무 표에 한 행이라도 있거나, identity 시퀀스가 한 번이라도 번호를 냈으면(행을 지웠어도) 거절한다. 판이 18 이
+- 원본이 판 19 보다 옛 판이면 거절한다. 먼저 이 판의 fd 로 사본을 판올림한다(`fd migrate --db <사본>`).
+- 원본의 표 · 칸이 판 19 와 다르면(손으로 고친 원장) 거절한다.
+- 대상의 업무 표에 한 행이라도 있거나, identity 시퀀스가 한 번이라도 번호를 냈으면(행을 지웠어도) 거절한다. 판이 19 가
   아니거나 로케일 관문을 못 지나도 거절한다.
 - 대상 DB 에 이 실행 말고 붙은 연결(서버 · psql 등)이 있으면 예행 · 본 실행 모두 거절하고, 남은 연결의 pid · 역할 ·
   application_name 을 적는다. 붙은 서버의 쓰기 일부(관측 기록)는 실행기 잠금을 타지 않아 옮기는 트랜잭션에 끼어든다.
@@ -747,7 +748,7 @@ fd migrate verify --from fd-copy.db --db <URL>
 compose 배포는 위 「72시간 안에 되돌리기」의 절차로 되돌린다(선택 파일을 켜기 전이면 「켜기 전에 섰을 때」). 이 절은 명령
 자체의 동작과 거절 갈래다.
 
-`fd migrate export-sqlite` 는 이관의 역이다. 판 18 의 Postgres 원장을 **새** SQLite 파일(판 18)로 옮긴다 - 이관한 뒤 Postgres
+`fd migrate export-sqlite` 는 이관의 역이다. 판 19 의 Postgres 원장을 **새** SQLite 파일(판 19)로 옮긴다 - 이관한 뒤 Postgres
 에 쌓인 항목 · 선점 · 이벤트 · 판단을 들고 SQLite 판으로 돌아가는 길이다. 이관과 같은 트랜잭션 · 같은 대조(행 수 · 전 칸 지문 ·
 순번)를 돌고, 대상 옆 임시 파일에 쓴 뒤 대조가 맞아야 `--to` 이름을 붙인다. 어긋나거나 실패하면(예행은 늘) 아무 파일도 남지
 않는다. 종료 코드는 이관과 같다.
@@ -769,7 +770,7 @@ fd migrate verify --from fd-back.db --db <URL>
 
 - `--to` 자리에 파일이 있거나 그 옆에 `-wal` · `-shm` · `-journal` 이 있으면 거절한다. 덮지 않고, 남은 `-wal` 이 새 파일에
   되살아나지 않게 한다.
-- 원본은 판 18 이어야 한다. 그 뒤 판으로 올린 Postgres 원장은 SQLite 판에 자리가 없어 거절한다. 표 · 칸이 판 18 과 다른
+- 원본은 판 19 여야 한다. 그 뒤 판으로 올린 Postgres 원장은 SQLite 판에 자리가 없어 거절한다. 표 · 칸이 판 19 와 다른
   원장(손으로 고친 원장)도 거절한다. 판과 모양은 옮기는 스냅숏 안에서 잰다. 접속 계정은 이관과 같다(초사용자나 `fd_owner` 의
   멤버 - 시퀀스를 읽는다).
 - 이관의 사전 검사가 받지 않을 값(깨진 JSON 등)이 원본에 있으면 거절한다 - 낸 파일을 다시 이관할 수 없게 되기 때문이다.

@@ -20,7 +20,7 @@ import (
 
 // 손으로 적은 이관 카탈로그가 두 엔진의 살아 있는 카탈로그와 같다: 표 목록(옮기지 않는 것을 뺀), 칸 이름 · 순서 · 타입 ·
 // NOT NULL · 행 좌표 칸(SQLite 기본키) · identity · AUTOINCREMENT, 그리고 FK 순서(부모가 먼저). 옮기지 않는 표의 이름
-// 목록(LeftBehindNames)도 판 18 원본에 실제로 있는 표다.
+// 목록(LeftBehindNames)도 이관 판 원본에 실제로 있는 표다.
 func TestImportCatalogMatchesBothEngines(t *testing.T) {
 	if pg.ImportVersion != store.SchemaVersion {
 		t.Fatalf("이관 판 %d 이 SQLite 의 마지막 판 %d 과 다르다 - SQLite 판이 오르면 카탈로그를 그 판으로 다시 적어야 한다",
