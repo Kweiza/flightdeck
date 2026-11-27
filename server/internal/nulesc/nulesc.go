@@ -1,14 +1,15 @@
 // Package nulesc 는 Postgres text 가 못 담는 NUL(U+0000)을 되돌릴 수 있는 `\x00` 표기로 옮기는 규칙이다: 글 하나에 거는 Escape 와,
-// JSON 문서 안에서 U+0000 이 든 글 값 토큰만 원문 바이트에서 고치는 EscapeJSON, 그리고 서버가 받는 입력 값의 자리마다 그 둘을
-// 거는 Input · Fields(input.go).
+// JSON 문서 안에서 U+0000 이 든 글 값 토큰만 원문 바이트에서 고치는 EscapeJSON, 그리고 서버가 받는 입력에서 원장에 닿기 전에
+// 흔적이 사라질 글을 거절하는 Input · Fields(input.go).
 //
 // ★ 바꿔 넣기는 자유 글에만 건다. 식별자(이름으로 다른 것을 가리키는 글 - JSON 객체의 키가 그 하나다)의 NUL 은 바꾸지 않고
 // 거절한다: 바꾼 이름이 원래 `\x00` 네 글자를 담은 다른 이름과 같아지면 이름 공간에서 두 값이 하나가 된다. 원장의 식별자 칸은
 // 이관 카탈로그(store/pg 의 Column.Identifier)가 가르고, JSON 키는 EscapeJSON 이 ErrKeyNUL 로 거절한다.
 //
-// ★ 표준 라이브러리만 쓴다. SQLite 원장을 Postgres 로 옮기는 이관(store/pg 의 Cell)과 서버의 쓰기 길(api 의 요청 풀기 · web 의
-// 폼 읽기가 부르는 Input · Fields)이 같은 함수를 쓰도록 이관 카탈로그(store/pg)와 떼어 둔다. 이관은 칸 카탈로그로, 쓰기 길은 입력
-// 값의 표지(`nul:"text"`)로 자유 글과 이름을 가른다.
+// ★ 표준 라이브러리만 쓴다. 바꿔 넣기는 이관 카탈로그(store/pg)의 칸 규칙(pg.Cell)이 이 함수들로 하고, 그 규칙을 SQLite 원장을
+// Postgres 로 옮기는 이관과 서버의 쓰기 길(store 의 원장 칸 관문 - 업무 쓰기 문장마다 건다)이 함께 쓴다. 입력(api 의 요청 풀기 ·
+// web 의 폼 읽기 · mcpsrv 의 도구 인자)은 바꾸지 않고 거절만 한다(Input · Fields · CheckDoc · CheckName) - 자유 글과 이름은 입력
+// 값의 표지(`nul:"text"`)로 가른다.
 package nulesc
 
 import (
@@ -60,6 +61,40 @@ func Escape(s string) string {
 			b.WriteByte(s[i])
 			i++
 		}
+	}
+	return b.String()
+}
+
+// Unescape 는 Escape 의 역이다(README 「SQLite 원장을 Postgres 로 옮기기」의 되돌리는 규칙): 「x00」 바로 앞의 백슬래시 묶음이
+// 홀수 개(2k+1)면 k 개 백슬래시 + NUL, 짝수 개(2k)면 k 개 백슬래시 + 「x00」. 그 밖의 바이트는 그대로다.
+//
+// ★ 바뀐 글에만 건다 - 바뀌지 않은 글(NUL 이 없던 글)에 원래 있던 `\x00` 네 글자도 NUL 로 읽는다(Escape 의 ★ 되돌리는 단위).
+// 서버는 이것을 부르지 않는다: 원장의 글은 원장의 꼴 그대로 읽고 비교한다(Text). 되돌림 규칙을 시험이 한 벌로 잴 수 있게 둔다.
+func Unescape(e string) string {
+	var b strings.Builder
+	for i := 0; i < len(e); {
+		if e[i] != '\\' {
+			b.WriteByte(e[i])
+			i++
+			continue
+		}
+		j := i
+		for j < len(e) && e[j] == '\\' {
+			j++
+		}
+		n := j - i
+		if !strings.HasPrefix(e[j:], mark) {
+			b.WriteString(e[i:j])
+			i = j
+			continue
+		}
+		b.WriteString(strings.Repeat(`\`, n/2))
+		if n%2 == 1 {
+			b.WriteByte(0)
+		} else {
+			b.WriteString(mark)
+		}
+		i = j + 3
 	}
 	return b.String()
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"log/slog"
 	"net"
 	"os"
@@ -724,6 +725,10 @@ type txConn struct {
 	// 거절한다 - 바깥 트랜잭션이 사라진 SQLite 연결은 뒤 문장을 자동 커밋으로 돌리므로, 부른 쪽이 그 오류를
 	// 흡수하고 이어 가도 아무것도 쓰이지 않게 여기서 막는다. 롤백은 막지 않는다.
 	broken error
+
+	// cells 는 원장 칸 관문이다(cellgate.go). 업무 쓰기 트랜잭션(runTx)만 단다 - 차 있으면 INSERT · UPDATE 의 칸 값 인자에
+	// 이관과 같은 칸 규칙을 걸고, 거절이면 문장을 보내지 않고 트랜잭션을 망가진 것으로 표시한다.
+	cells *cellGate
 }
 
 // poison 은 이 트랜잭션을 망가진 것으로 표시한다. 처음 까닭만 남긴다.
@@ -734,17 +739,33 @@ func (t *txConn) poison(err error) {
 }
 
 func (t *txConn) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
-	if t.broken != nil {
-		return nil, t.broken
+	args, err := t.ready(q, args)
+	if err != nil {
+		return nil, err
 	}
 	return t.eng.exec(ctx, t.raw, q, args)
 }
 
+// QueryContext 도 관문을 지난다 - 쓰기 문장이 행을 돌려받는 자리(INSERT … RETURNING, insertUnlessTaken)가 이리로 온다.
 func (t *txConn) QueryContext(ctx context.Context, q string, args ...any) (*rowSet, error) {
+	args, err := t.ready(q, args)
+	if err != nil {
+		return nil, err
+	}
+	return t.eng.query(ctx, t.raw, q, args)
+}
+
+// ready 는 문장을 보내기 전의 몫이다: 망가진 트랜잭션이면 그 까닭이고, 원장 칸 관문이 거절하면 트랜잭션을 망가뜨리고 그 거절이다.
+func (t *txConn) ready(q string, args []any) ([]any, error) {
 	if t.broken != nil {
 		return nil, t.broken
 	}
-	return t.eng.query(ctx, t.raw, q, args)
+	args, err := t.cells.args(q, args)
+	if err != nil {
+		t.poison(err)
+		return nil, err
+	}
+	return args, nil
 }
 
 func (t *txConn) QueryRowContext(ctx context.Context, q string, args ...any) *row {
@@ -818,51 +839,95 @@ func bindDollar(q string) (string, error) {
 }
 
 // placeholders 는 q 에서 자리표시 `?` 의 바이트 위치와, 따옴표 · 주석 밖에 위치 매개변수(`$1` 꼴)가 있는가를 낸다.
-// 순수 함수다.
+// 순수 함수다. 낱말 나누기는 lexSQL 이다(원장 칸 관문의 문장 꼴 읽기 - cellgate.go 의 shapeOf - 와 한 벌이다).
+func placeholders(q string) (marks []int, positional bool) {
+	for t := range lexSQL(q) {
+		switch t.kind {
+		case tokMark:
+			marks = append(marks, t.at)
+		case tokPos:
+			positional = true
+		}
+	}
+	return marks, positional
+}
+
+// tokKind 는 lexSQL 이 낸 낱말의 갈래다.
+type tokKind uint8
+
+const (
+	tokPunct tokKind = iota // 그 밖의 한 바이트(괄호 · 쉼표 · 연산자)
+	tokWord                 // 이름 · 키워드 · 수(isIdentByte 의 묶음)
+	tokMark                 // 자리표시 `?`
+	tokPos                  // 위치 매개변수(`$1` 꼴)의 `$`
+	tokLit                  // 따옴표 글 · 큰따옴표 식별자 · 달러 따옴표
+)
+
+// sqlTok 은 낱말 하나다: q[at:end].
+type sqlTok struct {
+	kind    tokKind
+	at, end int
+}
+
+// lexSQL 은 q 를 낱말로 나눠 앞에서부터 낸다. 공백 · 주석은 건너뛴다. 순수 함수다.
 //
 // 자리표시가 아닌 `?`: 작은따옴표 문자열(E'…' 의 역슬래시 이스케이프 포함) · 큰따옴표 식별자 ·
 // 달러 따옴표($$…$$, $tag$…$tag$) · 줄 주석(--) · 블록 주석(/* */, PG 처럼 겹칠 수 있다) 안의 것.
 // 닫히지 않은 따옴표 · 주석은 끝까지 그 안으로 본다 - 문장 오류는 DB 가 낸다.
-func placeholders(q string) (marks []int, positional bool) {
-	n := len(q)
-	for i := 0; i < n; {
-		c := q[i]
-		switch {
-		case c == '\'':
-			esc := i > 0 && (q[i-1] == 'E' || q[i-1] == 'e') && (i < 2 || !isIdentByte(q[i-2]))
-			i = skipQuoted(q, i, '\'', esc)
-		case c == '"':
-			i = skipQuoted(q, i, '"', false)
-		case c == '-' && i+1 < n && q[i+1] == '-':
-			if j := strings.IndexByte(q[i:], '\n'); j >= 0 {
-				i += j + 1
-			} else {
-				i = n
-			}
-		case c == '/' && i+1 < n && q[i+1] == '*':
-			i = skipBlockComment(q, i)
-		case c == '$' && (i == 0 || !isIdentByte(q[i-1])):
-			tag, ok := dollarTag(q, i)
-			if !ok {
-				if i+1 < n && q[i+1] >= '0' && q[i+1] <= '9' {
-					positional = true
+func lexSQL(q string) iter.Seq[sqlTok] {
+	return func(yield func(sqlTok) bool) {
+		n := len(q)
+		for i := 0; i < n; {
+			c, at, kind := q[i], i, tokPunct
+			switch {
+			case c == '\'':
+				esc := i > 0 && (q[i-1] == 'E' || q[i-1] == 'e') && (i < 2 || !isIdentByte(q[i-2]))
+				i, kind = skipQuoted(q, i, '\'', esc), tokLit
+			case c == '"':
+				i, kind = skipQuoted(q, i, '"', false), tokLit
+			case c == '-' && i+1 < n && q[i+1] == '-':
+				if j := strings.IndexByte(q[i:], '\n'); j >= 0 {
+					i += j + 1
+				} else {
+					i = n
 				}
+				continue
+			case c == '/' && i+1 < n && q[i+1] == '*':
+				i = skipBlockComment(q, i)
+				continue
+			case c == '$' && (i == 0 || !isIdentByte(q[i-1])):
+				tag, ok := dollarTag(q, i)
+				if !ok {
+					if i+1 < n && q[i+1] >= '0' && q[i+1] <= '9' {
+						kind = tokPos
+					}
+					i++
+					break
+				}
+				if j := strings.Index(q[i+len(tag):], tag); j >= 0 {
+					i += 2*len(tag) + j
+				} else {
+					i = n
+				}
+				kind = tokLit
+			case c == '?':
+				i, kind = i+1, tokMark
+			case isIdentByte(c):
+				for i < n && isIdentByte(q[i]) {
+					i++
+				}
+				kind = tokWord
+			case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
 				i++
 				continue
+			default:
+				i++
 			}
-			if j := strings.Index(q[i+len(tag):], tag); j >= 0 {
-				i += 2*len(tag) + j
-			} else {
-				i = n
+			if !yield(sqlTok{kind: kind, at: at, end: i}) {
+				return
 			}
-		case c == '?':
-			marks = append(marks, i)
-			i++
-		default:
-			i++
 		}
 	}
-	return marks, positional
 }
 
 // skipQuoted 는 q[i] 의 따옴표로 연 것이 닫힌 바로 뒤 위치를 낸다. 따옴표 두 개는 그 글자 하나다.

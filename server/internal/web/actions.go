@@ -44,7 +44,7 @@ const reasonMin = 4
 // 원장의 이 자리가 무엇을 담는 자리인지 흐려지지 않는다.
 const reasonMax = 2000
 
-// ActionInput 은 폼에서 온 것 전부다. 사유만 자유 글이다(`nul:"text"` - acceptNUL).
+// ActionInput 은 폼에서 온 것 전부다. 사유만 자유 글이다(`nul:"text"` - checkInput).
 type ActionInput struct {
 	Kind    ActionKind
 	Project string
@@ -320,7 +320,7 @@ func (h *handler) formInput(w http.ResponseWriter, r *http.Request, kind ActionK
 		Item:    strings.TrimSpace(r.PostFormValue("item")),
 		Reason:  strings.TrimSpace(r.PostFormValue("reason")),
 	}
-	if !h.acceptNUL(w, r, "POST /actions/"+string(kind), &in) {
+	if !h.checkInput(w, r, "POST /actions/"+string(kind), &in) {
 		return ActionInput{}, false
 	}
 	if v := JudgeAction(in); !v.OK {
@@ -330,24 +330,24 @@ func (h *handler) formInput(w http.ResponseWriter, r *http.Request, kind ActionK
 	return in, true
 }
 
-// acceptNUL 은 폼 값 in(구조체를 가리키는 포인터)에 쓰기 길의 NUL 규칙을 건다 - api 의 요청 풀기와 같은 nulesc.Fields 다(자유 글
-// 칸의 NUL 은 `\x00` 표기로 바꾸고, 이름 칸의 NUL 은 거절). 거절이면 그 자리에서 응답하고 false 다. 바꿔 받은 것은 api 와 같은
-// 까닭으로 응답에 표지를 달지 않고 로그에 남긴다(api 의 acceptNUL).
-func (h *handler) acceptNUL(w http.ResponseWriter, r *http.Request, route string, in any) bool {
-	rewritten, err := nulesc.Fields(in)
+// checkInput 은 폼 값 in(구조체를 가리키는 포인터)에 쓰기 길의 입력 규칙을 건다 - api 의 요청 풀기와 같은 nulesc.Fields 다(이름
+// 칸의 NUL, 어느 칸이든 깨진 UTF-8 은 거절). 값은 바꾸지 않는다 - 사유 같은 자유 글의 NUL 은 원장에 담길 때 store 의 원장 칸
+// 관문이 `\x00` 표기로 옮기므로, 길이 판정(JudgeAction)은 받은 원문으로 잰다. 거절이면 그 자리에서 응답하고 false 다.
+func (h *handler) checkInput(w http.ResponseWriter, r *http.Request, route string, in any) bool {
+	err := nulesc.Fields(in)
 	var refused *nulesc.Refusal
 	switch {
-	case errors.As(err, &refused):
+	case errors.As(err, &refused) && errors.Is(err, nulesc.ErrUTF8):
+		http.Error(w, fmt.Sprintf("폼 칸 %s 이 올바른 UTF-8 이 아니다.\n뒤로 가서 고쳐 다시 보내라.", refused.Pointer), http.StatusBadRequest)
+		return false
+	case refused != nil:
 		http.Error(w, fmt.Sprintf("폼 칸 %s 에 NUL(U+0000)이 있다 - 이름 칸의 NUL 은 받지 않는다(사유 같은 자유 글의 NUL 은 \\x00 "+
-			"표기로 바꿔 받는다).\n뒤로 가서 고쳐 다시 보내라.", refused.Pointer), http.StatusBadRequest)
+			"표기로 담긴다).\n뒤로 가서 고쳐 다시 보내라.", refused.Pointer), http.StatusBadRequest)
 		return false
 	case err != nil:
-		h.log.ErrorContext(r.Context(), "폼 값에 NUL 규칙을 걸지 못했다", "route", route, "error", err.Error())
+		h.log.ErrorContext(r.Context(), "폼 값에 입력 규칙을 걸지 못했다", "route", route, "error", err.Error())
 		http.Error(w, "폼을 읽지 못했다. 서버 로그의 원인 전문을 보라.", http.StatusInternalServerError)
 		return false
-	}
-	if len(rewritten) > 0 {
-		h.log.InfoContext(r.Context(), "폼 글의 NUL 을 \\x00 표기로 바꿔 받았다", "route", route, "fields", rewritten)
 	}
 	return true
 }
@@ -482,7 +482,7 @@ func (h *handler) projectView(w http.ResponseWriter, r *http.Request) {
 		Target:  target,
 		Axis:    axis,
 	}
-	if !h.acceptNUL(w, r, "POST /actions/project-view", &in) {
+	if !h.checkInput(w, r, "POST /actions/project-view", &in) {
 		return
 	}
 

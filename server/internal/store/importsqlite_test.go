@@ -601,22 +601,24 @@ func TestImportSQLiteDoesNotCommitWithoutTheRecord(t *testing.T) {
 }
 
 // 바꾸기는 JSON 글 하나 단위다: 항목 라벨을 바꾼 이벤트(item.label)의 after 와 그 항목의 labels 는 원장에서 같은 글이고, 이관
-// 뒤에도 같다 - 같은 이벤트의 before 에만 U+0000 이 있어도 after 의 `\x00` 네 글자는 그대로 옮긴다. 원장은 앱이 쓴 것이다.
+// 뒤에도 같다 - 같은 이벤트의 before 에만 U+0000 이 있어도 after 의 `\x00` 네 글자는 그대로 옮긴다. 원장은 앱이 쓴 것이다 - before
+// 의 U+0000 은 앞 판 서버가 쓴 꼴이다(지금 서버는 원장 칸 관문이 그 글을 `\x00` 표기로 옮겨 쓴다).
 func TestImportSQLiteKeepsTheLabelEventInStepWithTheItem(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	seed(t, s, "p")
 	sess := mustSession(t, s, "p", "cc")
-	if err := s.AddItem(ctx, model.Item{Project: "p", ID: "it", Title: "제목", Labels: []string{"a\x00"}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SetLabels(ctx, "p", "it", []string{`\x00z`}, sess.ID); err != nil {
+	if err := s.AddItem(ctx, model.Item{Project: "p", ID: "it", Title: "제목", Labels: []string{`\x00z`}}); err != nil {
 		t.Fatal(err)
 	}
 	src := s.Path()
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// 앞 판 서버가 그 항목의 라벨을 ["a" + NUL] 에서 바꾸며 쓴 이벤트(SetLabels 의 꼴) - before 의 U+0000 은 그 판이 쓴 꼴이다. 지금
+	// 서버는 원장 칸 관문이 그 글을 `\x00` 표기로 옮겨 쓰므로 시험이 문장으로 넣는다.
+	liteExec(t, src, `INSERT INTO event(at, project, session_id, kind, payload) VALUES (`+importAt+`, 'p', '`+sess.ID+
+		`', 'item.label', '{"after":["\\x00z"],"before":["a\u0000"],"item":"it"}')`)
 	dsn, dst := importTarget(t)
 	rep, err := importLedger(t, ctx, src, dsn, TransferOptions{})
 	if err != nil {

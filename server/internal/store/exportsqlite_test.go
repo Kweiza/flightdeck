@@ -753,15 +753,17 @@ func TestVerifyExportedComparesVerbatim(t *testing.T) {
 	}
 }
 
-// Postgres 원장의 JSON 칸에 앱이 쓴 \u0000(라벨의 U+0000 - 그 칸은 jsonb 가 아니라 글이라 Postgres 가 받는다)은 역이관이 그대로
-// 낸다: 거절하지 않고(72시간 되돌리기가 서지 않는다) 바꾸지도 않는다. 낸 파일과 원장의 변환 없는 대조가 맞고, 그 파일을 다시
+// Postgres 원장의 JSON 칸에 앞 판 서버가 쓴 \u0000(라벨의 U+0000 - 그 칸은 jsonb 가 아니라 글이라 Postgres 가 받는다. 지금
+// 서버는 원장 칸 관문이 그 글을 `\x00` 표기로 옮겨 쓴다)은 역이관이 그대로 낸다: 거절하지 않고(72시간 되돌리기가 서지 않는다) 바꾸지도 않는다. 낸 파일과 원장의 변환 없는 대조가 맞고, 그 파일을 다시
 // 이관하면 그 칸을 바꿔 넣고 기록에 남긴다.
 func TestExportSQLiteCarriesJSONNULVerbatim(t *testing.T) {
 	ctx := context.Background()
 	_, dsn, dst := importedPG(t)
-	if err := dst.SetLabels(ctx, "p", "i1", []string{"l\x00"}, "s1"); err != nil {
-		t.Fatalf("Postgres 원장에 라벨 쓰기: %v", err)
-	}
+	// 앞 판 서버가 라벨을 쓴 꼴(SetLabels - 항목의 labels 와 그 이벤트) - 지금 서버는 원장 칸 관문이 그 글을 `\x00` 표기로
+	// 옮겨 쓰므로 시험이 문장으로 넣는다.
+	pgExec(t, dst, `UPDATE item SET labels = '["l\u0000"]' WHERE id = 'i1'`)
+	pgExec(t, dst, `INSERT INTO event(at, project, session_id, kind, payload) VALUES (?, 'p', 's1', 'item.label', ?)`,
+		fmtTime(nowStamp()), `{"after":["l\u0000"],"before":[],"item":"i1"}`)
 	labels := pgString(t, dst, `SELECT labels FROM item WHERE id = 'i1'`)
 	if labels != `["l\u0000"]` {
 		t.Fatalf("Postgres 원장의 labels %q", labels)

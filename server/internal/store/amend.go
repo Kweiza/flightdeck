@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/kweiza/flightdeck/internal/model"
+	"github.com/kweiza/flightdeck/internal/nulesc"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -258,12 +259,15 @@ func MarkItemRevisionChanges(revs []model.ItemRevision, current model.Item) {
 }
 
 // amendChanged 는 실제로 값이 달라진 축이다. 순수 함수이고 순서는 title·body·paths 로 고정한다.
+//
+// ★ 글은 원장의 꼴로 맞댄다(nulesc.Same). before 는 원장에서 읽은 값(NUL 이 `\x00` 표기로 담겼다)이고 after 는 받은
+// 원문이라, 바이트로 맞대면 NUL 이 든 같은 제목을 다시 보낸 것이 「바뀌었다」가 된다.
 func amendChanged(before, after model.Item) []string {
 	out := make([]string, 0, 3)
-	if before.Title != after.Title {
+	if !nulesc.Same(before.Title, after.Title) {
 		out = append(out, "title")
 	}
-	if before.Body != after.Body {
+	if !nulesc.Same(before.Body, after.Body) {
 		out = append(out, "body")
 	}
 	if !sameStrings(before.Paths, after.Paths) {

@@ -91,12 +91,14 @@ func (t Table) KeyLabel(vals []any) string {
 		if !c.Key || i >= len(vals) {
 			continue
 		}
-		parts = append(parts, c.Name+"="+labelValue(vals[i]))
+		parts = append(parts, c.Name+"="+LabelValue(vals[i]))
 	}
 	return strings.Join(parts, " ")
 }
 
-func labelValue(v any) string {
+// LabelValue 는 좌표에 싣는 값 하나의 꼴이다: 글 · 바이트는 따옴표로 감싸(NUL · 줄바꿈이 보이게) 80 바이트로 자르고, NULL 은
+// 「NULL」이다. 이관의 행 좌표(KeyLabel)와 store 의 원장 칸 관문이 같은 꼴로 적는다.
+func LabelValue(v any) string {
 	const max = 80
 	switch x := v.(type) {
 	case nil:

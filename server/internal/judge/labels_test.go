@@ -22,6 +22,11 @@ func TestApplyLabels(t *testing.T) {
 		{"cur 의 중복은 정리된다", []string{"a", "a"}, nil, nil, []string{"a"}},
 		{"공백은 다듬고 빈 값은 버린다", nil, []string{"  tickler  ", "", "   "}, nil, []string{"tickler"}},
 		{"전부 비면 빈 슬라이스", []string{"a"}, nil, []string{"a"}, []string{}},
+		// 같은가는 원장의 꼴로 잰다(LabelKey): 원장의 `\x00` 표기 · 앞 판이 남긴 NUL · 받은 NUL 은 한 꼬리표다.
+		{"받은 NUL 로 원장 표기를 뺀다", []string{`a\x00`, "b"}, nil, []string{"a\x00"}, []string{"b"}},
+		{"원장 표기로 앞 판의 NUL 을 뺀다", []string{"a\x00", "b"}, nil, []string{`a\x00`}, []string{"b"}},
+		{"함께 있던 둘이 함께 빠진다", []string{"a\x00", `a\x00`, "b"}, nil, []string{"a\x00"}, []string{"b"}},
+		{"원장 표기가 있으면 받은 NUL 을 더하지 않는다", []string{`a\x00`}, []string{"a\x00"}, nil, []string{`a\x00`}},
 	}
 	for _, c := range cases {
 		got := ApplyLabels(c.cur, c.add, c.rm)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/kweiza/flightdeck/internal/ledger"
 	"github.com/kweiza/flightdeck/internal/legacy"
+	"github.com/kweiza/flightdeck/internal/nulesc"
 	"github.com/kweiza/flightdeck/internal/store"
 )
 
@@ -157,6 +158,11 @@ func (a *App) runImport(ctx context.Context, args []string, out io.Writer) int {
 	}
 	if proj == "" {
 		fmt.Fprintln(out, "프로젝트 id 를 정하지 못했다 — --project 로 줘라")
+		return 2
+	}
+	if err := nulesc.CheckName(proj); err != nil {
+		// 프로젝트 id 는 원장의 모든 행이 쓰는 이름이다 - 원장 칸 관문이 적용 트랜잭션 전체를 거절하므로 예행 · 적용 모두 여기서 멈춘다.
+		fmt.Fprintf(out, "프로젝트 id %q 를 이름으로 쓸 수 없다(%v) - --project 로 줘라\n", proj, err)
 		return 2
 	}
 
@@ -437,6 +443,17 @@ func (a *App) importJudgments(ctx context.Context, dbFlag, fromDir string, apply
 	fmt.Fprintf(out, "fd import --judgments · %s → DB\n\n", fromDir)
 	fmt.Fprintf(out, "  판단 %d · 링크 %d · 스냅숏 %d · 세션 %d · 프로젝트 %d · 머신 %d (스키마 %d판)\n",
 		c.Judgments, c.Links, c.Snapshots, c.Sessions, c.Projects, c.Machines, m.SchemaVersion)
+
+	// 원장 칸 관문(이관 · 서버 쓰기와 같은 칸 규칙)이 적용에서 낼 판정을 예행도 낸다 - DB 없이 같은 문장 · 같은 관문으로 잰다.
+	rewrites, err := store.ScreenLedger(d)
+	if err != nil {
+		a.log.Error("원장 칸 규칙이 되쓰기를 거절한다", "route", clip(fromDir, 200), "error", err.Error())
+		fmt.Fprintf(out, "\n되쓰기 거절(한 행이라도 걸리면 한 트랜잭션 전체가 되돌아간다): %s\n", err)
+		return 2
+	}
+	if rewrites > 0 {
+		fmt.Fprintf(out, "  자유 글 %d칸의 NUL 은 \\x00 표기로 넣는다(원장 칸 규칙 - SQLite 이관과 같은 바이트)\n", rewrites)
+	}
 
 	if !apply {
 		// ★ 예행은 **DB 를 열지도 않는다.** 여는 것만으로 WAL·백업·마이그레이션이 나고,

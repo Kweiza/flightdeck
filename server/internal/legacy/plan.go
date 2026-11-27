@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/kweiza/flightdeck/internal/judge"
 	"github.com/kweiza/flightdeck/internal/model"
+	"github.com/kweiza/flightdeck/internal/nulesc"
 )
 
 // ImportPlan 은 **무엇을 넣고 무엇을 거절하는지의 판정**이다. 실행이 아니다.
@@ -109,13 +111,29 @@ func PlanImport(sc Scan, opt PlanOptions) ImportPlan {
 	reject := func(source, path, field, code, detail string, f bool) {
 		p.Rejects = append(p.Rejects, Reject{
 			Source: source, Path: path, Field: field, Code: code, Detail: detail, Fatal: f})
+		if f {
+			fatal[source+"\x00"+path] = true
+		}
+	}
+	var nulAt []string
+	screen := func(source, path string, names, texts []cellField) bool {
+		code, field, detail, nul := screenCells(names, texts)
+		if code != "" {
+			reject(source, path, field, code, detail, true)
+			return false
+		}
+		for _, f := range nul {
+			nulAt = append(nulAt, fmt.Sprintf("%s %s %s", source, path, f))
+		}
+		return true
 	}
 
 	// ── 핸드오프: 파싱하지 않는다. 통째로 blob 이다
 	handoffByRel := map[string]bool{}
 	mtimeFallback := 0
 	for _, h := range sc.Handoffs {
-		if isFatal("handoff", h.Rel) {
+		if isFatal("handoff", h.Rel) ||
+			!screen("handoff", h.Rel, nil, []cellField{{"file", h.File}, {"body", h.Body}}) {
 			continue
 		}
 		handoffByRel[h.Rel] = true
@@ -174,6 +192,13 @@ func PlanImport(sc Scan, opt PlanOptions) ImportPlan {
 			ps.Sections = append(ps.Sections, PlannedSection{
 				Name: s.Name, Body: body, Kind: kind, Canonical: canonical})
 		}
+		texts := []cellField{{"desc", c.Desc}, {"blocked_why", ps.BlockedWhy}}
+		for _, sec := range ps.Sections {
+			texts = append(texts, cellField{"## " + sec.Name, sec.Name}, cellField{"## " + sec.Name + " 본문", sec.Body})
+		}
+		if !screen("session", c.File, []cellField{{"file", c.File}, {"worktree", c.Worktree}}, texts) {
+			continue
+		}
 		p.Sessions = append(p.Sessions, ps)
 	}
 	if len(p.Unclassified) > 0 {
@@ -185,7 +210,16 @@ func PlanImport(sc Scan, opt PlanOptions) ImportPlan {
 	// ── 큐 항목
 	itemIDs := map[string]bool{}
 	for _, it := range sc.Items {
-		if isFatal("queue", "queue/"+it.Bucket+"/"+it.File) || it.ID == "" {
+		path := "queue/" + it.Bucket + "/" + it.File
+		if isFatal("queue", path) || it.ID == "" {
+			continue
+		}
+		names := []cellField{{"id", it.ID}}
+		for _, a := range it.After {
+			names = append(names, cellField{"after", a})
+		}
+		texts := itemTexts(model.Item{Title: it.Title, Body: it.Body, CloseReason: it.DroppedReason, Labels: it.Labels()})
+		if !screen("queue", path, names, texts) {
 			continue
 		}
 		itemIDs[it.ID] = true
@@ -275,9 +309,15 @@ func PlanImport(sc Scan, opt PlanOptions) ImportPlan {
 
 		pi := PlannedItem{Item: m}
 		if h := strings.TrimSpace(it.Handoff); h != "" {
-			if handoffByRel[h] {
+			switch {
+			case handoffByRel[h]:
 				pi.HandoffRel = h
-			} else {
+			case isFatal("handoff", h):
+				p.Gone = append(p.Gone, Gone{
+					Kind: "item.handoff", From: it.ID, Target: h,
+					Detail: "가리키는 핸드오프를 거절했다(거절 목록에 그 까닭이 있다) - FK 로 옮길 대상이 없으므로 연결을 만들지 않는다",
+				})
+			default:
 				p.Gone = append(p.Gone, Gone{
 					Kind: "item.handoff", From: it.ID, Target: h,
 					Detail: "가리키는 핸드오프 파일이 이 트리에 없다 — `.claude/handoffs/` 는 gitignore 라 " +
@@ -331,6 +371,10 @@ func PlanImport(sc Scan, opt PlanOptions) ImportPlan {
 				reject("dashboard", path, "at", "bad_time", err.Error(), true)
 				continue
 			}
+			if !screen("dashboard", path, []cellField{{"commit", l.Commit}},
+				[]cellField{{"title", l.Title}, {"body", l.Body}, {"note", l.Note}}) {
+				continue
+			}
 			// ★ 서사가 통째로 빈 랜딩이 실물에 5건 있다(`note: ''`). 판단 표는 빈 본문을
 			//   받지 않으므로(스키마 CHECK) 그대로는 못 들어간다. 그렇다고 거절하면
 			//   **제목과 커밋 sha 까지 함께 사라진다** — 그 둘은 실재하는 기록이다.
@@ -367,15 +411,21 @@ func PlanImport(sc Scan, opt PlanOptions) ImportPlan {
 					"근거를 지어내지 않고 parts 를 통째로 거절한다", len(sc.Dash.Parts)), true)
 		default:
 			for i, pt := range sc.Dash.Parts {
-				if isFatal("dashboard", fmt.Sprintf("DATA.parts[%d]", i)) {
+				path := fmt.Sprintf("DATA.parts[%d]", i)
+				if isFatal("dashboard", path) {
 					continue
 				}
-				p.Parts = append(p.Parts, PlannedPart{
+				pp := PlannedPart{
 					Key:      "part:" + pt.Name,
 					Value:    partValueJSON(pt),
 					Evidence: PartEvidence(judged, pt),
 					Digest:   judged.SHA,
-				})
+				}
+				if !screen("dashboard", path, []cellField{{"name", pp.Key}},
+					[]cellField{{"value", pp.Value}, {"evidence", pp.Evidence}, {"digest", pp.Digest}}) {
+					continue
+				}
+				p.Parts = append(p.Parts, pp)
 			}
 			p.Notes = append(p.Notes, "진척 `parts` 는 snapshot(method='manual')로 들어간다 — "+
 				"근거는 `judged` 블록에서 만든다. **손으로 올릴 칸이 아니다**: 그 숫자는 "+
@@ -384,13 +434,17 @@ func PlanImport(sc Scan, opt PlanOptions) ImportPlan {
 
 		for i, s := range sc.Dash.Issues {
 			id := fmt.Sprintf("legacy-issue-%02d", i+1)
-			p.Issues = append(p.Issues, PlannedItem{Item: model.Item{
+			m := model.Item{
 				Project: opt.Project, ID: id,
 				Title:  clip(firstLine(s), 120),
 				Body:   s,
 				Labels: []string{"출처:대시보드 issues"},
 				State:  model.ItemOpen,
-			}})
+			}
+			if !screen("dashboard", fmt.Sprintf("DATA.issues[%d]", i), nil, itemTexts(m)) {
+				continue
+			}
+			p.Issues = append(p.Issues, PlannedItem{Item: m})
 		}
 		for i, b := range sc.Dash.Blockers {
 			id := fmt.Sprintf("legacy-blocker-%02d", i+1)
@@ -412,8 +466,16 @@ func PlanImport(sc Scan, opt PlanOptions) ImportPlan {
 						"대시보드가 스스로 이 경고를 띄우던 축이고, FK 로 옮기면 그 침묵이 원리적으로 사라진다",
 				})
 			}
+			if !screen("dashboard", fmt.Sprintf("DATA.blockers[%d]", i), nil, itemTexts(m)) {
+				continue
+			}
 			p.Blockers = append(p.Blockers, PlannedItem{Item: m})
 		}
+	}
+	if len(nulAt) > 0 {
+		p.Notes = append(p.Notes, fmt.Sprintf(
+			"자유 글 %d칸에 NUL 이 있어 **`\\x00` 표기로 넣는다**(원장 칸 규칙 - 서버의 쓰기 · SQLite 이관과 같은 바이트, "+
+				"nulesc.Escape 로 되돌릴 수 있다): %s", len(nulAt), strings.Join(nulAt, " · ")))
 	}
 
 	// ── 대조표
@@ -427,6 +489,43 @@ func PlanImport(sc Scan, opt PlanOptions) ImportPlan {
 		return p.Unclassified[i].Name < p.Unclassified[j].Name
 	})
 	return p
+}
+
+// cellField 는 원장에 담길 글 하나와 그 자리 이름이다(거절 · 알림에 싣는다).
+type cellField struct{ name, value string }
+
+// screenCells 는 레코드 하나가 원장에 담길 글을 원장 칸 규칙(store 의 원장 칸 관문 - 이관 카탈로그의 pg.Cell 과 같은 갈래)으로
+// 미리 잰다. 순수 함수다.
+//
+//   - 이름(names - 원장의 식별자 칸으로 가는 글)의 NUL · 깨진 UTF-8, 자유 글(texts)의 깨진 UTF-8 은 그 레코드의 거절이다(code ·
+//     field · detail). 관문은 그런 글을 거절해 적용 트랜잭션 전체를 되돌린다 - 여기서 빼지 않으면 예행은 「넣는다」고 하고
+//     적용은 아무것도 안 넣는다.
+//   - 자유 글의 NUL 은 받는다: 관문이 `\x00` 표기로 옮긴다. 그 자리 이름을 nul 로 낸다(Notes 가 말한다).
+func screenCells(names, texts []cellField) (code, field, detail string, nul []string) {
+	for _, f := range names {
+		if err := nulesc.CheckName(f.value); err != nil {
+			return "bad_name", f.name, fmt.Sprintf("%s %.60q: %v - 원장의 이름 칸이라 그대로 담을 수 없고, 바꾸면 다른 이름이 된다",
+				f.name, f.value, err), nil
+		}
+	}
+	for _, f := range texts {
+		if !utf8.ValidString(f.value) {
+			return "bad_utf8", f.name, fmt.Sprintf("%s 가 깨진 UTF-8 이다 - 원장(Postgres text)이 담지 못한다", f.name), nil
+		}
+		if strings.IndexByte(f.value, 0) >= 0 {
+			nul = append(nul, f.name)
+		}
+	}
+	return "", "", "", nul
+}
+
+// itemTexts 는 항목 m 이 원장의 자유 글 칸에 담을 글이다(제목 · 본문 · 닫은 사유 · 꼬리표).
+func itemTexts(m model.Item) []cellField {
+	out := []cellField{{"title", m.Title}, {"body", m.Body}, {"close_reason", m.CloseReason}}
+	for _, l := range m.Labels {
+		out = append(out, cellField{"labels", l})
+	}
+	return out
 }
 
 // PartEvidence 는 진척 숫자의 근거 문자열이다. 순수 함수다.

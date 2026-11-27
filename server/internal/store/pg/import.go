@@ -197,6 +197,26 @@ func (t Table) Identity() (Column, bool) {
 	return Column{}, false
 }
 
+// Col 은 표의 칸 name 이다. 없으면 nil 이다. 가리키는 것은 카탈로그의 칸이다 - 읽기만 한다.
+func (t Table) Col(name string) *Column {
+	for i := range t.Cols {
+		if t.Cols[i].Name == name {
+			return &t.Cols[i]
+		}
+	}
+	return nil
+}
+
+// TableOf 는 이름이 name 인 옮기는 표다. 카탈로그 밖이면 false 다. store 의 원장 칸 관문이 쓰기 문장의 칸을 이것으로 찾는다.
+func TableOf(name string) (Table, bool) {
+	for _, t := range tables {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return Table{}, false
+}
+
 // Tables 는 옮기는 표 전부다. FK 순서(부모가 먼저)이고 기준선의 선언 순서와 같다. 읽기만 한다.
 //
 // ★ 자기 참조(judgment.supersedes)는 순서로 못 푼다. 옮기기는 FK 검사를 커밋으로 미룬다(기준선의 FK 는 전부 DEFERRABLE 이다).
@@ -402,7 +422,7 @@ func convert(c Column, v any, text func(Column, string) (string, Fault, Rewrite)
 // ★ 바꿔 넣기는 이관의 SQLite 원본만의 사정이다. 변환 없이 맞대는 쪽에 그 규칙을 걸면 두 쪽이 다른 값을 같다고 한다: 역이관이
 // 낸 파일에 넣은 NUL 이 Postgres 의 `\x00` 네 글자와 같아진다. 그래서 두 쪽을 다 원문 그대로 맞댄다.
 // ★ 이관이 jsonb 때문에 거는 규칙(JSON 글 · 키의 `\u0000`, 짝 없는 서로게이트)도 걸지 않는다. 두 엔진 다 글 칸이라 원문 그대로
-// 담고 SQLite 의 JSON 함수도 그 문서를 읽는다 - Postgres 판 서버가 쓴 그런 값(쓰기 길이 nulesc 규칙을 타기 전 판이 쓴 것) 하나에
+// 담고 SQLite 의 JSON 함수도 그 문서를 읽는다 - Postgres 판 서버가 쓴 그런 값(쓰기 길에 원장 칸 관문이 서기 전 판이 쓴 것) 하나에
 // 역이관(72시간 되돌리기)이 서면 안 된다.
 // 그 파일을 다시 Postgres 로 옮길 때 이관의 사전 검사가 그 행을 바꿔 넣거나 좌표와 함께 거절한다(인덱스 키 상한과 같은 자리다).
 // ★ Cell 이 받는 두 저장 갈래(글 칸의 BLOB, bytea 칸의 TEXT)도 원본의 사정이다 - SQLite 원본은 칸 타입을 강제하지 않아
@@ -528,7 +548,7 @@ func FaultLabel(key string, c Column, v any, f Fault) string {
 	if _, _, err := nulesc.EscapeJSON(s); !errors.As(err, &r) {
 		return key
 	}
-	return key + " JSON " + labelValue(r.Pointer)
+	return key + " JSON " + LabelValue(r.Pointer)
 }
 
 // docText 는 JSON 칸 c 의 원래 값 v(글이나 BLOB)를 글로 낸다. JSON 칸이 아니거나 글 · BLOB 이 아니면 false 다.

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/kweiza/flightdeck/internal/model"
+	"github.com/kweiza/flightdeck/internal/nulesc"
 )
 
 // D 계층 — 세션·워크스페이스·신호·발자국·ref·변경집합.
@@ -63,7 +64,7 @@ func (t *Tx) OpenSessionAs(project, machineID, worktree, ccSessionID, label, har
 	existing, err := sessionByTriple(t.ctx, t.tx, machineID, worktree, ccSessionID)
 	switch {
 	case err == nil:
-		if label != "" && label != existing.Label {
+		if label != "" && !nulesc.Same(label, existing.Label) { // 원장의 꼴로 맞댄다(amendChanged 의 ★)
 			if _, err := t.tx.ExecContext(t.ctx,
 				`UPDATE session SET label = ? WHERE id = ?`, label, existing.ID); err != nil {
 				return model.Session{}, false, fmt.Errorf("세션 label 갱신 실패(id=%q): %w", existing.ID, err)

@@ -939,11 +939,15 @@ fd migrate verify --from fd-copy.db --db <URL>
     another is text with the same bytes), the pre-checks refuse the colliding row by table · column set · row key - before
     the target would refuse it at commit. A partial index (one live hold, and so on) is checked only among the rows inside
     its condition. A NUL cannot cause a collision - those columns are identifier columns, so their NUL is refused above.
-- **Text the server receives after the switch follows the same rule.** On both engines, a NUL in free text a write carries
-  (MCP · CLI · hooks · dashboard forms - titles, bodies, reasons, labels: text people write) becomes `\x00`, byte for byte
-  what the move produces. A NUL in a name place (ids, kinds, states, paths, JSON keys, the URL) and a lone surrogate are
-  refused with 400 (`nul_refused` · `lone_surrogate`) and nothing is written. Each rewritten request leaves one server log
-  line with the path, the request_id and the places that changed (not the text).
+- **Text the server writes after the switch follows the same rule.** On both engines, a NUL in free text bound for the
+  ledger (titles, bodies, reasons, labels: text people write; for text the server joins, such as a judgment body made of the
+  actor and the reason, the whole joined text) becomes `\x00` just before it is stored, byte for byte what moving a SQLite
+  ledger holding the same text produces. It does not matter where the write comes from (MCP · CLI · hooks · dashboard
+  forms, and `fd import --apply` · `--judgments`, which do not go through REST). A NUL in a name place (ids, kinds, states,
+  paths, JSON keys, the URL), a lone surrogate and broken UTF-8 are refused with 400 (`nul_refused` · `lone_surrogate` ·
+  `bad_utf8`) and nothing is written. From the dry run on, `fd import` lists such records as refused and `--judgments` refuses the whole rewrite. Length limits and
+  responses use the text as sent. Each rewritten cell leaves one server log line after the commit with the table, the
+  column and the row coordinates (not the text).
 - After moving and leaving the moved marker, the import moves the source's pre-upgrade copies (`<source>.bak-*`, with their
   side files) into a new directory `<source>.pre-import-<time>.bak/` (it does not delete them). That file is no longer the
   ledger, and those copies are not copies of whatever ledger is put there later. A dry run, a refusal, or a failure moves

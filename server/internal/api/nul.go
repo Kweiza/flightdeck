@@ -3,109 +3,106 @@ package api
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
-	"strings"
 
 	"github.com/kweiza/flightdeck/internal/nulesc"
+	"github.com/kweiza/flightdeck/internal/store"
 )
 
-// 쓰기 길의 NUL 규칙 — 요청이 서버에 들어오는 두 입구(URL · JSON 본문)에 이관과 같은 규칙(nulesc)을 건다.
+// 쓰기 길의 입력 규칙 - 요청이 서버에 들어오는 두 입구(URL · JSON 본문)에서 **거절만** 한다.
 //
-// ## 왜 입구인가
+// ## 나눈 몫
 //
-// Postgres text 는 NUL(U+0000)을 못 담아(22021) 그 글이 든 쓰기가 500 이 되고, SQLite 는 같은 글을 그대로 저장한다 - 엔진마다
-// 다른 값 · 다른 결과다. 처리기마다 · 저장소 문장마다 덧대지 않고 요청이 값으로 풀리는 자리 하나에서 고친다: MCP · CLI · 훅 ·
-// 보드가 모두 이 REST 를 타므로(화면 폼은 web 이 같은 nulesc.Fields 를 건다) 두 엔진이 같은 값을 받는다. 저장소 문장(store 의
-// exec)에서 고치지 않는 까닭: 거기에는 원장에서 읽어 옮겨 적는 값(개정 이력의 옛 제목 · 본문, 되돌리기 사본)도 지나가 입력과
-// 원장 값을 가를 수 없고, 어느 칸이 이름인지도 모른다.
+// Postgres text 는 NUL(U+0000)과 깨진 UTF-8 을 못 담아(22021) 그 글이 든 쓰기 · 조회가 500 이 되고, SQLite 는 같은 글을 그대로
+// 다룬다. 자유 글의 NUL 을 이관과 같은 `\x00` 표기로 옮기는 것은 입력이 아니라 원장에 담기는 글 하나의 일이다 - store 의 원장
+// 칸 관문(store/cellgate.go)이 업무 쓰기 문장마다 이관 카탈로그의 칸 규칙(pg.Cell)을 건다. 그래야 여러 입력을 합친 칸 · 자른 칸이
+// 이관과 같은 바이트가 되고, 요청을 안 푸는 쓰기(fd import)도 같은 규칙을 지난다. 입력은 받은 바이트 그대로 처리기로 간다 - 길이
+// 재기 · 비교는 받은 원문으로 한다.
 //
-// ## 규칙
+// 입구가 거절하는 것은 원장에 닿기 전에 흔적이 사라지거나 조회 열쇠로 쓰여 500 이 되는 글이다:
 //
-//   - JSON 본문: 자유 글 칸(`nul:"text"`)의 NUL 은 `\x00` 표기로 바꿔 받고(이관의 nulesc.Escape 와 같은 바이트), 이름 칸의 NUL ·
-//     키의 U+0000 · 짝 없는 서로게이트는 400 이다(nulesc.Input).
-//   - URL: 경로 · 질의는 모두 이름(id · 프로젝트 · 검색어 같은 조회 열쇠)이라 NUL 이 있으면 400 이다(JudgeURLNUL).
+//   - URL: 경로 · 질의는 모두 이름(id · 프로젝트 · 검색어 같은 조회 열쇠)이다 - NUL 이나 깨진 UTF-8(`%FF`)이 있으면 400(JudgeURL).
+//   - JSON 본문: 이름 칸(자유 글 표지 `nul:"text"` 가 없는 칸)의 NUL, 키의 U+0000, 짝 없는 서로게이트, 깨진 UTF-8 은 400 이다
+//     (nulesc.Input - 풀기가 U+FFFD 로 바꿔 흔적을 지우는 것은 푼 바이트 그대로 잰다).
+//   - MCP 도구 인자는 REST 로 넘기기 전에 mcpsrv 가 같은 nulesc.CheckDoc 으로 잰다(풀기가 지우는 것을 REST 가 다시 볼 수 없다).
+//
+// 원장 칸 관문이 거절한 글(식별자 칸의 NUL 처럼 입력 표지가 놓친 것)도 같은 400 으로 간다(ClassifyError 의 *store.CellRefusal).
 
-// JudgeURLNUL 은 URL 의 경로 · 질의(이름 · 값)에 NUL 이 있는지 본다. 있으면 그 자리를 사람이 읽는 말로 낸다. 순수 함수다.
+// JudgeURL 은 URL 의 경로 · 질의(이름 · 값)에 NUL 이나 깨진 UTF-8 이 있는지 본다. 있으면 그 자리를 사람이 읽는 말과 그 갈래
+// (nulesc.ErrNUL · nulesc.ErrUTF8)로 낸다. 순수 함수다.
 //
 // 경로는 푼 경로(u.Path - 처리기가 PathValue 로 읽는 것)를 잰다. 질의는 이름 차례로 잰다(어느 자리를 먼저 말할지가 요청마다
 // 같게).
-func JudgeURLNUL(u *url.URL) (where string, bad bool) {
-	if strings.IndexByte(u.Path, 0) >= 0 {
-		return "경로", true
+func JudgeURL(u *url.URL) (where string, bad error) {
+	if err := nulesc.CheckName(u.Path); err != nil {
+		return "경로", err
 	}
 	q := u.Query()
-	keys := make([]string, 0, len(q))
-	for k := range q {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-	for _, k := range keys {
-		if strings.IndexByte(k, 0) >= 0 {
-			return "질의 이름", true
+	for _, k := range slices.Sorted(maps.Keys(q)) {
+		if err := nulesc.CheckName(k); err != nil {
+			return "질의 이름", err
 		}
 		for _, v := range q[k] {
-			if strings.IndexByte(v, 0) >= 0 {
-				return fmt.Sprintf("질의 %q", k), true
+			if err := nulesc.CheckName(v); err != nil {
+				return fmt.Sprintf("질의 %q", k), err
 			}
 		}
 	}
-	return "", false
+	return "", nil
 }
 
-// withNULGate 는 URL 에 NUL 이 든 요청을 처리기 앞에서 400 으로 거절한다.
+// withURLGate 는 URL 에 NUL · 깨진 UTF-8 이 든 요청을 처리기 앞에서 400 으로 거절한다. 화면(web)도 이 사슬 안의 처리기라 같이 걸린다.
 //
 // chain 에서 screenWrite 뒤 · idempotency 앞이다: 거절이 멱등 표에 자리를 잡지 않고, 화면 쓰기의 출처 대조(403)가 먼저다.
-func (s *server) withNULGate(next http.Handler) http.Handler {
+func (s *server) withURLGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if where, bad := JudgeURLNUL(r.URL); bad {
-			s.writeError(w, r, nulRefused("URL 의 "+where))
+		if where, bad := JudgeURL(r.URL); bad != nil {
+			s.writeError(w, r, classifyInput(bad, "URL 의 "+where))
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// acceptNUL 은 푼 문서 doc 와 값 dst 에 NUL 규칙을 건다. 거절이면 응답까지 내고 false 다.
-//
-// ★ 바꿔 받은 것은 응답에 표지를 달지 않고 서버 로그(Info - request_id · 경로 · 바꾼 칸의 자리, 글 내용은 안 싣는다)에 남긴다.
-// 까닭: 바꾼 글은 저장된 그대로 이후의 조회 · 보드 · 이벤트에 `\x00` 네 글자로 보여 숨은 값이 없고(풀기가 짝 없는 서로게이트를
-// U+FFFD 로 바꾸는 것과 달리 되돌릴 수 있다 - nulesc.Escape), 응답 본문에 표지 칸을 두면 처리기마다 결과 타입이 갈라지며
-// (writeJSON 의 한 벌 규율), 응답 머리에 두면 멱등 재생(withIdempotency 는 본문만 담는다)이 그것을 잃는다. 어느 글이 바뀌었는지의
-// 기록(경로 · 칸 자리)은 이관의 기록 파일 자리를 이 로그 줄이 맡는다.
-func (s *server) acceptNUL(w http.ResponseWriter, r *http.Request, doc []byte, dst any) bool {
-	rewritten, err := nulesc.Input(string(doc), dst)
-	if err != nil {
+// checkInput 은 푼 문서 doc 와 값 dst 에 입력 규칙을 건다(바꾸지 않는다). 거절이면 응답까지 내고 false 다.
+func (s *server) checkInput(w http.ResponseWriter, r *http.Request, doc []byte, dst any) bool {
+	if err := nulesc.Input(doc, dst); err != nil {
 		s.fail(w, r, err)
 		return false
-	}
-	if len(rewritten) > 0 {
-		s.log.InfoContext(r.Context(), "요청 글의 NUL 을 \\x00 표기로 바꿔 받았다",
-			"route", s.resolveRoute(r), "path", clip(r.URL.Path, 200),
-			"request_id", infoFrom(r.Context()).id(), "fields", rewritten)
 	}
 	return true
 }
 
-// classifyNUL 은 NUL 규칙이 거절한 글 하나를 응답으로 옮긴다(ClassifyError 가 부른다).
-func classifyNUL(r *nulesc.Refusal) Classified {
-	switch {
-	case errors.Is(r, nulesc.ErrSurrogate):
-		return badRequest("lone_surrogate",
-			fmt.Sprintf("요청 글 %q 에 짝 없는 서로게이트(홀로 선 \\ud800-\\udfff)가 있다", r.Pointer),
-			"그 글을 올바른 UTF-8 로 고쳐 다시 보내라 - 받으면 U+FFFD 로 바뀌어 다른 글과 같아진다.")
-	case errors.Is(r, nulesc.ErrKeyNUL), errors.Is(r, nulesc.ErrNUL):
-		return nulRefused(fmt.Sprintf("요청 글 %q", r.Pointer))
+// classifyRefusal 은 입력 규칙(nulesc)이나 원장 칸 관문(store)이 거절한 글 하나를 응답으로 옮긴다(ClassifyError 가 부른다). 입력의
+// 잘못이 아닌 것(원장 칸 관문의 깨진 JSON - 서버가 만든 값의 결함)이면 false 다.
+func classifyRefusal(err error) (Classified, bool) {
+	var nul *nulesc.Refusal
+	if errors.As(err, &nul) {
+		return classifyInput(nul.Err, fmt.Sprintf("요청 글 %q", nul.Pointer)), true
 	}
-	return badRequest("bad_json", fmt.Sprintf("요청 글 %q 를 JSON 으로 읽을 수 없다", r.Pointer),
-		"필드 이름과 타입을 확인해라.")
+	var cell *store.CellRefusal
+	if errors.As(err, &cell) && cell.Unwrap() != nil {
+		return classifyInput(cell.Unwrap(), fmt.Sprintf("원장 칸 %s.%s(%s)", cell.Table, cell.Column, cell.Where)), true
+	}
+	return Classified{}, false
 }
 
-// nulRefused 는 이름 자리의 NUL 을 거절하는 응답이다. 자유 글의 NUL 은 거절이 아니라 바꿔 받으므로 여기 오는 것은 바꾸면 다른
-// 것을 가리키게 되는 글뿐이다 - 그 까닭을 안내에 싣는다.
-func nulRefused(where string) Classified {
-	return badRequest("nul_refused", where+" 에 NUL(U+0000)이 있다",
-		"그 자리(식별자 · 종류 · 경로 · 검색어 · JSON 키)에서 NUL 을 빼고 다시 보내라 - 자유 글(제목 · 본문 · 사유 · 꼬리표)의 "+
-			"NUL 은 \\x00 표기로 바꿔 받지만, 이름을 바꾸면 원래 \\x00 네 글자인 다른 이름과 같아져 다른 것을 가리킨다.")
+// classifyInput 은 거절 갈래 kind(nulesc 의 갈래)와 그 자리 where 를 응답으로 옮긴다.
+func classifyInput(kind error, where string) Classified {
+	switch {
+	case errors.Is(kind, nulesc.ErrSurrogate):
+		return badRequest("lone_surrogate", where+" 에 짝 없는 서로게이트(홀로 선 \\ud800-\\udfff)가 있다",
+			"그 글을 올바른 UTF-8 로 고쳐 다시 보내라 - 받으면 U+FFFD 로 바뀌어 다른 글과 같아진다.")
+	case errors.Is(kind, nulesc.ErrUTF8):
+		return badRequest("bad_utf8", where+" 이 올바른 UTF-8 이 아니다",
+			"그 글을 UTF-8 로 고쳐 다시 보내라 - 깨진 바이트는 원장(Postgres text)이 담지 못하고, 받으면 U+FFFD 로 바뀌어 다른 글과 같아진다.")
+	case errors.Is(kind, nulesc.ErrKeyNUL), errors.Is(kind, nulesc.ErrNUL):
+		return badRequest("nul_refused", where+" 에 NUL(U+0000)이 있다",
+			"그 자리(식별자 · 종류 · 경로 · 검색어 · JSON 키)에서 NUL 을 빼고 다시 보내라 - 자유 글(제목 · 본문 · 사유 · 꼬리표)의 "+
+				"NUL 은 원장에 \\x00 표기로 담기지만, 이름을 바꾸면 원래 \\x00 네 글자인 다른 이름과 같아져 다른 것을 가리킨다.")
+	}
+	return badRequest("bad_json", where+" 를 JSON 으로 읽을 수 없다", "필드 이름과 타입을 확인해라.")
 }

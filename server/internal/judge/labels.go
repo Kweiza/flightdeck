@@ -1,6 +1,10 @@
 package judge
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/kweiza/flightdeck/internal/nulesc"
+)
 
 // ApplyLabels 는 꼬리표 집합에 더하기와 빼기를 적용한다. 순수 함수다.
 //
@@ -22,11 +26,16 @@ import "strings"
 // 공백만 있는 값과 빈 문자열은 버린다. 판정의 정본은 IsTickler 이고 그것은 정확
 // 일치만 보므로(tickler.go), 앞뒤 공백이 붙은 채 저장되면 사람 눈에는 같은
 // 꼬리표인데 판정에서 조용히 빠진다.
+//
+// ★ 같은가는 **원장의 꼴**로 잰다(LabelKey). cur 는 원장에서 읽은 값(Postgres 원장이면 NUL 이 `\x00` 표기로 담겼다)이고
+// add · rm 은 받은 원문이다 - 둘을 바이트로 맞대면 NUL 이 든 꼬리표는 rm 으로 못 지우고, 원래 `\x00` 네 글자인 다른
+// 꼬리표가 대신 지워진다. 원장은 둘을 가를 바이트가 없으므로(이관도 같은 값으로 옮긴다) 같은 꼬리표로 본다. 결과에는
+// 받은 값을 그대로 싣는다 - 원장의 꼴로 옮기는 것은 store 의 원장 칸 관문이다.
 func ApplyLabels(cur, add, rm []string) []string {
 	drop := make(map[string]bool, len(rm))
 	for _, l := range rm {
-		if l = strings.TrimSpace(l); l != "" {
-			drop[l] = true
+		if k := LabelKey(l); k != "" {
+			drop[k] = true
 		}
 	}
 
@@ -34,10 +43,11 @@ func ApplyLabels(cur, add, rm []string) []string {
 	seen := make(map[string]bool, len(cur)+len(add))
 	keep := func(l string) {
 		l = strings.TrimSpace(l)
-		if l == "" || drop[l] || seen[l] {
+		k := LabelKey(l)
+		if k == "" || drop[k] || seen[k] {
 			return
 		}
-		seen[l] = true
+		seen[k] = true
 		out = append(out, l)
 	}
 
@@ -49,3 +59,6 @@ func ApplyLabels(cur, add, rm []string) []string {
 	}
 	return out
 }
+
+// LabelKey 는 꼬리표 l 을 맞댈 열쇠다: 앞뒤 공백을 걷고 원장의 꼴(nulesc.Text)로 옮긴 값. 빈 값이면 버릴 꼬리표다.
+func LabelKey(l string) string { return nulesc.Text(strings.TrimSpace(l)) }

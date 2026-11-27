@@ -162,15 +162,16 @@ func nonBlank(in []string) []string {
 	return out
 }
 
-// onlyIn 은 a 에는 있고 b 에는 없는 값이다. 순서는 a 를 따른다.
+// onlyIn 은 a 에는 있고 b 에는 없는 값이다. 순서는 a 를 따른다. 같은가는 ApplyLabels 와 같은 열쇠(judge.LabelKey - 원장의
+// 꼴)로 잰다 - 원장에서 읽은 값과 받은 원문이 섞여 있다.
 func onlyIn(a, b []string) []string {
 	has := make(map[string]bool, len(b))
 	for _, v := range b {
-		has[v] = true
+		has[judge.LabelKey(v)] = true
 	}
 	out := make([]string, 0)
 	for _, v := range a {
-		if !has[v] {
+		if !has[judge.LabelKey(v)] {
 			out = append(out, v)
 		}
 	}

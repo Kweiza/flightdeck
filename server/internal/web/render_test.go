@@ -17,6 +17,7 @@ import (
 	"github.com/kweiza/flightdeck/internal/model"
 	"github.com/kweiza/flightdeck/internal/service"
 	"github.com/kweiza/flightdeck/internal/store"
+	"github.com/kweiza/flightdeck/internal/store/storetest/freshstore"
 )
 
 // ★ 이 파일의 소비자 좌표계는 **렌더된 HTML 문자열**이다.
@@ -43,10 +44,18 @@ type fixture struct {
 
 const testProject = "cp"
 
-// fixtureOpt 는 하네스의 축을 바꾼다. 지금 있는 축은 시계 하나다.
+// fixtureOpt 는 하네스의 축을 바꾼다. 지금 있는 축은 시계와 저장 엔진이다.
 type fixtureOpt func(*fixtureConfig)
 
-type fixtureConfig struct{ clock func() time.Time }
+type fixtureConfig struct {
+	clock  func() time.Time
+	engine freshstore.Engine // 비면 SQLite
+}
+
+// withEngine 은 원장의 저장 엔진을 고른다(Postgres 는 FD_TEST_PG 가 있어야 한다 - freshstore.OpenOn).
+func withEngine(e freshstore.Engine) fixtureOpt {
+	return func(c *fixtureConfig) { c.engine = e }
+}
 
 // withClock 은 **서비스와 화면 양쪽에 같은 시계**를 준다.
 //
@@ -64,16 +73,11 @@ func newFixture(t *testing.T, opts ...fixtureOpt) *fixture {
 		o(&cfg)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	dbp1 := filepath.Join(t.TempDir(), "fd.db")
-	// ★ 적용은 기동에서 분리돼 있다(설계 §7 ①) — 열기 전에 올린다.
-	if err := store.Migrate(context.Background(), dbp1, nil); err != nil {
-		t.Fatalf("DB 적용 실패: %v", err)
+	if cfg.engine == "" {
+		cfg.engine = freshstore.SQLite
 	}
-	st, err := store.OpenWithLogger(dbp1, log)
-	if err != nil {
-		t.Fatalf("DB 열기 실패: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
+	// ★ 적용은 기동에서 분리돼 있다(설계 §7 ①) - freshstore 가 열기 전에 올린다.
+	st, _ := freshstore.OpenOn(t, cfg.engine, log)
 
 	var svcOpts []service.Option
 	webOpts := []Option{WithLogger(log), WithRefresh(7)}

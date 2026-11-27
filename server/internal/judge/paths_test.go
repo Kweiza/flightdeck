@@ -104,6 +104,10 @@ func TestJudgePathCoordinate(t *testing.T) {
 		{"상대 백슬래시", `internal\api\x.go`, false, "백슬래시"},
 		{"백슬래시 하나만", `a\b`, false, "백슬래시"},
 
+		{"NUL", "internal/a\x00.go", false, "NUL"},
+		{"깨진 UTF-8", "internal/a\xff.go", false, "UTF-8"},
+		{"`\x00` 네 글자는 NUL 이 아니다", `internal/a\x00.go`, false, "백슬래시"},
+
 		{"정상 상대경로", "internal/api/x.go", true, "슬래시 좌표계"},
 		{"정상 절대경로", "/home/a/repo/x.go", true, "슬래시 좌표계"},
 		{"디렉토리 토큰", "tools/", true, "슬래시 좌표계"},

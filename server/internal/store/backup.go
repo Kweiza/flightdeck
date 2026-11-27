@@ -429,8 +429,8 @@ func importSourceDSN(path string) string {
 	return sqliteURI(path, q)
 }
 
-// WriteLedger 는 원장을 DB 에 되쓴다. **CLI 표면이 없다** — 지금은 무손실을 시험이 증명하는
-// 데 쓰이고, 후속에서 `fd import --judgments` 를 배선만 하면 된다.
+// WriteLedger 는 원장을 DB 에 되쓴다(`fd import --judgments --apply`). 업무 쓰기 트랜잭션(Tx)이라 원장 칸 관문을 지난다 -
+// 자유 글의 NUL 은 `\x00` 표기로 담기고 이름 칸의 NUL 은 전체를 거절한다(예행은 ScreenLedger 가 같은 판정을 DB 없이 낸다).
 //
 // ★ AddJudgment 를 쓰지 않는다. 그것은 빈 ID 에 새 ULID 를, 빈 At 에 지금 시각을 채운다 —
 // 복원은 원문을 그대로 되살려야 하므로 raw INSERT 로 간다. 트리거와 CHECK 는 그대로 걸린다
@@ -451,57 +451,74 @@ func (s *Store) WriteLedger(ctx context.Context, d LedgerDump) error {
 		if _, err := t.tx.ExecContext(t.ctx, t.tx.dialect().deferForeignKeys()); err != nil {
 			return fmt.Errorf("FK 검사 미루기 실패: %w", err)
 		}
-		machineStmt := ledgerInsert("machine", machineCols)
-		for _, m := range d.Machines {
-			if _, err := t.tx.ExecContext(t.ctx, machineStmt,
-				m.ID, m.Hostname, m.FirstSeen, m.LastSeen); err != nil {
-				return fmt.Errorf("원장 머신 되쓰기 실패(id=%q): %w", clip(m.ID, 64), err)
-			}
-		}
-		projectStmt := ledgerInsert("project", projectCols)
-		for _, p := range d.Projects {
-			if _, err := t.tx.ExecContext(t.ctx, projectStmt,
-				p.ID, p.Path, p.RemoteURL, p.DefaultBranch,
-				p.Config, p.ConfigFromSHA, p.CreatedAt, p.PinnedAt, p.ArchivedAt); err != nil {
-				return fmt.Errorf("원장 프로젝트 되쓰기 실패(id=%q): %w", clip(p.ID, 64), err)
-			}
-		}
-		sessionStmt := ledgerInsert("session", sessionCols)
-		for _, x := range d.Sessions {
-			if _, err := t.tx.ExecContext(t.ctx, sessionStmt,
-				x.ID, x.Project, x.MachineID, x.Worktree, x.CCSessionID,
-				x.Label, x.State, x.BlockedWhy, x.OpenedAt, x.Harness); err != nil {
-				return fmt.Errorf("원장 세션 되쓰기 실패(id=%q project=%q): %w",
-					clip(x.ID, 64), clip(x.Project, 64), err)
-			}
-		}
-		judgmentStmt := ledgerInsert("judgment", judgmentCols)
-		for _, j := range d.Judgments {
-			if _, err := t.tx.ExecContext(t.ctx, judgmentStmt,
-				j.ID, j.Project, j.SessionID, j.At, j.Kind, j.Title, j.Body, j.Supersedes); err != nil {
-				return fmt.Errorf("원장 판단 되쓰기 실패(id=%q kind=%q): %w",
-					clip(j.ID, 64), clip(j.Kind, 32), err)
-			}
-		}
-		linkStmt := ledgerInsert("judgment_link", linkCols)
-		for _, l := range d.Links {
-			if _, err := t.tx.ExecContext(t.ctx, linkStmt,
-				l.JudgmentID, l.TargetKind, l.TargetID, l.TargetProject); err != nil {
-				return fmt.Errorf("원장 링크 되쓰기 실패(judgment=%q target=%s/%s): %w",
-					clip(l.JudgmentID, 64), clip(l.TargetKind, 32), clip(l.TargetID, 64), err)
-			}
-		}
-		snapshotStmt := ledgerInsert("snapshot", snapshotCols)
-		for _, sn := range d.Snapshots {
-			if _, err := t.tx.ExecContext(t.ctx, snapshotStmt,
-				sn.Project, sn.Key, sn.Value, sn.Method,
-				sn.Evidence, sn.InputDigest, sn.ComputedAt); err != nil {
-				return fmt.Errorf("원장 스냅숏 되쓰기 실패(project=%q key=%q): %w",
-					clip(sn.Project, 64), clip(sn.Key, 64), err)
+		for _, r := range ledgerRows(d) {
+			if _, err := t.tx.ExecContext(t.ctx, r.q, r.args...); err != nil {
+				return fmt.Errorf("%s: %w", r.what, err)
 			}
 		}
 		return nil
 	})
+}
+
+// ScreenLedger 는 WriteLedger 가 원장 칸 관문(cellgate.go)에서 겪을 것을 DB 없이 잰다 - `fd import --judgments` 의 예행이
+// 적용과 같은 판정을 내도록. 관문이 거절할 글이 있으면 그 첫 거절(적용이면 트랜잭션 전체가 되돌아간다)이고, 없으면 `\x00`
+// 표기로 바꿔 넣을 칸 수다. 순수 함수다.
+func ScreenLedger(d LedgerDump) (rewrites int, err error) {
+	g := &cellGate{}
+	for _, r := range ledgerRows(d) {
+		if _, err := g.args(r.q, r.args); err != nil {
+			return 0, fmt.Errorf("%s: %w", r.what, err)
+		}
+	}
+	return len(g.rewrites), nil
+}
+
+// ledgerRow 는 되쓰기 문장 하나와 그 인자, 실패 문구의 머리다.
+type ledgerRow struct {
+	q    string
+	args []any
+	what string
+}
+
+// ledgerRows 는 원장 d 를 되쓰는 문장들이다(폐포 순서: 머신 · 프로젝트 · 세션 · 판단 · 링크 · 스냅숏). 순수 함수다 - WriteLedger
+// 가 실행하고 ScreenLedger 가 DB 없이 잰다(한 벌이라 예행과 적용이 갈릴 자리가 없다).
+func ledgerRows(d LedgerDump) []ledgerRow {
+	out := make([]ledgerRow, 0, len(d.Machines)+len(d.Projects)+len(d.Sessions)+len(d.Judgments)+len(d.Links)+len(d.Snapshots))
+	machineStmt := ledgerInsert("machine", machineCols)
+	for _, m := range d.Machines {
+		out = append(out, ledgerRow{machineStmt, []any{m.ID, m.Hostname, m.FirstSeen, m.LastSeen},
+			fmt.Sprintf("원장 머신 되쓰기 실패(id=%q)", clip(m.ID, 64))})
+	}
+	projectStmt := ledgerInsert("project", projectCols)
+	for _, p := range d.Projects {
+		out = append(out, ledgerRow{projectStmt, []any{p.ID, p.Path, p.RemoteURL, p.DefaultBranch,
+			p.Config, p.ConfigFromSHA, p.CreatedAt, p.PinnedAt, p.ArchivedAt},
+			fmt.Sprintf("원장 프로젝트 되쓰기 실패(id=%q)", clip(p.ID, 64))})
+	}
+	sessionStmt := ledgerInsert("session", sessionCols)
+	for _, x := range d.Sessions {
+		out = append(out, ledgerRow{sessionStmt, []any{x.ID, x.Project, x.MachineID, x.Worktree, x.CCSessionID,
+			x.Label, x.State, x.BlockedWhy, x.OpenedAt, x.Harness},
+			fmt.Sprintf("원장 세션 되쓰기 실패(id=%q project=%q)", clip(x.ID, 64), clip(x.Project, 64))})
+	}
+	judgmentStmt := ledgerInsert("judgment", judgmentCols)
+	for _, j := range d.Judgments {
+		out = append(out, ledgerRow{judgmentStmt, []any{j.ID, j.Project, j.SessionID, j.At, j.Kind, j.Title, j.Body, j.Supersedes},
+			fmt.Sprintf("원장 판단 되쓰기 실패(id=%q kind=%q)", clip(j.ID, 64), clip(j.Kind, 32))})
+	}
+	linkStmt := ledgerInsert("judgment_link", linkCols)
+	for _, l := range d.Links {
+		out = append(out, ledgerRow{linkStmt, []any{l.JudgmentID, l.TargetKind, l.TargetID, l.TargetProject},
+			fmt.Sprintf("원장 링크 되쓰기 실패(judgment=%q target=%s/%s)",
+				clip(l.JudgmentID, 64), clip(l.TargetKind, 32), clip(l.TargetID, 64))})
+	}
+	snapshotStmt := ledgerInsert("snapshot", snapshotCols)
+	for _, sn := range d.Snapshots {
+		out = append(out, ledgerRow{snapshotStmt, []any{sn.Project, sn.Key, sn.Value, sn.Method,
+			sn.Evidence, sn.InputDigest, sn.ComputedAt},
+			fmt.Sprintf("원장 스냅숏 되쓰기 실패(project=%q key=%q)", clip(sn.Project, 64), clip(sn.Key, 64))})
+	}
+	return out
 }
 
 // ledgerOpenRefusal 은 원장 열기를 거절하는 문구다. 순수 함수다.

@@ -36,6 +36,7 @@ import (
 	"github.com/kweiza/flightdeck/internal/judge"
 	"github.com/kweiza/flightdeck/internal/lang"
 	"github.com/kweiza/flightdeck/internal/model"
+	"github.com/kweiza/flightdeck/internal/nulesc"
 	"github.com/kweiza/flightdeck/internal/service"
 	"github.com/kweiza/flightdeck/internal/store"
 	"github.com/kweiza/flightdeck/internal/window"
@@ -486,6 +487,17 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 		s.log.WarnContext(ctx, "인자 삼킴 거절",
 			"mode", name, "session_id", clip(sessionID, 64), "project", s.id.ProjectID)
 		return textResult(s.withTail(ctx, RenderRefusal(name, reason, ""), tailOpts{}), true)
+	}
+
+	// 인자 원문 관문 - 짝 없는 서로게이트 · 깨진 UTF-8 · 키의 U+0000 은 **풀기 전에** 거절한다(nulesc.CheckDoc, REST 의 요청
+	// 풀기와 같은 규칙). 풀기(decodeArgs)가 U+FFFD 로 바꿔 흔적을 지운 뒤 REST 로 넘기면 REST 는 다른 글을 받아 그대로 원장에
+	// 남긴다 - REST 의 같은 관문이 다시 볼 바이트가 없다. 자리는 인자 삼킴 관문과 같은 까닭으로 신호 뒤 · 디스패치 앞이다.
+	if err := nulesc.CheckDoc(args); err != nil {
+		s.log.WarnContext(ctx, "도구 인자 거절",
+			"mode", name, "session_id", clip(sessionID, 64), "project", s.id.ProjectID, "error", err.Error())
+		return textResult(s.withTail(ctx, RenderRefusal(name, "인자 "+err.Error(),
+			"그 글을 올바른 UTF-8 로 고쳐(홀로 선 \\ud800-\\udfff · 깨진 바이트 · 키 안의 U+0000 을 빼고) 다시 불러라 - "+
+				"그대로 받으면 U+FFFD 로 바뀌어 다른 글로 남는다."), tailOpts{}), true)
 	}
 
 	var res toolResult

@@ -29,8 +29,12 @@ func TestMigrateImportSQLiteSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpsertMachine(ctx, model.Machine{ID: "m1", Hostname: "ho\x00st"}); err != nil {
+	if err := s.UpsertMachine(ctx, model.Machine{ID: "m1", Hostname: "host"}); err != nil {
 		t.Fatalf("원본 행: %v", err)
+	}
+	// NUL 이 든 원본 칸은 앞 판 서버가 쓴 것이다 - 지금 서버는 원장 칸 관문이 그 NUL 을 \x00 표기로 옮겨 쓴다.
+	if _, err := s.DB().ExecContext(ctx, `UPDATE machine SET hostname = 'ho' || char(0) || 'st' WHERE id = 'm1'`); err != nil {
+		t.Fatalf("원본 행의 NUL: %v", err)
 	}
 	s.Close()
 	dsn := storetest.NewBare(t, "")

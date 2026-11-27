@@ -11,7 +11,7 @@ import (
 )
 
 // Escape 는 되돌릴 수 있고(단사), 결과에 NUL 이 없고, NUL 도 「x00」도 없는 글은 그대로 둔다. 「x00」 앞 백슬래시 묶음의 홀짝으로
-// 되돌리는 규칙(unescape - README 가 사람에게 적은 것)으로 짧은 글 전부를 맞댄다.
+// 되돌리는 규칙(Unescape - README 가 사람에게 적은 것)으로 짧은 글 전부를 맞댄다.
 func TestEscapeIsReversible(t *testing.T) {
 	alphabet := []byte{'\\', 'x', '0', 0, 'a'}
 	seen := map[string]string{}
@@ -24,8 +24,8 @@ func TestEscapeIsReversible(t *testing.T) {
 		switch {
 		case strings.IndexByte(e, 0) >= 0:
 			t.Fatalf("Escape(%q) = %q 에 NUL 이 남았다", s, e)
-		case unescape(e) != s:
-			t.Fatalf("Escape(%q) = %q 를 되돌리니 %q 다", s, e, unescape(e))
+		case nulesc.Unescape(e) != s:
+			t.Fatalf("Escape(%q) = %q 를 되돌리니 %q 다", s, e, nulesc.Unescape(e))
 		case strings.IndexByte(s, 0) < 0 && !strings.Contains(s, "x00") && e != s:
 			t.Fatalf("NUL 도 x00 도 없는 %q 를 %q 로 바꿨다", s, e)
 		}
@@ -56,37 +56,6 @@ func TestEscapeIsReversible(t *testing.T) {
 			t.Errorf("Escape(%q) = %q, 기대 %q", in, got, want)
 		}
 	}
-}
-
-// unescape 는 Escape 의 역이다(README 「SQLite 원장을 Postgres 로 옮기기」의 되돌리는 규칙): 「x00」 바로 앞의 백슬래시 묶음이
-// 홀수 개(2k+1)면 k 개 백슬래시 + NUL, 짝수 개(2k)면 k 개 백슬래시 + 「x00」. 그 밖의 바이트는 그대로다.
-func unescape(e string) string {
-	var b strings.Builder
-	for i := 0; i < len(e); {
-		if e[i] != '\\' {
-			b.WriteByte(e[i])
-			i++
-			continue
-		}
-		j := i
-		for j < len(e) && e[j] == '\\' {
-			j++
-		}
-		n := j - i
-		if !strings.HasPrefix(e[j:], "x00") {
-			b.WriteString(e[i:j])
-			i = j
-			continue
-		}
-		b.WriteString(strings.Repeat(`\`, n/2))
-		if n%2 == 1 {
-			b.WriteByte(0)
-		} else {
-			b.WriteString("x00")
-		}
-		i = j + 3
-	}
-	return b.String()
 }
 
 // EscapeJSON 은 U+0000 이 든 글 값 토큰만 원문 바이트에서 고친다: 같은 문서의 다른 글 · 공백 · 수 · 다른 이스케이프는 원래

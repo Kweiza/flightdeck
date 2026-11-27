@@ -778,6 +778,8 @@ func (s *Store) runTx(ctx context.Context, sp txSpec, body func(*txConn) error, 
 	if err != nil {
 		return asFault(fmt.Errorf("트랜잭션 시작 실패: %w", err))
 	}
+	// 업무 쓰기는 모두 여기를 지난다 - 원장 칸 관문(cellgate.go)을 단다. 바꿔 넣은 칸은 커밋된 뒤에만 로그로 낸다.
+	tx.cells = &cellGate{}
 	// ★ 안전망: body 가 패닉하면 아래 커밋 · 롤백 어느 쪽에도 닿지 않는다. 그러면 연결과 잠금(Postgres 의
 	//   전역 · 관측 advisory 잠금, SQLite 의 쓰기 잠금)이 ctx 가 끝날 때까지 남고, 끝나지 않는 ctx 면 영영 남아
 	//   뒤 쓰기가 전부 잠금 대기 상한으로 죽는다. 이미 끝난 트랜잭션의 Rollback 은 sql.ErrTxDone 만 낸다.
@@ -808,6 +810,7 @@ func (s *Store) runTx(ctx context.Context, sp txSpec, body func(*txConn) error, 
 		//   삼키고 끝까지 가면 커밋이 ROLLBACK 으로 끝나 이 갈래로 온다(FaultAborted).
 		return abort(asFault(fmt.Errorf("커밋 실패: %w", err)))
 	}
+	tx.cells.report(ctx, s.log)
 	after(true)
 	return nil
 }

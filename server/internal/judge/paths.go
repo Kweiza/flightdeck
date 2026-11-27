@@ -12,6 +12,8 @@ package judge
 import (
 	"fmt"
 	"strings"
+
+	"github.com/kweiza/flightdeck/internal/nulesc"
 )
 
 // PathsOverlap 은 두 경로 집합이 겹치는지 판정한다.
@@ -175,6 +177,11 @@ func JudgePathCoordinate(p string) CoordinateVerdict {
 				"%q 라는 이름의 디렉토리 아래의 POSIX 상대경로일 수도 있지만, "+
 				"그런 경로라도 이 도구는 지원하지 않는다 — 드라이브 절대경로와 문자열만으로 못 가른다",
 			clipPath(q), coordinateGuidance, string(q[0])+":")}
+	case nulesc.CheckName(q) != nil:
+		// 경로 좌표는 이름이다. NUL 은 POSIX 경로에 있을 수 없고, 깨진 UTF-8 은 원장(Postgres text)이 못 담는다 - 원장 칸
+		// 관문은 이름 칸의 그런 글을 거절하고 JSON 칸(item.paths)에서는 다른 글(`\x00` 표기)로 옮긴다.
+		return CoordinateVerdict{Reason: fmt.Sprintf(
+			"%q 에 NUL 이나 깨진 UTF-8 이 있다 - 경로 좌표는 이름이라 원장이 그대로 담을 수 있는 글이어야 한다", clipPath(q))}
 	case strings.HasPrefix(q, `\\`):
 		return CoordinateVerdict{Reason: fmt.Sprintf(
 			"%q 는 Windows UNC 경로다. %s", clipPath(q), coordinateGuidance)}
