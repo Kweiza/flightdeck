@@ -1,5 +1,9 @@
 // Package nulesc 는 Postgres text 가 못 담는 NUL(U+0000)을 되돌릴 수 있는 `\x00` 표기로 옮기는 규칙이다: 글 하나에 거는 Escape 와,
-// JSON 문서 안에서 U+0000 이 든 글 토큰만 원문 바이트에서 고치는 EscapeJSON.
+// JSON 문서 안에서 U+0000 이 든 글 값 토큰만 원문 바이트에서 고치는 EscapeJSON.
+//
+// ★ 바꿔 넣기는 자유 글에만 건다. 식별자(이름으로 다른 것을 가리키는 글 - JSON 객체의 키가 그 하나다)의 NUL 은 바꾸지 않고
+// 거절한다: 바꾼 이름이 원래 `\x00` 네 글자를 담은 다른 이름과 같아지면 이름 공간에서 두 값이 하나가 된다. 원장의 식별자 칸은
+// 이관 카탈로그(store/pg 의 Column.Identifier)가 가르고, JSON 키는 EscapeJSON 이 ErrKeyNUL 로 거절한다.
 //
 // ★ 표준 라이브러리만 쓰는 순수 함수다. SQLite 원장을 Postgres 로 옮기는 이관(store/pg 의 Cell)이 쓰고, Postgres 원장에 새로 쓰는
 // 길도 같은 규칙을 그대로 가져다 쓸 수 있게 이관 카탈로그(store/pg)와 떼어 둔다.
@@ -12,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // mark 는 Escape 가 NUL 자리에 쓰는 표기의 백슬래시 뒤 글자다. 표기는 `\` + mark - 바이트 이스케이프를 읽는 사람이 NUL 로
@@ -57,38 +62,45 @@ func Escape(s string) string {
 	return b.String()
 }
 
-// Change 는 EscapeJSON 이 고친 글 토큰 하나의 자리다.
-type Change struct {
-	// Pointer 는 그 글의 자리(RFC 6901 JSON Pointer)다. 원래 문서의 키(디코드한 값) · 배열 번호로 적는다. 키가 바뀌었으면 그 키를
-	// 이름으로 가진 멤버의 자리다(Key).
-	Pointer string `json:"pointer"`
-	// Key 는 고친 글이 멤버 이름이라는 뜻이다. 거짓이면 Pointer 자리의 값이다.
-	Key bool `json:"key,omitempty"`
-}
-
 var (
 	// ErrSyntax: 받은 글이 JSON 문서가 아니다.
 	ErrSyntax = errors.New("JSON 문서가 아니다")
 	// ErrSurrogate: 글에 짝 없는 서로게이트 이스케이프(홀로 선 `\ud800` · `\udc00`)가 있다. jsonb 는 그 문서를 거절하고, 디코더는
 	// 그것을 U+FFFD 로 바꿔 다른 두 글을 같게 만든다.
 	ErrSurrogate = errors.New("짝 없는 서로게이트")
+	// ErrKeyNUL: 객체의 키(멤버 이름)에 U+0000 이 있다. 키는 바꾸지 않는다 - 바꾼 키가 같은 객체에서 원래 `\x00` 네 글자를 담은
+	// 옆 키와 같아지면(`{"\u0000":1,"\\x00":2}`) 두 멤버가 한 이름이 되고, jsonb 는 그중 하나를 버린다.
+	ErrKeyNUL = errors.New("키 안의 U+0000")
 )
 
-// EscapeJSON 은 JSON 문서 doc 에서 U+0000 이 든 글 토큰(키 포함)만 고친 문서와 고친 자리를 낸다. 고친 토큰을 디코드하면 원래 값에
-// Escape 를 건 값이다. 문서를 디코드해 다시 쓰지 않는다 - 원문 바이트에서 그 토큰의 이스케이프 단위만 바꾼다:
+// Refusal 은 EscapeJSON 이 문서를 거절한 글 하나의 자리다. 갈래(ErrSurrogate · ErrKeyNUL)는 errors.Is 로 잰다.
+type Refusal struct {
+	Err error
+	// Pointer 는 그 글의 자리(RFC 6901 JSON Pointer - 원래 문서의 키 · 배열 번호)다. 글이 키면 그 키를 이름으로 가진 멤버의
+	// 자리다(짝 없는 서로게이트 단위는 U+FFFD 로 읽는다).
+	Pointer string
+}
+
+func (r *Refusal) Error() string { return fmt.Sprintf("%v(글 자리 %q)", r.Err, r.Pointer) }
+func (r *Refusal) Unwrap() error { return r.Err }
+
+// EscapeJSON 은 JSON 문서 doc 에서 U+0000 이 든 글 값 토큰만 고친 문서와 고친 글의 자리(RFC 6901 JSON Pointer - 원래 문서의 키 ·
+// 배열 번호)를 낸다. 고친 토큰을 디코드하면 원래 값에 Escape 를 건 값이다. 문서를 디코드해 다시 쓰지 않는다 - 원문 바이트에서 그
+// 토큰의 이스케이프 단위만 바꾼다:
 //
 //   - U+0000 단위(`\u0000`)는 `\\x00` 이 된다(디코드하면 `\x00` 네 글자).
 //   - 백슬래시 단위(`\\` · `\u005c`)의 묶음은 바로 뒤 단위가 U+0000 이거나 「x00」 세 글자일 때 각 단위를 두 번 쓴다.
 //   - 그 밖의 단위, U+0000 이 없는 토큰, 토큰 밖(공백 · 수 · 순서)은 원래 바이트다.
 //
-// U+0000 이 없는 문서는 받은 그대로 낸다(고친 자리가 없다). 문서가 아니면 ErrSyntax, 어느 글에든 짝 없는 서로게이트가 있으면
-// ErrSurrogate 이고 그때도 문서는 받은 그대로다.
+// U+0000 이 없는 문서는 받은 그대로 낸다(고친 자리가 없다). 문서가 아니면 ErrSyntax, 어느 글에든 짝 없는 서로게이트가 있거나
+// 어느 키에든 U+0000 이 있으면 그 글의 자리를 담은 *Refusal(ErrSurrogate · ErrKeyNUL - 앞에서부터 처음 만난 것)이고, 그때도
+// 문서는 받은 그대로다.
 //
 // ★ 고치는 단위가 글 토큰 하나다. 같은 문서의 다른 글은 Escape 를 타지 않는다 - U+0000 이 없는 문서에 든 같은 글과 같은 바이트로
 // 남는다(감사 이벤트의 after 와 그 행의 칸이 옮긴 뒤에도 같은 값이다).
 // ★ 디코드 · 재부호화를 하지 않는 까닭: 디코더는 짝 없는 서로게이트를 U+FFFD 로 바꿔 다른 두 키를 하나로 만들고, 다시 쓰면 같은
 // 값의 다른 이스케이프(`\u0041` · `A`)가 한 꼴이 되어 원래 바이트를 잃는다.
-func EscapeJSON(doc string) (string, []Change, error) {
+func EscapeJSON(doc string) (string, []string, error) {
 	if !json.Valid([]byte(doc)) {
 		return doc, nil, ErrSyntax
 	}
@@ -106,15 +118,15 @@ func EscapeJSON(doc string) (string, []Change, error) {
 	return w.out.String(), w.changes, nil
 }
 
-// walker 는 json.Valid 를 지난 문서를 앞에서부터 한 번 걷는다. 글 토큰마다 단위를 읽어 서로게이트를 재고, U+0000 이 든 토큰은 고친
-// 바이트를 out 에 쓴다. at 은 out 으로 아직 옮기지 않은 원문의 시작이고, path 는 지금 자리의 키 · 배열 번호다.
+// walker 는 json.Valid 를 지난 문서를 앞에서부터 한 번 걷는다. 글 토큰마다 단위를 읽어 서로게이트 · 키의 U+0000 을 재고, U+0000 이
+// 든 값 토큰은 고친 바이트를 out 에 쓴다. at 은 out 으로 아직 옮기지 않은 원문의 시작이고, path 는 지금 자리의 키 · 배열 번호다.
 type walker struct {
 	s       string
 	i       int
 	out     strings.Builder
 	at      int
 	path    []string
-	changes []Change
+	changes []string
 }
 
 func (w *walker) space() {
@@ -204,8 +216,9 @@ func (u unit) u() bool   { return u.end-u.at == 6 }
 // shortEscapes 는 `\X` 단위가 디코드하는 글자다(JSON 문법의 전부).
 var shortEscapes = map[byte]rune{'"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}
 
-// token 은 w.i 의 글 토큰을 읽고 디코드한 값을 낸다. 짝 없는 서로게이트면 ErrSurrogate 다. 값에 U+0000 이 있으면 그 토큰을 고쳐
-// 쓰고 자리를 changes 에 싣는다(key 면 그 토큰이 멤버 이름이다).
+// token 은 w.i 의 글 토큰을 읽고 디코드한 값을 낸다(짝 없는 서로게이트 단위는 U+FFFD 로 읽는다). 짝 없는 서로게이트가 있거나 key
+// (그 토큰이 멤버 이름이다)에 U+0000 이 있으면 그 글의 자리를 담은 *Refusal 이다. 값에 U+0000 이 있으면 그 토큰을 고쳐 쓰고
+// 자리를 changes 에 싣는다.
 func (w *walker) token(key bool) (string, error) {
 	start := w.i
 	w.i++ // 여는 따옴표
@@ -229,30 +242,37 @@ func (w *walker) token(key bool) (string, error) {
 	}
 	w.i++ // 닫는 따옴표
 	var dec strings.Builder
-	nul := false
+	lone, nul := false, false
 	for k := 0; k < len(units); k++ {
 		u := units[k]
 		switch {
 		case u.raw():
 			dec.WriteByte(w.s[u.at])
 		case u.u() && utf16.IsSurrogate(u.r):
-			if u.r >= 0xDC00 || k+1 == len(units) || !units[k+1].u() || units[k+1].r < 0xDC00 || units[k+1].r > 0xDFFF {
-				return "", fmt.Errorf("%w(%q 의 글 %s)", ErrSurrogate, pointer(w.path), w.s[u.at:u.end])
+			if u.r < 0xDC00 && k+1 < len(units) && units[k+1].u() && units[k+1].r >= 0xDC00 && units[k+1].r <= 0xDFFF {
+				dec.WriteRune(utf16.DecodeRune(u.r, units[k+1].r))
+				k++
+				continue
 			}
-			dec.WriteRune(utf16.DecodeRune(u.r, units[k+1].r))
-			k++
+			lone = true
+			dec.WriteRune(utf8.RuneError)
 		default:
 			nul = nul || u.r == 0
 			dec.WriteRune(u.r)
 		}
 	}
-	if nul {
+	at := w.path
+	if key {
+		at = append(w.path[:len(w.path):len(w.path)], dec.String())
+	}
+	switch {
+	case lone:
+		return "", &Refusal{Err: ErrSurrogate, Pointer: pointer(at)}
+	case nul && key:
+		return "", &Refusal{Err: ErrKeyNUL, Pointer: pointer(at)}
+	case nul:
 		w.rewrite(start, units)
-		c := Change{Pointer: pointer(w.path)}
-		if key {
-			c = Change{Pointer: pointer(append(w.path[:len(w.path):len(w.path)], dec.String())), Key: true}
-		}
-		w.changes = append(w.changes, c)
+		w.changes = append(w.changes, pointer(at))
 	}
 	return dec.String(), nil
 }

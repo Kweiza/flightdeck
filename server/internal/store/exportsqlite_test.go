@@ -313,18 +313,16 @@ func TestExportSQLiteRefusesAnExistingTarget(t *testing.T) {
 	}
 }
 
-// 옮길 수 없는 원본은 파일을 남기지 않고 거절한다: Postgres 가 아닌 원본, 빈 DB, 이관 판이 아닌 원장, 그리고 이관의 사전 검사가
-// 받지 않을 값(깨진 JSON, 짝 없는 서러게이트가 든 JSON)이 든 원장 - 낸 파일을 다시 이관할 수 없게 되므로 역이관도 받지 않는다.
-// JSON 의 \u0000 은 거절하지 않고 그대로 낸다(TestExportSQLiteCarriesJSONNULVerbatim).
+// 옮길 수 없는 원본은 파일을 남기지 않고 거절한다: Postgres 가 아닌 원본, 빈 DB, 이관 판이 아닌 원장, 그리고 깨진 JSON 이 든
+// 원장 - SQLite 판의 JSON 함수도 못 읽는 글이다. jsonb 만 거절하는 JSON(\u0000 · 짝 없는 서러게이트)은 거절하지 않고 그대로
+// 낸다(TestExportSQLiteCarriesJSONNULVerbatim · TestExportSQLiteCarriesALoneSurrogateVerbatim).
 func TestExportSQLiteRefusesASourceItCannotMove(t *testing.T) {
 	ctx := context.Background()
 	newer, newerStore := importTarget(t)
 	stamp(t, newerStore, pg.ImportVersion+1)
 	_, broken, brokenStore := importedPG(t)
 	pgExec(t, brokenStore, `UPDATE item SET paths = '[깨진' WHERE id = 'i1'`)
-	_, lone, loneStore := importedPG(t)
-	pgExec(t, loneStore, `UPDATE item SET labels = '["\ud800"]' WHERE id = 'i1'`)
-	faults := map[string]pg.Fault{"깨진 JSON": pg.FaultJSON, "짝 없는 서러게이트": pg.FaultJSONSurrogate}
+	faults := map[string]pg.Fault{"깨진 JSON": pg.FaultJSON}
 	for _, c := range []struct {
 		name, from, want string
 	}{
@@ -332,7 +330,6 @@ func TestExportSQLiteRefusesASourceItCannotMove(t *testing.T) {
 		{"빈 DB", storetest.NewBare(t, ""), "빈 DB"},
 		{"판이 오른 원장", newer, "판 " + transferRange() + " 이 아니다"},
 		{"깨진 JSON", broken, "사전 검사"},
-		{"짝 없는 서러게이트", lone, "사전 검사"},
 	} {
 		for _, dry := range []bool{true, false} {
 			back := exportBack(t)
@@ -795,5 +792,38 @@ func TestExportSQLiteCarriesJSONNULVerbatim(t *testing.T) {
 	}
 	if len(cells) != 2 || cells["item.labels"] != 1 || cells["event.payload"] != 1 {
 		t.Fatalf("다시 이관한 기록 %v", cells)
+	}
+}
+
+// Postgres 원장의 JSON 칸에 짝 없는 서러게이트가 한 행이라도 있어도 역이관은 서지 않는다: 두 엔진 다 글 칸이라 원문을 그대로
+// 내고(SQLite 의 JSON 함수는 그 문서를 읽는다 - jsonb 만 거절한다), 낸 파일과 원장의 변환 없는 대조가 맞는다. 그 파일을 다시
+// Postgres 로 옮길 때는 이관의 사전 검사가 그 행을 칸 · 행 · JSON 자리와 함께 거절한다 - 서러게이트 거절은 옮겨 넣는 길에만 있다.
+func TestExportSQLiteCarriesALoneSurrogateVerbatim(t *testing.T) {
+	ctx := context.Background()
+	_, dsn, dst := importedPG(t)
+	pgExec(t, dst, `UPDATE item SET labels = '["\ud800"]' WHERE id = 'i1'`)
+	back := exportBack(t)
+	rep, err := exportLedger(t, ctx, dsn, back, TransferOptions{})
+	if err != nil || len(rep.Faults) != 0 || len(rep.TargetFaults) != 0 || !rep.Matched() || rep.Copied == 0 {
+		t.Fatalf("역이관: %v, 걸린 갈래 %+v · %+v", err, rep.Faults, rep.TargetFaults)
+	}
+	var got string
+	liteQuery(t, back, `SELECT labels FROM item WHERE id = 'i1'`, &got)
+	if got != `["\ud800"]` {
+		t.Fatalf("낸 파일의 labels %q, 기대 원문 그대로", got)
+	}
+	settleLedger(t, dsn)
+	if again, err := VerifySQLite(ctx, back, dsn, VerifyOptions{Exported: true}, quietLog()); err != nil || !again.Matched() ||
+		len(again.Faults) != 0 || len(again.TargetFaults) != 0 {
+		t.Fatalf("낸 파일의 대조: %v, 걸린 갈래 %+v · %+v", err, again.Faults, again.TargetFaults)
+	}
+	other, _ := importTarget(t)
+	re, err := importLedger(t, ctx, back, other, TransferOptions{DryRun: true})
+	if err == nil || !strings.Contains(err.Error(), "사전 검사") || len(re.Faults) != 1 {
+		t.Fatalf("낸 파일의 이관: %v, 걸린 갈래 %+v", err, re.Faults)
+	}
+	if g := re.Faults[0]; g.Table != "item" || g.Column != "labels" || g.Reason != pg.FaultJSONSurrogate || len(g.Keys) != 1 ||
+		!strings.Contains(g.Keys[0], `id="i1" JSON "/0"`) {
+		t.Fatalf("낸 파일의 이관이 걸린 갈래 %+v", g)
 	}
 }

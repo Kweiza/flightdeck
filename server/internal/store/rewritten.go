@@ -9,7 +9,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/kweiza/flightdeck/internal/nulesc"
 	"github.com/kweiza/flightdeck/internal/store/pg"
 )
 
@@ -33,8 +32,9 @@ type rewrittenCell struct {
 	Key    map[string]any `json:"key"`
 	Column string         `json:"column"`
 	Rule   pg.Rewrite     `json:"rule"`
-	// Paths 는 JSON 칸에서 고친 글의 자리다(RFC 6901 JSON Pointer, 원래 문서의 키). 글 칸은 칸 전체가 단위라 비었다.
-	Paths []nulesc.Change `json:"paths,omitempty"`
+	// Paths 는 JSON 칸에서 고친 글 값의 자리다(RFC 6901 JSON Pointer, 원래 문서의 키). 키는 고치지 않는다 - U+0000 이 든 키는
+	// 사전 검사가 거절한다. 글 칸은 칸 전체가 단위라 비었다.
+	Paths []string `json:"paths,omitempty"`
 	// Original 은 원본에서 읽은 그 칸의 바이트다(JSON 에서는 base64).
 	Original []byte `json:"original"`
 }

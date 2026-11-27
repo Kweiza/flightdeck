@@ -479,13 +479,16 @@ curl -s localhost:7420/healthz
 
 `/healthz` must have `db_ok` and `db_locale_ok` true.
 
-- **NUL becomes `\x00`.** SQLite holds NUL bytes (0x00) in text columns; Postgres cannot. Step 5's dry run and move and step
-  7's comparison do not refuse such a column: they move it with NUL written as the four characters `\x00`, list the changed
-  columns under "옮기며 바꾼 원본 칸" ("source columns changed in the move") by table · column · rule · row key, and repeat the
-  number of changed rows under the verdict line. Every changed column is kept with its original bytes in
+- **NUL becomes `\x00` in free text only; a NUL in an identifier or a JSON key is refused.** SQLite holds NUL bytes (0x00)
+  in text columns; Postgres cannot. Step 5's dry run and move and step 7's comparison do not refuse a NUL in free text (text
+  columns such as bodies and titles, and string values in JSON columns): they move it written as the four characters `\x00`,
+  list the changed columns under "옮기며 바꾼 원본 칸" ("source columns changed in the move") by table · column · rule · row
+  key, and repeat the number of changed rows under the verdict line. Every changed column is kept with its original bytes in
   `~/.flightdeck/fd.db.rewritten-<time>.jsonl` - that file is the authority on those original bytes, so do not delete it.
-  There is no hand-editing step. The SQLite ledger file is left as it is. The rule and how to reverse it are in "Moving a
-  SQLite ledger to Postgres" below.
+  A NUL in free text needs no hand-editing step. A NUL in an identifier column (primary key · UNIQUE · a column that points
+  at another row) or in a JSON key is not changed: step 5's dry run refuses it in the pre-checks - fix that row in the copy
+  and run it again. The SQLite ledger file is left as it is. The rule and how to reverse it are in "Moving a SQLite ledger to
+  Postgres" below.
 - If it stops **before step 5 leaves the marker** (a refusal or failure in 2-5), nothing is committed (the import is one
   transaction), **with two exceptions**. If step 5's move stops with "옮겼다(N 행, 커밋했다) - 그런데 원본 옆에 이관 표지를
   남기지 못했다" ("moved (N rows, committed) - but could not leave the move marker next to the source"), it did commit. If
@@ -883,8 +886,8 @@ fd migrate verify --from fd-copy.db --db <URL>
   import both refuse and list each remaining connection's pid · role · application_name. Some writes of an attached server
   (observation records) do not take the migration lock and would interleave with the moving transaction.
 - Pre-checks: broken UTF-8 in text columns, broken JSON in JSON columns (a JSON column with a raw NUL byte inside a string
-  is not a JSON document either and lands here) and JSON with a lone surrogate, a storage type that does not match the
-  column, NULL primary keys, primary key · UNIQUE columns that collide once moved (below), foreign keys pointing at missing rows, and text over the limit of an index key column
+  is not a JSON document either and lands here) and JSON with a lone surrogate, a NUL in an identifier column and U+0000 in
+  a JSON key (below), a storage type that does not match the column, NULL primary keys, primary key · UNIQUE columns that collide once moved (below), foreign keys pointing at missing rows, and text over the limit of an index key column
   (event's project 2048 bytes, kind 512 bytes - the Postgres B-tree cannot take that row). If anything hits, nothing is
   written and each hit is listed by table · column · reason · primary key. Fix those rows in the copy and run it again. Rows
   over the key limit are the exception: do not fix them - they belong to the append-only audit ledger (event), and cutting a
@@ -893,29 +896,36 @@ fd migrate verify --from fd-copy.db --db <URL>
   both ledgers).
 - New values cannot pass the same limit: the server refuses a project over 2048 bytes or a kind over 512 bytes with a 400
   (`key_too_long`) on both engines.
-- **NUL becomes `\x00`.** Postgres text cannot hold a NUL byte (0x00), and jsonb refuses a document with U+0000 (`\u0000`)
-  in a string. Such columns are not refused; they are moved with the rule below. The rule works on one string at a time
-  and can be reversed.
+- **NUL becomes `\x00` in free text only; a NUL in an identifier or a JSON key is refused.** Postgres text cannot hold a
+  NUL byte (0x00), and jsonb refuses a document with U+0000 (`\u0000`) in a string. Free text (text columns that are not
+  identifier columns, and string values in JSON columns) is not refused; it is moved with the rule below. The rule works on
+  one string at a time and can be reversed.
+  - Identifier places are not changed; the pre-checks refuse them: a NUL in an identifier column (primary key and UNIQUE
+    columns, and columns that name another row whether or not a foreign key backs them - project, `*_id`, `dep_*` and so
+    on), and U+0000 in a JSON key (the key's JSON Pointer follows the row key). A changed name could equal another name
+    that always held the four characters `\x00`: primary key · UNIQUE would collide, a row pointing at that name would point
+    at another row (nothing catches that at commit for a reference column without a foreign key), or two keys of one
+    document would become one. Identifiers are short names the server or a person picks, so fix them in the copy.
   - Text columns: in a value that holds a NUL, each NUL becomes the four characters `\x00`, and a run of backslashes directly
     followed by a NUL or by `x00` is doubled - a `\x00` notation already in the same value becomes `\\x00` and stays
     apart from the NUL positions. Every other byte (including other notations such as `\n` or `\x1f`) and every value
     without a NUL is left byte for byte.
-  - JSON columns: the document is not decoded and written again. Only the strings (keys included) that hold U+0000 are
+  - JSON columns: the document is not decoded and written again. Only the string values that hold U+0000 are
     fixed, in place within their original bytes - `\u0000` becomes `\\x00` (which decodes to the four characters `\x00`),
     and within that string a run of backslashes (`\\` or `\u005c`) directly followed by U+0000 or by `x00` is doubled.
     Strings without U+0000 keep their original bytes even in the same document (their `\x00` notations too), as do numbers,
     whitespace, order and other escapes (`\u00e9`, `\/`).
-  - JSON with a lone surrogate (an unpaired `\ud800`-`\udfff`) is refused by the pre-checks. jsonb does not take it, and
-    decoding and writing it again turns it into U+FFFD, merging two different keys into one.
+  - JSON with a lone surrogate (an unpaired `\ud800`-`\udfff`) is refused by the pre-checks (the string's JSON Pointer
+    follows the row key). jsonb does not take it, and decoding and writing it again turns it into U+FFFD, merging two
+    different keys into one.
   - Reversing: in a changed string (the whole value for a text column), a run of backslashes directly before `x00` that is
     odd (2k+1) was k backslashes + NUL, and one that is even (2k) was k backslashes + `x00`. Everything else is unchanged.
     The record file below says which columns and strings were changed - the values in the moved ledger alone cannot tell a
     changed column from one that always held the four characters `\x00`.
   - **The record of changed columns.** Before it commits, the move writes `<source>.rewritten-<time>.jsonl` next to the
     source: one JSON line per changed column with `table`, `key` (the row's primary key columns → moved values, never cut),
-    `column`, `rule` (the rule in the screen report), `paths` (for a JSON column, where the fixed strings are - RFC 6901
-    JSON Pointers with the original document's keys, `"key": true` when the member name itself was fixed; absent for text
-    columns) and `original` (the column's bytes as read from the source, base64). There is no limit on the number of lines.
+    `column`, `rule` (the rule in the screen report), `paths` (for a JSON column, where the fixed string values are - a list
+    of RFC 6901 JSON Pointers with the original document's keys; absent for text columns) and `original` (the column's bytes as read from the source, base64). There is no limit on the number of lines.
     **That file is the authority on the original bytes of those columns** - do not delete it; keep it with the source copy.
     If the file cannot be written, the move does not commit (nothing is moved). The moved marker
     (`<source>.moved-to-postgres`) names it under `rewritten`, and so does the line below "옮겼다". A dry run and the
@@ -923,12 +933,12 @@ fd migrate verify --from fd-copy.db --db <URL>
   - Nothing is changed silently: the dry run, the move and `fd migrate verify` list the changed columns under "옮기며 바꾼
     원본 칸" by table · column · rule · count · row key (the first 20 per group, shortened - the record file has them all)
     and repeat the number of changed rows under the verdict line. The comparison applies the same rule to the source values,
-    so changed rows match. Target values are compared without conversion; a NUL in a text column, a storage type that does
-    not match the column, or broken JSON (a lone surrogate included) in the target is flagged by the target value check.
-  - If primary key · UNIQUE columns become equal to another row's once moved (one key holds a NUL and another holds `\x00`
-    in that place, or one key sits in a text column as a BLOB and another is text with the same bytes), the pre-checks
-    refuse the colliding row by table · column set · row key - before the target would refuse it at commit. A partial index
-    (one live hold, and so on) is checked only among the rows inside its condition.
+    so changed rows match. Target values are compared without conversion; broken UTF-8, a NUL in a text column, a storage
+    type that does not match the column, or broken JSON in the target is flagged by the target value check.
+  - If primary key · UNIQUE columns become equal to another row's once moved (one key sits in a text column as a BLOB and
+    another is text with the same bytes), the pre-checks refuse the colliding row by table · column set · row key - before
+    the target would refuse it at commit. A partial index (one live hold, and so on) is checked only among the rows inside
+    its condition. A NUL cannot cause a collision - those columns are identifier columns, so their NUL is refused above.
 - After moving and leaving the moved marker, the import moves the source's pre-upgrade copies (`<source>.bak-*`, with their
   side files) into a new directory `<source>.pre-import-<time>.bak/` (it does not delete them). That file is no longer the
   ledger, and those copies are not copies of whatever ledger is put there later. A dry run, a refusal, or a failure moves
@@ -974,15 +984,17 @@ fd migrate verify --from fd-back.db --db <URL> --exported
   build and is refused. So is a ledger whose tables or columns differ from the import version (a hand-edited ledger). The version and the shape are measured in
   the snapshot the export copies from. The account is the same as for the import (a superuser or a member of `fd_owner` - it
   reads the sequences).
-- A source holding a value the import's pre-checks would refuse (broken JSON, JSON with a lone surrogate and the like) is refused, since the exported
-  file could not be imported again. The index key limit is not checked: the original values already in the Postgres ledger are
-  exported as they are, and `fd migrate verify` compares those originals. Importing that file again stops at the import's
-  pre-checks, which name the row.
+- A source holding a value SQLite could not read (broken JSON) is refused. The import-only rules (JSON with a lone surrogate
+  or with U+0000 in a key, the index key limit) are not checked: both engines keep these columns as text and SQLite's JSON
+  functions read those documents, so the original values already in the Postgres ledger are exported as they are and
+  `fd migrate verify --exported` compares those originals - the way back does not stop on one such value. Importing that
+  file again stops at the import's pre-checks, which name the row.
 - Postgres values are written as they are. The `\x00` the import wrote in place of a NUL is not turned back into a NUL (the
   import's record file is the authority on the original bytes) - the exported file holds no NUL, and its comparison with the
   Postgres ledger (step 4) matches without conversion. A `\u0000` in a JSON string (written by the server after the import -
   JSON columns are text, not jsonb, so Postgres holds it) is not refused either and is written as it is. The way back does
-  not stop on that value, and importing that file again changes that column by the rule above and records it.
+  not stop on that value. Importing that file again changes a `\u0000` in a string value by the rule above and records it,
+  and refuses one in a key in the pre-checks.
 - If pre-upgrade copies (`<to>.bak-*`, with their side files) sit next to `--to`, they are moved into a new directory
   `<to>.pre-export-<time>.bak/` before the name is given (not deleted) - they are not copies of the new ledger, so they are
   kept out of the place where `fd migrate --rollback` picks. A dry run moves nothing.

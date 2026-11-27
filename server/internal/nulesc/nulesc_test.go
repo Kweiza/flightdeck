@@ -89,42 +89,55 @@ func unescape(e string) string {
 	return b.String()
 }
 
-// EscapeJSON 은 U+0000 이 든 글 토큰만 원문 바이트에서 고친다: 같은 문서의 다른 글 · 공백 · 수 · 다른 이스케이프는 원래
-// 바이트이고, 고친 자리를 JSON Pointer 로 낸다. 짝 없는 서로게이트는 U+0000 이 없어도 거절한다.
+// EscapeJSON 은 U+0000 이 든 글 값 토큰만 원문 바이트에서 고친다: 같은 문서의 다른 글 · 공백 · 수 · 다른 이스케이프는 원래
+// 바이트이고, 고친 자리를 JSON Pointer 로 낸다. 키의 U+0000 은 고치지 않고 거절하며(식별자다 - 바꾸면 옆 키와 같아질 수 있다),
+// 짝 없는 서로게이트는 U+0000 이 없어도 거절한다. 거절은 그 글의 자리(Refusal.Pointer)를 댄다.
 func TestEscapeJSONRewritesOnlyTheTokensWithNUL(t *testing.T) {
 	for _, c := range []struct {
 		name, in, want string
-		changes        []nulesc.Change
+		changes        []string
 		err            error
+		at             string // 거절한 글의 자리(거절이 아니면 빈 글)
 	}{
-		{"값", `{"a":"x\u0000"}`, `{"a":"x\\x00"}`, []nulesc.Change{{Pointer: "/a"}}, nil},
-		{"키", `{"\u0000":1}`, `{"\\x00":1}`, []nulesc.Change{{Pointer: "/\x00", Key: true}}, nil},
-		{"안쪽 키", `{"o":{"k\u0000":[1]}}`, `{"o":{"k\\x00":[1]}}`, []nulesc.Change{{Pointer: "/o/k\x00", Key: true}}, nil},
-		{"문서 전체가 글", `"\u0000"`, `"\\x00"`, []nulesc.Change{{Pointer: ""}}, nil},
-		{"Pointer 이스케이프", `{"a/b":{"~":["\u0000"]}}`, `{"a/b":{"~":["\\x00"]}}`, []nulesc.Change{{Pointer: "/a~1b/~0/0"}}, nil},
-		{"이스케이프된 백슬래시 뒤 u0000 은 글자다", `["\\u0000"]`, `["\\u0000"]`, nil, nil},
-		{"범위 밖 수 뒤", `[1e400,"\u0000"]`, `[1e400,"\\x00"]`, []nulesc.Change{{Pointer: "/1"}}, nil},
+		{"값", `{"a":"x\u0000"}`, `{"a":"x\\x00"}`, []string{"/a"}, nil, ""},
+		{"문서 전체가 글", `"\u0000"`, `"\\x00"`, []string{""}, nil, ""},
+		{"Pointer 이스케이프", `{"a/b":{"~":["\u0000"]}}`, `{"a/b":{"~":["\\x00"]}}`, []string{"/a~1b/~0/0"}, nil, ""},
+		{"이스케이프된 백슬래시 뒤 u0000 은 글자다", `["\\u0000"]`, `["\\u0000"]`, nil, nil, ""},
+		{"범위 밖 수 뒤", `[1e400,"\u0000"]`, `[1e400,"\\x00"]`, []string{"/1"}, nil, ""},
 		// 디코드해 다시 쓰는 길이면 \u00e9 는 é, \/ 는 / 로 바뀐다. 고친 토큰 안의 그것들도 원래 바이트다.
 		{"다른 이스케이프는 원래 바이트", `{ "h":"\u00e9\/", "n": "\/\u00e9\u0000", "f": 1.50 }`,
-			`{ "h":"\u00e9\/", "n": "\/\u00e9\\x00", "f": 1.50 }`, []nulesc.Change{{Pointer: "/n"}}, nil},
+			`{ "h":"\u00e9\/", "n": "\/\u00e9\\x00", "f": 1.50 }`, []string{"/n"}, nil, ""},
 		// 바꾸는 단위가 글 하나다: U+0000 이 없는 옆 글의 \x00 표기는 그대로다.
-		{"옆 글의 \\x00 표기", `["\u0000","\\x00"]`, `["\\x00","\\x00"]`, []nulesc.Change{{Pointer: "/0"}}, nil},
-		{"같은 글의 \\x00 표기", `["\\x00\u0000"]`, `["\\\\x00\\x00"]`, []nulesc.Change{{Pointer: "/0"}}, nil},
-		{"\\u005c 도 백슬래시다", `["\u005c\u0000"]`, `["\u005c\u005c\\x00"]`, []nulesc.Change{{Pointer: "/0"}}, nil},
-		{"\\u0078 도 x 다", `["\\\u00780\u0030\u0000"]`, `["\\\\\u00780\u0030\\x00"]`, []nulesc.Change{{Pointer: "/0"}}, nil},
-		{"짝 맞은 서로게이트", `["\ud83d\ude00\u0000"]`, `["\ud83d\ude00\\x00"]`, []nulesc.Change{{Pointer: "/0"}}, nil},
-		{"U+0000 없는 문서", `{"a":["\\x00","\u00e9"]}`, `{"a":["\\x00","\u00e9"]}`, nil, nil},
-		{"홀로 선 높은 서로게이트", `["\ud800"]`, `["\ud800"]`, nil, nulesc.ErrSurrogate},
-		{"홀로 선 낮은 서로게이트", `["a\udc00b"]`, `["a\udc00b"]`, nil, nulesc.ErrSurrogate},
-		{"높은 뒤 높은", `["\ud800\ud800"]`, `["\ud800\ud800"]`, nil, nulesc.ErrSurrogate},
-		// 디코더는 둘 다 「U+FFFD + U+0000」으로 읽어 다른 두 키를 하나로 만든다.
-		{"U+FFFD 로 같아질 두 키", `{"\ud800\u0000":1,"\ufffd\u0000":2}`, `{"\ud800\u0000":1,"\ufffd\u0000":2}`, nil, nulesc.ErrSurrogate},
-		{"깨진 문서", `[`, `[`, nil, nulesc.ErrSyntax},
-		{"날 NUL", "[\"\x00\"]", "[\"\x00\"]", nil, nulesc.ErrSyntax},
+		{"옆 글의 \\x00 표기", `["\u0000","\\x00"]`, `["\\x00","\\x00"]`, []string{"/0"}, nil, ""},
+		{"같은 글의 \\x00 표기", `["\\x00\u0000"]`, `["\\\\x00\\x00"]`, []string{"/0"}, nil, ""},
+		{"\\u005c 도 백슬래시다", `["\u005c\u0000"]`, `["\u005c\u005c\\x00"]`, []string{"/0"}, nil, ""},
+		{"\\u0078 도 x 다", `["\\\u00780\u0030\u0000"]`, `["\\\\\u00780\u0030\\x00"]`, []string{"/0"}, nil, ""},
+		{"짝 맞은 서로게이트", `["\ud83d\ude00\u0000"]`, `["\ud83d\ude00\\x00"]`, []string{"/0"}, nil, ""},
+		{"값이 여럿", `{"a":["\u0000"],"b":"\u0000"}`, `{"a":["\\x00"],"b":"\\x00"}`, []string{"/a/0", "/b"}, nil, ""},
+		{"U+0000 없는 문서", `{"a":["\\x00","\u00e9"]}`, `{"a":["\\x00","\u00e9"]}`, nil, nil, ""},
+		// 키는 바꾸지 않는다: 바꾸면 이 두 키가 하나(`\x00`)가 되어 jsonb 가 한 멤버를 버린다.
+		{"키와 옆 키의 \\x00 표기", `{"\u0000":1,"\\x00":2}`, `{"\u0000":1,"\\x00":2}`, nil, nulesc.ErrKeyNUL, "/\x00"},
+		{"키", `{"\u0000":1}`, `{"\u0000":1}`, nil, nulesc.ErrKeyNUL, "/\x00"},
+		{"안쪽 키", `{"o":{"k\u0000":[1]}}`, `{"o":{"k\u0000":[1]}}`, nil, nulesc.ErrKeyNUL, "/o/k\x00"},
+		// 값을 먼저 고쳤어도 뒤의 키가 거절이면 문서는 받은 그대로다.
+		{"고친 값 뒤의 키", `{"a":"\u0000","b\u0000":1}`, `{"a":"\u0000","b\u0000":1}`, nil, nulesc.ErrKeyNUL, "/b\x00"},
+		{"키 안의 Pointer 이스케이프", `[{"~/\u0000":1}]`, `[{"~/\u0000":1}]`, nil, nulesc.ErrKeyNUL, "/0/~0~1\x00"},
+		{"홀로 선 높은 서로게이트", `["\ud800"]`, `["\ud800"]`, nil, nulesc.ErrSurrogate, "/0"},
+		{"홀로 선 낮은 서로게이트", `["a\udc00b"]`, `["a\udc00b"]`, nil, nulesc.ErrSurrogate, "/0"},
+		{"높은 뒤 높은", `["\ud800\ud800"]`, `["\ud800\ud800"]`, nil, nulesc.ErrSurrogate, "/0"},
+		// 디코더는 둘 다 「U+FFFD + U+0000」으로 읽어 다른 두 키를 하나로 만든다. 서로게이트가 먼저다.
+		{"U+FFFD 로 같아질 두 키", `{"\ud800\u0000":1,"\ufffd\u0000":2}`, `{"\ud800\u0000":1,"\ufffd\u0000":2}`, nil,
+			nulesc.ErrSurrogate, "/" + "\ufffd" + "\x00"},
+		{"깨진 문서", `[`, `[`, nil, nulesc.ErrSyntax, ""},
+		{"날 NUL", "[\"\x00\"]", "[\"\x00\"]", nil, nulesc.ErrSyntax, ""},
 	} {
 		got, changes, err := nulesc.EscapeJSON(c.in)
 		if got != c.want || !reflect.DeepEqual(changes, c.changes) || !errors.Is(err, c.err) || (err == nil) != (c.err == nil) {
-			t.Errorf("%s: EscapeJSON(%s) = (%s, %+v, %v), 기대 (%s, %+v, %v)", c.name, c.in, got, changes, err, c.want, c.changes, c.err)
+			t.Errorf("%s: EscapeJSON(%s) = (%s, %q, %v), 기대 (%s, %q, %v)", c.name, c.in, got, changes, err, c.want, c.changes, c.err)
+		}
+		var r *nulesc.Refusal
+		if refused := errors.As(err, &r); refused != (c.at != "") || (refused && r.Pointer != c.at) {
+			t.Errorf("%s: 거절 자리 %+v, 기대 %q", c.name, r, c.at)
 		}
 	}
 	// 원래 바이트를 둔다: 디코드한 값이 같은 두 문서(\u0041 · A)는 고친 뒤에도 다르다.

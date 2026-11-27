@@ -156,12 +156,13 @@ func TestImportCatalogMatchesBothEngines(t *testing.T) {
 	}
 }
 
-// Cell 은 Postgres 가 거절할 값을 사유와 함께 거르고, 바이트를 바꾸지 않는 저장 갈래는 받고, NUL 은 정해진 규칙으로 바꿔
-// 넣으며 그 갈래를 낸다.
+// Cell 은 Postgres 가 거절할 값을 사유와 함께 거르고, 바이트를 바꾸지 않는 저장 갈래는 받고, 자유 글의 NUL 은 정해진 규칙으로
+// 바꿔 넣으며 그 갈래를 낸다. 식별자 자리(식별자 칸 · JSON 키)의 NUL 은 바꾸지 않고 거절한다.
 func TestCellFaults(t *testing.T) {
 	text := pg.Column{Name: "t", Kind: pg.Text}
 	notNull := pg.Column{Name: "n", Kind: pg.Text, NotNull: true}
-	key := pg.Column{Name: "k", Kind: pg.Text, NotNull: true, Key: true}
+	key := pg.Column{Name: "k", Kind: pg.Text, NotNull: true, Key: true, Identifier: true}
+	ident := pg.Column{Name: "r", Kind: pg.Text, Identifier: true}
 	num := pg.Column{Name: "i", Kind: pg.Int}
 	blob := pg.Column{Name: "b", Kind: pg.Bytes}
 	doc := pg.Column{Name: "j", Kind: pg.Text, JSON: true}
@@ -179,7 +180,10 @@ func TestCellFaults(t *testing.T) {
 		{"NOT NULL 칸의 NULL", notNull, nil, nil, pg.FaultNull, ""},
 		{"기본키의 NULL", key, nil, nil, pg.FaultKeyNull, ""},
 		{"글의 NUL 은 \\x00 이 된다", text, "a\x00b", `a\x00b`, "", pg.RewriteNUL},
-		{"기본키의 NUL 도 같은 규칙이다", key, "k\x00", `k\x00`, "", pg.RewriteNUL},
+		{"기본키의 NUL 은 거절한다", key, "k\x00", "k\x00", pg.FaultIdentNUL, ""},
+		{"참조 칸의 NUL 도 거절한다", ident, "p\x00", "p\x00", pg.FaultIdentNUL, ""},
+		{"식별자 칸의 BLOB 에 든 NUL 도 거절한다", ident, []byte{'p', 0}, "p\x00", pg.FaultIdentNUL, ""},
+		{"식별자 칸의 \\x00 표기는 그대로다", ident, `p\x00`, `p\x00`, "", ""},
 		{"NUL 이 든 칸의 \\x00 표기는 백슬래시가 두 배다", text, `\x00` + "\x00", `\\x00\x00`, "", pg.RewriteNUL},
 		{"NUL 이 없는 칸의 \\x00 표기는 그대로다", text, `a\x00\\`, `a\x00\\`, "", ""},
 		{"깨진 UTF-8", text, "\xff", "\xff", pg.FaultUTF8, ""},
@@ -195,7 +199,10 @@ func TestCellFaults(t *testing.T) {
 		{"깨진 JSON", doc, "[", "[", pg.FaultJSON, ""},
 		{"날 NUL 이 든 JSON 은 문서가 아니다", doc, "[\"\x00\"]", "[\"\x00\"]", pg.FaultJSON, ""},
 		{"JSON 글 안의 \\u0000", doc, `{"a":"x\u0000"}`, `{"a":"x\\x00"}`, "", pg.RewriteJSONNUL},
-		{"JSON 키 안의 \\u0000", doc, `{"\u0000":1}`, `{"\\x00":1}`, "", pg.RewriteJSONNUL},
+		{"JSON 키 안의 \\u0000 은 거절한다", doc, `{"\u0000":1}`, `{"\u0000":1}`, pg.FaultJSONKeyNUL, ""},
+		// 키를 바꿔 넣으면 옆 키와 같아진다.
+		{"바꾼 키가 옆 키와 같아질 문서", doc, `{"\u0000":1,"\\x00":2}`, `{"\u0000":1,"\\x00":2}`, pg.FaultJSONKeyNUL, ""},
+		{"글 값의 \\u0000 뒤에 있어도 키는 거절이다", doc, `{"a":"\u0000","b\u0000":1}`, `{"a":"\u0000","b\u0000":1}`, pg.FaultJSONKeyNUL, ""},
 		{"이스케이프된 백슬래시 뒤 u0000 은 글자다", doc, `["\\u0000"]`, `["\\u0000"]`, "", ""},
 		// float64 로 못 옮기는 수 뒤에 있어도 \u0000 을 잰다(수를 글 그대로 읽는다).
 		{"범위 밖 수 뒤의 \\u0000", doc, `[1e400,"\u0000"]`, `[1e400,"\\x00"]`, "", pg.RewriteJSONNUL},
@@ -341,7 +348,8 @@ func TestCellKeepsTheColumnType(t *testing.T) {
 }
 
 // SettledCell 은 값을 바꾸지 않는다(변환 없이 맞댄다): Cell 이 받는 두 갈래(글 칸의 BLOB, bytea 칸의 TEXT)는 저장 갈래 오류,
-// 글 칸의 NUL 은 FaultNUL, Cell 의 거절은 그 사유로 걸고, JSON 글의 \u0000 은 두 엔진이 다 담는 여섯 글자라 원문 그대로 받는다.
+// 글 칸의 NUL 은 식별자 칸이든 아니든 FaultNUL, 깨진 JSON 은 FaultJSON 으로 건다. 이관이 jsonb 때문에 거는 JSON 규칙(글 · 키의
+// \u0000, 짝 없는 서로게이트)은 걸지 않는다 - 두 엔진이 다 글 칸에 담고 SQLite 의 JSON 함수도 읽는 원문이다.
 func TestSettledCellComparesVerbatim(t *testing.T) {
 	text, bytes := pg.Column{Name: "c", Kind: pg.Text}, pg.Column{Name: "c", Kind: pg.Bytes}
 	doc := pg.Column{Name: "c", Kind: pg.Text, JSON: true}
@@ -355,7 +363,10 @@ func TestSettledCellComparesVerbatim(t *testing.T) {
 		{text, "a\x00b", pg.FaultNUL},
 		{text, []byte("a\x00b"), pg.FaultNUL},
 		{doc, `["\u0000"]`, ""},
-		{doc, `["\ud800"]`, pg.FaultJSONSurrogate},
+		{doc, `["\ud800"]`, ""},
+		{doc, `{"\u0000":1}`, ""},
+		{doc, "[", pg.FaultJSON},
+		{pg.Column{Name: "c", Kind: pg.Text, Identifier: true}, "a\x00", pg.FaultNUL},
 		{doc, "[\"\x00\"]", pg.FaultJSON},
 		{text, `a\x00b`, ""},
 		{doc, `["\\x00"]`, ""},
@@ -510,6 +521,91 @@ func TestUniquesMatchTheBaseline(t *testing.T) {
 	}
 	if n != len(pg.Tables())+4 { // 표마다 기본키 하나 + UNIQUE 제약 하나 + 부분 · UNIQUE 인덱스 셋
 		t.Fatalf("기준선의 유일 인덱스 %d 개, 기대 %d 개", n, len(pg.Tables())+4)
+	}
+}
+
+// 식별자 칸(Column.Identifier) 표시가 기준선과 맞는다: Postgres 의 유일 인덱스 · FK 에 드는 글 칸은 다 식별자 칸이고(지문 칸은
+// key_digest 대신 key), FK 없이 다른 행을 이름으로 가리키는 칸(손 목록)만 더 있다. 이름이 식별자 꼴(id · project · *_id ·
+// *_project · dep_*)인 글 칸도 다 식별자 칸이다. 그래서 바꿔 넣은 NUL 이 기본키 · UNIQUE 겹침(FaultUnique)이나 다른 행을 가리키는
+// 값을 만들 길이 없다.
+func TestIdentifierColumnsMatchTheBaseline(t *testing.T) {
+	db := openPG(t)
+	// FK 가 없는 참조 칸: 다른 행(항목 · 작업 · 커밋 · 세션 · 프로젝트)을 이름으로 가리킨다.
+	byName := []string{"item_after.dep_item", "item_after.dep_job", "item_after.dep_sha", "item_after.dep_project",
+		"pick_eval.project", "pick_eval.session_id", "pick_eval.picked", "judgment_link.target_project",
+		"resource_hold.job_id", "job.item_id", "event.project", "event.session_id"}
+	inBaseline := map[string]bool{}
+	for _, tb := range pg.Tables() {
+		for _, r := range strs(t, db, `SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid
+				AND a.attnum = ANY(i.indkey::int2[]) WHERE i.indisunique AND i.indrelid = format('%I', $1::text)::regclass
+			UNION SELECT a.attname FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+				WHERE c.contype = 'f' AND c.conrelid = format('%I', $1::text)::regclass`, tb.Name) {
+			name := r[0]
+			if tb.DigestKey != "" && name == tb.DigestKey+"_digest" {
+				name = tb.DigestKey
+			}
+			inBaseline[tb.Name+"."+name] = true
+		}
+	}
+	identName := func(n string) bool {
+		return n == "id" || n == "project" || strings.HasSuffix(n, "_id") || strings.HasSuffix(n, "_project") ||
+			strings.HasPrefix(n, "dep_")
+	}
+	var extra []string
+	for _, tb := range pg.Tables() {
+		for _, u := range tb.Uniques() {
+			for _, n := range u.Cols {
+				if !tb.Cols[tb.Index(n)].Identifier {
+					t.Errorf("%s 의 유일 묶음 %s 의 칸 %s 가 식별자 칸이 아니다", tb.Name, u.Name, n)
+				}
+			}
+		}
+		for _, c := range tb.Cols {
+			at := tb.Name + "." + c.Name
+			if c.Kind != pg.Text {
+				continue
+			}
+			switch {
+			case inBaseline[at] && !c.Identifier:
+				t.Errorf("%s 는 기준선의 유일 인덱스 · FK 칸인데 식별자 칸이 아니다", at)
+			case identName(c.Name) && !c.Identifier:
+				t.Errorf("%s 는 식별자 이름인데 식별자 칸이 아니다", at)
+			case c.Identifier && !inBaseline[at]:
+				extra = append(extra, at)
+			}
+		}
+	}
+	if len(inBaseline) == 0 {
+		t.Fatal("기준선에서 유일 인덱스 · FK 칸을 하나도 못 읽었다")
+	}
+	slices.Sort(extra)
+	slices.Sort(byName)
+	if !slices.Equal(extra, byName) {
+		t.Errorf("기준선 밖의 식별자 칸 %q, 기대(FK 없는 참조 칸) %q", extra, byName)
+	}
+}
+
+// 칸 하나를 통째로 거절하는 갈래는 행 좌표 그대로고, JSON 글 하나를 거절한 갈래(짝 없는 서로게이트 · 키의 U+0000)는 그 글의
+// 자리를 덧붙인다 - 큰 문서에서 고칠 글을 찾게.
+func TestFaultLabelPointsAtTheRefusedString(t *testing.T) {
+	text := pg.Column{Name: "c", Kind: pg.Text}
+	doc := pg.Column{Name: "c", Kind: pg.Text, JSON: true}
+	for _, c := range []struct {
+		col  pg.Column
+		v    any
+		f    pg.Fault
+		want string
+	}{
+		{doc, `{"a":{"b\u0000":1}}`, pg.FaultJSONKeyNUL, `id=1 JSON "/a/b\x00"`},
+		{doc, []byte(`[0,{"x":"\udc00"}]`), pg.FaultJSONSurrogate, `id=1 JSON "/1/x"`},
+		{doc, `{"a/b":{"~\u0000":1}}`, pg.FaultJSONKeyNUL, `id=1 JSON "/a~1b/~0\x00"`},
+		{doc, "[", pg.FaultJSON, `id=1`},
+		{text, "a\x00", pg.FaultIdentNUL, `id=1`},
+		{text, "\xff", pg.FaultUTF8, `id=1`},
+	} {
+		if got := pg.FaultLabel("id=1", c.col, c.v, c.f); got != c.want {
+			t.Errorf("FaultLabel(%q, %s) = %q, 기대 %q", c.v, c.f, got, c.want)
+		}
 	}
 }
 

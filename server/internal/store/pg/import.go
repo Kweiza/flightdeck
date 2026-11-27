@@ -2,6 +2,7 @@ package pg
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"strings"
 	"unicode/utf8"
@@ -92,8 +93,13 @@ type Column struct {
 	// Key 는 행을 가리키는 칸이다: SQLite 판의 기본키, 기본키가 없는 item_after 는 seq(= rowid). 사전 검사에 걸린 행 ·
 	// 대조에서 어긋난 행을 이 칸들의 값으로 적는다.
 	Key bool
+	// Identifier 는 식별자 칸이다: 기본키(key 가 함께 단다), 기준선의 UNIQUE 묶음, 그리고 다른 행을 이름으로 가리키는 칸(FK 가
+	// 있든 없든 - project · *_id · dep_* 등). 이관은 이 칸의 NUL 을 바꿔 넣지 않고 거절한다(FaultIdentNUL) - 바꾼 값이 원래
+	// `\x00` 네 글자를 담은 다른 이름과 같아지면 그 이름을 가리키던 행이 다른 행을 가리킨다. 바꿔 넣기는 자유 글에만이다.
+	// 표시는 이 카탈로그 한 곳이고, 기준선의 기본키 · UNIQUE · FK 칸을 빠짐없이 덮는지는 import_test.go 가 Postgres 카탈로그로 잰다.
+	Identifier bool
 	// JSON 은 서버가 JSON 문서로 쓰는 칸이다(json.Marshal). Postgres 에서는 text 그대로지만 jsonb 로 읽힐 수 있는 칸이라
-	// 깨진 문서 · 짝 없는 서로게이트는 거절하고 글 안의 \u0000 은 그 글 토큰만 바꿔 넣는다(RewriteJSONNUL).
+	// 깨진 문서 · 짝 없는 서로게이트 · 키 안의 \u0000 은 거절하고 글 값 안의 \u0000 은 그 글 토큰만 바꿔 넣는다(RewriteJSONNUL).
 	JSON bool
 	// Identity 는 기준선에서 GENERATED ALWAYS AS IDENTITY 다. 옛 번호를 그대로 넣으려면 소유 역할로 OVERRIDING SYSTEM
 	// VALUE 를 붙이고, 넣은 뒤 같은 트랜잭션에서 `ALTER SEQUENCE … RESTART WITH` 로 번호를 맞춘다(Sequence).
@@ -200,10 +206,11 @@ var tables = []Table{
 	{Name: "project", Cols: []Column{key(txt("id")), nn(txt("path")), txt("remote_url"), nn(txt("default_branch")),
 		txt("config"), txt("config_from_sha"), nn(txt("created_at")), txt("pinned_at"), txt("archived_at")}},
 	{Name: "machine", Cols: []Column{key(txt("id")), nn(txt("hostname")), nn(txt("first_seen")), nn(txt("last_seen"))}},
-	{Name: "session", Cols: []Column{key(txt("id")), nn(txt("project")), nn(txt("machine_id")), nn(txt("worktree")),
-		nn(txt("cc_session_id")), txt("label"), nn(txt("state")), txt("blocked_why"), nn(txt("opened_at")), txt("harness")},
+	{Name: "session", Cols: []Column{key(txt("id")), ref(nn(txt("project"))), ref(nn(txt("machine_id"))),
+		ref(nn(txt("worktree"))), ref(nn(txt("cc_session_id"))), txt("label"), nn(txt("state")), txt("blocked_why"),
+		nn(txt("opened_at")), txt("harness")},
 		unique: []Unique{{Name: "session_machine_id_worktree_cc_session_id_key", Cols: []string{"machine_id", "worktree", "cc_session_id"}}}},
-	{Name: "session_workspace", Cols: []Column{key(txt("session_id")), nn(txt("project")), key(txt("path")), nn(num("is_primary"))}},
+	{Name: "session_workspace", Cols: []Column{key(txt("session_id")), ref(nn(txt("project"))), key(txt("path")), nn(num("is_primary"))}},
 	{Name: "signal", Cols: []Column{key(txt("session_id")), key(txt("kind")), nn(txt("at"))}},
 	{Name: "footprint", Cols: []Column{key(txt("session_id")), key(txt("path")), key(txt("origin")),
 		nn(txt("first_at")), nn(txt("last_at"))}},
@@ -213,40 +220,41 @@ var tables = []Table{
 	{Name: "item", Cols: []Column{key(txt("project")), key(txt("id")), nn(txt("title")), nn(txt("body")),
 		doc(nn(txt("paths"))), doc(nn(txt("labels"))), nn(txt("state")), txt("close_reason"), txt("landed_ref"),
 		nn(txt("created_at")), txt("closed_at")}},
-	{Name: "item_after", Cols: []Column{nn(txt("project")), nn(txt("item_id")), txt("dep_item"), txt("dep_job"),
-		txt("dep_sha"), txt("dep_project"), rowid(ident(num("seq")))}},
-	{Name: "claim", Cols: []Column{key(txt("project")), key(txt("item_id")), nn(txt("session_id")), nn(txt("at")),
+	{Name: "item_after", Cols: []Column{ref(nn(txt("project"))), ref(nn(txt("item_id"))), ref(txt("dep_item")),
+		ref(txt("dep_job")), ref(txt("dep_sha")), ref(txt("dep_project")), rowid(ident(num("seq")))}},
+	{Name: "claim", Cols: []Column{key(txt("project")), key(txt("item_id")), ref(nn(txt("session_id"))), nn(txt("at")),
 		txt("released_at"), txt("force_reason")}},
-	{Name: "pick_eval", AutoIncrement: true, Cols: []Column{ident(num("id")), nn(txt("project")), nn(txt("session_id")),
-		nn(txt("at")), txt("picked"), doc(nn(txt("rejected"))), doc(txt("picked_with"))}},
-	{Name: "judgment", Cols: []Column{key(txt("id")), txt("project"), txt("session_id"), nn(txt("at")), nn(txt("kind")),
-		txt("title"), nn(txt("body")), txt("supersedes")}},
+	{Name: "pick_eval", AutoIncrement: true, Cols: []Column{ident(num("id")), ref(nn(txt("project"))),
+		ref(nn(txt("session_id"))), nn(txt("at")), ref(txt("picked")), doc(nn(txt("rejected"))), doc(txt("picked_with"))}},
+	{Name: "judgment", Cols: []Column{key(txt("id")), ref(txt("project")), ref(txt("session_id")), nn(txt("at")),
+		nn(txt("kind")), txt("title"), nn(txt("body")), ref(txt("supersedes"))}},
 	{Name: "judgment_link", Cols: []Column{key(txt("judgment_id")), key(txt("target_kind")), key(txt("target_id")),
-		txt("target_project")}},
+		ref(txt("target_project"))}},
 	{Name: "snapshot", DigestKey: "key", Cols: []Column{key(txt("project")), key(txt("key")), nn(txt("value")),
 		nn(txt("method")), txt("evidence"), txt("input_digest"), nn(txt("computed_at"))}},
 	{Name: "counter", Cols: []Column{key(txt("project")), key(txt("name")), nn(num("value"))}},
-	{Name: "resource_hold", AutoIncrement: true, Cols: []Column{ident(num("id")), nn(txt("project")), nn(txt("resource")),
-		txt("session_id"), txt("job_id"), nn(txt("acquired_at")), txt("released_at"), txt("force_reason")},
+	{Name: "resource_hold", AutoIncrement: true, Cols: []Column{ident(num("id")), ref(nn(txt("project"))),
+		ref(nn(txt("resource"))), ref(txt("session_id")), ref(txt("job_id")), nn(txt("acquired_at")), txt("released_at"),
+		txt("force_reason")},
 		unique: []Unique{{Name: "resource_one_holder", Cols: []string{"project", "resource"}, WhereNull: "released_at"}}},
-	{Name: "job", Cols: []Column{key(txt("id")), nn(txt("project")), nn(txt("kind")), txt("item_id"), txt("session_id"),
-		txt("branch"), txt("recipe"), nn(txt("state")), txt("fail_kind"), nn(txt("queued_at")), txt("started_at"),
+	{Name: "job", Cols: []Column{key(txt("id")), ref(nn(txt("project"))), nn(txt("kind")), ref(txt("item_id")),
+		ref(txt("session_id")), txt("branch"), txt("recipe"), nn(txt("state")), txt("fail_kind"), nn(txt("queued_at")), txt("started_at"),
 		txt("ended_at"), txt("beat_at"), txt("base_sha"), txt("head_sha"), txt("landed_sha"), txt("image_tag"),
 		txt("ack_at"), txt("log_tail")}},
 	{Name: "event", AutoIncrement: true, Cols: []Column{ident(num("id")), nn(txt("at")),
-		capped(EventProjectMaxBytes, txt("project")), txt("session_id"), capped(EventKindMaxBytes, nn(txt("kind"))),
-		doc(nn(txt("payload")))}},
+		ref(capped(EventProjectMaxBytes, txt("project"))), ref(txt("session_id")),
+		capped(EventKindMaxBytes, nn(txt("kind"))), doc(nn(txt("payload")))}},
 	{Name: "idempotency", Cols: []Column{key(txt("key")), nn(txt("fingerprint")), nn(num("status")), nn(txt("ctype")),
 		nn(blob("body")), nn(txt("at"))}},
-	{Name: "landing_queue", AutoIncrement: true, Cols: []Column{ident(num("id")), nn(txt("project")), nn(txt("session_id")),
-		nn(txt("enqueued_at")), txt("left_at"), txt("left_kind"), txt("left_detail")},
+	{Name: "landing_queue", AutoIncrement: true, Cols: []Column{ident(num("id")), ref(nn(txt("project"))),
+		ref(nn(txt("session_id"))), nn(txt("enqueued_at")), txt("left_at"), txt("left_kind"), txt("left_detail")},
 		unique: []Unique{{Name: "landing_queue_one_live_per_session", Cols: []string{"project", "session_id"}, WhereNull: "left_at"}}},
 	{Name: "landing_queue_resource", Cols: []Column{key(num("row_id")), key(txt("resource"))}},
 	{Name: "project_member", Cols: []Column{key(txt("root_project")), key(txt("member_project")), nn(txt("path")),
 		nn(txt("declared_at"))}},
 	{Name: "item_revision", Cols: []Column{key(txt("project")), key(txt("item_id")), key(num("rev")), nn(txt("at")),
-		txt("session_id"), nn(txt("title")), nn(txt("body")), doc(nn(txt("paths"))), nn(txt("reason"))}},
-	{Name: "session_inbox", Cols: []Column{key(txt("session_id")), nn(txt("machine_id")), nn(txt("socket")),
+		ref(txt("session_id")), nn(txt("title")), nn(txt("body")), doc(nn(txt("paths"))), nn(txt("reason"))}},
+	{Name: "session_inbox", Cols: []Column{key(txt("session_id")), ref(nn(txt("machine_id"))), ref(nn(txt("socket"))),
 		nn(txt("mode")), nn(txt("seen_at"))},
 		unique: []Unique{{Name: "session_inbox_socket", Cols: []string{"machine_id", "socket"}}}},
 }
@@ -255,7 +263,8 @@ func txt(name string) Column  { return Column{Name: name, Kind: Text} }
 func num(name string) Column  { return Column{Name: name, Kind: Int} }
 func blob(name string) Column { return Column{Name: name, Kind: Bytes} }
 func nn(c Column) Column      { c.NotNull = true; return c }
-func key(c Column) Column     { c.Key, c.NotNull = true, true; return c }
+func key(c Column) Column     { c.Key, c.NotNull = true, true; return ref(c) }
+func ref(c Column) Column     { c.Identifier = true; return c }
 func doc(c Column) Column     { c.JSON = true; return c }
 func ident(c Column) Column   { c.Identity = true; return key(c) }
 func rowid(c Column) Column   { c.Rowid = true; return c }
@@ -263,8 +272,8 @@ func rowid(c Column) Column   { c.Rowid = true; return c }
 func capped(n int, c Column) Column { c.MaxBytes = n; return c }
 
 // Fault 는 사전 검사가 칸 하나를 거절한 갈래다. 하나라도 걸리면 이관은 아무것도 안 쓰고, 걸린 행을 표 · 행 좌표 · 칸으로 낸다.
-// 고치는 것은 원본 사본에서 사람이 한다. 이관이 스스로 바꿔 넣는 것은 되돌릴 수 있는 규칙이 정해진 갈래(Rewrite - NUL)뿐이고,
-// 이관의 대조는 원본 값에 같은 규칙을 건 뒤 맞댄다 - 그 밖의 값을 짐작으로 고쳐 넣으면 전 칸 대조가 설 자리가 없다.
+// 고치는 것은 원본 사본에서 사람이 한다. 이관이 스스로 바꿔 넣는 것은 되돌릴 수 있는 규칙이 정해진 갈래(Rewrite - 자유 글의
+// NUL)뿐이고, 이관의 대조는 원본 값에 같은 규칙을 건 뒤 맞댄다 - 그 밖의 값을 짐작으로 고쳐 넣으면 전 칸 대조가 설 자리가 없다.
 type Fault string
 
 const (
@@ -274,8 +283,14 @@ const (
 	FaultNull Fault = "NOT NULL 칸의 NULL"
 	// FaultNUL: 변환 없이 맞대는 값(SettledCell - 옮긴 대상, 역이관의 Postgres 원본, 역이관이 낸 SQLite 파일)의 글 칸에 NUL
 	// 바이트가 있다. Postgres 에서는 날 수 없고, 역이관이 낸 파일에 있으면 낸 뒤에 무엇이 넣은 것이다. 이관의 SQLite 원본에 든
-	// NUL 은 거절하지 않고 바꿔 넣는다(RewriteNUL).
+	// NUL 은 자유 글이면 바꿔 넣고(RewriteNUL) 식별자 칸이면 FaultIdentNUL 이다.
 	FaultNUL Fault = "NUL 바이트"
+	// FaultIdentNUL: 이관의 SQLite 원본에서 식별자 칸(Column.Identifier - 기본키 · UNIQUE · 다른 행을 가리키는 칸)의 NUL
+	// 바이트. 바꿔 넣지 않는다 - 바꾼 값은 원래 `\x00` 네 글자를 담은 다른 이름과 같아져, 그 이름 공간에서 두 값이 합쳐진다: FK
+	// 없는 참조(item_after.dep_project)가 없던 프로젝트 대신 그 이름의 실제 프로젝트를 가리키고, 표 안의 겹침 재기
+	// (FaultUnique)로는 그것이 안 보인다. 그래서 이 갈래의 NUL 은 원천에서 거절한다 - 식별자는 서버가 짓거나 사람이 짓는 짧은
+	// 이름이라 NUL 이 든 값은 고장이다.
+	FaultIdentNUL Fault = "식별자 칸의 NUL"
 	// FaultUTF8: UTF8 DB 의 text 는 깨진 바이트열을 거절한다(SQLite 는 그대로 둔다).
 	FaultUTF8 Fault = "깨진 UTF-8"
 	// FaultStorage: 선언 타입으로 옮길 수 없는 값(정수 칸의 글, 글 칸의 실수 등). SQLite 는 칸 타입을 강제하지 않는다.
@@ -284,11 +299,17 @@ const (
 	// 그 칸은 처음부터 문서가 아니었고, 그 바이트를 `\x00` 로 바꿔도 문서가 되지 않는다(`\x` 는 JSON 이스케이프가 아니다).
 	FaultJSON Fault = "깨진 JSON"
 	// FaultJSONSurrogate: JSON 문서의 글(키 포함)에 짝 없는 서로게이트 이스케이프(홀로 선 `\ud800`)가 있다. jsonb 는 그 문서를
-	// 거절하고, 디코드하면 U+FFFD 로 바뀌어 다른 두 글이 같아진다. 서버(json.Marshal)는 그렇게 쓰지 않는다.
+	// 거절하고, 디코드하면 U+FFFD 로 바뀌어 다른 두 글이 같아진다. 서버(json.Marshal)는 그렇게 쓰지 않는다. 이관의 사전 검사
+	// (Cell)에서만 난다 - SQLite 의 JSON 함수는 그 문서를 읽으므로 역이관 · 그 파일의 대조(SettledCell)는 원문 그대로 둔다.
+	// 행 좌표에 그 글의 자리(JSON Pointer)를 싣는다(FaultLabel).
 	FaultJSONSurrogate Fault = "JSON 안의 짝 없는 서로게이트"
+	// FaultJSONKeyNUL: JSON 문서의 키(멤버 이름)에 든 U+0000(`\u0000`). 바꿔 넣지 않는다 - 키는 그 객체 안의 식별자라, 바꾼 키가
+	// 원래 `\x00` 네 글자를 담은 옆 키와 같아지면(`{"\u0000":1,"\\x00":2}`) jsonb 가 한 멤버를 버린다. 행 좌표에 그 키의
+	// 자리(JSON Pointer)를 싣는다(FaultLabel). 이관의 사전 검사(Cell)에서만 난다.
+	FaultJSONKeyNUL Fault = "JSON 키 안의 U+0000"
 	// FaultUnique: 기본키 · UNIQUE 칸 묶음(Table.Uniques)의 옮길 값이 앞의 행과 같다. 기준선은 뒤 행을 거절한다. SQLite 에서는
-	// 달랐던 두 값이 옮기며 같아진 자리다 - NUL 을 바꿔 넣은 값이 원래 `\x00` 네 글자를 담은 값과 같아지거나, 글 칸의 BLOB 이
-	// 같은 바이트의 글과 같아진다. 칸 자리에 칸 묶음을, 좌표에 뒤 행의 옮길 값을 싣는다.
+	// 달랐던 두 값이 옮기며 같아진 자리다 - 글 칸의 BLOB 이 같은 바이트의 글과 같아진다. NUL 로는 나지 않는다: 그 묶음의 칸은
+	// 전부 식별자 칸이라 NUL 은 FaultIdentNUL 로 먼저 걸리고 바꿔 넣지 않는다. 칸 자리에 칸 묶음을, 좌표에 뒤 행의 옮길 값을 싣는다.
 	FaultUnique Fault = "기본키 · UNIQUE 겹침"
 	// FaultForeignKey: 부모가 없는 행. 기준선은 커밋 때 거절한다.
 	FaultForeignKey Fault = "FK 부모가 없다"
@@ -303,11 +324,12 @@ const (
 type Rewrite string
 
 const (
-	// RewriteNUL: 글 칸의 NUL 바이트(0x00). Postgres text 는 NUL 을 못 담는다 - 칸 전체에 nulesc.Escape 를 걸어 `\x00` 네
-	// 글자로 옮긴다.
+	// RewriteNUL: 자유 글 칸(식별자 칸이 아닌 글 칸)의 NUL 바이트(0x00). Postgres text 는 NUL 을 못 담는다 - 칸 전체에
+	// nulesc.Escape 를 걸어 `\x00` 네 글자로 옮긴다. 식별자 칸의 NUL 은 FaultIdentNUL 이다.
 	RewriteNUL Rewrite = `NUL 바이트 → \x00`
-	// RewriteJSONNUL: JSON 칸의 글(키 포함)에 든 U+0000(문서의 `\u0000`). U+0000 이 든 글 토큰에만 글 칸과 같은 규칙을 건다
+	// RewriteJSONNUL: JSON 칸의 글 값(키 아님)에 든 U+0000(문서의 `\u0000`). U+0000 이 든 글 토큰에만 글 칸과 같은 규칙을 건다
 	// (nulesc.EscapeJSON) - 그 토큰은 `\\x00` 로 쓰인다(디코드하면 `\x00` 네 글자). jsonb 는 `\u0000` 이 든 문서를 거절한다(22P05).
+	// 키의 U+0000 은 FaultJSONKeyNUL 이다.
 	RewriteJSONNUL Rewrite = `JSON 안의 \u0000 → \x00`
 )
 
@@ -321,11 +343,17 @@ const (
 // ★ 값을 바꾸지 않고 옮기는 갈래 둘을 받는다: 글 칸에 든 BLOB(같은 바이트가 UTF-8 이면 글이다)과 bytea 칸에 든 TEXT.
 // 바이트가 그대로이고, 옮긴 값의 타입이 칸 타입이라 대상에서 읽은 값과 행 해시의 표지까지 같다. 바이트가 바뀌어야 하는
 // 갈래(정수 ↔ 글, 실수)는 거절하고 원래 타입을 그대로 둔다 - 그 값의 행 해시는 대상과 표지가 다르다.
-// ★ 바이트를 바꿔 넣는 갈래는 NUL 하나다(Rewrite). Postgres 가 받을 길이 없고 되돌릴 수 있는 규칙(nulesc.Escape)이 있다.
+// ★ 바이트를 바꿔 넣는 갈래는 자유 글의 NUL 하나다(Rewrite). Postgres 가 받을 길이 없고 되돌릴 수 있는 규칙(nulesc.Escape)이
+// 있다. 식별자 자리(식별자 칸 · JSON 키)의 NUL 은 바꾸지 않고 거절한다(FaultIdentNUL · FaultJSONKeyNUL) - 바꾼 이름이 원래
+// `\x00` 네 글자를 담은 다른 이름과 같아질 길을 원천에서 막는다.
 //
 // ★ 사전 검사를 지난 값(Fault 가 빈)의 타입은 언제나 nil 이거나 칸 타입의 꼴이다(Text → string, Int → int64, Bytes →
 // []byte). 행 해시가 이것에 기댄다(RowHash 의 ★).
-func Cell(c Column, v any) (any, Fault, Rewrite) {
+func Cell(c Column, v any) (any, Fault, Rewrite) { return convert(c, v, importText) }
+
+// convert 는 읽은 값 v 를 칸 c 의 타입으로 옮기는 몫이다(Cell · SettledCell 이 같다). 글 칸에 든 글(BLOB 이면 같은 바이트의
+// 글)은 규칙 text 가 잰다 - 이관의 원본(importText)과 변환 없이 맞대는 값(settledText)이 갈리는 자리는 그것 하나다.
+func convert(c Column, v any, text func(Column, string) (string, Fault, Rewrite)) (any, Fault, Rewrite) {
 	switch x := v.(type) {
 	case nil:
 		switch {
@@ -347,7 +375,7 @@ func Cell(c Column, v any) (any, Fault, Rewrite) {
 		case Bytes:
 			return []byte(x), "", ""
 		}
-		return textCell(c, x)
+		return text(c, x)
 	case []byte:
 		switch c.Kind {
 		case Int:
@@ -360,33 +388,32 @@ func Cell(c Column, v any) (any, Fault, Rewrite) {
 			}
 			return x, "", ""
 		}
-		return textCell(c, string(x))
+		return text(c, string(x))
 	}
 	return v, FaultStorage, ""
 }
 
 // SettledCell 은 변환 없이 맞대는 값 v 를 잰다: 옮긴 대상(이관 · 역이관의 커밋 전 대조, `fd migrate verify` 의 Postgres 쪽),
 // 역이관의 원본(Postgres), 역이관이 낸 SQLite 파일(`fd migrate verify --exported`)이다. 값을 바꾸지 않는다 - 셋째 값은 늘 비었다.
-// Cell 의 거절에 더해 둘을 거절한다: 글 칸의 NUL 바이트(FaultNUL)와 저장 갈래가 칸 타입과 다른 값(FaultStorage, Text → 글 ·
-// Int → 정수 · Bytes → BLOB 이어야 한다). 걸리면 값은 받은 그대로 돌려줘 행 해시의 표지도 원본과 갈린다.
+// 거절은 어느 한쪽 엔진이 못 담거나 못 읽는 값뿐이다(settledText - 깨진 UTF-8, 깨진 JSON, 글 칸의 NUL 바이트)에 더해, 기본키 ·
+// NOT NULL 칸의 NULL 과 저장 갈래가 칸 타입과 다른 값(FaultStorage, Text → 글 · Int → 정수 · Bytes → BLOB 이어야 한다)이다.
+// 걸리면 값은 받은 그대로 돌려줘 행 해시의 표지도 원본과 갈린다.
 //
 // ★ 바꿔 넣기는 이관의 SQLite 원본만의 사정이다. 변환 없이 맞대는 쪽에 그 규칙을 걸면 두 쪽이 다른 값을 같다고 한다: 역이관이
 // 낸 파일에 넣은 NUL 이 Postgres 의 `\x00` 네 글자와 같아진다. 그래서 두 쪽을 다 원문 그대로 맞댄다.
-// ★ 글 칸의 NUL 은 거절하고 JSON 글의 `\u0000` 은 그대로 받는다 - 거절은 한쪽 엔진이 못 담는 값만이다. Postgres text 는 NUL 을
-// 못 담으므로 그 값은 Postgres 에서 날 수 없고 SQLite 쪽에 있으면 낸 뒤에 무엇이 넣은 것이다. `\u0000` 은 여섯 글자라 두 엔진이
-// 다 담고, Postgres 서버가 U+0000 이 든 글을 json.Marshal 로 쓰면 생긴다 - 그것을 거절하면 역이관(72시간 되돌리기)이 선다.
+// ★ 이관이 jsonb 때문에 거는 규칙(JSON 글 · 키의 `\u0000`, 짝 없는 서로게이트)도 걸지 않는다. 두 엔진 다 글 칸이라 원문 그대로
+// 담고 SQLite 의 JSON 함수도 그 문서를 읽는다 - Postgres 판 서버가 쓴 그런 값 하나에 역이관(72시간 되돌리기)이 서면 안 된다.
+// 그 파일을 다시 Postgres 로 옮길 때 이관의 사전 검사가 그 행을 바꿔 넣거나 좌표와 함께 거절한다(인덱스 키 상한과 같은 자리다).
 // ★ Cell 이 받는 두 저장 갈래(글 칸의 BLOB, bytea 칸의 TEXT)도 원본의 사정이다 - SQLite 원본은 칸 타입을 강제하지 않아
 // 그렇게 쌓였을 수 있고, 바이트가 그대로라 옮겨도 된다. 대상에 다른 갈래로 남았으면 넣은 뒤에 무엇이 바꾼 것이다. 바이트가
 // 같아 지문으로는 안 갈리므로 여기서 잰다. SQLite 쪽의 자리다 - Postgres 는 엔진이 칸 타입을 강제해 늘 맞는다.
 func SettledCell(c Column, v any) (any, Fault, Rewrite) {
-	out, f, rw := Cell(c, v)
+	out, f, _ := convert(c, v, settledText)
 	switch {
-	case rw == RewriteNUL:
-		return v, FaultNUL, ""
+	case f == FaultNUL:
+		return v, f, ""
 	case f == "" && v != nil && !storedAs(c.Kind, v):
 		return v, FaultStorage, ""
-	case rw != "": // RewriteJSONNUL - 원문 그대로다
-		return v, "", ""
 	}
 	return out, f, ""
 }
@@ -422,23 +449,42 @@ func storedAs(k Kind, v any) bool {
 	return false
 }
 
-// textCell 은 글 칸에 든 글 s 를 잰다: 깨진 UTF-8 은 거절하고, JSON 칸은 jsonCell 이 재고, NUL 이 든 글은 nulesc.Escape 로
-// 바꿔 넣는다(RewriteNUL). NUL 이 없는 글은 한 바이트도 안 바뀐다.
-func textCell(c Column, s string) (string, Fault, Rewrite) {
+// importText 는 이관의 SQLite 원본 글 칸에 든 글 s 를 잰다: 깨진 UTF-8 은 거절하고, JSON 칸은 jsonCell 이 잰다. NUL 이 든 글은
+// 식별자 칸(Column.Identifier)이면 거절하고(FaultIdentNUL) 자유 글 칸이면 nulesc.Escape 로 바꿔 넣는다(RewriteNUL). NUL 이 없는
+// 글은 한 바이트도 안 바뀐다.
+func importText(c Column, s string) (string, Fault, Rewrite) {
 	switch {
 	case !utf8.ValidString(s):
 		return s, FaultUTF8, ""
 	case c.JSON:
 		return jsonCell(s)
+	case strings.IndexByte(s, 0) < 0:
+		return s, "", ""
+	case c.Identifier:
+		return s, FaultIdentNUL, ""
+	}
+	return nulesc.Escape(s), "", RewriteNUL
+}
+
+// settledText 는 변환 없이 맞대는 글 칸의 글 s 를 잰다(SettledCell). 어느 한쪽 엔진이 못 담거나 못 읽는 글만 거절한다: 깨진
+// UTF-8(Postgres text 가 못 담는다), JSON 칸이 문서가 아닌 것(FaultJSON - 두 엔진의 JSON 함수가 다 못 읽는다, 날 NUL 이 든 JSON
+// 도 여기다), 글 칸의 NUL 바이트(FaultNUL - Postgres text 가 못 담는다).
+func settledText(c Column, s string) (string, Fault, Rewrite) {
+	switch {
+	case !utf8.ValidString(s):
+		return s, FaultUTF8, ""
+	case c.JSON && !json.Valid([]byte(s)):
+		return s, FaultJSON, ""
 	case strings.IndexByte(s, 0) >= 0:
-		return nulesc.Escape(s), "", RewriteNUL
+		return s, FaultNUL, ""
 	}
 	return s, "", ""
 }
 
-// jsonCell 은 JSON 칸 하나를 잰다(글 바이트의 깨진 UTF-8 은 textCell 이 먼저 걸렀다): 문서가 아니면 FaultJSON, 짝 없는
-// 서로게이트가 있으면 FaultJSONSurrogate, 글(키 포함)에 U+0000 이 있으면 그 글 토큰만 원문 바이트에서 고친 문서와
-// RewriteJSONNUL 이다(nulesc.EscapeJSON). 같은 문서의 다른 글 · 공백 · 수 · 순서 · 이스케이프는 원래 바이트다.
+// jsonCell 은 이관의 SQLite 원본 JSON 칸 하나를 잰다(글 바이트의 깨진 UTF-8 은 importText 가 먼저 걸렀다): 문서가 아니면
+// FaultJSON, 짝 없는 서로게이트가 있으면 FaultJSONSurrogate, 키에 U+0000 이 있으면 FaultJSONKeyNUL, 글 값에 U+0000 이 있으면 그
+// 글 토큰만 원문 바이트에서 고친 문서와 RewriteJSONNUL 이다(nulesc.EscapeJSON). 같은 문서의 다른 글 · 공백 · 수 · 순서 ·
+// 이스케이프는 원래 바이트다.
 //
 // ★ U+0000 은 문서에 `\u0000` 으로만 쓰인다. 날 NUL 바이트가 든 칸은 처음부터 문서가 아니고(글 안의 제어 문자는 이스케이프해야
 // 한다), 그 바이트를 `\x00` 로 바꿔도 문서가 되지 않는다(`\x` 는 JSON 이스케이프가 아니다) - FaultJSON 이다.
@@ -447,6 +493,8 @@ func jsonCell(s string) (string, Fault, Rewrite) {
 	switch {
 	case errors.Is(err, nulesc.ErrSurrogate):
 		return s, FaultJSONSurrogate, ""
+	case errors.Is(err, nulesc.ErrKeyNUL):
+		return s, FaultJSONKeyNUL, ""
 	case err != nil:
 		return s, FaultJSON, ""
 	case len(changes) > 0:
@@ -455,23 +503,45 @@ func jsonCell(s string) (string, Fault, Rewrite) {
 	return s, "", ""
 }
 
-// RewritePaths 는 Cell 이 RewriteJSONNUL 로 바꾼 JSON 칸의 원래 값 v(원본에서 읽은 그대로)에서 고친 글의 자리다. 글 칸의
-// RewriteNUL 은 칸 전체가 단위라 자리가 없다(nil). 이관이 바꾼 칸의 기록에 싣는다.
-func RewritePaths(c Column, v any) []nulesc.Change {
-	if !c.JSON {
-		return nil
-	}
-	var s string
-	switch x := v.(type) {
-	case string:
-		s = x
-	case []byte:
-		s = string(x)
-	default:
+// RewritePaths 는 Cell 이 RewriteJSONNUL 로 바꾼 JSON 칸의 원래 값 v(원본에서 읽은 그대로)에서 고친 글의 자리(RFC 6901 JSON
+// Pointer)다. 글 칸의 RewriteNUL 은 칸 전체가 단위라 자리가 없다(nil). 이관이 바꾼 칸의 기록에 싣는다.
+func RewritePaths(c Column, v any) []string {
+	s, ok := docText(c, v)
+	if !ok {
 		return nil
 	}
 	_, changes, _ := nulesc.EscapeJSON(s)
 	return changes
+}
+
+// FaultLabel 은 거절 f 에 걸린 칸 c(원래 값 v)의 좌표를 행 좌표 key 뒤에 잇는다. JSON 글 하나를 거절한 갈래(FaultJSONSurrogate ·
+// FaultJSONKeyNUL)면 그 글의 자리(RFC 6901 JSON Pointer, 따옴표로 감싸 NUL 이 보인다)를 「JSON "…"」로 덧붙인다 - 큰 문서
+// (event.payload)에서 고칠 글을 찾게. 칸 전체가 단위인 갈래면 key 그대로다. 칸 규칙에 걸린 칸을 세는 자리(store 의 cellTally)가
+// 이것으로 좌표를 적는다.
+func FaultLabel(key string, c Column, v any, f Fault) string {
+	s, ok := docText(c, v)
+	if !ok || (f != FaultJSONSurrogate && f != FaultJSONKeyNUL) {
+		return key
+	}
+	var r *nulesc.Refusal
+	if _, _, err := nulesc.EscapeJSON(s); !errors.As(err, &r) {
+		return key
+	}
+	return key + " JSON " + labelValue(r.Pointer)
+}
+
+// docText 는 JSON 칸 c 의 원래 값 v(글이나 BLOB)를 글로 낸다. JSON 칸이 아니거나 글 · BLOB 이 아니면 false 다.
+func docText(c Column, v any) (string, bool) {
+	if !c.JSON {
+		return "", false
+	}
+	switch x := v.(type) {
+	case string:
+		return x, true
+	case []byte:
+		return string(x), true
+	}
+	return "", false
 }
 
 // KeyDigest 는 snapshot 키의 지문이다. 기준선의 fd_key_digest(sha256(convert_to(key, 'UTF8')))와 같은 값이다.

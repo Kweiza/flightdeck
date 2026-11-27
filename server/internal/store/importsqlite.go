@@ -85,10 +85,10 @@ type TransferReport struct {
 	TargetChecked bool
 	// Faults 는 원본의 사전 검사에 걸린 것이다.
 	Faults []FaultGroup
-	// TargetFaults 는 대상에서 읽은 값이 값 검사(pg.SettledCell - 원본의 검사에 바꿔 넣을 값 · 저장 갈래까지)에 걸린 것이다.
+	// TargetFaults 는 대상에서 읽은 값이 값 검사(pg.SettledCell - 깨진 UTF-8 · 깨진 JSON · 글 칸의 NUL · 저장 갈래)에 걸린 것이다.
 	// 대조가 대상 값을 읽을 때 잰다.
 	TargetFaults []FaultGroup
-	// Rewrites 는 원본 값을 정해진 규칙으로 바꿔 옮긴 칸이다(pg.Rewrite - SQLite 원본의 NUL). 이관은 그 값을 넣고, 이관 원본의
+	// Rewrites 는 원본 값을 정해진 규칙으로 바꿔 옮긴 칸이다(pg.Rewrite - SQLite 원본 자유 글의 NUL). 이관은 그 값을 넣고, 이관 원본의
 	// 대조는 같은 규칙을 건 원본 값으로 맞댄다. RewrittenRows 는 그런 칸이 하나라도 있는 원본 행의 수다. 역이관과 역이관이 낸
 	// 파일의 대조(VerifyOptions.Exported)에는 늘 비었다(SettledCell - 변환하지 않는다).
 	Rewrites      []RewriteGroup
@@ -573,9 +573,10 @@ type sqliteSide struct{}
 func (sqliteSide) sqlite() bool { return true }
 
 // intake 는 pg.SettledCell 이다(역이관이 받는 Postgres 원본의 값). 역이관은 Postgres 값을 그대로 낸다 - 이관이 넣은 `\x00` 를
-// NUL 로 되돌리지 않고, 바꿔 넣어야 할 값(JSON 안의 \u0000)이 든 원본은 바꾸지 않고 거절한다. 낸 파일이 Postgres 원장과
-// 바이트로 맞아야 되돌리기의 대조가 그 파일을 그 원장의 사본이라고 말할 수 있다. 인덱스 키 상한은 재지 않는다 - 이미 원장에
-// 있는 원문이다.
+// NUL 로 되돌리지 않고, 이관이 jsonb 때문에 바꾸거나 거절하는 JSON(글 · 키의 \u0000, 짝 없는 서로게이트)도 원문 그대로 옮긴다.
+// SQLite 글 칸이 그대로 담고 JSON 함수도 그 문서를 읽는다. 거절은 SQLite 가 못 읽는 깨진 JSON 과 저장 갈래가 칸 타입과 다른
+// 값뿐이다. 낸 파일이 Postgres 원장과 바이트로 맞아야 되돌리기의 대조가 그 파일을 그 원장의 사본이라고 말할 수 있다. 인덱스 키
+// 상한은 재지 않는다 - 이미 원장에 있는 원문이다.
 func (sqliteSide) intake() cellRule { return pg.SettledCell }
 
 // shape 는 표 · 칸만 잰다. 판은 열 때 쟀다(openImportSource) - 원본은 -wal 이 빈 읽기 전용 파일이라 연 뒤에 판이 안 바뀐다.
@@ -662,8 +663,9 @@ type pgSide struct{}
 
 func (pgSide) sqlite() bool { return false }
 
-// intake 는 pg.ImportCell 이다(이관이 받는 SQLite 원본의 값). SQLite 는 Postgres 가 못 담는 값(NUL)을 담으므로 정해진 규칙으로
-// 바꿔 옮기고 그 칸을 보고에 싣는다(pg.Cell). 인덱스 키 상한까지 잰다.
+// intake 는 pg.ImportCell 이다(이관이 받는 SQLite 원본의 값). SQLite 는 Postgres 가 못 담는 값(NUL)을 담으므로 자유 글의 NUL 은
+// 정해진 규칙으로 바꿔 옮기고 그 칸을 보고에 싣고, 식별자 자리(식별자 칸 · JSON 키)의 NUL 은 거절한다(pg.Cell). 인덱스 키
+// 상한까지 잰다.
 func (pgSide) intake() cellRule { return pg.ImportCell }
 
 // shape 는 원본(역이관)의 판이 이관 판 범위(transferPlan)이고 표 · 칸이 그 범위의 모양인지 잰다. 원본은 살아 있는 서버의 원장이라 연 때가
@@ -829,7 +831,7 @@ func (ct *cellTally) row(t pg.Table, r cellRow, key string) {
 	rewritten := false
 	for i, c := range t.Cols {
 		if f := r.faults[i]; f != "" {
-			ct.faults.add(t.Name, c.Name, f, key)
+			ct.faults.add(t.Name, c.Name, f, pg.FaultLabel(key, c, r.read[i], f))
 		}
 		if rw := r.rewrites[i]; rw != "" {
 			ct.rewrites.add(t.Name, c.Name, rw, key)
@@ -953,7 +955,8 @@ func scanLedger(ctx context.Context, q Reader, from ledgerSide, cell cellRule) (
 // 값이라 행 표지 · 겹침도 옮긴 값으로 잰다.
 //
 // ★ 겹침은 글 · bytea 칸이 든 묶음만 잰다(pg.Table.Mergeable). SQLite 의 제약이 원본 값의 겹침은 이미 막았고, 옮기며 다른 두 값이
-// 같아지는 자리는 그 칸뿐이다(NUL 바꿔 넣기 · 글 칸의 BLOB). 정수 기본키뿐인 큰 표(event)의 지문을 들고 있지 않는다.
+// 같아지는 자리는 그 칸뿐이다(글 칸의 BLOB 이 같은 바이트의 글과 같아진다). NUL 바꿔 넣기로는 나지 않는다 - 묶음의 칸은 다
+// 식별자 칸이라 그 NUL 은 바꾸지 않고 거절한다(pg.FaultIdentNUL). 정수 기본키뿐인 큰 표(event)의 지문을 들고 있지 않는다.
 func scanTable(ctx context.Context, q Reader, t pg.Table, sqlite bool, cell cellRule, ct *cellTally) (marks []pg.RowMark, maxID int64, err error) {
 	id, hasID := t.Identity()
 	idAt := t.Index(id.Name)
@@ -1137,7 +1140,7 @@ const (
 )
 
 // copyTables 는 원본 q(from)의 표 전부를 대상 트랜잭션 tx(to)에 FK 순서로 넣고 넣은 행 수를 낸다. 값은 받는 쪽의 규칙
-// (to.intake - 1차 훑기와 같은 규칙)을 지난 값이다 - 원본 그대로이고, SQLite 원본의 NUL 만 정해진 규칙으로 바뀐다(pg.Rewrite).
+// (to.intake - 1차 훑기와 같은 규칙)을 지난 값이다 - 원본 그대로이고, SQLite 원본 자유 글의 NUL 만 정해진 규칙으로 바뀐다(pg.Rewrite).
 // identity 칸도 옛 번호 그대로다(Postgres 대상이면 pg.Table.InsertSQL 이 그 구절을 붙이고, SQLite 대상이면 item_after.seq 가
 // rowid 로 돌아간다). 이관과 역이관이 이 하나로 옮긴다.
 func copyTables(ctx context.Context, q Reader, from ledgerSide, tx *txConn, to ledgerSide) (int, error) {

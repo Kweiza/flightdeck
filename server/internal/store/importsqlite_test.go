@@ -23,7 +23,6 @@ import (
 	"testing"
 
 	"github.com/kweiza/flightdeck/internal/model"
-	"github.com/kweiza/flightdeck/internal/nulesc"
 	"github.com/kweiza/flightdeck/internal/store/pg"
 	"github.com/kweiza/flightdeck/internal/store/storetest"
 )
@@ -301,15 +300,26 @@ func TestImportSQLiteRefusesFaultsAndWritesNothing(t *testing.T) {
 		{"JSON 칸의 날 NUL", `UPDATE item SET labels = CAST(X'5B226100225D' AS TEXT) WHERE id = 'i1'`, "item", "labels", `id="i1"`, pg.FaultJSON},
 		{"부모 없는 행", `INSERT INTO claim(project, item_id, session_id, at) VALUES ('p', 'i2', 'nobody', 'x')`,
 			"claim", "session_id", "→ session", pg.FaultForeignKey},
-		// 짝 없는 서러게이트는 jsonb 가 받지 않는다. 디코드해 다시 쓰면 U+FFFD 가 되어 다른 두 키가 하나가 된다 - 거절한다.
+		// 짝 없는 서러게이트는 jsonb 가 받지 않는다. 디코드해 다시 쓰면 U+FFFD 가 되어 다른 두 키가 하나가 된다 - 거절한다. 행 좌표에
+		// 그 글의 자리(JSON Pointer - 짝 없는 단위는 U+FFFD 로 읽는다)가 붙는다.
 		{"JSON 의 짝 없는 서러게이트", `UPDATE item SET labels = '{"\ud800\u0000":1,"\ufffd\u0000":2}' WHERE id = 'i1'`,
-			"item", "labels", `id="i1"`, pg.FaultJSONSurrogate},
-		// 옮기며 같아지는 기본키 · UNIQUE 칸: NUL 을 바꿔 넣은 id 가 원래 `\x00` 네 글자를 담은 id 와, 글 칸의 BLOB 가 같은 바이트의
-		// 글과 같아진다(대상이 커밋 때 거절할 것을 좌표와 함께 먼저 낸다). 부분 인덱스는 그 조건 안의 행끼리만 잰다 - 놓은 점유는
-		// 살아 있는 점유와 겹쳐도 된다.
-		{"NUL 을 바꿔 넣어 겹치는 기본키", `INSERT INTO judgment(id, project, session_id, at, kind, title, body) VALUES
+			"item", "labels", `id="i1" JSON "/` + "\ufffd" + `\x00"`, pg.FaultJSONSurrogate},
+		// JSON 키의 U+0000 은 바꿔 넣지 않는다: 두 키가 옮긴 뒤 하나(`\x00`)가 되어 jsonb 로 읽으면 한 값이 사라진다. 행 · 칸과 그
+		// 키의 자리(JSON Pointer)로 거절한다.
+		{"JSON 키의 U+0000", `INSERT INTO event(at, project, kind, payload) VALUES ('x', 'p', 'k3', '{"\u0000":1,"\\x00":2}')`,
+			"event", "payload", `id=3 JSON "/\x00"`, pg.FaultJSONKeyNUL},
+		// 식별자 칸의 NUL 은 바꿔 넣지 않는다. 기본키: 바꿔 넣으면 원래 `\x00` 네 글자를 담은 id 와 같아진다.
+		{"기본키의 NUL", `INSERT INTO judgment(id, project, session_id, at, kind, title, body) VALUES
 				('a\x00', 'p', 's1', 'x', 'decision', 't', 'b'), (CAST(X'6100' AS TEXT), 'p', 's1', 'x', 'decision', 't', 'b')`,
-			"judgment", "id", `id="a\\x00"`, pg.FaultUnique},
+			"judgment", "id", `id="a\x00"`, pg.FaultIdentNUL},
+		// FK 없는 참조 칸: dep_project 가 `p` + NUL(없는 프로젝트)을 가리키는데, 바꿔 넣으면 문자 그대로의 `p\x00` 프로젝트(같은 id 의
+		// 항목이 있다)를 가리켜 없던 선후 관계가 생긴다. 표 안의 겹침 재기로는 안 보인다.
+		{"FK 없는 참조 칸의 NUL", `INSERT INTO project(id, path, default_branch, created_at) VALUES ('p\x00', '/r/q', 'main', 'x');
+			INSERT INTO item(project, id, title, body, created_at) VALUES ('p\x00', 'i1', 't', 'b', 'x');
+			INSERT INTO item_after(project, item_id, dep_item, dep_project) VALUES ('p', 'i2', 'i1', CAST(X'7000' AS TEXT))`,
+			"item_after", "dep_project", "seq=8", pg.FaultIdentNUL},
+		// 옮기며 같아지는 기본키 · UNIQUE 칸: 글 칸의 BLOB 가 같은 바이트의 글과 같아진다(대상이 커밋 때 거절할 것을 좌표와 함께
+		// 먼저 낸다). 부분 인덱스는 그 조건 안의 행끼리만 잰다 - 놓은 점유는 살아 있는 점유와 겹쳐도 된다.
 		{"BLOB 로 겹치는 지문 키", `INSERT INTO snapshot(project, key, value, method, computed_at) VALUES ('p', X'6B31', 'v', 'command', 'x')`,
 			"snapshot", "project,key", `key="k1"`, pg.FaultUnique},
 		{"BLOB 로 겹치는 살아 있는 점유", `INSERT INTO resource_hold(project, resource, session_id, acquired_at, released_at) VALUES
@@ -431,13 +441,13 @@ func TestImportSQLiteRewritesNULAndReportsIt(t *testing.T) {
 	type recordWant struct {
 		key      string
 		original string
-		paths    []nulesc.Change
+		paths    []string
 	}
 	wantRecord := map[cell]recordWant{
 		{"item", "body", pg.RewriteNUL}:         {`{"id":"i1","project":"p"}`, "a\x00b", nil},
-		{"item", "labels", pg.RewriteJSONNUL}:   {`{"id":"i1","project":"p"}`, `["l\u0000"]`, []nulesc.Change{{Pointer: "/0"}}},
+		{"item", "labels", pg.RewriteJSONNUL}:   {`{"id":"i1","project":"p"}`, `["l\u0000"]`, []string{"/0"}},
 		{"judgment", "body", pg.RewriteNUL}:     {`{"id":"j3"}`, `표기 \x00 와 날 ` + "\x00" + ` 끝`, nil},
-		{"event", "payload", pg.RewriteJSONNUL}: {`{"id":3}`, `{"m":"x\u0000y","n":"\\x00"}`, []nulesc.Change{{Pointer: "/m"}}},
+		{"event", "payload", pg.RewriteJSONNUL}: {`{"id":3}`, `{"m":"x\u0000y","n":"\\x00"}`, []string{"/m"}},
 	}
 	record := readRecord(t, rep.RewriteRecord)
 	if len(record) != len(wantRecord) {
@@ -621,11 +631,11 @@ func TestImportSQLiteKeepsTheLabelEventInStepWithTheItem(t *testing.T) {
 		t.Fatalf("옮긴 이벤트 before %q", before)
 	}
 	// 바꾼 칸은 그 이벤트 하나, 그 안의 글 하나다(항목의 labels 에는 이제 U+0000 이 없다).
-	paths := map[string][]nulesc.Change{}
+	paths := map[string][]string{}
 	for _, r := range readRecord(t, rep.RewriteRecord) {
 		paths[r.Table+"."+r.Column] = append(paths[r.Table+"."+r.Column], r.Paths...)
 	}
-	if !reflect.DeepEqual(paths["event.payload"], []nulesc.Change{{Pointer: "/before/0"}}) || len(paths) != 1 {
+	if !reflect.DeepEqual(paths["event.payload"], []string{"/before/0"}) || len(paths) != 1 {
 		t.Fatalf("바꾼 칸의 기록 %+v", paths)
 	}
 }
@@ -865,15 +875,15 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 			}
 		})
 	}
-	// 대상 값이 값 검사에 걸리면 어긋남과 따로 그 칸 · 사유 · 행을 적는다(대상에서 읽은 값을 버리지 않는다). 짝 없는 서러게이트는
-	// jsonb 가 거절하는 JSON 이다.
+	// 대상 값이 값 검사에 걸리면 어긋남과 따로 그 칸 · 사유 · 행을 적는다(대상에서 읽은 값을 버리지 않는다). 깨진 JSON 은 두
+	// 엔진의 JSON 함수가 다 못 읽는 글이다.
 	t.Run("대상 값 검사", func(t *testing.T) {
 		src := importSource(t, importSeed)
 		dsn, dst := importTarget(t)
 		if _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil {
 			t.Fatalf("이관: %v", err)
 		}
-		pgExec(t, dst, `UPDATE item SET labels = '["\ud800"]' WHERE id = 'i1'`)
+		pgExec(t, dst, `UPDATE item SET labels = '[' WHERE id = 'i1'`)
 		rep, err := VerifySQLite(ctx, src, dsn, VerifyOptions{}, quietLog())
 		if err == nil || !strings.Contains(err.Error(), "대상 값 검사") {
 			t.Fatalf("대상 값 검사에 걸린 칸을 판정에 넣지 않았다: %v", err)
@@ -882,7 +892,7 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 			t.Fatalf("대상 값 검사 갈래: %+v", rep.TargetFaults)
 		}
 		g := rep.TargetFaults[0]
-		if g.Table != "item" || g.Column != "labels" || g.Reason != pg.FaultJSONSurrogate || g.Count != 1 ||
+		if g.Table != "item" || g.Column != "labels" || g.Reason != pg.FaultJSON || g.Count != 1 ||
 			len(g.Keys) != 1 || !strings.Contains(g.Keys[0], `id="i1"`) {
 			t.Fatalf("대상 값 검사 갈래: %+v", g)
 		}
