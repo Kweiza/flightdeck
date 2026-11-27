@@ -44,6 +44,8 @@ func TestMigrateImportSQLiteSurface(t *testing.T) {
 	var outs []string
 	step := func(want int, wantText string, args ...string) {
 		t.Helper()
+		// 앞 명령이 닫은 연결이 서버에서 빠지기를 기다린다 - 이관 · 역이관은 원장에 붙은 다른 연결을 거절한다.
+		storetest.SettleClients(t, dsn, 0)
 		rc, out := h.run("", append([]string{"migrate"}, args...)...)
 		outs = append(outs, out)
 		if rc != want || !strings.Contains(out, wantText) {

@@ -300,6 +300,8 @@ fd migrate verify --from fd-copy.db --db <URL>
 - 원본의 표 · 칸이 판 18 과 다르면(손으로 고친 원장) 거절한다.
 - 대상의 업무 표에 한 행이라도 있거나, identity 시퀀스가 한 번이라도 번호를 냈으면(행을 지웠어도) 거절한다. 판이 18 이
   아니거나 로케일 관문을 못 지나도 거절한다.
+- 대상 DB 에 이 실행 말고 붙은 연결(서버 · psql 등)이 있으면 예행 · 본 실행 모두 거절하고, 남은 연결의 pid · 역할 ·
+  application_name 을 적는다. 붙은 서버의 쓰기 일부(관측 기록)는 실행기 잠금을 타지 않아 옮기는 트랜잭션에 끼어든다.
 - 사전 검사: text 칸의 NUL 바이트 · 깨진 UTF-8, JSON 칸의 깨진 JSON · `\u0000`, 칸과 다른 저장 타입, 기본키 NULL,
   snapshot 키 지문의 겹침, FK 가 가리키는 행이 없는 것. 하나라도 걸리면 아무것도 쓰지 않고 표 · 칸 · 사유 · 행의 기본키를 적는다. 사본에서 그 행을
   고친 뒤 다시 돌린다. `fd migrate verify` 도 사전 검사에 걸린 원본은 맞다고 하지 않는다.
@@ -314,24 +316,34 @@ fd migrate verify --from fd-copy.db --db <URL>
 않는다. 종료 코드는 이관과 같다.
 
 ```bash
-# 1. Postgres 원장에 쓰는 서버를 내린다. 원본은 스냅숏 하나(REPEATABLE READ READ ONLY)로 읽기만 한다.
-# 2. 예행: 본 실행과 같은 길을 임시 파일에 끝까지 돌고 그 파일을 지운다.
+# 1. Postgres 원장에 쓰는 서버를 내린다. 이 실행 말고 붙은 연결이 있으면 거절하고 남은 연결의 pid · 역할 ·
+#    application_name 을 적는다. 원본은 스냅숏 하나(REPEATABLE READ READ ONLY)로 읽기만 한다.
+# 2. 예행: 본 실행과 같은 길을 임시 파일에 끝까지 돌고(이름 붙이기는 같은 디렉토리의 일회용 하드 링크로 재 본다) 그 파일을 지운다.
 fd migrate export-sqlite --db <URL> --to fd-back.db --dry-run
 # 3. 옮긴다. 성공하면 대조표와 함께 「옮겼다: N 행, 대조가 맞았다 → fd-back.db」를 낸다.
 fd migrate export-sqlite --db <URL> --to fd-back.db
-# 4. (선택) 낸 파일로 서버를 띄우기 전에 다시 맞댄다. 이관의 verify 를 그대로 쓴다.
+# 4. 낸 파일로 서버를 띄우기 전에 꼭 다시 맞댄다. 이관의 verify 를 그대로 쓴다.
 fd migrate verify --from fd-back.db --db <URL>
 ```
 
+- 4 는 빼지 않는다. 커밋 전 대조는 옮긴 스냅숏끼리 맞대므로, 연결을 잰 뒤 원본에 붙은 서버가 커밋한 쓰기는 옮기지도 않고
+  맞다고 한다. verify 는 원본을 새 스냅숏으로 다시 읽어 그 어긋남을 잡는다. 어긋나면 낸 파일을 지우고 서버를 내린 채 1 부터
+  다시 돌린다.
+
 - `--to` 자리에 파일이 있거나 그 옆에 `-wal` · `-shm` · `-journal` 이 있으면 거절한다. 덮지 않고, 남은 `-wal` 이 새 파일에
   되살아나지 않게 한다.
-- 원본은 판 18 이어야 한다. 그 뒤 판으로 올린 Postgres 원장은 SQLite 판에 자리가 없어 거절한다. 접속 계정은 이관과 같다
-  (초사용자나 `fd_owner` 의 멤버 - 시퀀스를 읽는다).
+- 원본은 판 18 이어야 한다. 그 뒤 판으로 올린 Postgres 원장은 SQLite 판에 자리가 없어 거절한다. 표 · 칸이 판 18 과 다른
+  원장(손으로 고친 원장)도 거절한다. 판과 모양은 옮기는 스냅숏 안에서 잰다. 접속 계정은 이관과 같다(초사용자나 `fd_owner` 의
+  멤버 - 시퀀스를 읽는다).
 - 이관의 사전 검사가 받지 않을 값(깨진 JSON 등)이 원본에 있으면 거절한다 - 낸 파일을 다시 이관할 수 없게 되기 때문이다.
 - 순번: AUTOINCREMENT 표(pick_eval · resource_hold · event · landing_queue)는 Postgres 가 낸 최고 번호를 `sqlite_sequence` 에
   되살려 그 번호를 다시 내지 않는다. item_after 는 SQLite rowid 표라 지워진 최고 번호를 기억하지 못한다 - seq 값(순서)은 rowid 로
   그대로 옮고, 다음 번호는 SQLite 판 그대로 max(rowid)+1 이다.
 - 판단 검색 색인(judgment_fts)은 Postgres 에 없어 옮기지 않는다. 옮긴 판단 행에서 다시 짓고 판단 행과 맞는지 잰다.
+- 낸 파일의 모드는 0644 이고, 이름을 붙인 디렉토리를 fsync 한 뒤에야 「옮겼다」를 낸다.
+- Ctrl-C · SIGTERM 으로 멈추면 임시 파일을 지우고 1 로 끝난다. SIGKILL · 전원 차단으로 끝나면 `--to` 디렉토리에
+  `.<이름>.export-<숫자>`(와 그 옆 `-wal` · `-shm` · `.link`)가 남을 수 있다. 역이관이 돌지 않을 때
+  `ls -a <디렉토리> | grep '^\.fd-back\.db\.export-'` 로 알아보고 지운다. 그 파일에는 이름이 붙지 않았으니 원장이 아니다.
 
 **되돌리기 예행.** 실제로 옮기기 전에 왕복을 한 번 돌려 둔다: 원장 사본 → `import-sqlite` 로 시험용 Postgres 원장 → 그 원장으로
 서버를 띄워 몇 가지를 쓴다(항목 · 선점 · 판단) → 서버를 내리고 `export-sqlite` → `fd migrate verify --from <낸 파일> --db <URL>`

@@ -144,6 +144,39 @@ func CutConnections(tb testing.TB, dsn string) {
 	}
 }
 
+// SettleClients 는 dsn 의 DB 에 붙은 클라이언트 연결이 keep 개 이하가 될 때까지 기다린다. 시험이 닫은 연결도 서버 쪽
+// 백엔드는 조금 늦게 빠진다 - 「이 실행 말고 붙은 연결이 없어야」 하는 길(이관 · 역이관)을 돌리기 전에 앞 단계(채우기 · 앞
+// 명령)의 연결이 다 빠지기를 기다리는 자리다. 운영 코드는 기다리지 않는다 - 남은 연결은 거절이다.
+func SettleClients(tb testing.TB, dsn string, keep int) {
+	tb.Helper()
+	_, admin, err := server()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	name := strings.TrimPrefix(u.Path, "/")
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+	for {
+		var n int
+		if err := admin.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = $1 AND backend_type = 'client backend'`, name).Scan(&n); err != nil {
+			tb.Fatalf("시험 DB 연결 세기 실패(%s): %v", name, err)
+		}
+		if n <= keep {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			tb.Fatalf("시험 DB 연결이 %s 안에 %d 개로 안 줄었다(%s, 남은 %d)", opTimeout, keep, name, n)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 // opTimeout 은 DB 하나를 만들거나 지우는 한 번의 상한이다. 평소에는 1초도 안 걸린다 — 이것은 서버가
 // 응답하지 않을 때 시험이 영영 서지 않게 하는 상한일 뿐이다.
 const opTimeout = time.Minute

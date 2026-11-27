@@ -8,6 +8,7 @@ package store
 import (
 	"context"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -28,7 +29,7 @@ func importedPG(t *testing.T) (string, string, *Store) {
 	t.Helper()
 	src := importSource(t, importSeed)
 	dsn, dst := importTarget(t)
-	if _, err := ImportSQLite(context.Background(), src, dsn, TransferOptions{}, quietLog()); err != nil {
+	if _, err := importLedger(t, context.Background(), src, dsn, TransferOptions{}); err != nil {
 		t.Fatalf("이관: %v", err)
 	}
 	return src, dsn, dst
@@ -72,7 +73,6 @@ func TestExportSQLiteRoundTripKeepsThePostgresWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer app.Close()
 
 	at := time.Date(2026, 1, 3, 4, 5, 6, 0, time.UTC)
 	if err := app.AddItem(ctx, model.Item{Project: "p", ID: "pg-item", Title: "Postgres 에서 연 항목", Body: "처음 본문",
@@ -125,9 +125,13 @@ func TestExportSQLiteRoundTripKeepsThePostgresWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 업무 Store 는 서버 자리다 - 역이관 전에 내린다(원본에 붙은 다른 연결은 거절이다).
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	back := exportBack(t)
-	rep, err := ExportSQLite(ctx, dsn, back, TransferOptions{}, quietLog())
+	rep, err := exportLedger(t, ctx, dsn, back, TransferOptions{})
 	if err != nil {
 		t.Fatalf("역이관 실패: %v\n%+v", err, rep)
 	}
@@ -255,7 +259,7 @@ func TestExportSQLiteDryRunLeavesNoFile(t *testing.T) {
 	_, dsn, dst := importedPG(t)
 	rows, seqs := targetRows(t, dst), identityStates(t, dst)
 	back := exportBack(t)
-	rep, err := ExportSQLite(ctx, dsn, back, TransferOptions{DryRun: true}, quietLog())
+	rep, err := exportLedger(t, ctx, dsn, back, TransferOptions{DryRun: true})
 	if err != nil || !rep.TargetChecked || rep.Copied != 0 || !rep.Matched() || len(rep.Rows) != len(pg.Tables()) {
 		t.Fatalf("예행: %v (대상을 쟀다 %v · 옮긴 행 %d · 표 %d · 대조 %v)", err, rep.TargetChecked, rep.Copied, len(rep.Rows),
 			rep.Matched())
@@ -266,8 +270,13 @@ func TestExportSQLiteDryRunLeavesNoFile(t *testing.T) {
 	if targetRows(t, dst) != rows || !maps.Equal(identityStates(t, dst), seqs) {
 		t.Fatalf("역이관 예행이 원본을 바꿨다")
 	}
-	if rep, err := ExportSQLite(ctx, dsn, back, TransferOptions{}, quietLog()); err != nil || rep.Copied == 0 {
+	if rep, err := exportLedger(t, ctx, dsn, back, TransferOptions{}); err != nil || rep.Copied == 0 {
 		t.Fatalf("예행 뒤 본 실행: %v (옮긴 행 %d)", err, rep.Copied)
+	}
+	if fi, err := os.Stat(back); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm() != exportFileMode {
+		t.Fatalf("낸 원장의 모드 %v - SQLite 가 만든 원장과 같은 %v 여야 한다", fi.Mode().Perm(), exportFileMode)
 	}
 	if targetRows(t, dst) != rows || !maps.Equal(identityStates(t, dst), seqs) {
 		t.Fatalf("역이관이 원본을 바꿨다")
@@ -285,7 +294,7 @@ func TestExportSQLiteRefusesAnExistingTarget(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, dry := range []bool{true, false} {
-			_, err := ExportSQLite(ctx, dsn, filepath.Join(dir, "back.db"), TransferOptions{DryRun: dry}, quietLog())
+			_, err := exportLedger(t, ctx, dsn, filepath.Join(dir, "back.db"), TransferOptions{DryRun: dry})
 			if err == nil || !strings.Contains(err.Error(), "이미 있다") {
 				t.Fatalf("%s 가 있는데 예행 %v 가 거절하지 않았다: %v", name, dry, err)
 			}
@@ -297,7 +306,7 @@ func TestExportSQLiteRefusesAnExistingTarget(t *testing.T) {
 			t.Fatalf("%s 가 바뀌었다: %q %v", name, b, err)
 		}
 	}
-	if _, err := ExportSQLite(ctx, dsn, dsn, TransferOptions{}, quietLog()); err == nil || !strings.Contains(err.Error(), "SQLite 파일만") {
+	if _, err := exportLedger(t, ctx, dsn, dsn, TransferOptions{}); err == nil || !strings.Contains(err.Error(), "SQLite 파일만") {
 		t.Fatalf("Postgres 대상에 역이관했다: %v", err)
 	}
 }
@@ -320,7 +329,7 @@ func TestExportSQLiteRefusesASourceItCannotMove(t *testing.T) {
 	} {
 		for _, dry := range []bool{true, false} {
 			back := exportBack(t)
-			rep, err := ExportSQLite(ctx, c.from, back, TransferOptions{DryRun: dry}, quietLog())
+			rep, err := exportLedger(t, ctx, c.from, back, TransferOptions{DryRun: dry})
 			if err == nil || !strings.Contains(err.Error(), c.want) || rep.Copied != 0 {
 				t.Fatalf("%s(예행 %v): %v, 옮긴 행 %d - %q 로 거절해야 한다", c.name, dry, err, rep.Copied, c.want)
 			}
@@ -339,7 +348,7 @@ func TestExportSQLiteRefusesASourceItCannotMove(t *testing.T) {
 func TestExportSQLiteDoesNotCommitAMismatch(t *testing.T) {
 	ctx := context.Background()
 	_, dsn, _ := importedPG(t)
-	src, err := openExportSource(ctx, ParseTarget(dsn), quietLog())
+	src, err := openExportSource(ParseTarget(dsn), quietLog())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,6 +361,7 @@ func TestExportSQLiteDoesNotCommitAMismatch(t *testing.T) {
 		liteExec(t, tmp, `CREATE TRIGGER t_bend_title AFTER INSERT ON item BEGIN
 			UPDATE item SET title = title || '!' WHERE rowid = new.rowid; END`)
 		var rep TransferReport
+		storetest.SettleClients(t, dsn, 1) // src 의 연결 하나만 남는다 - 역이관은 원본에 붙은 다른 연결을 거절한다
 		err = exportInto(ctx, src, tmp, dry, &rep, quietLog())
 		if err == nil || !strings.Contains(err.Error(), "커밋하지 않는다") {
 			t.Fatalf("예행 %v: 어긋난 역이관이 끝났다: %v", dry, err)
@@ -366,5 +376,264 @@ func TestExportSQLiteDoesNotCommitAMismatch(t *testing.T) {
 		if n != 0 {
 			t.Fatalf("예행 %v: 커밋하지 않았는데 임시 원장에 %d 행", dry, n)
 		}
+	}
+}
+
+// 원본의 판 · 모양은 옮기는 스냅숏 안에서 잰다: 연 뒤에 판이 오르거나 표 · 칸이 붙은 원본은 예행 · 본 실행 모두 거절하고
+// 임시 원장에 아무것도 넣지 않는다. 열 때 쟀다면 연 때의 판 18 로 지나 붙은 칸을 버리고 옮긴다.
+func TestExportSQLiteMeasuresTheSourceInTheCopySnapshot(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct{ name, change, want string }{
+		{"판이 오른 원본", `INSERT INTO schema_version(version, applied_at) VALUES (19, 'x')`, "판 18 이 아니다"},
+		{"칸이 붙은 원본", `ALTER TABLE item ADD COLUMN t_extra text`, "item 의 칸"},
+		{"표가 붙은 원본", `CREATE TABLE t_extra(id bigint)`, "모르는 표 t_extra"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, dsn, dst := importedPG(t)
+			src, err := openExportSource(ParseTarget(dsn), quietLog())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer src.Close()
+			pgExec(t, dst, c.change)
+			for _, dry := range []bool{true, false} {
+				tmp, err := newExportFile(ctx, exportBack(t), quietLog())
+				if err != nil {
+					t.Fatal(err)
+				}
+				var rep TransferReport
+				storetest.SettleClients(t, dsn, 1)
+				err = exportInto(ctx, src, tmp, dry, &rep, quietLog())
+				if err == nil || !strings.Contains(err.Error(), c.want) || rep.Copied != 0 {
+					t.Fatalf("예행 %v: %q 로 거절하지 않았다: %v (옮긴 행 %d)", dry, c.want, err, rep.Copied)
+				}
+				var n int64
+				liteQuery(t, tmp, `SELECT (SELECT count(*) FROM item) + (SELECT count(*) FROM event)`, &n)
+				if n != 0 {
+					t.Fatalf("예행 %v: 거절했는데 임시 원장에 %d 행", dry, n)
+				}
+			}
+		})
+	}
+}
+
+// 원본(역이관) · 대상(이관)에 이 실행 말고 붙은 연결이 있으면 예행 · 본 실행 모두 거절한다 - 처방(서버를 내려라)과 남은
+// 연결의 역할 · application_name 을 싣고, 아무것도 남기지 않는다. 그 연결을 닫으면 같은 실행이 지난다.
+func TestTransferRefusesALedgerWithAnotherClient(t *testing.T) {
+	ctx := context.Background()
+	src, dsn, _ := importedPG(t)
+	attach := func(t *testing.T, dsn string) *Store {
+		t.Helper()
+		u, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := u.Query()
+		q.Set("application_name", "t-other-client")
+		u.RawQuery = q.Encode()
+		other, err := openPG(ParseTarget(u.String()), quietLog(), lockTimeout)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return other
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	role := "역할 " + u.User.Username() // 붙인 연결은 시험 접속 URL 의 사용자로 붙는다
+	refused := func(t *testing.T, err error, head string) {
+		t.Helper()
+		for _, want := range []string{head + " 원장에 이 실행 말고 붙은 연결이 1 개", "application_name t-other-client", role, "fd serve"} {
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("%q 로 거절하지 않았다: %v", want, err)
+			}
+		}
+	}
+
+	t.Run("역이관 원본", func(t *testing.T) {
+		other := attach(t, dsn)
+		for _, dry := range []bool{true, false} {
+			back := exportBack(t)
+			storetest.SettleClients(t, dsn, 1)
+			_, err := ExportSQLite(ctx, dsn, back, TransferOptions{DryRun: dry}, quietLog())
+			refused(t, err, "원본")
+			if got := dirNames(t, filepath.Dir(back)); len(got) != 0 {
+				t.Fatalf("예행 %v: 거절 뒤 %v 가 남았다", dry, got)
+			}
+		}
+		if err := other.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := exportLedger(t, ctx, dsn, exportBack(t), TransferOptions{}); err != nil {
+			t.Fatalf("연결을 닫은 뒤 역이관: %v", err)
+		}
+	})
+	t.Run("이관 대상", func(t *testing.T) {
+		to, fresh := importTarget(t)
+		seqs := identityStates(t, fresh)
+		other := attach(t, to)
+		for _, dry := range []bool{true, false} {
+			storetest.SettleClients(t, to, 1)
+			_, err := ImportSQLite(ctx, src, to, TransferOptions{DryRun: dry}, quietLog())
+			refused(t, err, "대상")
+		}
+		if n := targetRows(t, fresh); n != 0 || !maps.Equal(identityStates(t, fresh), seqs) {
+			t.Fatalf("거절했는데 대상에 %d 행 · 순번 %v", n, identityStates(t, fresh))
+		}
+		if err := other.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := importLedger(t, ctx, src, to, TransferOptions{}); err != nil {
+			t.Fatalf("연결을 닫은 뒤 이관: %v", err)
+		}
+	})
+}
+
+// 종류(backend_type)가 가려진 연결도 센다. 초사용자가 아닌 역할은 남의 역할의 연결을 pg_stat_activity 에서 종류 NULL 로
+// 본다 - 서버(앱 역할)와 실행기(소유 역할의 구성원)가 그렇다. 종류만 보고 세면 그 서버를 못 본다.
+func TestSoleClientCountsAConnectionWhoseKindIsHidden(t *testing.T) {
+	ctx := context.Background()
+	dsn, dst := importTarget(t)
+	serverURL, _ := loginAs(t, dst, dsn, pg.AppRole)
+	runURL, _ := loginAs(t, dst, dsn, pg.OwnerRole)
+	server, err := openPG(ParseTarget(serverURL), quietLog(), lockTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	run, err := openPG(ParseTarget(runURL), quietLog(), lockTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	storetest.SettleClients(t, dsn, 2)
+	err = run.ReadTx(ctx, func(q Reader) error {
+		var hidden int64
+		if err := q.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_stat_activity
+			WHERE datname = current_database() AND pid <> pg_backend_pid() AND backend_type IS NULL AND usesysid IS NOT NULL`).
+			Scan(&hidden); err != nil {
+			return err
+		}
+		if hidden != 1 {
+			t.Fatalf("시험 전제: 실행기 역할에게 서버 연결의 종류가 가려져야 한다(가려진 연결 %d)", hidden)
+		}
+		return soleClient(ctx, q, "원본")
+	})
+	if err == nil || !strings.Contains(err.Error(), "붙은 연결이 1 개") || !strings.Contains(err.Error(), "역할 t_login_") {
+		t.Fatalf("종류가 가려진 서버 연결을 세지 않았다: %v", err)
+	}
+}
+
+// 커밋 전 대조는 대상에서 읽은 값의 저장 갈래까지 잰다(pg.TargetCell). 옮긴 SQLite 의 글 칸에 같은 바이트의 BLOB 이 남으면
+// 원본의 검사(pg.Cell)로는 같은 값이지만, 옮기기가 칸 타입으로 넣지 않은 것이라 커밋하지 않는다.
+func TestExportSQLiteRefusesAValueInTheWrongStorage(t *testing.T) {
+	ctx := context.Background()
+	_, dsn, _ := importedPG(t)
+	src, err := openExportSource(ParseTarget(dsn), quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	for _, dry := range []bool{true, false} {
+		tmp, err := newExportFile(ctx, exportBack(t), quietLog())
+		if err != nil {
+			t.Fatal(err)
+		}
+		liteExec(t, tmp, `CREATE TRIGGER t_blob_title AFTER INSERT ON item BEGIN
+			UPDATE item SET title = CAST(title AS BLOB) WHERE rowid = new.rowid; END`)
+		var rep TransferReport
+		storetest.SettleClients(t, dsn, 1)
+		err = exportInto(ctx, src, tmp, dry, &rep, quietLog())
+		if err == nil || !strings.Contains(err.Error(), "대상 값 검사") {
+			t.Fatalf("예행 %v: 글 칸의 BLOB 을 지나쳤다: %v", dry, err)
+		}
+		if len(rep.TargetFaults) != 1 || rep.TargetFaults[0].Table != "item" || rep.TargetFaults[0].Column != "title" ||
+			rep.TargetFaults[0].Fault != pg.FaultStorage {
+			t.Fatalf("예행 %v: 대상 값 검사 갈래 %+v", dry, rep.TargetFaults)
+		}
+		var n int64
+		liteQuery(t, tmp, `SELECT count(*) FROM item`, &n)
+		if n != 0 {
+			t.Fatalf("예행 %v: 커밋하지 않았는데 임시 원장에 %d 행", dry, n)
+		}
+	}
+}
+
+// 묶음 INSERT 의 끊는 자리 둘을 역이관도 지난다: 행 수(batchRows 를 두 번 넘는 event)와 값 바이트(batchBytes 를 넘는 BLOB 하나
+// 뒤에 행이 더 있다). 낸 파일이 Postgres 원장과 맞고 그 행 · 바이트가 다 있다.
+func TestExportSQLiteCrossesTheBatchLimits(t *testing.T) {
+	ctx := context.Background()
+	_, dsn, dst := importedPG(t)
+	pgExec(t, dst, `INSERT INTO event(at, kind, payload)
+		SELECT `+importAt+`, 'bulk', '{"i":' || i || '}' FROM generate_series(1, 1203) AS i`)
+	pgExec(t, dst, `INSERT INTO idempotency(key, fingerprint, status, ctype, body, at) VALUES
+		('big', 'fp', 200, 'application/octet-stream', decode(repeat('00ff', 4718592), 'hex'), `+importAt+`),
+		('after-big', 'fp', 200, 'text/plain', '\x00'::bytea, `+importAt+`)`)
+	back := exportBack(t)
+	rep, err := exportLedger(t, ctx, dsn, back, TransferOptions{})
+	if err != nil || !rep.Matched() {
+		t.Fatalf("역이관: %v (대조 %v)", err, rep.Matched())
+	}
+	if again, err := VerifySQLite(ctx, back, dsn, quietLog()); err != nil || !again.Matched() {
+		t.Fatalf("낸 파일과 Postgres 원장의 대조: %v", err)
+	}
+	for q, want := range map[string]int64{
+		`SELECT count(*) FROM event WHERE kind = 'bulk'`:                                                          1203,
+		`SELECT count(*) FROM idempotency WHERE key = 'big' AND typeof(body) = 'blob' AND length(body) = 9437184`: 1,
+		`SELECT count(*) FROM idempotency WHERE key = 'after-big' AND body = X'00'`:                               1,
+	} {
+		var got int64
+		liteQuery(t, back, q, &got)
+		if got != want {
+			t.Errorf("%s = %d, 기대 %d", q, got, want)
+		}
+	}
+}
+
+// 닫은 임시 원장의 옆 파일을 재지 못하면(없음이 아닌 오류 - 여기서는 자기를 가리키는 고리 링크) 커밋이 본 파일에 다
+// 옮았는지 모르므로 이름을 붙이지 않는다. 없거나 빈 옆 파일은 지난다.
+func TestExportSettledRefusesASidecarItCannotMeasure(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), ".back.db.export-1")
+	if err := os.WriteFile(tmp, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp+"-shm", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := exportSettled(tmp); err != nil {
+		t.Fatalf("옆 파일이 없거나 비었는데 거절했다: %v", err)
+	}
+	if err := os.Symlink(tmp+"-wal", tmp+"-wal"); err != nil {
+		t.Skipf("고리 링크를 못 만드는 플랫폼: %v", err)
+	}
+	if err := exportSettled(tmp); err == nil || !strings.Contains(err.Error(), "재지 못했다") {
+		t.Fatalf("재지 못한 -wal 을 빈 것으로 봤다: %v", err)
+	}
+}
+
+// 예행은 이름 붙이기도 본 실행과 같은 호출(os.Link)로 대상 디렉토리에서 재 보고 그 이름을 바로 지운다. 링크가 실패하면 예행이
+// 거절한다 - 여기서는 그 일회용 이름을 미리 차지해 링크를 실패시킨다.
+func TestNameExportDryRunProbesTheLink(t *testing.T) {
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, ".back.db.export-1")
+	if err := os.WriteFile(tmp, []byte("원장"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	to := filepath.Join(dir, "back.db")
+	if err := nameExport(tmp, to, true); err != nil {
+		t.Fatalf("예행의 링크 재기: %v", err)
+	}
+	if got := dirNames(t, dir); !slices.Equal(got, []string{".back.db.export-1"}) {
+		t.Fatalf("예행이 이름을 남겼다: %v", got)
+	}
+	if err := os.WriteFile(tmp+".link", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := nameExport(tmp, to, true); err == nil || !strings.Contains(err.Error(), "하드 링크") {
+		t.Fatalf("링크가 실패하는 자리를 예행이 지나쳤다: %v", err)
+	}
+	if _, err := os.Lstat(to); err == nil {
+		t.Fatal("예행이 대상 이름을 붙였다")
 	}
 }

@@ -318,6 +318,9 @@ fd migrate verify --from fd-copy.db --db <URL>
 - A source whose tables or columns differ from version 18 (a hand-edited ledger) is refused.
 - A target with even one row in a business table is refused, as is one whose identity sequence has ever issued a number
   (even after the rows were deleted), one not at version 18, or one that fails the locale gate.
+- If any connection other than this run is attached to the target database (a server, psql, ...), the dry run and the real
+  import both refuse and list each remaining connection's pid · role · application_name. Some writes of an attached server
+  (observation records) do not take the migration lock and would interleave with the moving transaction.
 - Pre-checks: NUL bytes and broken UTF-8 in text columns, broken JSON and `\u0000` in JSON columns, a storage type that does
   not match the column, NULL primary keys, colliding snapshot key digests, and foreign keys pointing at missing rows. If
   anything hits, nothing is written and each hit is listed by table · column · reason · primary key. Fix those rows in the
@@ -334,19 +337,29 @@ sequences), writes into a temporary file next to the target, and gives it the `-
 On a mismatch or failure (and always on a dry run) no file is left behind. Exit codes are the same as the import's.
 
 ```bash
-# 1. Stop the server that writes the Postgres ledger. The source is only read, in one snapshot (REPEATABLE READ READ ONLY).
-# 2. Dry run: runs the same path to the end in a temporary file, then deletes that file.
+# 1. Stop the server that writes the Postgres ledger. If any connection other than this run is attached, the export refuses
+#    and lists each remaining connection's pid · role · application_name. The source is only read, in one snapshot
+#    (REPEATABLE READ READ ONLY).
+# 2. Dry run: runs the same path to the end in a temporary file (naming is tried with a throwaway hard link in the same
+#    directory), then deletes that file.
 fd migrate export-sqlite --db <URL> --to fd-back.db --dry-run
 # 3. Move. On success it prints the comparison table and "moved N rows, the comparison matched -> fd-back.db".
 fd migrate export-sqlite --db <URL> --to fd-back.db
-# 4. (Optional) compare again before starting a server on the new file. This is the import's verify, unchanged.
+# 4. Always compare again before starting a server on the new file. This is the import's verify, unchanged.
 fd migrate verify --from fd-back.db --db <URL>
 ```
 
+- Do not skip step 4. The comparison before commit matches the moved snapshot against itself, so a write that a server
+  attached to the source committed after the connection check is neither moved nor noticed. verify reads the source again in
+  a fresh snapshot and catches that mismatch. If it does not match, delete the exported file and start again from step 1
+  with the server stopped.
+
 - If a file already sits at `--to`, or a `-wal` · `-shm` · `-journal` sits next to it, the export refuses. It never
   overwrites, and a leftover `-wal` cannot be replayed into the new file.
-- The source must be at version 18. A Postgres ledger upgraded past it has no place in the SQLite build and is refused. The
-  account is the same as for the import (a superuser or a member of `fd_owner` - it reads the sequences).
+- The source must be at version 18. A Postgres ledger upgraded past it has no place in the SQLite build and is refused. So is
+  a ledger whose tables or columns differ from version 18 (a hand-edited ledger). The version and the shape are measured in
+  the snapshot the export copies from. The account is the same as for the import (a superuser or a member of `fd_owner` - it
+  reads the sequences).
 - A source holding a value the import's pre-checks would refuse (broken JSON and the like) is refused, since the exported
   file could not be imported again.
 - Sequences: the AUTOINCREMENT tables (pick_eval · resource_hold · event · landing_queue) get the highest number Postgres
@@ -355,6 +368,11 @@ fd migrate verify --from fd-back.db --db <URL>
   SQLite build.
 - The judgment search index (judgment_fts) does not exist on Postgres, so it is not moved. It is rebuilt from the moved
   judgment rows and checked against them.
+- The exported file has mode 0644, and "moved" is printed only after the directory holding the new name has been fsynced.
+- Stopped with Ctrl-C or SIGTERM, the export deletes its temporary file and exits 1. Ended by SIGKILL or a power cut, it may
+  leave `.<name>.export-<digits>` (with its `-wal` · `-shm` · `.link`) in the `--to` directory. While no export is running,
+  find them with `ls -a <directory> | grep '^\.fd-back\.db\.export-'` and delete them. They never got the name, so they are
+  not a ledger.
 
 **Rehearsing the way back.** Before the real move, run the round trip once: a copy of the ledger → `import-sqlite` into a
 test Postgres ledger → start a server on it and write a few things (an item, a claim, a judgment) → stop the server and

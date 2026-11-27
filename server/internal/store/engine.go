@@ -431,6 +431,32 @@ func (e engine) schemaObjectsQuery() string {
 	return `SELECT count(*) FROM sqlite_master WHERE type IN ('table','index','trigger','view')`
 }
 
+// tablesQuery 는 업무 표 이름을 이름순으로 내는 질의다. 원장 옮기기의 모양 검사(checkShape)와 표 목록을 스키마와 맞대는
+// 시험(catalog_test.go)이 이 하나로 읽는다 - 엔진마다 sqlite_master · information_schema 를 따로 적으면 한 엔진의 검사만 남는다.
+//
+//   - SQLite: sqlite_master 의 표(FTS5 가상 표와 그 그림자 표 포함). 엔진 자신의 표(sqlite_ 로 시작)는 뺀다.
+//   - Postgres: 이름 없는 질의가 닿는 스키마(current_schema)의 표.
+func tablesQuery(e engine) string {
+	if e == enginePG {
+		return `SELECT tablename::text FROM pg_catalog.pg_tables WHERE schemaname = current_schema() ORDER BY tablename`
+	}
+	return `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY name`
+}
+
+// columnsQuery 는 표 하나(인자)의 칸 이름을 선언 순서로 내는 질의다. 없는 표면 0행이다.
+//
+// ★ 계산 칼럼(GENERATED)은 두 엔진 모두 뺀다. SQLite 의 pragma_table_info 가 원래 그것을 안 보이고(table_xinfo 만
+// 보인다), Postgres 의 계산 칼럼(snapshot.key_digest)은 누구도 손으로 못 적는 파생값이라 원장이 실을 것도 아니다.
+// 한쪽만 빼면 같은 맞대기가 엔진마다 다른 것을 잰다.
+func columnsQuery(e engine) string {
+	if e == enginePG {
+		return `SELECT a.attname::text FROM pg_catalog.pg_attribute a
+		         WHERE a.attrelid = to_regclass(?) AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''
+		         ORDER BY a.attnum`
+	}
+	return `SELECT name FROM pragma_table_info(?) ORDER BY cid`
+}
+
 // baseVersion 은 빈 DB 에 처음 까는 기준선의 판이다. SQLite 는 schema.sql(1판) 위에 증분 전부를 얹고, Postgres 는
 // 기준선이 곧 SQLite 18판을 접어 넣은 판이다(pgBaseline).
 func (e engine) baseVersion() int {

@@ -4,6 +4,7 @@ package pg_test
 // importsqlite_test.go 다.
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -277,6 +278,35 @@ func TestCellKeepsTheColumnType(t *testing.T) {
 					t.Errorf("%s 칸이 NULL 을 %#v 로 냈다", kind, got)
 				}
 			}
+		}
+	}
+}
+
+// TargetCell 은 Cell 이 받는 두 갈래(글 칸의 BLOB, bytea 칸의 TEXT)를 저장 갈래 오류로 걸고 값을 받은 그대로 둔다. 칸
+// 타입 그대로 저장된 값과 NULL 은 Cell 과 같이 잰다.
+func TestTargetCellRefusesTheOtherStorage(t *testing.T) {
+	text, bytes := pg.Column{Name: "c", Kind: pg.Text}, pg.Column{Name: "c", Kind: pg.Bytes}
+	for _, c := range []struct {
+		col  pg.Column
+		v    any
+		want pg.Fault
+	}{
+		{text, []byte("x"), pg.FaultStorage},
+		{bytes, "x", pg.FaultStorage},
+		{text, "x", ""},
+		{bytes, []byte("x"), ""},
+		{pg.Column{Name: "c", Kind: pg.Int}, int64(1), ""},
+		{text, nil, ""},
+	} {
+		got, fault := pg.TargetCell(c.col, c.v)
+		if fault != c.want {
+			t.Errorf("%s 칸의 %#v: 사유 %q, 기대 %q", c.col.Kind, c.v, fault, c.want)
+		}
+		if fault == pg.FaultStorage && fmt.Sprintf("%T", got) != fmt.Sprintf("%T", c.v) {
+			t.Errorf("%s 칸이 걸린 %#v 를 %T 로 바꿨다", c.col.Kind, c.v, got)
+		}
+		if want, wantFault := pg.Cell(c.col, c.v); c.want == "" && (wantFault != "" || fmt.Sprint(got) != fmt.Sprint(want)) {
+			t.Errorf("%s 칸의 %#v: Cell 과 다르다(%#v · %#v)", c.col.Kind, c.v, got, want)
 		}
 	}
 }

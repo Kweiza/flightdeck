@@ -110,6 +110,9 @@ func liteExec(t *testing.T, path, q string) {
 }
 
 // importTarget 은 기준선 · 판 행이 있는 빈 Postgres 원장을 만든다. 접속 URL 과, 같은 원장을 연 Store(대상 재기용)를 낸다.
+//
+// ★ 그 Store 는 연결을 쥐고 있지 않는다(SetMaxIdleConns(0) - 질의마다 열고 닫는다). 이관 · 역이관은 그 원장에 붙은 다른
+// 연결을 거절한다(soleClient) - 재기용 Store 가 쉬는 연결을 쥐면 옮기기마다 그 Store 를 닫아야 한다.
 func importTarget(t *testing.T) (string, *Store) {
 	t.Helper()
 	dsn := storetest.New(t)
@@ -118,8 +121,32 @@ func importTarget(t *testing.T) (string, *Store) {
 		t.Fatalf("openPG: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
+	s.db.raw.SetMaxIdleConns(0)
 	stamp(t, s, pg.ImportVersion)
 	return dsn, s
+}
+
+// importLedger 는 ImportSQLite 다. 대상이 Postgres 면 앞 단계(채우기 · 앞 실행 · 재기)의 연결이 서버에서 다 빠지기를 먼저
+// 기다린다 - 이관은 대상에 붙은 다른 연결을 거절한다(soleClient). 닫은 연결의 백엔드는 조금 늦게 빠진다.
+func importLedger(t *testing.T, ctx context.Context, from, to string, opt TransferOptions) (TransferReport, error) {
+	t.Helper()
+	settleLedger(t, to)
+	return ImportSQLite(ctx, from, to, opt, quietLog())
+}
+
+// exportLedger 는 ExportSQLite 다. 원본에 대해 importLedger 와 같이 기다린다.
+func exportLedger(t *testing.T, ctx context.Context, from, to string, opt TransferOptions) (TransferReport, error) {
+	t.Helper()
+	settleLedger(t, from)
+	return ExportSQLite(ctx, from, to, opt, quietLog())
+}
+
+// settleLedger 는 dsn 이 Postgres 원장이면 거기 붙은 클라이언트 연결이 다 빠지기를 기다린다(storetest.SettleClients).
+func settleLedger(t *testing.T, dsn string) {
+	t.Helper()
+	if ParseTarget(dsn).Postgres() {
+		storetest.SettleClients(t, dsn, 0)
+	}
 }
 
 // identityStates 는 대상 identity 시퀀스마다 「last_value/is_called」다(순번을 건드렸는가의 잣대). 새 원장은 전부 1/false 다.
@@ -164,7 +191,7 @@ func TestImportSQLiteRoundTrip(t *testing.T) {
 		('after-big', 'fp', 200, 'text/plain', X'00', `+importAt+`);`)
 	dsn, dst := importTarget(t)
 
-	rep, err := ImportSQLite(ctx, src, dsn, TransferOptions{}, quietLog())
+	rep, err := importLedger(t, ctx, src, dsn, TransferOptions{})
 	if err != nil {
 		t.Fatalf("이관 실패: %v\n%+v", err, rep)
 	}
@@ -220,7 +247,7 @@ func TestImportSQLiteKeepsDeletedTopNumbers(t *testing.T) {
 	ctx := context.Background()
 	src := importSource(t, importSeed)
 	dsn, dst := importTarget(t)
-	rep, err := ImportSQLite(ctx, src, dsn, TransferOptions{}, quietLog())
+	rep, err := importLedger(t, ctx, src, dsn, TransferOptions{})
 	if err != nil {
 		t.Fatalf("이관 실패: %v", err)
 	}
@@ -277,7 +304,7 @@ func TestImportSQLiteRefusesFaultsAndWritesNothing(t *testing.T) {
 			liteExec(t, src, c.break_)
 			dsn, dst := importTarget(t)
 			for _, dry := range []bool{true, false} {
-				rep, err := ImportSQLite(ctx, src, dsn, TransferOptions{DryRun: dry}, quietLog())
+				rep, err := importLedger(t, ctx, src, dsn, TransferOptions{DryRun: dry})
 				if err == nil || !strings.Contains(err.Error(), "사전 검사") {
 					t.Fatalf("예행 %v: 걸린 원본을 받았다: %v", dry, err)
 				}
@@ -308,7 +335,7 @@ func TestImportSQLiteDryRunWritesNothing(t *testing.T) {
 	src := importSource(t, importSeed)
 	dsn, dst := importTarget(t)
 	fresh := identityStates(t, dst)
-	rep, err := ImportSQLite(ctx, src, dsn, TransferOptions{DryRun: true}, quietLog())
+	rep, err := importLedger(t, ctx, src, dsn, TransferOptions{DryRun: true})
 	if err != nil || !rep.TargetChecked || rep.Copied != 0 || len(rep.Rows) != len(pg.Tables()) || !rep.Matched() {
 		t.Fatalf("예행: %v %+v", err, rep)
 	}
@@ -318,15 +345,15 @@ func TestImportSQLiteDryRunWritesNothing(t *testing.T) {
 	if got := identityStates(t, dst); !maps.Equal(got, fresh) {
 		t.Fatalf("예행이 순번을 바꿔 놓았다: %v → %v", fresh, got)
 	}
-	if rep, err := ImportSQLite(ctx, src, dsn, TransferOptions{}, quietLog()); err != nil || rep.Copied == 0 {
+	if rep, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil || rep.Copied == 0 {
 		t.Fatalf("예행 뒤 본 실행: %v (옮긴 행 %d)", err, rep.Copied)
 	}
 	other := filepath.Join(t.TempDir(), "not-there.db")
-	rep, err = ImportSQLite(ctx, src, other, TransferOptions{DryRun: true}, quietLog())
+	rep, err = importLedger(t, ctx, src, other, TransferOptions{DryRun: true})
 	if err != nil || rep.TargetChecked {
 		t.Fatalf("Postgres 아닌 대상의 예행: %v, 대상을 쟀다 %v", err, rep.TargetChecked)
 	}
-	if _, err := ImportSQLite(ctx, src, other, TransferOptions{}, quietLog()); err == nil || !strings.Contains(err.Error(), "Postgres 접속 URL") {
+	if _, err := importLedger(t, ctx, src, other, TransferOptions{}); err == nil || !strings.Contains(err.Error(), "Postgres 접속 URL") {
 		t.Fatalf("Postgres 아닌 대상에 옮겼다: %v", err)
 	}
 }
@@ -336,12 +363,12 @@ func TestImportSQLiteRefusesATargetThatIsNotEmpty(t *testing.T) {
 	ctx := context.Background()
 	src := importSource(t, importSeed)
 	dsn, dst := importTarget(t)
-	if _, err := ImportSQLite(ctx, src, dsn, TransferOptions{}, quietLog()); err != nil {
+	if _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil {
 		t.Fatalf("첫 이관: %v", err)
 	}
 	before := targetRows(t, dst)
 	for _, dry := range []bool{true, false} {
-		_, err := ImportSQLite(ctx, src, dsn, TransferOptions{DryRun: dry}, quietLog())
+		_, err := importLedger(t, ctx, src, dsn, TransferOptions{DryRun: dry})
 		if err == nil || !strings.Contains(err.Error(), "비어 있지 않다") {
 			t.Fatalf("예행 %v: 찬 대상에 다시 옮겼다: %v", dry, err)
 		}
@@ -354,7 +381,7 @@ func TestImportSQLiteRefusesATargetThatIsNotEmpty(t *testing.T) {
 	dsn2, dst2 := importTarget(t)
 	pgExec(t, dst2, `SELECT nextval(pg_get_serial_sequence('event', 'id'))`)
 	for _, dry := range []bool{true, false} {
-		_, err := ImportSQLite(ctx, src, dsn2, TransferOptions{DryRun: dry}, quietLog())
+		_, err := importLedger(t, ctx, src, dsn2, TransferOptions{DryRun: dry})
 		if err == nil || !strings.Contains(err.Error(), "비어 있지 않다") || !strings.Contains(err.Error(), "event.id 순번") {
 			t.Fatalf("예행 %v: 번호를 낸 순번이 있는 대상에 옮겼다: %v", dry, err)
 		}
@@ -368,7 +395,7 @@ func TestImportSQLiteRefusesATargetThatIsNotEmpty(t *testing.T) {
 	dsn3, dst3 := importTarget(t)
 	pgExec(t, dst3, `SELECT setval(pg_get_serial_sequence('event', 'id'), 101, false)`)
 	for _, dry := range []bool{true, false} {
-		_, err := ImportSQLite(ctx, src, dsn3, TransferOptions{DryRun: dry}, quietLog())
+		_, err := importLedger(t, ctx, src, dsn3, TransferOptions{DryRun: dry})
 		if err == nil || !strings.Contains(err.Error(), "비어 있지 않다") || !strings.Contains(err.Error(), "event.id 순번(다음 번호 101)") {
 			t.Fatalf("예행 %v: 시작값에서 옮겨진 순번이 있는 대상에 옮겼다: %v", dry, err)
 		}
@@ -378,7 +405,7 @@ func TestImportSQLiteRefusesATargetThatIsNotEmpty(t *testing.T) {
 	}
 
 	bare := storetest.NewBare(t, "")
-	if _, err := ImportSQLite(ctx, src, bare, TransferOptions{}, quietLog()); err == nil || !strings.Contains(err.Error(), "--to 18") {
+	if _, err := importLedger(t, ctx, src, bare, TransferOptions{}); err == nil || !strings.Contains(err.Error(), "--to 18") {
 		t.Fatalf("빈 DB 에 옮겼거나 처방이 없다: %v", err)
 	}
 }
@@ -390,7 +417,7 @@ func TestImportSQLiteRefusesAnOlderSource(t *testing.T) {
 	mustMigrateTo(t, path, pg.ImportVersion-1)
 	dsn, dst := importTarget(t)
 	for _, dry := range []bool{true, false} {
-		_, err := ImportSQLite(ctx, path, dsn, TransferOptions{DryRun: dry}, quietLog())
+		_, err := importLedger(t, ctx, path, dsn, TransferOptions{DryRun: dry})
 		if err == nil || !strings.Contains(err.Error(), "판 17") || !strings.Contains(err.Error(), "fd migrate --db") {
 			t.Fatalf("예행 %v: 판 17 원본을 받았거나 안내가 없다: %v", dry, err)
 		}
@@ -439,7 +466,7 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			dsn, dst := importTarget(t)
-			if _, err := ImportSQLite(ctx, src, dsn, TransferOptions{}, quietLog()); err != nil {
+			if _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil {
 				t.Fatalf("이관: %v", err)
 			}
 			for _, q := range strings.Split(c.change, ";") {
@@ -464,7 +491,7 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 	// 대상 값이 값 검사에 걸리면 어긋남과 따로 그 칸 · 사유 · 행을 적는다(대상에서 읽은 값을 버리지 않는다).
 	t.Run("대상 값 검사", func(t *testing.T) {
 		dsn, dst := importTarget(t)
-		if _, err := ImportSQLite(ctx, src, dsn, TransferOptions{}, quietLog()); err != nil {
+		if _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil {
 			t.Fatalf("이관: %v", err)
 		}
 		pgExec(t, dst, `UPDATE item SET labels = '["\u0000"]' WHERE id = 'i1'`)
@@ -483,7 +510,7 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 	})
 	t.Run("순번", func(t *testing.T) {
 		dsn, dst := importTarget(t)
-		if _, err := ImportSQLite(ctx, src, dsn, TransferOptions{}, quietLog()); err != nil {
+		if _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil {
 			t.Fatalf("이관: %v", err)
 		}
 		pgExec(t, dst, `SELECT setval(pg_get_serial_sequence('pick_eval', 'id'), 2)`)
@@ -531,7 +558,7 @@ func TestImportSQLiteDryRunMatchesTheRealRun(t *testing.T) {
 			}
 			fresh := identityStates(t, dst)
 			for _, dry := range []bool{true, false} {
-				rep, err := ImportSQLite(ctx, src, to, TransferOptions{DryRun: dry}, quietLog())
+				rep, err := importLedger(t, ctx, src, to, TransferOptions{DryRun: dry})
 				if err == nil || !strings.Contains(err.Error(), c.errHas) || rep.Copied != 0 {
 					t.Fatalf("예행 %v: %q 로 거절하지 않았다: %v (옮긴 행 %d)", dry, c.errHas, err, rep.Copied)
 				}
@@ -557,7 +584,7 @@ func TestImportSQLiteDoesNotCommitAMismatch(t *testing.T) {
 	pgExec(t, dst, `CREATE TRIGGER t_bend_title BEFORE INSERT ON item FOR EACH ROW EXECUTE FUNCTION t_bend_title()`)
 	fresh := identityStates(t, dst)
 	for _, dry := range []bool{true, false} {
-		rep, err := ImportSQLite(ctx, src, dsn, TransferOptions{DryRun: dry}, quietLog())
+		rep, err := importLedger(t, ctx, src, dsn, TransferOptions{DryRun: dry})
 		if err == nil || !strings.Contains(err.Error(), "커밋하지 않는다") || rep.Copied != 0 {
 			t.Fatalf("예행 %v: 어긋난 이관이 끝났다: %v (옮긴 행 %d)", dry, err, rep.Copied)
 		}
@@ -581,7 +608,7 @@ func TestVerifySQLiteRefusesASourceTheImportWouldRefuse(t *testing.T) {
 	ctx := context.Background()
 	src := importSource(t, importSeed)
 	dsn, _ := importTarget(t)
-	if _, err := ImportSQLite(ctx, src, dsn, TransferOptions{}, quietLog()); err != nil {
+	if _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil {
 		t.Fatalf("이관: %v", err)
 	}
 	liteExec(t, src, `UPDATE counter SET value = X'37'`)
@@ -623,10 +650,10 @@ func TestImportSQLiteRefusesAPendingWAL(t *testing.T) {
 	dsn, dst := importTarget(t)
 	for name, run := range map[string]func() error{
 		"예행": func() error {
-			_, err := ImportSQLite(ctx, src, dsn, TransferOptions{DryRun: true}, quietLog())
+			_, err := importLedger(t, ctx, src, dsn, TransferOptions{DryRun: true})
 			return err
 		},
-		"이관": func() error { _, err := ImportSQLite(ctx, src, dsn, TransferOptions{}, quietLog()); return err },
+		"이관": func() error { _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); return err },
 		"대조": func() error { _, err := VerifySQLite(ctx, src, dsn, quietLog()); return err },
 	} {
 		if err := run(); err == nil || !strings.Contains(err.Error(), "-wal") || !strings.Contains(err.Error(), "VACUUM INTO") {
@@ -640,7 +667,7 @@ func TestImportSQLiteRefusesAPendingWAL(t *testing.T) {
 	if _, err := w.Exec(`VACUUM INTO '` + copied + `'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ImportSQLite(ctx, copied, dsn, TransferOptions{}, quietLog()); err != nil {
+	if _, err := importLedger(t, ctx, copied, dsn, TransferOptions{}); err != nil {
 		t.Fatalf("VACUUM INTO 사본의 이관: %v", err)
 	}
 	if n := pgCount(t, dst, `SELECT count(*) FROM machine WHERE id = 'm-wal'`); n != 1 {
@@ -658,7 +685,7 @@ func TestImportSQLiteOpensTheNamedFileOnly(t *testing.T) {
 	mustMigrate(t, src)
 	liteExec(t, src, importSeed)
 	dsn, dst := importTarget(t)
-	if _, err := ImportSQLite(ctx, src, dsn, TransferOptions{}, quietLog()); err != nil {
+	if _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil {
 		t.Fatalf("이관: %v", err)
 	}
 	if n := targetRows(t, dst); n == 0 {

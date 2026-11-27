@@ -169,6 +169,21 @@ type Reader interface {
 	QueryRowContext(ctx context.Context, q string, args ...any) *row
 }
 
+// catalogReader 는 엔진을 아는 읽기 면이다 - 판 재기(readMigrationState)처럼 엔진마다 문장이 다른 읽기가 받는다. dbtx 와
+// 실행기 세션이 만족하고, ReadTx 의 Reader 는 onEngine 으로 엔진을 붙여 준다.
+type catalogReader interface {
+	Reader
+	dialect() engine
+}
+
+// onEngine 은 Reader 에 그 원장의 엔진을 붙인다(catalogReader). 원장 옮기기가 원본 스냅숏(ReadTx) 안에서 판을 잴 때 쓴다.
+type onEngine struct {
+	Reader
+	eng engine
+}
+
+func (r onEngine) dialect() engine { return r.eng }
+
 // dbtx 는 단발 핸들(conn)과 트랜잭션(txConn)이 함께 만족하는 최소 면이다.
 // 질의 구현을 한 벌로 두기 위한 것이다 — 두 벌이 되면 트랜잭션 경로와 단발 경로가 표류한다.
 type dbtx interface {
@@ -601,7 +616,7 @@ func CheckPragmasAgainst(want, got map[string]string) error {
 //
 // ★ 엔진마다 다른 것은 카탈로그를 묻는 질의 둘뿐이다(engine.versionTableQuery · schemaObjectsQuery). 판정(PlanMigration)과
 // 판 읽기는 한 벌이다 - 이전 실행기가 증분 트랜잭션 안에서 판을 다시 잴 때도 이것을 쓴다(stepReady).
-func readMigrationState(ctx context.Context, db dbtx) (hasTable bool, dbVersion, objects int, err error) {
+func readMigrationState(ctx context.Context, db catalogReader) (hasTable bool, dbVersion, objects int, err error) {
 	eng := db.dialect()
 	// schema_version 테이블 존재 확인
 	var n int

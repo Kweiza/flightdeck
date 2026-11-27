@@ -269,6 +269,34 @@ func Cell(c Column, v any) (any, Fault) {
 	return v, FaultStorage
 }
 
+// TargetCell 은 옮긴 대상에서 읽은 값 v 를 잰다: Cell 의 검사에 더해, 저장 갈래가 칸 타입 그대로여야 한다(Text → 글,
+// Int → 정수, Bytes → BLOB). 걸리면 값은 받은 그대로 돌려줘 행 해시의 표지도 원본과 갈린다.
+//
+// ★ Cell 이 받는 두 갈래(글 칸의 BLOB, bytea 칸의 TEXT)는 원본의 사정이다 - SQLite 원본은 칸 타입을 강제하지 않아 그렇게
+// 쌓였을 수 있고, 바이트가 그대로라 옮겨도 된다. 대상은 옮기기가 칸 타입의 값으로 넣은 원장이라 다른 갈래로 남았으면 넣은
+// 뒤에 무엇이 바꾼 것이다. 바이트가 같아 지문으로는 안 갈리므로 여기서 잰다. SQLite 대상(역이관)의 자리다 - Postgres 대상은
+// 엔진이 칸 타입을 강제해 늘 맞는다.
+func TargetCell(c Column, v any) (any, Fault) {
+	out, f := Cell(c, v)
+	if f == "" && v != nil && !storedAs(c.Kind, v) {
+		return v, FaultStorage
+	}
+	return out, f
+}
+
+// storedAs 는 읽은 값 v 의 Go 타입이 칸 타입 k 의 저장 갈래인가다(드라이버가 저장 갈래마다 정한 타입으로 준다).
+func storedAs(k Kind, v any) bool {
+	switch v.(type) {
+	case int64:
+		return k == Int
+	case string:
+		return k == Text
+	case []byte:
+		return k == Bytes
+	}
+	return false
+}
+
 func textFault(c Column, s string) Fault {
 	switch {
 	case strings.IndexByte(s, 0) >= 0:
@@ -358,11 +386,12 @@ func (t Table) columnNames(sqlite bool) []string {
 	return names
 }
 
-// SourceColumns 는 SQLite 원본에 선언돼 있어야 할 칸 이름이다(rowid 자리는 선언된 칸이 아니다).
-func (t Table) SourceColumns() []string {
+// DeclaredColumns 는 원장에 선언돼 있어야 할 칸 이름이다(선언 순서). sqlite 면 rowid 자리를 뺀다 - SQLite 에서는 선언된 칸이
+// 아니다. Postgres 는 칸 전부다(생성 칸인 지문은 카탈로그 밖이다).
+func (t Table) DeclaredColumns(sqlite bool) []string {
 	var out []string
 	for _, c := range t.Cols {
-		if !c.Rowid {
+		if !sqlite || !c.Rowid {
 			out = append(out, c.Name)
 		}
 	}

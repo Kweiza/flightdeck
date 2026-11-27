@@ -7,36 +7,12 @@ import (
 )
 
 // 살아 있는 DB 의 카탈로그를 읽는 시험 도우미. 표 목록 · 칸 목록을 스키마와 맞대는 시험(이동 목록 · 프로젝트 참조 목록 ·
-// 원장 칸 목록 · 표 수)이 모두 이것으로 읽는다. 엔진 차이는 아래 두 질의의 갈래 한 곳뿐이다. 시험마다 sqlite_master ·
-// PRAGMA · information_schema 를 따로 적으면 한 엔진의 시험만 남고, 다른 엔진에서는 맞대기가 아예 안 돈다.
+// 원장 칸 목록 · 표 수)이 모두 이것으로 읽는다. 질의는 원장 옮기기의 모양 검사와 같은 두 질의(engine.go 의 tablesQuery ·
+// columnsQuery)이고, 엔진 차이는 그 갈래 한 곳뿐이다. 시험마다 sqlite_master · PRAGMA · information_schema 를 따로 적으면 한
+// 엔진의 시험만 남고, 다른 엔진에서는 맞대기가 아예 안 돈다.
 //
 // ★ 빈 결과는 실패로 본다. 좌표가 틀린 훑기(엉뚱한 스키마 · 바뀐 표 이름)는 0행을 내고, 0행 위의 맞대기는
 // 「빠진 것이 없다」로 초록이 된다.
-
-// tablesQuery 는 업무 표 이름을 이름순으로 내는 질의다.
-//
-//   - SQLite: sqlite_master 의 표(FTS5 가상 표와 그 그림자 표 포함). 엔진 자신의 표(sqlite_ 로 시작)는 뺀다.
-//   - Postgres: 이름 없는 질의가 닿는 스키마(current_schema)의 표. 시험 DB 마다 스키마 이름을 적지 않는다.
-func tablesQuery(e engine) string {
-	if e == enginePG {
-		return `SELECT tablename::text FROM pg_catalog.pg_tables WHERE schemaname = current_schema() ORDER BY tablename`
-	}
-	return `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY name`
-}
-
-// columnsQuery 는 표 하나(인자)의 칸 이름을 선언 순서로 내는 질의다. 없는 표면 0행이다.
-//
-// ★ 계산 칼럼(GENERATED)은 두 엔진 모두 뺀다. SQLite 의 pragma_table_info 가 원래 그것을 안 보이고(table_xinfo 만
-// 보인다), Postgres 의 계산 칼럼(snapshot.key_digest)은 누구도 손으로 못 적는 파생값이라 원장이 실을 것도 아니다.
-// 한쪽만 빼면 같은 맞대기가 엔진마다 다른 것을 잰다.
-func columnsQuery(e engine) string {
-	if e == enginePG {
-		return `SELECT a.attname::text FROM pg_catalog.pg_attribute a
-		         WHERE a.attrelid = to_regclass(?) AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''
-		         ORDER BY a.attnum`
-	}
-	return `SELECT name FROM pragma_table_info(?) ORDER BY cid`
-}
 
 // liveTables 는 s 의 업무 표 이름을 이름순으로 낸다(tablesQuery).
 func liveTables(t *testing.T, s *Store) []string {
