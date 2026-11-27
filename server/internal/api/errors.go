@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/kweiza/flightdeck/internal/nulesc"
 	"github.com/kweiza/flightdeck/internal/service"
 	"github.com/kweiza/flightdeck/internal/store"
 )
@@ -68,6 +69,13 @@ func ClassifyError(err error) Classified {
 			Message:  longSearch.Error(),
 			Guidance: "검색어를 줄여 다시 보내라.",
 		}
+	}
+
+	// 요청 글의 NUL 규칙(nulesc.Input · Fields)이 거절한 글 하나. 쓰기 전에 거절한 입력 오류라 400 이다. 문구는 거절 갈래와 글의
+	// 자리(칸 이름 · 번호, 요청이 보낸 JSON 의 키)로만 만든다.
+	var nul *nulesc.Refusal
+	if errors.As(err, &nul) {
+		return classifyNUL(nul)
 	}
 
 	// project · kind 가 이벤트 인덱스의 키 상한보다 길다. 쓰기 전에 거절한 입력 오류라 400 이다(store.eventKeyRefusal).

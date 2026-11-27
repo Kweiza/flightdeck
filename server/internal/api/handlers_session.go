@@ -21,10 +21,10 @@ type openSessionRequest struct {
 	ProjectPath   string `json:"project_path"`
 	DefaultBranch string `json:"default_branch"`
 	MachineID     string `json:"machine_id"`
-	Hostname      string `json:"hostname"`
+	Hostname      string `json:"hostname" nul:"text"`
 	Worktree      string `json:"worktree"`
 	CCSessionID   string `json:"cc_session_id"`
-	Label         string `json:"label"`
+	Label         string `json:"label" nul:"text"`
 	// ★ 옛 클라이언트는 이 필드를 안 싣는다 — 그때 빈 문자열이고 「미상」이다.
 	// 없는 것을 claude 로 접지 않는 규율이 여기서도 그대로다.
 	Harness string `json:"harness"`
@@ -101,7 +101,7 @@ func (s *server) handleFindSession(w http.ResponseWriter, r *http.Request) {
 
 type patchSessionRequest struct {
 	State string `json:"state"`
-	Why   string `json:"why"`
+	Why   string `json:"why" nul:"text"`
 }
 
 // handlePatchSession 은 세션 상태를 바꾼다.

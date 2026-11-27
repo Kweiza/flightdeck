@@ -168,10 +168,10 @@ type addItemRequest struct {
 	Project   string       `json:"project"`
 	SessionID string       `json:"session_id"`
 	ID        string       `json:"id"`
-	Title     string       `json:"title"`
-	Body      string       `json:"body"`
+	Title     string       `json:"title" nul:"text"`
+	Body      string       `json:"body" nul:"text"`
 	Paths     []string     `json:"paths"`
-	Labels    []string     `json:"labels"`
+	Labels    []string     `json:"labels" nul:"text"`
 	After     []afterInput `json:"after"`
 }
 
@@ -266,8 +266,8 @@ func (s *server) handleClaimItem(w http.ResponseWriter, r *http.Request) {
 // 그 세션이 아니다. 세션을 요구하는 순간 탈출구가 다시 막힌다.
 type claimReleaseRequest struct {
 	Project string `json:"project"`
-	Actor   string `json:"actor"`  // 누가 회수했나. 판단 본문에 그대로 남는다
-	Reason  string `json:"reason"` // 왜. **비면 service 가 거절한다**
+	Actor   string `json:"actor" nul:"text"`  // 누가 회수했나. 판단 본문에 그대로 남는다
+	Reason  string `json:"reason" nul:"text"` // 왜. **비면 service 가 거절한다**
 }
 
 // handleReclaimClaim 은 사람이 선점 하나를 회수한다.
@@ -305,7 +305,7 @@ type claimLeaveRequest struct {
 	Project   string `json:"project"`
 	SessionID string `json:"session_id"`
 	ItemID    string `json:"item_id"`
-	Reason    string `json:"reason"` // 왜 안 했나. **비면 service 가 거절한다**
+	Reason    string `json:"reason" nul:"text"` // 왜 안 했나. **비면 service 가 거절한다**
 }
 
 // handleLeaveClaim 은 살아 있는 세션이 자기 선점을 놓는다.
@@ -334,10 +334,10 @@ func (s *server) handleLeaveClaim(w http.ResponseWriter, r *http.Request) {
 
 type followupRequest struct {
 	ID     string       `json:"id"`
-	Title  string       `json:"title"`
-	Body   string       `json:"body"`
+	Title  string       `json:"title" nul:"text"`
+	Body   string       `json:"body" nul:"text"`
 	Paths  []string     `json:"paths"`
-	Labels []string     `json:"labels"`
+	Labels []string     `json:"labels" nul:"text"`
 	After  []afterInput `json:"after"`
 	// Project 는 이 후속이 만들어질 프로젝트다(증분 015). 비면 마무리하는 항목과 같다.
 	Project string `json:"project"`
@@ -347,9 +347,9 @@ type finishRequest struct {
 	Project     string            `json:"project"`
 	SessionID   string            `json:"session_id"`
 	Outcome     string            `json:"outcome"`
-	Title       string            `json:"title"`
-	Body        string            `json:"body"`
-	CloseReason string            `json:"close_reason"`
+	Title       string            `json:"title" nul:"text"`
+	Body        string            `json:"body" nul:"text"`
+	CloseReason string            `json:"close_reason" nul:"text"`
 	Followups   []followupRequest `json:"followups"`
 	Links       []linkInput       `json:"links"`
 }
@@ -471,8 +471,8 @@ func (s *server) handleCutAfter(w http.ResponseWriter, r *http.Request) {
 type labelRequest struct {
 	Project   string   `json:"project"`
 	SessionID string   `json:"session_id"`
-	Add       []string `json:"add"`
-	Rm        []string `json:"rm"`
+	Add       []string `json:"add" nul:"text"`
+	Rm        []string `json:"rm" nul:"text"`
 }
 
 func (s *server) handleLabelItem(w http.ResponseWriter, r *http.Request) {
@@ -511,10 +511,10 @@ func (s *server) handleLabelItem(w http.ResponseWriter, r *http.Request) {
 type amendRequest struct {
 	Project   string    `json:"project"`
 	SessionID string    `json:"session_id"`
-	Title     *string   `json:"title"`
-	Body      *string   `json:"body"`
+	Title     *string   `json:"title" nul:"text"`
+	Body      *string   `json:"body" nul:"text"`
 	Paths     *[]string `json:"paths"`
-	Reason    string    `json:"reason"`
+	Reason    string    `json:"reason" nul:"text"`
 }
 
 func (s *server) handleAmendItem(w http.ResponseWriter, r *http.Request) {

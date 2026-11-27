@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -41,10 +42,7 @@ func (s *server) writeJSON(w http.ResponseWriter, r *http.Request, status int, v
 
 // writeError 는 분류된 오류를 낸다. request_id 를 반드시 싣는다.
 func (s *server) writeError(w http.ResponseWriter, r *http.Request, c Classified) {
-	id := ""
-	if info := infoFrom(r.Context()); info != nil {
-		id = info.requestID
-	}
+	id := infoFrom(r.Context()).id()
 	body, err := json.Marshal(ErrorBody{Error: ErrorDetail{
 		Code: c.Code, Message: c.Message, Guidance: c.Guidance, RequestID: id,
 	}})
@@ -75,14 +73,11 @@ func (s *server) fail(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 func (s *server) logInternal(r *http.Request, msg string, err error) {
-	id := ""
-	if info := infoFrom(r.Context()); info != nil {
-		id = info.requestID
-	}
+	info := infoFrom(r.Context())
 	s.log.ErrorContext(r.Context(), msg,
 		"route", s.resolveRoute(r),
-		"request_id", id,
-		"session_id", infoFrom(r.Context()).session(),
+		"request_id", info.id(),
+		"session_id", info.session(),
 		"error", err.Error(),
 	)
 }
@@ -91,12 +86,18 @@ func (s *server) logInternal(r *http.Request, msg string, err error) {
 //
 // 모르는 필드는 **거절하지 않는다** — 클라이언트(플러그인)는 자동 갱신되므로
 // 서버보다 새로운 필드를 보내는 구간이 정상적으로 존재한다(설계 §7 의 버전 스큐).
+//
+// 푼 값에는 NUL 규칙(nulesc.Input)을 건다 — 쓰기 길의 JSON 입구가 모두 여기를 지나므로(MCP · CLI · 훅 · 보드가 모두 이
+// REST 를 탄다) 엔진마다 · 처리기마다 따로 두지 않는다. 자유 글(`nul:"text"` 칸)의 NUL 은 이관과 같은 `\x00` 표기로 바꿔 받고,
+// 이름 자리의 NUL · 키의 U+0000 · 짝 없는 서로게이트는 400 이다(ClassifyError 의 *nulesc.Refusal). 짝 없는 서로게이트는 풀기가
+// U+FFFD 로 바꿔 흔적을 지우므로 푼 바이트 그대로(dec.InputOffset 까지)를 잰다.
 func (s *server) decode(w http.ResponseWriter, r *http.Request, dst any) bool {
-	body := http.MaxBytesReader(w, r.Body, s.opt.MaxBodyBytes)
-	err := json.NewDecoder(body).Decode(dst)
+	var raw bytes.Buffer
+	dec := json.NewDecoder(io.TeeReader(http.MaxBytesReader(w, r.Body, s.opt.MaxBodyBytes), &raw))
+	err := dec.Decode(dst)
 	switch {
 	case err == nil:
-		return true
+		return s.acceptNUL(w, r, raw.Bytes()[:dec.InputOffset()], dst)
 	case errors.Is(err, io.EOF):
 		s.writeError(w, r, badRequest("empty_body", "요청 본문이 비었다", "JSON 객체 하나를 실어라."))
 		return false

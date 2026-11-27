@@ -20,8 +20,8 @@ func (s *server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 // 않는다. 두 벌이 되면 반드시 표류한다).
 func (s *server) handleRemoveProject(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Actor   string `json:"actor"`
-		Reason  string `json:"reason"`
+		Actor   string `json:"actor" nul:"text"`
+		Reason  string `json:"reason" nul:"text"`
 		Confirm bool   `json:"confirm"`
 	}
 	if !s.decode(w, r, &req) {

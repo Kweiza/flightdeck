@@ -46,6 +46,14 @@ func (i *reqInfo) setSession(id string) {
 	i.mu.Unlock()
 }
 
+// id 는 요청 상관키다. 사슬 밖(nil)이면 빈 값이다.
+func (i *reqInfo) id() string {
+	if i == nil {
+		return ""
+	}
+	return i.requestID
+}
+
 func (i *reqInfo) session() string {
 	if i == nil {
 		return ""
@@ -240,15 +248,11 @@ func (s *server) withAccessLog(next http.Handler) http.Handler {
 			dur := s.now().Sub(start).Seconds()
 			s.met.observe(route, rec.status, dur)
 			info := infoFrom(r.Context())
-			id := ""
-			if info != nil {
-				id = info.requestID
-			}
 			s.log.InfoContext(r.Context(), "request served",
 				"route", route,
 				"status", rec.status,
 				"duration", dur,
-				"request_id", id,
+				"request_id", info.id(),
 				"session_id", info.session(),
 			)
 		}()
@@ -380,13 +384,9 @@ func (s *server) withRecover(next http.Handler) http.Handler {
 			}
 			s.met.incPanic()
 			info := infoFrom(r.Context())
-			id := ""
-			if info != nil {
-				id = info.requestID
-			}
 			s.log.ErrorContext(r.Context(), "request panicked",
 				"route", s.resolveRoute(r),
-				"request_id", id,
+				"request_id", info.id(),
 				"session_id", info.session(),
 				"error", clip(toString(rv), 600),
 				"stack", clip(string(debug.Stack()), 4000),

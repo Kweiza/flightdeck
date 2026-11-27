@@ -1,12 +1,14 @@
 // Package nulesc 는 Postgres text 가 못 담는 NUL(U+0000)을 되돌릴 수 있는 `\x00` 표기로 옮기는 규칙이다: 글 하나에 거는 Escape 와,
-// JSON 문서 안에서 U+0000 이 든 글 값 토큰만 원문 바이트에서 고치는 EscapeJSON.
+// JSON 문서 안에서 U+0000 이 든 글 값 토큰만 원문 바이트에서 고치는 EscapeJSON, 그리고 서버가 받는 입력 값의 자리마다 그 둘을
+// 거는 Input · Fields(input.go).
 //
 // ★ 바꿔 넣기는 자유 글에만 건다. 식별자(이름으로 다른 것을 가리키는 글 - JSON 객체의 키가 그 하나다)의 NUL 은 바꾸지 않고
 // 거절한다: 바꾼 이름이 원래 `\x00` 네 글자를 담은 다른 이름과 같아지면 이름 공간에서 두 값이 하나가 된다. 원장의 식별자 칸은
 // 이관 카탈로그(store/pg 의 Column.Identifier)가 가르고, JSON 키는 EscapeJSON 이 ErrKeyNUL 로 거절한다.
 //
-// ★ 표준 라이브러리만 쓰는 순수 함수다. SQLite 원장을 Postgres 로 옮기는 이관(store/pg 의 Cell)이 쓰고, Postgres 원장에 새로 쓰는
-// 길도 같은 규칙을 그대로 가져다 쓸 수 있게 이관 카탈로그(store/pg)와 떼어 둔다.
+// ★ 표준 라이브러리만 쓴다. SQLite 원장을 Postgres 로 옮기는 이관(store/pg 의 Cell)과 서버의 쓰기 길(api 의 요청 풀기 · web 의
+// 폼 읽기가 부르는 Input · Fields)이 같은 함수를 쓰도록 이관 카탈로그(store/pg)와 떼어 둔다. 이관은 칸 카탈로그로, 쓰기 길은 입력
+// 값의 표지(`nul:"text"`)로 자유 글과 이름을 가른다.
 package nulesc
 
 import (
@@ -73,11 +75,12 @@ var (
 	ErrKeyNUL = errors.New("키 안의 U+0000")
 )
 
-// Refusal 은 EscapeJSON 이 문서를 거절한 글 하나의 자리다. 갈래(ErrSurrogate · ErrKeyNUL)는 errors.Is 로 잰다.
+// Refusal 은 EscapeJSON 이 문서를, Fields 가 입력 값을 거절한 글 하나의 자리다. 갈래(ErrSurrogate · ErrKeyNUL · ErrNUL)는
+// errors.Is 로 잰다.
 type Refusal struct {
 	Err error
-	// Pointer 는 그 글의 자리(RFC 6901 JSON Pointer - 원래 문서의 키 · 배열 번호)다. 글이 키면 그 키를 이름으로 가진 멤버의
-	// 자리다(짝 없는 서로게이트 단위는 U+FFFD 로 읽는다).
+	// Pointer 는 그 글의 자리(RFC 6901 JSON Pointer - 원래 문서의 키 · 배열 번호, 입력 값이면 칸 이름 · 번호)다. 글이 키면 그
+	// 키를 이름으로 가진 멤버의 자리다(짝 없는 서로게이트 단위는 U+FFFD 로 읽는다).
 	Pointer string
 }
 

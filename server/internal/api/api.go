@@ -400,8 +400,9 @@ func (s *server) routes() *http.ServeMux {
 //	    auth    — 401. 로그 줄 없음
 //	      accessLog — 여기서부터 "게이트를 통과한 요청"이다. 1건당 1줄
 //	        screenWrite — 화면 폼의 출처를 대조하고 쿼리 키를 헤더로 올린다
-//	          idempotency — 쓰기 재시도를 같은 결과로 접는다
-//	            recover   — 패닉을 500 으로. 액세스 로그가 그 500 을 본다
+//	          nulGate   — URL(경로 · 질의)의 NUL 을 400 으로(nul.go)
+//	            idempotency — 쓰기 재시도를 같은 결과로 접는다
+//	              recover   — 패닉을 500 으로. 액세스 로그가 그 500 을 본다
 //
 // recover 가 accessLog **안쪽**인 이유: 바깥에 두면 패닉 요청의 액세스 로그가
 // 상태코드 0 으로 남아 "무엇이 500 을 냈나"를 지표에서 못 찾는다.
@@ -409,7 +410,7 @@ func (s *server) routes() *http.ServeMux {
 // screenWrite 가 idempotency **바깥**인 이유: 안쪽에 두면 키가 헤더로 올라가기 전에
 // 이미 400 이 나간 뒤다. accessLog 안쪽인 이유: 여기서 내는 403 도 로그에 남아야 한다.
 func (s *server) chain(h http.Handler) http.Handler {
-	return s.withRequestID(s.withRateLimit(s.withAuth(s.withAccessLog(s.withScreenWrite(s.withIdempotency(s.withRecover(s.withRelativeLocation(h))))))))
+	return s.withRequestID(s.withRateLimit(s.withAuth(s.withAccessLog(s.withScreenWrite(s.withNULGate(s.withIdempotency(s.withRecover(s.withRelativeLocation(h)))))))))
 }
 
 // ShutdownGrace 는 드레인이 인플라이트에 주는 시간이다.

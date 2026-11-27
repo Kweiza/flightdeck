@@ -57,8 +57,8 @@ type landRequest struct {
 	Project   string `json:"project"`
 	SessionID string `json:"session_id"`
 	Mode      string `json:"mode"`
-	Kind      string `json:"kind"`   // mode=report 일 때 ok|fail
-	Detail    string `json:"detail"` // fail·leave 는 필수(store.ValidateLandingLeave 가 본다)
+	Kind      string `json:"kind"`              // mode=report 일 때 ok|fail
+	Detail    string `json:"detail" nul:"text"` // fail·leave 는 필수(store.ValidateLandingLeave 가 본다)
 	// Resources 는 mode=acquire 일 때만 쓴다 — 비면 service.LandInput 이 기존 단일
 	// 레인({service.LaneResource})으로 정규화한다(Task 3). report·leave 는 이미 선
 	// 자원 집합을 줄 행에서 읽으므로 이 필드를 안 본다.
@@ -139,8 +139,8 @@ func (s *server) handleLandingQueue(w http.ResponseWriter, r *http.Request) {
 // 물린 레인을 그 세션 이름으로 풀게 만들면 탈출구가 없다.
 type laneReleaseRequest struct {
 	Project string `json:"project"`
-	Actor   string `json:"actor"`  // 누가 회수했나. 판단 본문에 그대로 남는다
-	Reason  string `json:"reason"` // 왜. **비면 service 가 거절한다**
+	Actor   string `json:"actor" nul:"text"`  // 누가 회수했나. 판단 본문에 그대로 남는다
+	Reason  string `json:"reason" nul:"text"` // 왜. **비면 service 가 거절한다**
 }
 
 // handleReleaseLaneRow 는 사람이 줄 행 하나를 회수한다.

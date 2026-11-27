@@ -2,10 +2,10 @@ package api
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +16,7 @@ import (
 
 	"github.com/kweiza/flightdeck/internal/service"
 	"github.com/kweiza/flightdeck/internal/store"
+	"github.com/kweiza/flightdeck/internal/store/storetest/freshstore"
 )
 
 // 이 패키지의 시험은 **소비자 좌표계**로만 단정한다 —
@@ -94,24 +95,21 @@ const testProject = "cp"
 
 func newEnv(t *testing.T, tune func(*Options)) *env {
 	t.Helper()
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "fd.db")
-	repo := filepath.Join(dir, "repo")
+	return newEnvOn(t, freshstore.SQLite, tune)
+}
+
+// newEnvOn 은 엔진 eng 의 빈 원장 위에 서버 한 벌을 세운다(Postgres 는 FD_TEST_PG 가 있어야 한다 - freshstore.OpenOn).
+func newEnvOn(t *testing.T, eng freshstore.Engine, tune func(*Options)) *env {
+	t.Helper()
+	repo := filepath.Join(t.TempDir(), "repo")
 	if err := os.MkdirAll(repo, 0o755); err != nil {
 		t.Fatalf("프로젝트 디렉토리 생성 실패: %v", err)
 	}
 
 	logs := &syncBuffer{}
 	log := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	// ★ 적용은 기동에서 분리돼 있다(설계 §7 ①) — 열기 전에 올린다.
-	if err := store.Migrate(context.Background(), dbPath, nil); err != nil {
-		t.Fatalf("DB 적용 실패: %v", err)
-	}
-	st, err := store.OpenWithLogger(dbPath, log)
-	if err != nil {
-		t.Fatalf("DB 열기 실패: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
+	// ★ 적용은 기동에서 분리돼 있다(설계 §7 ①) — freshstore 가 열기 전에 올린다.
+	st, dbPath := freshstore.OpenOn(t, eng, log)
 
 	svc := service.New(st, log)
 	opt := Options{Log: log}
@@ -213,7 +211,13 @@ func errorOf(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
 // openSession 은 세션 하나를 열고 그 id 를 돌려준다.
 func (e *env) openSession(ccSessionID string) string {
 	e.t.Helper()
-	w := e.write(http.MethodPost, "/api/v1/sessions", map[string]any{
+	return e.openSessionWith(ccSessionID, nil)
+}
+
+// openSessionWith 는 openSession 의 본문에 칸 over 를 덮어 연다.
+func (e *env) openSessionWith(ccSessionID string, over map[string]any) string {
+	e.t.Helper()
+	body := map[string]any{
 		"project":       testProject,
 		"project_path":  e.repo,
 		"machine_id":    "m1",
@@ -221,12 +225,14 @@ func (e *env) openSession(ccSessionID string) string {
 		"worktree":      e.repo,
 		"cc_session_id": ccSessionID,
 		"label":         "시험 세션",
-	})
+	}
+	maps.Copy(body, over)
+	w := e.write(http.MethodPost, "/api/v1/sessions", body)
 	if w.Code != http.StatusCreated && w.Code != http.StatusOK {
 		e.t.Fatalf("세션 열기 실패: %d %s", w.Code, w.Body.String())
 	}
-	body := decodeBody(e.t, w)
-	sess, ok := body["session"].(map[string]any)
+	res := decodeBody(e.t, w)
+	sess, ok := res["session"].(map[string]any)
 	if !ok {
 		e.t.Fatalf("세션 응답에 session 절이 없다: %s", w.Body.String())
 	}

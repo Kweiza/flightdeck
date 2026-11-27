@@ -19,8 +19,8 @@ type noteRequest struct {
 	Project   string `json:"project"`
 	SessionID string `json:"session_id"`
 	Kind      string `json:"kind"`
-	Title     string `json:"title"`
-	Body      string `json:"body"`
+	Title     string `json:"title" nul:"text"`
+	Body      string `json:"body" nul:"text"`
 	ItemID    string `json:"item_id"`
 	// ★ links 에는 대상 프로젝트를 안 연다. 그 경로는 resolveItemProject 의 검증을
 	//   안 타므로, 거기에 프로젝트를 실을 수 있게 하면 **거절 층을 우회하는 문**이 된다.
@@ -127,9 +127,9 @@ func (s *server) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
 
 type snapshotRequest struct {
 	Project     string `json:"project"`
-	Value       string `json:"value"`
+	Value       string `json:"value" nul:"text"`
 	Method      string `json:"method"`
-	Evidence    string `json:"evidence"`
+	Evidence    string `json:"evidence" nul:"text"`
 	InputDigest string `json:"input_digest"`
 }
 
