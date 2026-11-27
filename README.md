@@ -593,7 +593,9 @@ from being raised).
 
 Run B only when A's table says "to go back, B", or when the upgrade stopped before "4 done". It takes this directory's
 Postgres layer (db and the one-shots) down, removes the marker (no server ever wrote to the Postgres ledger, and it matches
-the SQLite ledger or is empty), and starts on this version's default path. The selection file stays off.
+the SQLite ledger or is empty), and starts on this version's default path. The selection file stays off. If the import left
+the marker, it also moved the ledger's pre-upgrade copies into `fd.db.pre-import-<time>.bak/` - since you go back to the same
+ledger, move them back next to it by hand if you need one for `fd migrate --rollback`.
 
 ```bash
 ( set -eu
@@ -623,8 +625,9 @@ move come back too. During the window, do not update to a flightdeck version tha
 SQLite version: `export-sqlite` only takes a ledger within its own import version range. If you moved at version 18 and
 upgraded to this version inside the window, the Postgres ledger is raised to 19 too; go back with this version's
 `export-sqlite` (the older one refuses 19). Before the dump, that upgrade looks for rows over the index key limit and, if
-there are any, stops with their coordinates and how to fix them (the same limit as the pre-checks in "Moving a SQLite ledger
-to Postgres" below).
+there are any, stops with their coordinates and leaves the ledger at its current version (the same limit as the pre-checks in
+"Moving a SQLite ledger to Postgres" below). Do not fix those rows - it is an append-only audit ledger, and cutting a value
+makes it differ from the SQLite source and the dumps. Report the coordinates in an issue.
 **Only a deployment whose selection file is on** goes back this way; an upgrade that stopped before switching on is
 "Stopped before switching on" above. As in the upgrade, step 1 reads values into this shell (`fdwhere`; once step 5 has
 taken the server down they cannot be read, so its last two lines are what to give again in a new shell) and steps 2-7 are
@@ -746,8 +749,20 @@ keeps every record (version 19 → 18 is such a step). Below a step that changed
 nothing. Do not lower with `fd migrate --rollback`: that command **overwrites** the ledger with a pre-upgrade copy and loses
 what was written after it. The rollback checks the copy before overwriting: it refuses a copy that is not complete (a
 `-journal` left next to it, a failing integrity_check) or that is not this ledger's pre-upgrade copy (its version history
-differs from the ledger's - an old copy left behind after the ledger was replaced by an export or a restore). When it does
-overwrite, it keeps the current ledger as `fd.db.pre-rollback-<time>` (with its side files).
+differs from the ledger's - an old copy left behind after the ledger was replaced by an export or a restore). It also
+refuses a copy whose version history is the **same** as the ledger's: no upgrade was committed after that copy (the upgrade
+rolled back at its first step, or an earlier rollback already overwrote the ledger with it), so overwriting would only lose
+what was written since. When it does overwrite, it keeps the current ledger as `fd.db.pre-rollback-<time>` (with its side
+files). Neither the pre-upgrade copy nor the kept ledger ever replaces an existing name - if the name is taken within the same
+second, it gets a number from `-001` on (a numbered name sorts later, so the rollback picks it as the newest). When an upgrade
+stops, the failure hint names that ledger, shell-quoted, as `fd migrate --rollback --db '<ledger>'` -
+without `--db` it would roll back this environment's default ledger.
+
+**When you put a ledger file in place by hand** (restoring a copy, or cloning a ledger from another place or machine), first
+move the `fd.db.bak-*` files there (with their side files) into a new directory (such as `fd.db.pre-restore-<time>.bak/`). Do
+not delete them. A ledger cloned at the same version has the same version history (versions and apply times), so the version
+history check cannot tell another ledger's copy apart - left in place, `fd migrate --rollback` could overwrite with it. The
+import and the export move them on their own (the two sections below).
 
 ### Daily dumps of a Postgres ledger
 
@@ -864,7 +879,16 @@ fd migrate verify --from fd-copy.db --db <URL>
   not match the column, NULL primary keys, colliding snapshot key digests, foreign keys pointing at missing rows, and text over
   the limit of an index key column (event's project 2048 bytes, kind 512 bytes - the Postgres B-tree cannot take that row). If
   anything hits, nothing is written and each hit is listed by table · column · reason · primary key. Fix those rows in the
-  copy and run it again. `fd migrate verify` does not report a match for a source that fails the pre-checks either.
+  copy and run it again. Rows over the key limit are the exception: do not fix them - they belong to the append-only audit
+  ledger (event), and cutting a value makes it differ from the source. Report the coordinates in an issue. `fd migrate verify`
+  does not report a match for a source that fails the pre-checks either (except the key limit - the comparison checks the
+  original values already in both ledgers).
+- New values cannot pass the same limit: the server refuses a project over 2048 bytes or a kind over 512 bytes with a 400
+  (`key_too_long`) on both engines.
+- After moving and leaving the moved marker, the import moves the source's pre-upgrade copies (`<source>.bak-*`, with their
+  side files) into a new directory `<source>.pre-import-<time>.bak/` (it does not delete them). That file is no longer the
+  ledger, and those copies are not copies of whatever ledger is put there later. A dry run, a refusal, or a failure moves
+  nothing.
 - Refusals the pre-checks cannot see (a CHECK on the target, the index entry size of columns outside those limits, privileges) hit the dry run exactly
   as they hit the real import. The dry run also holds the migration locks as the real import does.
 
@@ -904,7 +928,12 @@ fd migrate verify --from fd-back.db --db <URL>
   the snapshot the export copies from. The account is the same as for the import (a superuser or a member of `fd_owner` - it
   reads the sequences).
 - A source holding a value the import's pre-checks would refuse (broken JSON and the like) is refused, since the exported
-  file could not be imported again.
+  file could not be imported again. The index key limit is not checked: the original values already in the Postgres ledger are
+  exported as they are, and `fd migrate verify` compares those originals. Importing that file again stops at the import's
+  pre-checks, which name the row.
+- If pre-upgrade copies (`<to>.bak-*`, with their side files) sit next to `--to`, they are moved into a new directory
+  `<to>.pre-export-<time>.bak/` before the name is given (not deleted) - they are not copies of the new ledger, so they are
+  kept out of the place where `fd migrate --rollback` picks. A dry run moves nothing.
 - Sequences: the AUTOINCREMENT tables (pick_eval · resource_hold · event · landing_queue) get the highest number Postgres
   issued back into `sqlite_sequence`, so it is never issued again. item_after is a SQLite rowid table and cannot remember a
   deleted top number - its seq values (the order) move into rowid unchanged, and the next number is max(rowid)+1 as in the

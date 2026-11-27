@@ -388,9 +388,7 @@ func (t *Tx) CloseSessionWhoseWorktreeIsGone(id, project string, payload map[str
 	if err != nil {
 		return false, fmt.Errorf("자동 닫기 원장 payload 직렬화 실패(session_id=%q): %w", clip(id, 64), err)
 	}
-	if _, err := t.tx.ExecContext(t.ctx,
-		`INSERT INTO event(at, project, session_id, kind, payload) VALUES (?, ?, ?, ?, ?)`,
-		fmtTime(time.Now()), nullStr(project), id, EventSessionCloseWorktreeGone, string(buf)); err != nil {
+	if err := t.insertEvent(time.Now(), project, id, EventSessionCloseWorktreeGone, string(buf)); err != nil {
 		// ★ 돌려주면 호출부의 Tx 가 롤백되고 위 UPDATE 도 같이 사라진다 — 기록 없는 닫기를 안 남긴다.
 		return false, fmt.Errorf("자동 닫기 원장 기록 실패(session_id=%q): %w", clip(id, 64), err)
 	}

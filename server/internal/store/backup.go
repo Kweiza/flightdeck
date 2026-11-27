@@ -625,24 +625,27 @@ func Rollback(ctx context.Context, path, backupDir string, log *slog.Logger) (Ro
 	if ParseTarget(path).Postgres() {
 		return rollbackPG(ctx, ParseTarget(path), backupDir)
 	}
-	return rollbackSQLite(ctx, path, log)
+	return rollbackSQLite(ctx, path, time.Now(), log)
 }
 
-// rollbackSQLite 는 <db>.bak-* 중 가장 최근 것으로 DB 를 되돌린다. 고른 백업과 지금 원장을 남긴 이름을 낸다.
+// rollbackSQLite 는 <db>.bak-* 중 가장 최근 것으로 DB 를 되돌린다. 고른 백업과 지금 원장을 남긴 이름을 낸다. at 은 남기는 이름의
+// 시각이다(<db>.pre-rollback-<at>).
 //
-// ★ 덮기 전에 후보를 잰다(rollbackCandidate) - 다 뜬 사본이고(integrity_check · 옆 저널 없음) **이 원장의** 판올림 전 사본이어야
-// 한다. 덜 뜬 사본이나 남의 원장의 사본으로 덮으면 되돌리기가 원장을 잃는 자리가 된다.
+// ★ 덮기 전에 후보를 잰다(rollbackCandidate) - 다 뜬 사본이고(integrity_check · 옆 저널 없음) **이 원장의** 판올림 전 사본이고
+// 그 뒤로 이 원장에 커밋된 판올림이 있어야 한다. 덜 뜬 사본이나 남의 원장의 사본으로 덮으면 되돌리기가 원장을 잃는 자리가 된다.
 // ★ **지금 원장을 지우지 않는다.** 덮기 전에 원장 파일을 <db>.pre-rollback-<시각> 으로 베끼고 -wal · -shm · -journal 을 그
-// 이름 옆으로 옮긴다(옆 파일까지 한 벌이라 그 이름으로 열면 덮기 직전 상태다). 앞선 판은 -wal 을 지웠다 - 체크포인트 안 된 커밋이
-// 거기 있으면 되돌리기와 함께 사라졌다. 옆 파일은 원장 자리에서는 치워야 한다: 백업은 VACUUM INTO 로 뜬 일관 사본이라 WAL 이
-// 없는데, 옛 -wal 을 남기면 되돌린 파일 위에 반쯤 적용된 상태가 되살아난다(RollbackHint).
+// 이름 옆으로 옮긴다(옆 파일까지 한 벌이라 그 이름으로 열면 덮기 직전 상태다 - keepLedger). 앞선 판은 -wal 을 지웠다 - 체크포인트
+// 안 된 커밋이 거기 있으면 되돌리기와 함께 사라졌다. 옆 파일은 원장 자리에서는 치워야 한다: 백업은 VACUUM INTO 로 뜬 일관 사본이라
+// WAL 이 없는데, 옛 -wal 을 남기면 되돌린 파일 위에 반쯤 적용된 상태가 되살아난다.
+// ★ 남기는 이름은 **있는 파일을 갈지 않는다**(linkFresh). 같은 초에 두 번 돌면 두 번째가 같은 이름을 고르는데, 앞선 판은 그
+// 이름을 rename 으로 덮어 첫 번째가 남긴 원장(판올림 뒤의 기록이 남은 마지막 사본)을 지웠다.
 // ★ 순서: 후보를 원장 옆 임시 파일로 베껴 굳히고 → 지금 원장을 베껴 남기고 → 옆 파일을 남긴 이름으로 옮기고 → 임시 파일을 원장
 // 이름으로 바꾼다. 어디서 끊겨도 원장 자리에 파일이 없는 순간이 없고(이름 바꾸기 하나로 갈린다), 지금 원장은 남긴 이름에 있다.
 //
 // ★ **서버가 멈춰 있어야 한다.** 이 함수는 그것을 강제하지 못한다 — 파일을 쥔 프로세스를
 // 이 자리에서 알 방법이 없다. 도는 서버 밑에서 파일을 갈면 그 프로세스는 옛 페이지 캐시
 // 위에서 계속 돌고, 그 상태는 어디에도 안 나타난다.
-func rollbackSQLite(ctx context.Context, path string, log *slog.Logger) (RollbackOutcome, error) {
+func rollbackSQLite(ctx context.Context, path string, at time.Time, log *slog.Logger) (RollbackOutcome, error) {
 	var out RollbackOutcome
 	// 옮긴 원장(이관 표지)의 판을 되돌리면 SQLite 원장이 다시 살아난다 - 표지는 README 의 두 절차만 손으로 지운다(moved.go 머리말).
 	if err := movedRefusal(path); err != nil {
@@ -657,9 +660,9 @@ func rollbackSQLite(ctx context.Context, path string, log *slog.Logger) (Rollbac
 		return out, fmt.Errorf("백업을 원장 옆에 베끼지 못했다(%q): %w", clip(src, 200), err)
 	}
 	defer os.Remove(staged) // 이름을 바꾼 뒤면 지울 것이 없다
-	kept := path + ".pre-rollback-" + time.Now().UTC().Format("20060102T150405Z")
-	if err := keepLedger(path, kept); err != nil {
-		return out, fmt.Errorf("덮기 전에 지금 원장을 남기지 못했다(%q) - 덮지 않는다: %w", clip(kept, 200), err)
+	kept, err := keepLedger(path, path+".pre-rollback-"+fileStamp(at))
+	if err != nil {
+		return out, fmt.Errorf("덮기 전에 지금 원장을 남기지 못했다 - 덮지 않는다: %w", err)
 	}
 	if err := os.Rename(staged, path); err != nil {
 		return out, fmt.Errorf("백업을 되돌리지 못했다(%q → %q): %w - 지금 원장은 %q 에 있다(옆 파일 포함)",
@@ -673,15 +676,20 @@ func rollbackSQLite(ctx context.Context, path string, log *slog.Logger) (Rollbac
 }
 
 // rollbackCandidate 는 되돌릴 백업을 고른다: <db>.bak-* 중 가장 최근의 보통 파일이고, 다 뜬 원장이고(checkLedgerCopy), 이 바이너리가
-// 여는 판이고, **이 원장의** 판올림 전 사본이어야 한다. 하나라도 아니면 고르지 않고 사유를 낸다 - 그보다 옛 사본으로 내려가 고르지
-// 않는다(그 사이의 기록을 잃는다).
+// 여는 판이고, **이 원장의** 판올림 전 사본이고, 그 뒤로 이 원장에 커밋된 판올림이 있어야 한다. 하나라도 아니면 고르지 않고 사유를
+// 낸다 - 그보다 옛 사본으로 내려가 고르지 않는다(그 사이의 기록을 잃는다).
 //
 // ★ 옆 파일(-journal · -wal · -shm)은 후보가 아니다. 뜨는 도중 끊긴 옛 판의 사본은 <db>.bak-<시각>-journal 을 남기는데, 이름이
 // 사본보다 뒤에 정렬돼 「가장 최근」으로 골라졌다.
 // ★ 「이 원장의 사본」은 판 기록(schema_version 의 판 · 적용 시각)으로 잰다: 사본의 판 기록이 지금 원장의 판 기록 앞부분과 같아야
 // 한다. 판올림은 원장의 옛 판 행을 고치지 않고 위에 더하기만 하므로 이 원장을 올리기 전에 뜬 사본이면 늘 같다. 원장을 바꿔 놓은 뒤
 // (역이관이 낸 파일을 둔 72시간 되돌리기 · 손으로 되살리기) 남은 옛 원장의 사본은 판 행을 새로 적은 원장과 어긋난다 - 그 사본으로
-// 덮으면 맞대기를 마친 원장이 그 뒤의 기록 없이 옛 판으로 돌아간다. 판만 내리려면 `fd migrate --to N` 이다(DownSteps).
+// 덮으면 맞대기를 마친 원장이 그 뒤의 기록 없이 옛 판으로 돌아간다. 판만 내리려면 `fd migrate --to N` 이다(DownSteps). 이 재기는
+// 판 기록이 같은 복제 원장(같은 판 · 같은 적용 시각, 다른 기록)의 사본은 가르지 못한다 - 그래서 원장을 바꾸는 자리가 옛 후보를
+// 치운다(quarantineBackups).
+// ★ **판 기록이 지금 원장과 같은 사본은 고르지 않는다.** 되돌리기는 판올림을 무르는 명령인데, 같으면 그 사본 뒤로 이 원장에 커밋된
+// 판올림이 없다: 판올림이 첫 단에서 실패해 되감겼거나(무를 것이 없다), 앞선 되돌리기가 이미 그 사본으로 덮었다. 뒤 갈래에서 덮으면
+// 첫 되돌리기 뒤에 쓴 기록만 잃는다 - 같은 초에 두 번 돈 되돌리기가 판 19 원장의 마지막 사본을 판 18 로 덮은 길이 이것이었다.
 func rollbackCandidate(ctx context.Context, path string) (string, error) {
 	found, err := filepath.Glob(path + ".bak-*")
 	if err != nil {
@@ -720,6 +728,10 @@ func rollbackCandidate(ctx context.Context, path string) (string, error) {
 		return "", refuse("이 원장의 판올림 전 사본이 아니다(판 기록이 지금 원장과 다르다 - 원장을 바꿔 놓은 뒤 남은 옛 원장의 사본이다: " +
 			"역이관 · 되살리기). 덮으면 그 뒤의 기록을 잃는다. 판만 내리려면 `fd migrate --to <판>` 이 인덱스만 더한 판을 기록을 잃지 " +
 			"않고 내린다(README 「72시간 안에 되돌리기」)")
+	}
+	if len(rows) == len(cur) {
+		return "", refuse("그 사본은 판 기록이 지금 원장과 같다(판 %d) - 그 뒤로 이 원장에 커밋된 판올림이 없어 무를 것이 없다(판올림이 "+
+			"첫 단에서 되감겼거나 앞선 되돌리기가 이미 그 사본으로 덮었다). 덮으면 그 사본 뒤에 쓴 기록만 잃는다", topVersion(cur))
 	}
 	return src, nil
 }
@@ -808,9 +820,13 @@ func ledgerVersionRows(ctx context.Context, path string) ([]versionRow, error) {
 	return readVersionRows(ctx, r.db)
 }
 
-// stageCopy 는 src 를 원장 path 옆 임시 파일로 베껴 굳히고 그 이름을 낸다. 부르는 쪽이 이름을 바꾸거나 지운다.
-func stageCopy(src, path string) (string, error) {
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".restore-*")
+// stageCopy 는 src 를 name 옆 숨은 임시 파일(.<name 의 끝 이름>.stage-*)로 베껴 굳히고 그 이름을 낸다. 부르는 쪽이 이름을
+// 붙이거나 지운다.
+//
+// ★ 최종 이름에 바로 쓰지 않는다 - 베끼는 도중 끊기면 원본도 사본도 아닌 파일이 그 이름으로 남는다. 되돌리기는 이미 무언가
+// 잘못된 상황에서 부르는 명령이라, 그 자리에서 한 번 더 잃으면 남는 것이 없다.
+func stageCopy(src, name string) (string, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(name), "."+filepath.Base(name)+".stage-*")
 	if err != nil {
 		return "", err
 	}
@@ -821,40 +837,155 @@ func stageCopy(src, path string) (string, error) {
 	return tmp.Name(), nil
 }
 
-// keepLedger 는 원장 path 를 kept 로 남긴다: 원장 파일을 kept 로 베끼고(굳힌 뒤 이름을 붙인다) 옆 파일을 kept 옆으로 옮긴다. 원장
-// 파일이 없으면 옆 파일만 옮긴다. 원장 자리에 파일이 없는 순간을 만들지 않으려고 원장 파일은 옮기지 않고 베낀다(rollbackSQLite 의 ★).
-func keepLedger(path, kept string) error {
-	if _, err := os.Lstat(path); err == nil {
-		if err := copyFileAtomic(path, kept); err != nil {
-			return err
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
+// keepLedger 는 덮기 전의 원장 path 를 name(<db>.pre-rollback-<시각>) 자리에 남기고 남긴 이름을 낸다: 원장 파일을 숨은 임시
+// 파일로 베껴 굳힌 뒤, 원장 옆 파일(-wal · -shm · -journal)과 한 벌로 있는 이름을 갈지 않는 길로 붙이고(linkFresh - name 이나 그
+// 옆 이름이 차 있으면 번호를 붙인다), 다 붙은 뒤에야 원장 옆 파일을 뗀다. 원장 파일은 옮기지 않고 베낀다 - 원장 자리에 파일이
+// 없는 순간을 만들지 않는다(rollbackSQLite 의 ★).
+//
+// ★ 옆 파일은 모두 붙거나 하나도 안 붙는다(linkSet). 못 붙이면 이 실행이 붙인 것을 다 떼고 원장 옆 파일은 그대로 둔다 - -wal 만
+// 떠나 원장이 체크포인트 안 된 커밋을 잃는 반쪽 상태도, 옆 파일 없는 남긴 원장도 만들지 않는다.
+func keepLedger(path, name string) (string, error) {
+	tmp, err := stageCopy(path, name)
+	if err != nil {
+		return "", fmt.Errorf("원장 %q 을 베끼지 못했다: %w", clip(path, 200), err)
 	}
-	keptSides := pg.Sidecars(kept)
-	for i, side := range pg.Sidecars(path) {
-		if err := os.Rename(side, keptSides[i]); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("옆 파일 %q 을 옮기지 못했다: %w", clip(side, 200), err)
+	sides := pg.Sidecars(path)
+	kept, err := linkFresh(tmp, name, sides...)
+	if kept == "" {
+		os.Remove(tmp)
+		return "", fmt.Errorf("지금 원장을 남길 이름을 붙이지 못했다(원장 옆 파일은 그대로다): %w", err)
+	}
+	if err != nil {
+		return kept, err
+	}
+	for i, keptSide := range pg.Sidecars(kept) {
+		if _, err := os.Lstat(keptSide); err != nil {
+			continue // 원장 옆에 없던 옆 파일이다 - 붙인 이름 옆 자리는 비어 있었다(linkSet)
+		}
+		if err := os.Remove(sides[i]); err != nil {
+			return kept, fmt.Errorf("옆 파일 %q 을 원장 옆에서 떼지 못했다(같은 파일이 %q 에도 있다): %w",
+				clip(sides[i], 200), clip(keptSide, 200), err)
 		}
 	}
-	return syncDir(filepath.Dir(path))
+	return kept, syncDir(filepath.Dir(path))
 }
 
-// copyFileAtomic 은 같은 디렉토리의 임시 파일에 쓴 뒤 rename 한다.
+// maxNameNumber 는 freshName 이 이름 뒤에 붙여 보는 번호의 끝이다(-001 … -999).
+const maxNameNumber = 999
+
+// freshName 은 base + suffix 가 차 있으면 base-001 + suffix, base-002 + suffix … 를 차례로 create 에 넘겨, 처음으로 새로 만든 이름을
+// 낸다. create 는 그 이름이 이미 있으면 fs.ErrExist 로 실패하는 연산이어야 한다(link(2) · mkdir(2) - **있는 것을 갈지 않는다**).
+// 번호는 폭이 고정돼 사전순이 곧 붙인 순서다(rollbackCandidate 의 정렬).
+func freshName(base, suffix string, create func(string) error) (string, error) {
+	for i := 0; i <= maxNameNumber; i++ {
+		name := base + suffix
+		if i > 0 {
+			name = fmt.Sprintf("%s-%03d%s", base, i, suffix)
+		}
+		err := create(name)
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("%q 을 만들지 못했다: %w", clip(name, 200), err)
+		}
+		return name, nil
+	}
+	return "", fmt.Errorf("%q 와 그 뒤 번호 %d 개가 다 차 있다", clip(base+suffix, 200), maxNameNumber)
+}
+
+// linkFresh 는 다 쓰고 굳힌 파일 tmp 에 이름 name 을 붙이되 **이미 있는 이름은 갈지 않는다**(freshName - 하드 링크는 대상이
+// 있으면 실패한다, os.Rename 은 말없이 덮는다). sides 는 tmp 와 한 벌로 그 이름 옆에 붙일 옆 파일이다(pg.Sidecars 순서) - 붙일
+// 이름과 그 옆 이름이 모두 빈 첫 번호에 한 벌로 붙는다(linkSet). 붙인 이름을 내고, tmp 를 떼고, 그 디렉토리를 굳힌다. 이름을
+// 붙이기 전에 실패하면 빈 이름과 오류를 내고 tmp 는 부르는 쪽이 지운다. 붙인 뒤에 실패하면 붙인 이름과 오류를 낸다(그 이름의
+// 파일은 다 쓴 것이다).
 //
-// ★ 직접 덮어쓰면 복사 도중 죽었을 때 **원본도 백업도 아닌 파일**이 남는다. 되돌리기는
-// 이미 무언가 잘못된 상황에서 부르는 명령이라, 그 자리에서 한 번 더 잃으면 남는 것이 없다.
-func copyFileAtomic(src, dst string) error {
-	tmp, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".copy-*")
+// ★ 같은 초에 두 실행이 같은 이름을 고르는 자리가 둘이다: 판올림 전 사본(<db>.bak-<초>, sealBackup)과 되돌리기가 남기는 지금
+// 원장(<db>.pre-rollback-<초>, keepLedger). 앞선 판은 rename 으로 이름을 붙여 뒤 실행이 앞 실행의 파일을 덮었다.
+func linkFresh(tmp, name string, sides ...string) (string, error) {
+	to, err := freshName(name, "", func(n string) error { return linkSet(tmp, sides, n) })
 	if err != nil {
+		return "", err
+	}
+	if err := os.Remove(tmp); err != nil {
+		return to, fmt.Errorf("%q 에 이름을 붙였는데 임시 이름 %q 을 떼지 못했다: %w", clip(to, 200), clip(tmp, 200), err)
+	}
+	if err := syncDir(filepath.Dir(to)); err != nil {
+		return to, fmt.Errorf("%q 에 붙인 이름을 굳히지 못했다(디렉토리 fsync): %w", clip(to, 200), err)
+	}
+	return to, nil
+}
+
+// linkSet 은 tmp 를 n 에, sides[i] 를 n 의 옆 이름(pg.Sidecars(n)[i])에 하드 링크로 붙인다 - 모두 붙거나 하나도 안 붙는다. n 이나
+// 그 옆 이름이 하나라도 차 있으면 아무것도 붙이지 않고 fs.ErrExist 다(freshName 이 다음 번호로 간다). 옆 이름은 원본 옆 파일이
+// 없어도 비어 있어야 한다 - 끊긴 앞 실행이 남긴 -wal 이 새로 붙인 파일에 얹혀 되살아나지 않게. 없는 원본 옆 파일은 건너뛴다.
+func linkSet(tmp string, sides []string, n string) error {
+	dsts := pg.Sidecars(n)
+	for _, d := range append([]string{n}, dsts...) {
+		if _, err := os.Lstat(d); err == nil {
+			return fs.ErrExist
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	if err := os.Link(tmp, n); err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err := copyInto(tmp, src); err != nil {
-		return err
+	made := []string{n}
+	for i, side := range sides {
+		err := os.Link(side, dsts[i])
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			for _, m := range made {
+				os.Remove(m)
+			}
+			return fmt.Errorf("옆 파일 %q 을 %q 옆에 붙이지 못했다: %w", clip(side, 200), clip(n, 200), err)
+		}
+		made = append(made, dsts[i])
 	}
-	return os.Rename(tmpName, dst)
+	return nil
+}
+
+// fileStamp 는 원장 옆에 남기는 이름의 시각 꼴이다(UTC, 폭이 고정돼 사전순이 곧 시간순이다). 판올림 전 사본(BackupSuffix) ·
+// 되돌리기가 남긴 원장 · 치운 사본의 디렉토리가 이 하나를 쓴다.
+func fileStamp(at time.Time) string { return at.UTC().Format("20060102T150405Z") }
+
+// quarantineBackups 는 원장 path 옆의 판올림 전 사본(<path>.bak-* - 그 옆 파일까지)을 새 디렉토리
+// <path>.pre-<why>-<시각>.bak/ 로 옮기고 그 디렉토리를 낸다. 옮길 것이 없으면 빈 이름이다. 원장 자리의 원장이 바뀌는(또는 그
+// 자리를 떠나는) 자리가 이 하나를 부른다: 역이관이 낸 원장에 이름을 붙이기 전(ExportSQLite), 이관이 표지를 남긴 뒤(ImportSQLite).
+// 손으로 하는 교체는 README 의 절차가 같은 꼴의 디렉토리로 옮긴다(「72시간 안에 되돌리기」 · 「Postgres 원장을 SQLite 로 되돌리기」).
+//
+// ★ 왜 판 기록 재기(rollbackCandidate 의 isPrefix)만으로 모자라나: 원장을 복제해 두 곳에 다른 기록을 쌓으면 두 원장의 판과
+// 적용 시각이 같다 - 한쪽의 사본이 다른 쪽의 앞부분 재기를 지난다. 그 사본으로 덮으면 이 원장의 기록이 남의 기록으로 갈린다.
+// 원장이 바뀌는 순간에 옛 후보를 치우면 그 뒤에 남는 후보는 바뀐 원장이 뜬 사본뿐이다.
+// ★ 지우지 않는다. 디렉토리는 새로 만든다(있으면 번호를 붙인다 - 있는 디렉토리에 섞지 않는다). 새 디렉토리라 옮긴 이름이 겹치지
+// 않는다. 하나라도 못 옮기면 거기서 서고 오류가 남은 것을 댄다.
+func quarantineBackups(path, why string, at time.Time) (string, error) {
+	found, err := filepath.Glob(path + ".bak-*")
+	if err != nil {
+		return "", fmt.Errorf("판올림 전 사본을 찾지 못했다(path=%q): %w", clip(path, 200), err)
+	}
+	if len(found) == 0 {
+		return "", nil
+	}
+	dir, err := freshName(path+".pre-"+why+"-"+fileStamp(at), ".bak", func(n string) error { return os.Mkdir(n, 0o755) })
+	if err != nil {
+		return "", fmt.Errorf("판올림 전 사본을 치울 디렉토리를 만들지 못했다: %w", err)
+	}
+	for _, f := range found {
+		if err := os.Rename(f, filepath.Join(dir, filepath.Base(f))); err != nil {
+			return dir, fmt.Errorf("판올림 전 사본 %q 을 %q 로 옮기지 못했다(앞의 것은 옮겼다): %w", clip(f, 200), clip(dir, 200), err)
+		}
+	}
+	if err := syncDir(dir); err != nil {
+		return dir, fmt.Errorf("판올림 전 사본을 옮긴 디렉토리 %q 를 굳히지 못했다: %w", clip(dir, 200), err)
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return dir, fmt.Errorf("판올림 전 사본을 옮긴 뒤 %q 의 디렉토리를 굳히지 못했다: %w", clip(path, 200), err)
+	}
+	return dir, nil
 }
 
 // copyInto 는 src 의 바이트를 열린 파일 dst 에 쓰고 굳힌 뒤 닫는다. 실패해도 dst 를 닫는다.

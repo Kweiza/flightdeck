@@ -37,7 +37,8 @@ const ImportVersion = 19
 // ★ 판 범위 규칙은 이것 하나다. 인덱스만 더한 증분은 표 · 칸 · 행을 안 바꾸므로 그 아래 판의 원장도 옮길 것(Tables)이 같고, 같은
 // 까닭으로 기록을 잃지 않고 내릴 수 있다(store 의 DownSteps). 그래서 원본과 대상의 판이 범위 안에서 서로 달라도 받는다: 판 18 에서
 // 옮긴 SQLite 원장(표지가 있어 판을 못 올린다)을 판 19 로 오른 Postgres 원장과 맞대는 것이 그 갈래다(README 「켜기 전에 섰을
-// 때」). 인덱스가 받는 값의 상한(MaxBytes)은 사전 검사가 범위 전체에 똑같이 잰다 - 범위의 꼭대기가 그 인덱스를 갖기 때문이다.
+// 때」). 인덱스가 받는 값의 상한(MaxBytes)은 이관의 사전 검사(ImportCell)가 범위 전체에 똑같이 잰다 - 범위의 꼭대기가 그 인덱스를
+// 갖기 때문이다.
 func ImportFloor() int { return floorOf(Steps, ImportVersion, BaselineVersion) }
 
 // floorOf 는 증분 목록 steps 위에서 판 top 부터 아래로 인덱스만 더한 증분을 거슬러 닿는 판이다(base 아래로는 안 간다). 순수
@@ -102,8 +103,9 @@ type Column struct {
 	Rowid bool
 	// MaxBytes 는 글 칸 값의 바이트 상한이다(0 이면 없다). Postgres 의 B-tree 인덱스는 한 항목이 페이지의 약 1/3(2704 바이트)을
 	// 넘으면 넣기를 거절하는데, SQLite 는 상한이 없다. 그 인덱스의 키 칸에만 둔다(event_by_project_kind 의 project · kind,
-	// EventProjectMaxBytes). 사전 검사가 넘는 값을 FaultTooLong 으로 거절하고, Postgres 판올림은 그 인덱스를 만들기 전에 같은
-	// 상한으로 잰다(store 의 keyLimitGate).
+	// EventProjectMaxBytes). Postgres 가 **새로 받는** 값에만 잰다: 이관의 사전 검사(ImportCell)가 넘는 값을 FaultTooLong 으로
+	// 거절하고, Postgres 판올림은 그 인덱스를 만들기 전에 같은 상한으로 잰다(store 의 keyLimitGate), 새 행은 store 의 쓰기 관문이
+	// 막는다. 이미 원장에 있는 값을 맞대거나(대조) SQLite 로 내는(역이관) 길은 재지 않는다 - 원문 그대로 옮기고 맞댄다.
 	MaxBytes int
 }
 
@@ -267,6 +269,7 @@ const (
 	// FaultForeignKey: 부모가 없는 행. 기준선은 커밋 때 거절한다.
 	FaultForeignKey Fault = "FK 부모가 없다"
 	// FaultTooLong: 칸 상한(Column.MaxBytes)을 넘는 글. Postgres 의 B-tree 인덱스가 그 항목을 못 받는다(SQLite 는 받는다).
+	// 이관의 사전 검사(ImportCell)에서만 난다.
 	FaultTooLong Fault = "인덱스 키 상한을 넘는 글"
 )
 
@@ -337,6 +340,23 @@ func TargetCell(c Column, v any) (any, Fault) {
 	return out, f
 }
 
+// ImportCell 은 SQLite 원본에서 읽어 Postgres 로 **옮겨 넣을** 값 v 를 잰다: Cell 의 검사에 더해, 칸 상한(Column.MaxBytes)을
+// 넘는 글이면 FaultTooLong 이다. 이관의 사전 검사가 이것을 쓴다.
+//
+// ★ 상한은 Cell 에 두지 않는다. Cell 은 대조(verify)와 역이관(Postgres → SQLite)도 지나는데, 그 길의 값은 이미 원장에 있는
+// 원문이다 - 상한에 걸려 그 길이 막히면 남는 처방이 감사 행을 자르는 것뿐이고, 그러면 두 원장이 달라진다. Postgres 의 인덱스가
+// 이미 받은 값(짧은 kind 옆의 2048 바이트 넘는 project)도 칸별 상한에는 걸린다.
+func ImportCell(c Column, v any) (any, Fault) {
+	out, f := Cell(c, v)
+	if f != "" || c.MaxBytes == 0 {
+		return out, f
+	}
+	if s, ok := out.(string); ok && len(s) > c.MaxBytes {
+		return out, FaultTooLong
+	}
+	return out, ""
+}
+
 // storedAs 는 읽은 값 v 의 Go 타입이 칸 타입 k 의 저장 갈래인가다(드라이버가 저장 갈래마다 정한 타입으로 준다).
 func storedAs(k Kind, v any) bool {
 	switch v.(type) {
@@ -356,8 +376,6 @@ func textFault(c Column, s string) Fault {
 		return FaultNUL
 	case !utf8.ValidString(s):
 		return FaultUTF8
-	case c.MaxBytes > 0 && len(s) > c.MaxBytes:
-		return FaultTooLong
 	case c.JSON:
 		return jsonFault(s)
 	}

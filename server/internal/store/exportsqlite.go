@@ -24,7 +24,8 @@ import (
 //
 //	대상 자리 재기(파일 · 옆 파일이 없어야) → 원본 열기(Postgres) → 대상 디렉토리에 임시 파일(0644) · 이관 판 스키마
 //	→ transferInto(원본 스냅숏 하나에서 이관 판 · 모양 · 붙은 다른 연결을 재고 훑기 · 대상 트랜잭션 하나 · 커밋 전 대조)
-//	→ 임시 파일 닫기(옆 파일의 커밋이 본 파일로 옮았나) → 새 이름 붙이기 · 디렉토리 fsync(예행은 일회용 이름에 붙였다 지운다)
+//	→ 임시 파일 닫기(옆 파일의 커밋이 본 파일로 옮았나) → 그 자리의 옛 판올림 전 사본 치우기(quarantineBackups, 본 실행만)
+//	→ 새 이름 붙이기 · 디렉토리 fsync(예행은 일회용 이름에 붙였다 지운다)
 //
 // ★ 커밋 전 대조가 맞은 임시 파일만 이름을 얻는다. 어긋나거나 실패하거나 예행이면 임시 파일과 그 옆 파일을 지운다 - 대상
 // 자리에는 아무것도 남지 않는다. 신호(SIGINT · SIGTERM)도 ctx 취소로 받아 같은 길로 지운다 - SIGKILL · 전원 차단만
@@ -67,6 +68,14 @@ func ExportSQLite(ctx context.Context, from, to string, opt TransferOptions, log
 	if err := ctx.Err(); err != nil {
 		rep.Copied = 0
 		return rep, fmt.Errorf("역이관이 취소됐다 - 파일을 내지 않는다: %w", err)
+	}
+	if !opt.DryRun {
+		// 이름을 붙이기 전에 그 자리의 옛 판올림 전 사본을 치운다(quarantineBackups) - 새 원장이 이름을 얻는 순간 남의 원장의
+		// 사본이 `fd migrate --rollback` 의 후보로 그 옆에 있지 않게 한다. 못 치우면 이름을 붙이지 않는다.
+		if rep.Quarantined, err = quarantineBackups(to, "export", time.Now()); err != nil {
+			rep.Copied = 0
+			return rep, fmt.Errorf("새 원장을 내지 않았다 - %s 옆의 옛 판올림 전 사본(.bak-*)을 치우지 못했다: %w", clip(to, 200), err)
+		}
 	}
 	if err := nameExport(tmp, to, opt.DryRun); err != nil {
 		rep.Copied = 0

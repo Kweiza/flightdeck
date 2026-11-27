@@ -6,6 +6,7 @@ package store
 // 경로 글자, 그리고 옮긴 뒤 바뀐 행 · 순번 · 이관이 받지 않을 원본을 대조가 잡는지.
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -310,6 +311,11 @@ func TestImportSQLiteRefusesFaultsAndWritesNothing(t *testing.T) {
 				rep, err := importLedger(t, ctx, src, dsn, TransferOptions{DryRun: dry})
 				if err == nil || !strings.Contains(err.Error(), "사전 검사") {
 					t.Fatalf("예행 %v: 걸린 원본을 받았다: %v", dry, err)
+				}
+				// 인덱스 키 상한에 걸린 감사 행은 고치라고 하지 않는다 - 자르면 원본과 옮긴 원장이 달라진다.
+				fixIt, report := strings.Contains(err.Error(), "고친 뒤"), strings.Contains(err.Error(), "이슈로 알려 달라")
+				if tooLong := c.fault == pg.FaultTooLong; fixIt == tooLong || report != tooLong {
+					t.Fatalf("예행 %v: 다음 수가 갈래(%s)와 다르다: %v", dry, c.fault, err)
 				}
 				var hit *FaultGroup
 				for i, g := range rep.Faults {
@@ -793,5 +799,38 @@ func TestImportSQLiteOpensTheNamedFileOnly(t *testing.T) {
 	}
 	if got, want := sqliteURI("/a/b%c?d#e.db", nil), "file:/a/b%25c%3fd%23e.db?"; got != want {
 		t.Fatalf("sqliteURI = %q, 기대 %q", got, want)
+	}
+}
+
+// 이관은 표지를 남긴 뒤 원본 옆의 판올림 전 사본(과 그 옆 파일)을 새 디렉토리로 치운다 - 그 원장은 이제 원장이 아니고, 뒤에 그
+// 자리에 놓일 원장의 사본이 아니다. 예행은 옮기지 않는다.
+func TestImportSQLiteQuarantinesTheSourceBackups(t *testing.T) {
+	ctx := context.Background()
+	src := importSource(t, importSeed)
+	bak := src + ".bak-20260101T000000Z"
+	mustWrite(t, bak, []byte("옛 판올림 전 사본"))
+	mustWrite(t, bak+"-journal", []byte("옆"))
+	dsn, _ := importTarget(t)
+
+	rep, err := importLedger(t, ctx, src, dsn, TransferOptions{DryRun: true})
+	if left := globIn(t, filepath.Dir(src), "fd.db.bak-*"); err != nil || rep.Quarantined != "" || len(left) != 2 {
+		t.Fatalf("예행이 사본을 옮겼다: %v %q %v", err, rep.Quarantined, left)
+	}
+	rep, err = importLedger(t, ctx, src, dsn, TransferOptions{})
+	if err != nil {
+		t.Fatalf("이관: %v", err)
+	}
+	if _, err := os.Lstat(MovedMarker(src)); err != nil {
+		t.Fatalf("이관 표지가 없다: %v", err)
+	}
+	if !strings.HasPrefix(filepath.Base(rep.Quarantined), "fd.db.pre-import-") {
+		t.Fatalf("사본을 옮긴 디렉토리를 보고하지 않았다: %q", rep.Quarantined)
+	}
+	if left := globIn(t, filepath.Dir(src), "fd.db.bak-*"); len(left) != 0 {
+		t.Fatalf("원본 옆에 사본이 남았다: %v", left)
+	}
+	if !bytes.Equal(mustRead(t, filepath.Join(rep.Quarantined, filepath.Base(bak))), []byte("옛 판올림 전 사본")) ||
+		!bytes.Equal(mustRead(t, filepath.Join(rep.Quarantined, filepath.Base(bak)+"-journal")), []byte("옆")) {
+		t.Fatal("옮긴 사본 · 옆 파일이 그대로가 아니다")
 	}
 }

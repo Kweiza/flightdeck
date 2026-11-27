@@ -70,6 +70,17 @@ func ClassifyError(err error) Classified {
 		}
 	}
 
+	// project · kind 가 이벤트 인덱스의 키 상한보다 길다. 쓰기 전에 거절한 입력 오류라 400 이다(store.eventKeyRefusal).
+	var longKey *store.KeyTooLongError
+	if errors.As(err, &longKey) {
+		return Classified{
+			Status:   http.StatusBadRequest,
+			Code:     "key_too_long",
+			Message:  longKey.Error(),
+			Guidance: "그 값을 줄여 다시 보내라(project 는 저장소 디렉토리 이름이다).",
+		}
+	}
+
 	var refused *service.RefusedError
 	if errors.As(err, &refused) {
 		return Classified{

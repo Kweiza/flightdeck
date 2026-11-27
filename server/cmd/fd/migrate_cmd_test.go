@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -8,8 +9,11 @@ import (
 	"maps"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -243,6 +247,91 @@ func TestMigrateRollbackRemovesTheStaleJournal(t *testing.T) {
 			t.Errorf("되돌린 뒤에도 %s 가 남아 있다 — 이 저널이 백업 위에 얹히면 "+
 				"되돌리기가 무효가 되고 '반쯤 적용된' 상태가 되살아난다", filepath.Base(side))
 		}
+	}
+}
+
+// --db 로 준 원장의 판올림이 커밋된 단 뒤에서 서면, 실패 안내가 내는 되돌리기 명령은 **그 원장**을 되돌린다 - 이 환경의 기본 원장
+// (FD_DB)이 아니다. 안내의 명령을 셸이 읽는 그대로 갈라(공백 · 작은따옴표가 든 경로) 기본 원장이 따로 있는 환경에서 돌린다.
+//
+// ★ 증분 019 가 만들 인덱스 이름을 표로 먼저 차지해 둔다 - 018 은 커밋되고 019 가 선다(각 단은 자기 트랜잭션이다).
+func TestFailedUpgradeHintRollsBackTheLedgerItNamed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("안내의 명령을 POSIX 셸로 가른다")
+	}
+	h := newHarness(t)
+	version := func(path string) int {
+		t.Helper()
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		var v int
+		if err := db.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&v); err != nil {
+			t.Fatalf("%s 의 판을 못 읽었다: %v", path, err)
+		}
+		return v
+	}
+
+	// 기본 원장 B: 판올림 전 사본이 있어 --db 없는 되돌리기가 실제로 덮을 수 있는 원장이다.
+	b := filepath.Join(t.TempDir(), "fd.db")
+	for _, args := range [][]string{{"--to", "1"}, {}} {
+		if rc, out := h.run("", append([]string{"migrate", "--db", b}, args...)...); rc != 0 {
+			t.Fatalf("기본 원장 준비 실패(rc=%d): %s", rc, out)
+		}
+	}
+	bBytes, err := os.ReadFile(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := maps.Clone(h.env)
+	env[dbEnv] = b
+
+	dir := filepath.Join(t.TempDir(), "a b'c")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := filepath.Join(dir, "fd.db")
+	if rc, out := h.runEnv(env, "", "migrate", "--db", a, "--to", itoa(store.SchemaVersion-2)); rc != 0 {
+		t.Fatalf("대상 원장 준비 실패(rc=%d): %s", rc, out)
+	}
+	selfcheckDBAt(t, a, `CREATE TABLE event_by_project_kind(x INTEGER)`)
+
+	rc, out := h.runEnv(env, "", "migrate", "--db", a)
+	if rc != 1 {
+		t.Fatalf("막힌 판올림이 rc=%d 로 끝났다: %s", rc, out)
+	}
+	if v := version(a); v != store.SchemaVersion-1 {
+		t.Fatalf("전제가 깨졌다 - 커밋된 단 뒤에서 서야 한다(판 %d, 기대 %d): %s", v, store.SchemaVersion-1, out)
+	}
+	m := regexp.MustCompile("`(fd migrate --rollback [^`]*)`").FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("실패 안내에 되돌리기 명령이 없다: %s", out)
+	}
+	words, err := exec.Command("sh", "-c", "for w in "+m[1]+"; do printf '%s\\0' \"$w\"; done").Output()
+	if err != nil {
+		t.Fatalf("안내의 명령을 셸이 못 읽는다(%s): %v", m[1], err)
+	}
+	argv := strings.Split(strings.TrimSuffix(string(words), "\x00"), "\x00")
+	if argv[0] != "fd" || !slices.Contains(argv, a) {
+		t.Fatalf("안내의 명령이 막힌 원장 %q 를 한 낱말로 대지 않는다: %q", a, argv)
+	}
+
+	if rc, out := h.runEnv(env, "", argv[1:]...); rc != 0 {
+		t.Fatalf("안내의 명령이 rc=%d 로 끝났다: %s", rc, out)
+	}
+	if v := version(a); v != store.SchemaVersion-2 {
+		t.Fatalf("막힌 원장이 판 %d 다 - 판올림 전 판 %d 로 돌아가야 한다", v, store.SchemaVersion-2)
+	}
+	kept, err := filepath.Glob(a + ".pre-rollback-*")
+	if err != nil || len(kept) != 1 || version(kept[0]) != store.SchemaVersion-1 {
+		t.Fatalf("덮기 전의 원장을 남기지 않았다: %v %v", kept, err)
+	}
+	if got, err := os.ReadFile(b); err != nil || !bytes.Equal(got, bBytes) {
+		t.Fatalf("안내의 명령이 기본 원장을 건드렸다: %v", err)
+	}
+	if other, _ := filepath.Glob(b + ".pre-rollback-*"); len(other) != 0 {
+		t.Fatalf("안내의 명령이 기본 원장을 되돌렸다: %v", other)
 	}
 }
 

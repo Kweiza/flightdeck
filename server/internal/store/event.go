@@ -55,15 +55,24 @@ func (s *Store) TryLogEvent(ctx context.Context, kind, project, sessionID string
 	}
 	// 시각은 잠금을 받은 뒤에 잰다 - at 순서가 id 순서와 같게.
 	if err := s.Tx(ctx, func(t *Tx) error {
-		_, err := t.tx.ExecContext(t.ctx,
-			`INSERT INTO event(at, project, session_id, kind, payload) VALUES (?, ?, ?, ?, ?)`,
-			fmtTime(time.Now()), nullStr(project), nullStr(sessionID), kind, body)
-		return err
+		return t.insertEvent(time.Now(), project, sessionID, kind, body)
 	}); err != nil {
 		return fmt.Errorf("이벤트 기록 실패(kind=%q project=%q session=%q): %w",
 			clip(kind, 64), clip(project, 64), clip(sessionID, 64), err)
 	}
 	return nil
+}
+
+// insertEvent 는 event 에 한 줄을 넣는다. event 에 넣는 자리는 이것 하나다(TryLogEvent · CloseSessionWhoseWorktreeIsGone) - 키
+// 칸의 상한(eventKeyRefusal)을 여기서 잰다.
+func (t *Tx) insertEvent(at time.Time, project, sessionID, kind, body string) error {
+	if err := eventKeyRefusal(project, kind); err != nil {
+		return err
+	}
+	_, err := t.tx.ExecContext(t.ctx,
+		`INSERT INTO event(at, project, session_id, kind, payload) VALUES (?, ?, ?, ?, ?)`,
+		fmtTime(at), nullStr(project), nullStr(sessionID), kind, body)
+	return err
 }
 
 // 트랜잭션 결말 표시 — 예약 이벤트가 "그래서 그 트랜잭션이 어떻게 끝났나"를 스스로 말한다.

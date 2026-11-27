@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -557,6 +558,32 @@ func TestSearchJudgmentsTakesManyTerms(t *testing.T) {
 }
 
 // TestSearchJudgmentsTooLongIs400 은 원문 바이트 상한을 넘는 검색어가 질의 전에 400 으로 거절되고, 상한과 같은
+// 이벤트 인덱스의 키 상한을 넘는 project 로 세션을 열면 400 이다(store.KeyTooLongError) - 프로젝트를 등록하지도, 감사 원장에 그
+// 값을 남기지도 않는다. ClassifyError 에 갈래가 없으면 같은 거절이 조용히 500 이 된다. 상한까지는 받는다.
+func TestOpenSessionWithAnOverCapProjectIs400(t *testing.T) {
+	e := newEnv(t, nil)
+	open := func(project string) *httptest.ResponseRecorder {
+		return e.write(http.MethodPost, "/api/v1/sessions", map[string]any{
+			"project": project, "project_path": e.repo, "machine_id": "m1", "hostname": "host1",
+			"worktree": e.repo, "cc_session_id": "cc-" + itoa(len(project)), "label": "시험 세션",
+		})
+	}
+	long := strings.Repeat("p", 2049)
+	w := open(long)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("상한을 넘는 project 로 연 세션이 %d 로 나갔다(400 을 기대): %s", w.Code, w.Body.String())
+	}
+	if ce := errorOf(t, w); ce["code"] != "key_too_long" {
+		t.Fatalf("오류 절이 다르다: %v", ce)
+	}
+	if ps, err := e.st.ListProjects(t.Context()); err != nil || len(ps) != 0 {
+		t.Fatalf("거절했는데 프로젝트가 등록됐다: %v %v", ps, err)
+	}
+	if w := open(long[:2048]); w.Code != http.StatusCreated && w.Code != http.StatusOK {
+		t.Fatalf("상한까지 채운 project 를 거절했다: %d %s", w.Code, w.Body.String())
+	}
+}
+
 // 길이는 받는지 HTTP 에서 잰다. ClassifyError 는 화이트리스트라 갈래가 빠지면 같은 오류가 조용히 500 이 된다.
 func TestSearchJudgmentsTooLongIs400(t *testing.T) {
 	e := newEnv(t, nil)

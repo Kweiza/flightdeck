@@ -40,6 +40,10 @@ func (t *Tx) UpsertProject(p model.Project) error {
 	if p.ID == "" {
 		return errors.New("프로젝트 id 가 비었다")
 	}
+	// 등록한 id 가 뒤의 이벤트 project 가 된다 - 이벤트 키 상한을 넘는 id 는 들이지 않는다(eventKeyRefusal).
+	if err := eventKeyRefusal(p.ID, ""); err != nil {
+		return err
+	}
 	if p.DefaultBranch == "" {
 		p.DefaultBranch = "main"
 	}

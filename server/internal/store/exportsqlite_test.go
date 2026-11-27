@@ -48,7 +48,7 @@ func liteScan(t *testing.T, path string) *ledgerScan {
 	defer s.Close()
 	var sc *ledgerScan
 	if err := s.ReadTx(ctx, func(q Reader) error {
-		sc, err = scanLedger(ctx, q, sqliteSide{})
+		sc, err = scanLedger(ctx, q, sqliteSide{}, pgSide{}.intake())
 		return err
 	}); err != nil {
 		t.Fatalf("%s 훑기: %v", filepath.Base(path), err)
@@ -676,5 +676,40 @@ func TestCreateExclusiveRespectsUmask(t *testing.T) {
 	}
 	if fi.Mode().Perm()&^ledgerFileMode != 0 {
 		t.Fatalf("임시 파일 모드 %v 가 %v 보다 넓다", fi.Mode().Perm(), ledgerFileMode)
+	}
+}
+
+// 역이관 · 대조는 인덱스 키 상한을 재지 않는다 - Postgres 원장에 이미 있는 원문(짧은 kind 옆의 2048 바이트 넘는 project 는
+// 인덱스가 받는다)을 그대로 내고 맞댄다. 상한에 걸려 막히면 남는 처방이 감사 행을 자르는 것뿐이고, 그러면 두 원장이 달라진다.
+// 그 파일을 다시 Postgres 로 옮길 때는 이관의 사전 검사가 좌표와 함께 선다 - 상한은 옮겨 넣는 길에만 있다.
+func TestExportAndVerifyKeepAnOverCapKeyTheIndexTook(t *testing.T) {
+	ctx := context.Background()
+	_, dsn, dst := importedPG(t)
+	long := incompressible(11, pg.EventProjectMaxBytes+1)
+	pgExec(t, dst, `INSERT INTO event(at, project, kind, payload) VALUES ('2026-11-27T00:00:00.000000Z', ?, 'long', '{}')`, long)
+
+	back := exportBack(t)
+	rep, err := exportLedger(t, ctx, dsn, back, TransferOptions{})
+	if err != nil || len(rep.Faults) != 0 || !rep.Matched() {
+		t.Fatalf("인덱스가 받은 원문을 역이관이 거절했다: %v %+v", err, rep.Faults)
+	}
+	r, err := openSQLiteReader(ctx, back, importSourceDSN(back), quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	err = r.db.QueryRowContext(ctx, `SELECT project FROM event WHERE kind = 'long'`).Scan(&got)
+	r.Close()
+	if err != nil || got != long {
+		t.Fatalf("낸 파일의 project 가 원문과 다르다(%d 바이트, %v)", len(got), err)
+	}
+	if again, err := VerifySQLite(ctx, back, dsn, quietLog()); err != nil || !again.Matched() || len(again.Faults) != 0 {
+		t.Fatalf("원문 그대로인 두 원장의 대조가 막혔다: %v %+v", err, again.Faults)
+	}
+
+	other, _ := importTarget(t)
+	_, err = importLedger(t, ctx, back, other, TransferOptions{DryRun: true})
+	if err == nil || !strings.Contains(err.Error(), "이슈로 알려 달라") {
+		t.Fatalf("상한을 넘는 원문을 다시 옮겨 넣으려 했다: %v", err)
 	}
 }

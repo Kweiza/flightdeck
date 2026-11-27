@@ -24,10 +24,9 @@ func TestRollbackHint(t *testing.T) {
 	got := RollbackHint("/data/fd.db", "/data/fd.db.bak-20260803T120000Z")
 	for _, want := range []string{
 		"/data/fd.db.bak-20260803T120000Z", // 어디서 되돌리나
-		"/data/fd.db",                      // 어디로 되돌리나
-		"/data/fd.db-wal",                  // 옛 WAL 을 안 지우면 반쯤 적용된 상태가 되살아난다
-		"/data/fd.db-shm",
-		"cp -f",
+		// 어느 원장을 되돌리나 - 명령이 그 원장을 가리킨다. --db 가 없으면 기본 원장(FD_DB · ~/.flightdeck/fd.db)을 되돌린다.
+		"`fd migrate --rollback --db '/data/fd.db'`",
+		"트랜잭션째 되감겼다",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("절차에 %q 가 없다: %s", want, got)
@@ -37,17 +36,26 @@ func TestRollbackHint(t *testing.T) {
 	// 사실을 말해야 했고 시험도 "§7" 을 요구했다. 이제 그 처방이 지어졌으므로 문구가
 	// 말해야 할 것은 미구현이 아니라 **다음에 칠 명령**이다 — 절차가 실패한 그 자리에
 	// 수단이 있어야 한다는 규율은 그대로이고, 가리키는 곳만 바뀌었다.
-	if !strings.Contains(got, "fd migrate --rollback") {
-		t.Errorf("되돌리는 명령을 문구가 안 낸다 — 손 복사 절차만 남으면 -wal 지우기를 빠뜨린다: %s", got)
+	// ★ 손으로 파일을 옮기는 처방은 다시 싣지 않는다. 그 처방은 옆 파일 하나를 못 옮겨도 다음 줄(cp -f)이 원장을 덮었다.
+	for _, hint := range []string{got, RollbackHint("/data/fd.db", "")} {
+		for _, bad := range []string{"cp -f", "mv -f", "cp ", "mv "} {
+			if strings.Contains(hint, bad) {
+				t.Errorf("손으로 파일을 옮기는 처방(%q)을 냈다: %s", bad, hint)
+			}
+		}
 	}
 
-	// 백업이 없으면 **없다고 말한다.** 있는 척하면 그 순간 되돌릴 수 있다는 거짓이 생긴다.
-	none := RollbackHint("/data/fd.db", "")
-	if strings.Contains(none, "cp -f") {
-		t.Errorf("백업이 없는데 복사 명령을 냈다: %s", none)
+	// 경로는 셸 인용한다 - 공백 · 홑따옴표가 든 경로도 그대로 붙여 넣어 그 원장을 가리킨다.
+	odd := RollbackHint("/srv/a b'c/fd.db", "/srv/a b'c/fd.db.bak-20260803T120000Z")
+	if want := `--db '/srv/a b'\''c/fd.db'` + "`"; !strings.Contains(odd, want) {
+		t.Errorf("경로를 셸 인용하지 않았다(기대 %q): %s", want, odd)
 	}
-	if !strings.Contains(none, "되돌릴 파일이 없다") || !strings.Contains(none, ".bak-*") {
-		t.Errorf("백업 부재와 옛 백업 위치가 문구에 없다: %s", none)
+
+	// 백업이 없으면 **없다고 말한다.** 있는 척하면 그 순간 되돌릴 수 있다는 거짓이 생긴다. 옛 백업을 쓰는 명령도 그 원장을 가리킨다.
+	none := RollbackHint("/data/fd.db", "")
+	if !strings.Contains(none, "되돌릴 파일이 없다") || !strings.Contains(none, ".bak-*") ||
+		!strings.Contains(none, "`fd migrate --rollback --db '/data/fd.db'`") {
+		t.Errorf("백업 부재 · 옛 백업 위치 · 그 원장을 가리키는 명령이 문구에 없다: %s", none)
 	}
 }
 
@@ -120,8 +128,8 @@ func TestFailedUpgradeNamesTheBackup(t *testing.T) {
 	if !strings.Contains(msg, after[0]) {
 		t.Errorf("오류가 백업 경로(%s)를 안 낸다 — 되돌릴 곳을 손으로 찾아야 한다:\n%s", after[0], msg)
 	}
-	if !strings.Contains(msg, "cp -f") {
-		t.Errorf("오류에 되돌리는 절차가 없다:\n%s", msg)
+	if want := "fd migrate --rollback --db " + shellQuote(path); !strings.Contains(msg, want) {
+		t.Errorf("오류에 그 원장을 가리키는 되돌리기 명령(%s)이 없다:\n%s", want, msg)
 	}
 	if !strings.Contains(msg, "일부러 깨뜨린 증분") {
 		t.Errorf("오류가 어느 증분에서 깨졌는지 안 낸다:\n%s", msg)

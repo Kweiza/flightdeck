@@ -194,15 +194,49 @@ func TestCellFaults(t *testing.T) {
 		{"범위 밖 수 뒤의 \\u0000", doc, `[1e400,"\u0000"]`, `[1e400,"\u0000"]`, pg.FaultJSONNUL},
 		{"범위 밖 수는 받는다", doc, `{"n":1e400,"s":"\\u0000"}`, `{"n":1e400,"s":"\\u0000"}`, ""},
 		{"JSON 은 받는다", doc, `{"a":[1,"b"]}`, `{"a":[1,"b"]}`, ""},
-		{"상한까지는 받는다", capped, "abcd", "abcd", ""},
-		{"상한을 넘는 글", capped, "abcde", "abcde", pg.FaultTooLong},
-		{"상한은 글자가 아니라 바이트다", capped, "가나", "가나", pg.FaultTooLong},
-		{"상한 칸의 BLOB 도 바이트로 잰다", capped, []byte("abcde"), "abcde", pg.FaultTooLong},
+		// 상한은 Cell 이 재지 않는다 - 대조 · 역이관은 원문 그대로 옮기고 맞댄다(ImportCell 만 잰다).
+		{"Cell 은 상한을 재지 않는다", capped, "abcde", "abcde", ""},
 	} {
 		got, fault := pg.Cell(c.col, c.in)
 		if fault != c.fault || pg.RowHash([]any{got}) != pg.RowHash([]any{c.want}) {
 			t.Errorf("%s: Cell(%v) = (%#v, %q), 기대 (%#v, %q)", c.name, c.in, got, fault, c.want, c.fault)
 		}
+	}
+}
+
+// 인덱스 키 상한(Column.MaxBytes)은 Postgres 로 옮겨 넣을 값의 규칙(ImportCell)에만 있다. 대조 · 역이관이 지나는 Cell · TargetCell 은
+// 같은 값을 받는다. ImportCell 은 Cell 의 다른 검사를 그대로 한다.
+func TestImportCellAloneCapsTheIndexKey(t *testing.T) {
+	capped := pg.Column{Name: "p", Kind: pg.Text, MaxBytes: 4}
+	for _, c := range []struct {
+		name  string
+		in    any
+		fault pg.Fault
+	}{
+		{"상한까지는 받는다", "abcd", ""},
+		{"상한을 넘는 글", "abcde", pg.FaultTooLong},
+		{"상한은 글자가 아니라 바이트다", "가나", pg.FaultTooLong},
+		{"상한 칸의 BLOB 도 바이트로 잰다", []byte("abcde"), pg.FaultTooLong},
+		{"다른 검사가 먼저다", "a\x00bcde", pg.FaultNUL},
+		{"NULL 은 받는다", nil, ""},
+	} {
+		got, fault := pg.ImportCell(capped, c.in)
+		want, _ := pg.Cell(capped, c.in)
+		if fault != c.fault || pg.RowHash([]any{got}) != pg.RowHash([]any{want}) {
+			t.Errorf("%s: ImportCell(%v) = (%#v, %q), 기대 (%#v, %q)", c.name, c.in, got, fault, want, c.fault)
+		}
+		if c.fault == pg.FaultTooLong {
+			if _, f := pg.Cell(capped, c.in); f != "" {
+				t.Errorf("%s: Cell 이 상한을 쟀다(%q)", c.name, f)
+			}
+			if _, f := pg.TargetCell(capped, c.in); f != "" && c.name != "상한 칸의 BLOB 도 바이트로 잰다" {
+				t.Errorf("%s: TargetCell 이 상한을 쟀다(%q)", c.name, f)
+			}
+		}
+	}
+	// 상한이 없는 칸은 Cell 과 같다.
+	if _, f := pg.ImportCell(pg.Column{Name: "t", Kind: pg.Text}, strings.Repeat("a", 10000)); f != "" {
+		t.Fatalf("상한이 없는 칸을 쟀다: %q", f)
 	}
 }
 

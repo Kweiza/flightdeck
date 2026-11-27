@@ -101,6 +101,7 @@ func printTransferReport(out io.Writer, head string, rep store.TransferReport) {
 				fmt.Fprintf(out, "    %-24s %d\n", r.Table, r.Rows)
 			}
 		}
+		printQuarantined(out, rep)
 		return
 	}
 	fmt.Fprintln(out, "\n  대조표(표 · 원본 행 · 대상 행 · 전 칸 지문):")
@@ -125,6 +126,17 @@ func printTransferReport(out io.Writer, head string, rep store.TransferReport) {
 			fmt.Fprintf(out, "    %-30s 다음 %d > %d  %s\n", c.Table+"."+c.Column, c.Next, c.Floor, mark)
 		}
 	}
+	printQuarantined(out, rep)
+}
+
+// printQuarantined 는 SQLite 원장 자리의 판올림 전 사본을 옮긴 디렉토리를 말한다(store.TransferReport.Quarantined). 대조표가 없는
+// 갈래(오류)에서도 낸다 - 옮긴 뒤에 선 실행도 어디로 옮겼는지 말해야 한다.
+func printQuarantined(out io.Writer, rep store.TransferReport) {
+	if rep.Quarantined == "" {
+		return
+	}
+	fmt.Fprintf(out, "\n  판올림 전 사본(.bak-*)을 %s 로 옮겼다 - 그 자리의 원장이 바뀌어 `fd migrate --rollback` 이 고를 자리에 두지 않는다(지우지 않았다)\n",
+		rep.Quarantined)
 }
 
 // printFaults 는 값 검사에 걸린 갈래를 늘어놓는다. 원본의 사전 검사와 대조가 읽은 대상 값이 같은 꼴로 나온다.

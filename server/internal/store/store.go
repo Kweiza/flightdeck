@@ -1035,11 +1035,14 @@ func openMigrator(path string, opt MigrateOptions, log *slog.Logger) (*Store, mi
 		return nil, run, err
 	}
 	run.steps = migrations
-	run.backup = func(ctx context.Context, _ *migrateSession, from int) (string, error) { return s.backup(ctx, from) }
+	run.backup = func(ctx context.Context, _ *migrateSession, from int) (string, error) {
+		return s.backup(ctx, from, time.Now())
+	}
 	return s, run, nil
 }
 
-// RollbackHint 는 마이그레이션이 깨졌을 때 되돌리는 절차를 낸다. 순수 함수다.
+// RollbackHint 는 SQLite 판올림이 깨졌을 때 오류에 붙이는 다음 수다. 순수 함수다. dbPath 는 그 원장의 경로다 - 부르는 쪽이
+// 절대 경로로 준다(rollbackHint).
 //
 // ★ 이 문구가 오류와 로그에 실린다. 앞선 판은 업그레이드 경로에서 백업 경로를
 // **지역 변수로 버려서**, 정확히 §7 이 겨냥한 상황(다음 증분이 깨지는 날)에
@@ -1047,21 +1050,20 @@ func openMigrator(path string, opt MigrateOptions, log *slog.Logger) (*Store, mi
 // 적용 경로(MigrateApply)는 backup=%q 를 실었는데 업그레이드 경로는 안 실었다 —
 // 같은 상황을 다루는 두 경로가 다르게 생겼으면 한쪽이 틀린 것이다.
 //
-// -wal·-shm 을 원장 자리에서 함께 치우라고 적는 이유: 백업은 VACUUM INTO 로 뜬 **독립된 일관 사본**이라
-// WAL 이 딸려 있지 않다. 옛 -wal 을 남긴 채 .db 만 갈아 끼우면 SQLite 가 그 WAL 을
-// 되살려 얹고, 그러면 되돌렸다고 믿는 순간 반쯤 적용된 상태가 부활한다. 지우지 않고 남긴 원장 옆으로
-// 옮긴다 - 체크포인트 안 된 커밋이 거기 있을 수 있다(rollbackSQLite 의 ★).
+// ★ 명령에 **대상 원장을 셸 인용해 싣는다**(`--db '<경로>'`). 앞선 판은 `fd migrate --rollback` 만 적어, `--db A` 로 올리다 선
+// 사람이 그대로 돌리면 기본 원장(FD_DB · ~/.flightdeck/fd.db) B 를 되돌렸다 - B 옆에 온전한 백업이 있으면 모든 재기를 지나 B 를
+// 덮는다. 손으로 파일을 옮기는 처방은 싣지 않는다: 그 처방은 옆 파일 하나를 못 옮겨도 다음 줄(cp -f)이 원장을 덮었다. 재기 · 지금
+// 원장 남기기 · 옆 파일 옮기기는 명령이 한다(rollbackSQLite).
 func RollbackHint(dbPath, backupPath string) string {
+	cmd := "fd migrate --rollback --db " + shellQuote(dbPath)
 	if strings.TrimSpace(backupPath) == "" {
-		return "이번 적용은 백업을 뜨지 않았다(빈 DB 이거나 메모리 DB 다) — 되돌릴 파일이 없다. " +
-			"옛 백업은 " + clip(dbPath, 200) + ".bak-* 에 있고 `fd migrate --rollback` 이 그중 최신을 쓴다."
+		return "이번 적용은 백업을 뜨지 않았다(빈 DB 이거나 메모리 DB 다) — 이번 판올림이 남긴 되돌릴 파일이 없다. " +
+			"그 원장 옆의 옛 백업(.bak-*)은 서버를 멈추고 `" + cmd + "` 가 재고 그중 최신을 쓴다."
 	}
-	db := clip(dbPath, 200)
-	keep := db + ".pre-rollback"
-	return fmt.Sprintf("되돌리려면 서버를 멈추고 `fd migrate --rollback` 을 돈다 - 백업을 재고(다 뜬 이 원장의 사본인가), 지금 원장을 "+
-		"%s-<시각> 으로 남긴 뒤 덮는다. 손으로 하려면 지금 원장부터 남긴다: cp -f %q %q && { mv -f %q %q; mv -f %q %q; cp -f %q %q; } "+
-		"(백업은 VACUUM INTO 로 뜬 일관 사본이라 WAL 이 없다 — 옛 -wal 을 원장 자리에 남기면 반쯤 적용된 상태가 되살아난다).",
-		keep, db, keep, db+"-wal", keep+"-wal", db+"-shm", keep+"-shm", clip(backupPath, 200), db)
+	return fmt.Sprintf("실패한 단은 트랜잭션째 되감겼다(원장은 마지막으로 커밋된 판에 있다). 판올림 전 백업은 %s 이다. 이미 커밋된 "+
+		"단까지 물리려면 서버를 멈추고 `%s` 를 돈다 - 백업을 재고(다 뜬 이 원장의 사본인가, 그 뒤로 커밋된 판올림이 있는가) 지금 "+
+		"원장을 옆 파일까지 <원장>.pre-rollback-<시각> 으로 남긴 뒤 덮는다. 커밋된 단이 없으면 거절한다(무를 것이 없다).",
+		clip(backupPath, 200), cmd)
 }
 
 // MigrationAction 은 여는 시점에 무엇을 할지다.
@@ -1263,7 +1265,7 @@ func (s *Store) migrateTo(ctx context.Context, run migrateRun) error {
 		if err := localeGate(ctx, sess); err != nil {
 			return err
 		}
-		if err := keyLimitGate(ctx, sess); err != nil {
+		if err := keyLimitGate(ctx, sess, dbVersion); err != nil {
 			return err
 		}
 	}
@@ -1535,15 +1537,20 @@ func (s *Store) rollbackHint(backupPath string) string {
 	if s.db.eng == enginePG {
 		return "실패한 단은 트랜잭션째 되감겼다(DB 는 마지막으로 커밋된 판에 있다). " + pgFailureHint(backupPath)
 	}
-	return RollbackHint(s.path, backupPath)
+	path := s.path
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs // 안내의 명령은 어느 디렉토리에서 돌려도 이 원장을 가리켜야 한다
+	}
+	return RollbackHint(path, backupPath)
 }
 
-// BackupSuffix 는 백업 파일 이름의 꼬리를 만든다. 사전순 = 시간순이다.
+// BackupSuffix 는 백업 파일 이름의 꼬리를 만든다. 사전순 = 시간순이다(같은 초에 겹치면 linkFresh 가 번호를 붙인다).
 func BackupSuffix(at time.Time) string {
-	return ".bak-" + at.UTC().Format("20060102T150405Z")
+	return ".bak-" + fileStamp(at)
 }
 
-// backup 은 마이그레이션 직전 스냅숏을 뜬다. from 은 뜨는 원장의 판이다 - 사본이 그 판인지 잰다.
+// backup 은 마이그레이션 직전 스냅숏을 뜨고 붙인 이름을 낸다. from 은 뜨는 원장의 판이다 - 사본이 그 판인지 잰다. at 은 이름의
+// 시각이다(<db>.bak-<at>).
 //
 // 파일을 그냥 복사하지 않고 VACUUM INTO 를 쓴다 — WAL 모드에서는 .db 파일만 베끼면
 // -wal 에 남은 커밋이 빠져 **조용히 낡은 사본**이 된다. VACUUM INTO 는 그 시점의
@@ -1551,23 +1558,21 @@ func BackupSuffix(at time.Time) string {
 //
 // ★ **최종 이름(<db>.bak-*)에 바로 쓰지 않는다.** 그 이름이 곧 `fd migrate --rollback` 의 후보라, 뜨는 도중 프로세스 · 전원이
 // 끊기면 덜 쓴 사본(과 그 옆 -journal)이 가장 최근 백업으로 골라진다. 같은 디렉토리의 숨은 임시 이름(.<db>.bak-*.partial-*)에
-// 뜨고, 다 뜬 원장인지(checkLedgerCopy - integrity_check · 판) 잰 뒤 굳히고(fsync) 이름을 바꾸고 디렉토리를 굳힌다. 끊기면 숨은
+// 뜨고, 다 뜬 원장인지(checkLedgerCopy - integrity_check · 판) 잰 뒤 굳히고(fsync) 이름을 붙이고 디렉토리를 굳힌다. 끊기면 숨은
 // 이름만 남는다 - 후보가 아니다(rollbackCandidate). 이 실행이 실패로 끝나면 그 자리에서 지운다.
-func (s *Store) backup(ctx context.Context, from int) (string, error) {
+// ★ 이름은 **있는 파일을 갈지 않는 길**로 붙인다(linkFresh). 같은 초에 두 실행이 같은 이름을 고르면 앞선 판은 rename 으로 먼저
+// 붙은 사본을 덮었다 - 이제 뒤 실행이 번호 붙은 이름(<db>.bak-<시각>-001)을 받는다.
+func (s *Store) backup(ctx context.Context, from int, at time.Time) (string, error) {
 	if s.path == "" || strings.Contains(s.path, ":memory:") {
 		return "", nil // 메모리 DB 는 뜰 것이 없다. 무해한 무시라 여기 적는다
 	}
-	dst := s.path + BackupSuffix(time.Now())
-	if _, err := os.Stat(dst); err == nil {
-		// 같은 초에 두 번 열린 것이므로 이름을 벌린다.
-		dst = fmt.Sprintf("%s-%d", dst, os.Getpid())
-	}
-	dir := filepath.Dir(dst)
+	name := s.path + BackupSuffix(at)
+	dir := filepath.Dir(name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("백업 디렉토리 생성 실패(dir=%q): %w", dir, err)
 	}
 	// VACUUM INTO 는 대상이 없거나 빈 파일이어야 한다. 겹치지 않는 빈 파일을 먼저 잡는다(모드는 원장과 같다).
-	f, err := createExclusive(dir, "."+filepath.Base(dst)+".partial-", ledgerFileMode)
+	f, err := createExclusive(dir, "."+filepath.Base(name)+".partial-", ledgerFileMode)
 	if err != nil {
 		return "", fmt.Errorf("마이그레이션 전 백업의 임시 파일을 만들지 못했다(dir=%q): %w", dir, err)
 	}
@@ -1576,38 +1581,38 @@ func (s *Store) backup(ctx context.Context, from int) (string, error) {
 		removeLedgerFiles(tmp, s.log)
 		return "", fmt.Errorf("마이그레이션 전 백업의 임시 파일을 닫지 못했다(%q): %w", tmp, err)
 	}
-	if err := s.sealBackup(ctx, tmp, dst, from); err != nil {
+	dst, err := s.sealBackup(ctx, tmp, name, from)
+	if err != nil {
 		removeLedgerFiles(tmp, s.log)
 		return "", err
 	}
 	return dst, nil
 }
 
-// sealBackup 은 임시 이름 tmp 에 원장을 뜨고, 다 뜬 from 판 원장인지 잰 뒤 굳혀 dst 로 이름을 바꾼다(backup 의 ★).
-func (s *Store) sealBackup(ctx context.Context, tmp, dst string, from int) error {
+// sealBackup 은 임시 이름 tmp 에 원장을 뜨고, 다 뜬 from 판 원장인지 잰 뒤 굳혀 name 에(차 있으면 번호를 붙여 - linkFresh) 이름을
+// 붙이고 그 이름을 낸다(backup 의 ★).
+func (s *Store) sealBackup(ctx context.Context, tmp, name string, from int) (string, error) {
 	// VACUUM INTO 는 파라미터 바인딩을 안 받는다. 경로는 사용자 입력이 아니라
 	// 서버 설정에서 온 값이고, 작은따옴표만 이스케이프하면 리터럴로 안전하다.
 	q := "VACUUM INTO '" + strings.ReplaceAll(tmp, "'", "''") + "'"
 	if _, err := s.db.ExecContext(ctx, q); err != nil {
-		return fmt.Errorf("마이그레이션 전 백업 실패(dst=%q): %w", dst, err)
+		return "", fmt.Errorf("마이그레이션 전 백업 실패(dst=%q): %w", name, err)
 	}
 	rows, err := checkLedgerCopy(ctx, tmp)
 	if err != nil {
-		return fmt.Errorf("마이그레이션 전 백업을 뜬 사본이 온전하지 않다(dst=%q) - 판을 올리지 않는다: %w", dst, err)
+		return "", fmt.Errorf("마이그레이션 전 백업을 뜬 사본이 온전하지 않다(dst=%q) - 판을 올리지 않는다: %w", name, err)
 	}
 	if v := topVersion(rows); v != from {
-		return fmt.Errorf("마이그레이션 전 백업을 뜬 사본의 판이 %d 인데 원장은 %d판이다(dst=%q) - 판을 올리지 않는다", v, from, dst)
+		return "", fmt.Errorf("마이그레이션 전 백업을 뜬 사본의 판이 %d 인데 원장은 %d판이다(dst=%q) - 판을 올리지 않는다", v, from, name)
 	}
 	if err := syncFile(tmp); err != nil {
-		return fmt.Errorf("마이그레이션 전 백업을 굳히지 못했다(dst=%q): %w", dst, err)
+		return "", fmt.Errorf("마이그레이션 전 백업을 굳히지 못했다(dst=%q): %w", name, err)
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		return fmt.Errorf("마이그레이션 전 백업에 이름을 붙이지 못했다(dst=%q): %w", dst, err)
+	dst, err := linkFresh(tmp, name)
+	if err != nil {
+		return "", fmt.Errorf("마이그레이션 전 백업에 이름을 붙이지 못했다 - 판을 올리지 않는다: %w", err)
 	}
-	if err := syncDir(filepath.Dir(dst)); err != nil {
-		return fmt.Errorf("마이그레이션 전 백업의 디렉토리를 굳히지 못했다(dst=%q): %w", dst, err)
-	}
-	return nil
+	return dst, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
