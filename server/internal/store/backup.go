@@ -401,12 +401,26 @@ func ptrOf(ns sql.NullString) *string {
 //	                      그것이 바로 이 명령이 건져야 할 물건이다. 걸면 그 헤더를 영구히 고친다.
 //	                      되읽기 확인은 ledgerWantPragmas 로 한다(journal_mode 가 빠진 판) —
 //	                      요청하지도 않은 pragma 를 요구하면 롤백저널 DB 마다 거짓 진단이 난다.
-func ledgerDSN(path string) string {
+func ledgerDSN(path string) string { return sqliteURI(path, ledgerQuery()) }
+
+func ledgerQuery() url.Values {
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout("+busyTimeoutMS+")")
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Set("_txlock", "deferred")
-	return "file:" + path + "?" + q.Encode()
+	return q
+}
+
+// importSourceDSN 은 SQLite 이관 · 대조의 원본(openImportSource)을 여는 접속 문자열이다. ledgerDSN 에 mode=ro 를 더한다 -
+// 원본은 옮길 것일 뿐이라 이관이 그 파일에 쓸 자리가 없다. 읽기 전용 연결은 없는 파일을 만들지 않고, 끝낼 때 -wal 을
+// 본 파일로 옮기지(체크포인트) 않는다.
+//
+// ★ OpenLedger 가 mode=ro 를 안 쓰는 까닭(서버가 죽은 채 남은 -wal)은 이관에 없다. 이관은 비지 않은 -wal 이 옆에 있는
+// 원본을 열기 전에 거절한다(sourceWALRefusal).
+func importSourceDSN(path string) string {
+	q := ledgerQuery()
+	q.Set("mode", "ro")
+	return sqliteURI(path, q)
 }
 
 // WriteLedger 는 원장을 DB 에 되쓴다. **CLI 표면이 없다** — 지금은 무손실을 시험이 증명하는
@@ -541,22 +555,22 @@ func OpenLedger(ctx context.Context, path string, log *slog.Logger) (*Store, err
 	if plan.Action != MigrateNone {
 		return nil, ledgerOpenRefusal(plan)
 	}
-	return openSQLiteReader(ctx, path, log)
+	return openSQLiteReader(ctx, path, ledgerDSN(path), log)
 }
 
-// openSQLiteReader 는 SQLite 파일을 읽으려고 연다(ledgerDSN). 판을 재지도 스키마를 바꾸지도 않는다 - 판은 부르는 쪽이
-// 잰다(원장 내보내기는 이 바이너리의 판, 이관은 이관 판). 원장 내보내기(OpenLedger)와 SQLite 이관의 원본(openImportSource)이
-// 나눠 쓴다.
+// openSQLiteReader 는 SQLite 파일 path 를 접속 문자열 connStr(ledgerDSN · importSourceDSN)로 읽으려고 연다. 판을 재지도
+// 스키마를 바꾸지도 않는다 - 판은 부르는 쪽이 잰다(원장 내보내기는 이 바이너리의 판, 이관은 이관 판). 원장 내보내기
+// (OpenLedger)와 SQLite 이관의 원본(openImportSource)이 나눠 쓴다.
 //
 // 없는 파일에는 오류를 낸다. sql.Open 은 파일을 **만들기** 때문이다(OpenLedger 의 ★).
-func openSQLiteReader(ctx context.Context, path string, log *slog.Logger) (*Store, error) {
+func openSQLiteReader(ctx context.Context, path, connStr string, log *slog.Logger) (*Store, error) {
 	if log == nil {
 		log = slog.Default()
 	}
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("DB 파일이 없다(path=%q): %w", clip(path, 200), err)
 	}
-	db, err := sql.Open("sqlite", ledgerDSN(path))
+	db, err := sql.Open("sqlite", connStr)
 	if err != nil {
 		return nil, fmt.Errorf("읽기용 sqlite 열기 실패(path=%q): %w", clip(path, 200), err)
 	}

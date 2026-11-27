@@ -13,10 +13,11 @@
 // verify.go 이고(옮기는 표 목록 · 칸의 뜻 · 사전 검사 · 행 지문 · 순번), 실행은 store 의 ImportSQLite 다.
 //   - identity 칼럼 다섯(pick_eval · resource_hold · event · landing_queue 의 id, item_after.seq)은
 //     GENERATED ALWAYS 다. 옛 번호를 그대로 넣으려면 OwnerRole 로 `INSERT … OVERRIDING SYSTEM VALUE` 하고,
-//     표마다 `setval(pg_get_serial_sequence('<표>', '<칼럼>'), n, true)` 로 번호를 맞춘다. n 은 원본에서 이미 발급된
-//     가장 큰 번호다. AUTOINCREMENT 표는 greatest(max(<칼럼>), sqlite_sequence.seq) 다 — 지워진 최고 번호도 다시
-//     쓰지 않으므로 max(<칼럼>) 만으로 맞추면 그 번호를 다시 낸다. item_after.seq 는 rowid 라 max(rowid) 다.
-//     n 이 0 이면(발급된 번호가 없다) `setval(…, 1, false)` 로 새 시퀀스처럼 1 부터 낸다(Sequence).
+//     같은 트랜잭션에서 표마다 `ALTER SEQUENCE <pg_get_serial_sequence('<표>', '<칼럼>')> RESTART WITH n+1` 로 번호를
+//     맞춘다. n 은 원본에서 이미 발급된 가장 큰 번호다. AUTOINCREMENT 표는 greatest(max(<칼럼>), sqlite_sequence.seq)
+//     다 - 지워진 최고 번호도 다시 쓰지 않으므로 max(<칼럼>) 만으로 맞추면 그 번호를 다시 낸다. item_after.seq 는
+//     rowid 라 max(rowid) 다. n 이 0 이면(발급된 번호가 없다) 새 시퀀스처럼 1 부터 낸다(Sequence). setval 은 쓰지
+//     않는다(트랜잭션에 안 묶여 되감긴 이관이 순번만 바꿔 놓는다).
 //   - snapshot 의 기본키는 (project, key_digest) 다(key 의 sha256 계산 칼럼, fd_key_digest). upsert 의 충돌
 //     대상도 그것이다. 지문이 같은 다른 키는 넣기 전에 23000(snapshot_key_digest_unique)으로 거절된다.
 //   - 선점(claim)을 다시 쓰는 upsert 는 살아 있는 남의 행에서 23505(claim_one_live_holder)로 거절된다.

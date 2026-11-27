@@ -3,6 +3,8 @@ package pg
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 	"unicode/utf8"
 )
@@ -57,7 +59,7 @@ type Column struct {
 	// 깨진 문서와 \u0000 을 거절한다.
 	JSON bool
 	// Identity 는 기준선에서 GENERATED ALWAYS AS IDENTITY 다. 옛 번호를 그대로 넣으려면 소유 역할로 OVERRIDING SYSTEM
-	// VALUE 를 붙이고, 넣은 뒤 setval 로 번호를 맞춘다(Sequence).
+	// VALUE 를 붙이고, 넣은 뒤 같은 트랜잭션에서 `ALTER SEQUENCE … RESTART WITH` 로 번호를 맞춘다(Sequence).
 	Identity bool
 	// Rowid 는 SQLite 에서 이 칸 대신 rowid 를 읽는다는 뜻이다. item_after.seq 가 그것이다 - 그 표에는 기본키가 없어
 	// SQLite 는 rowid 로 순서를 읽고, 기준선은 그 자리를 seq 로 둔다.
@@ -86,10 +88,32 @@ func (t Table) Index(name string) int {
 }
 
 // LeftBehind 는 SQLite 원본의 표 name 을 일부러 옮기지 않는가다: schema_version(원장마다 자기 이전 이력이다),
-// sqlite_ 로 시작하는 엔진 표(sqlite_sequence 는 setval 로 흡수한다), FTS5 판단 색인과 그 그림자 표(기준선은 trigram
-// 인덱스로 대신한다). 그 밖의 원본 표는 전부 Tables 에 있어야 한다 - 모르는 표가 있으면 이관은 거절한다.
+// sqlite_ 로 시작하는 엔진 표(이름 공간을 엔진이 쥔다 - sqlite_sequence 는 순번 맞추기가 흡수한다), FTS5 판단 색인과 그
+// 그림자 표(leftBehind - 기준선은 trigram 인덱스로 대신한다). 그 밖의 원본 표는 전부 Tables 에 있어야 한다 - 모르는 표가
+// 있으면 이관은 거절한다.
 func LeftBehind(name string) bool {
-	return name == "schema_version" || strings.HasPrefix(name, "sqlite_") || strings.HasPrefix(name, "judgment_fts")
+	return strings.HasPrefix(name, "sqlite_") || leftBehind[name]
+}
+
+// leftBehind 는 옮기지 않는 표를 이름 그대로 적은 것이다. judgment_fts 는 외부 내용 FTS5 표(content='judgment')라 그림자
+// 표가 넷이다(_content 가 없다). 접두어로 거르면 그 이름으로 시작하는 다른 표(손으로 만든 표 · 다음 판의 표)를 말없이 버린다.
+// 이 목록이 판 18 원본의 실제 표와 같은지는 import_test.go 가 잰다.
+var leftBehind = map[string]bool{
+	"schema_version":       true,
+	"judgment_fts":         true,
+	"judgment_fts_data":    true,
+	"judgment_fts_idx":     true,
+	"judgment_fts_docsize": true,
+	"judgment_fts_config":  true,
+}
+
+// LeftBehindNames 는 이름 그대로 옮기지 않는 표 전부다(sqlite_ 접두어의 엔진 표는 빼고). 시험이 원본의 실제 표와 맞댄다.
+func LeftBehindNames() []string {
+	out := make([]string, 0, len(leftBehind))
+	for n := range leftBehind {
+		out = append(out, n)
+	}
+	return out
 }
 
 // Identity 는 표의 identity 칸이다. 없으면 false 다.
@@ -198,7 +222,11 @@ const (
 // ★ Postgres 에서 읽은 값도 이것을 지난다. 이미 그 꼴이라 그대로 나온다 - 그래서 두 엔진의 행 해시(RowHash)가 같은 값을 잰다.
 //
 // ★ 값을 바꾸지 않고 옮기는 갈래 둘을 받는다: 글 칸에 든 BLOB(같은 바이트가 UTF-8 이면 글이다)과 bytea 칸에 든 TEXT.
-// 바이트가 그대로라 전 칸 대조가 같다. 바이트가 바뀌어야 하는 갈래(정수 ↔ 글, 실수)는 거절한다.
+// 바이트가 그대로이고, 옮긴 값의 타입이 칸 타입이라 대상에서 읽은 값과 행 해시의 표지까지 같다. 바이트가 바뀌어야 하는
+// 갈래(정수 ↔ 글, 실수)는 거절하고 원래 타입을 그대로 둔다 - 그 값의 행 해시는 대상과 표지가 다르다.
+//
+// ★ 사전 검사를 지난 값(Fault 가 빈)의 타입은 언제나 nil 이거나 칸 타입의 꼴이다(Text → string, Int → int64, Bytes →
+// []byte). 행 해시가 이것에 기댄다(RowHash 의 ★).
 func Cell(c Column, v any) (any, Fault) {
 	switch x := v.(type) {
 	case nil:
@@ -256,6 +284,9 @@ func textFault(c Column, s string) Fault {
 //
 // ★ \u0000 은 디코드해서 잰다. 글자 `\u0000` 이 보여도 앞 백슬래시가 이스케이프된 것(`\\u0000`)이면 글은 백슬래시와
 // 「u0000」이고 jsonb 가 받는다. 그 글자가 없으면 디코드한 글에도 U+0000 이 없다(빠른 길).
+//
+// ★ 수는 글 그대로 받는다(UseNumber). float64 로 옮기면 범위 밖 수(1e400)에서 토큰이 오류로 끝나 그 뒤의 글을 못 잰다.
+// 끝은 io.EOF 하나다 - 그 밖의 오류는 json.Valid 를 지난 문서에서 날 자리가 없지만, 나면 끝으로 읽지 않고 깨진 문서로 낸다.
 func jsonFault(s string) Fault {
 	if !json.Valid([]byte(s)) {
 		return FaultJSON
@@ -264,10 +295,14 @@ func jsonFault(s string) Fault {
 		return ""
 	}
 	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
 	for {
 		tok, err := dec.Token()
-		if err != nil {
-			return "" // 끝(json.Valid 가 이미 문서 하나임을 쟀다)
+		switch {
+		case errors.Is(err, io.EOF):
+			return ""
+		case err != nil:
+			return FaultJSON
 		}
 		if str, ok := tok.(string); ok && strings.IndexByte(str, 0) >= 0 { // 키도 글 토큰으로 온다
 			return FaultJSONNUL
@@ -329,6 +364,10 @@ func (t Table) SourceColumns() []string {
 
 // InsertSQL 은 표에 rows 행을 한 문장으로 넣는 INSERT 다(`?` 자리표시, 행마다 칸 수만큼). identity 칸이 있으면
 // OVERRIDING SYSTEM VALUE 를 붙인다 - GENERATED ALWAYS 칸에 옛 번호를 그대로 넣는 길은 그것뿐이다.
+//
+// ★ 그 구절이 이 함수 안에 있어서 서버 코드의 OVERRIDING 을 훑는 시험(TestServerCodeNeverOverridesIdentity)이 이 함수를
+// 부르는 자리를 못 본다. 부르는 자리는 SQLite 이관의 옮기기(store 의 copyTables) 하나여야 한다 - import_test.go 의
+// TestInsertSQLIsCalledOnlyByTheImport 가 소스에서 잠근다.
 func (t Table) InsertSQL(rows int) string {
 	names := make([]string, len(t.Cols))
 	for i, c := range t.Cols {

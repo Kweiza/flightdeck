@@ -525,8 +525,20 @@ func dsn(path string) string {
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Set("_txlock", "immediate")
-	return "file:" + path + "?" + q.Encode()
+	return sqliteURI(path, q)
 }
+
+// sqliteURI 는 SQLite 파일 path 를 q 와 함께 여는 URI 접속 문자열(file:<경로>?<q>)이다. 기본 dsn · 원장 읽기(ledgerDSN) ·
+// 이관 원본(importSourceDSN)이 이 하나로 짓는다.
+//
+// ★ 경로의 %, ?, # 를 인코딩한다. 드라이버는 file: 접속 문자열을 URI 로 열고(SQLITE_OPEN_URI), SQLite 는 URI 경로의 %XX 를
+// 풀고 ? 와 # 에서 경로를 끊는다. 그대로 두면 `fd%20copy.db` 가 `fd copy.db` 를 열고(없으면 만든다), `a#b.db` 가 `a` 를
+// 연다. 그 셋 말고는 SQLite 가 경로에서 손대는 글자가 없어 그대로 둔다(Windows 의 \ · 드라이브 글자도 그대로다).
+func sqliteURI(path string, q url.Values) string {
+	return "file:" + sqlitePath.Replace(path) + "?" + q.Encode()
+}
+
+var sqlitePath = strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23")
 
 // busyTimeoutMS 는 SQLite 의 busy_timeout pragma 값(밀리초)이다. Postgres 의 lock_timeout 과 같은 상한이다.
 var busyTimeoutMS = millis(lockTimeout)

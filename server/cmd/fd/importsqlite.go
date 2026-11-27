@@ -31,7 +31,7 @@ type importFlags struct {
 
 func (a *App) parseImportFlags(name string, args []string) (importFlags, bool) {
 	fs := newFlagSet("migrate " + name)
-	from := fs.String("from", "", "옮길 SQLite 원장 파일(서버를 내린 뒤 뜬 사본)")
+	from := fs.String("from", "", "옮길 SQLite 원장 파일(서버를 내린 원본이나 VACUUM INTO 로 뜬 사본. 읽기 전용으로 연다)")
 	to := fs.String("db", "", "대상 Postgres 접속 URL(비면 "+dbEnv+")")
 	dry := fs.Bool("dry-run", false, "아무것도 쓰지 않고 잰다")
 	if err := fs.Parse(args); err != nil || fs.NArg() > 0 || strings.TrimSpace(*from) == "" {
@@ -61,7 +61,7 @@ func (a *App) runImportSQLite(ctx context.Context, args []string, out io.Writer)
 	case f.dryRun && !rep.TargetChecked:
 		fmt.Fprintf(out, "\n  원본은 옮길 수 있다. 대상은 재지 않았다(%s 는 Postgres 접속 URL 이 아니다)\n", rep.To)
 	case f.dryRun:
-		fmt.Fprintln(out, "\n  옮길 수 있다 - 아무것도 쓰지 않았다")
+		fmt.Fprintln(out, "\n  옮길 수 있다 - 본 실행과 같은 트랜잭션을 끝까지 돌고 되감았다(아무것도 쓰지 않았다)")
 	default:
 		fmt.Fprintf(out, "\n  옮겼다: %d 행, 대조가 맞았다\n", rep.Copied)
 	}
@@ -88,18 +88,8 @@ func (a *App) runVerifySQLite(ctx context.Context, args []string, out io.Writer)
 // printImportReport 는 이관 · 대조 보고를 사람 말로 낸다. 접속 URL 원문은 보고에 없다(표시값뿐이다).
 func printImportReport(out io.Writer, head string, rep store.ImportReport) {
 	fmt.Fprintf(out, "%s · %s → %s\n", head, rep.From, rep.To)
-	if len(rep.Faults) > 0 {
-		fmt.Fprintln(out, "\n  사전 검사에 걸린 행(표 · 칸 · 사유 · 수 · 행 좌표):")
-		for _, g := range rep.Faults {
-			fmt.Fprintf(out, "    %s.%s  %s  %d건\n", g.Table, g.Column, g.Fault, g.Count)
-			for _, k := range g.Keys {
-				fmt.Fprintf(out, "      %s\n", k)
-			}
-			if more := g.Count - len(g.Keys); more > 0 {
-				fmt.Fprintf(out, "      … 그 밖 %d건\n", more)
-			}
-		}
-	}
+	printFaults(out, "사전 검사에 걸린 원본 행", rep.Faults)
+	printFaults(out, "값 검사에 걸린 대상 행", rep.TargetFaults)
 	if len(rep.Tables) == 0 {
 		if len(rep.Rows) > 0 {
 			fmt.Fprintln(out, "\n  원본 행 수:")
@@ -129,6 +119,23 @@ func printImportReport(out io.Writer, head string, rep store.ImportReport) {
 				mark = "어긋남"
 			}
 			fmt.Fprintf(out, "    %-30s 다음 %d > %d  %s\n", c.Table+"."+c.Column, c.Next, c.Floor, mark)
+		}
+	}
+}
+
+// printFaults 는 값 검사에 걸린 갈래를 늘어놓는다. 원본의 사전 검사와 대조가 읽은 대상 값이 같은 꼴로 나온다.
+func printFaults(out io.Writer, title string, groups []store.FaultGroup) {
+	if len(groups) == 0 {
+		return
+	}
+	fmt.Fprintf(out, "\n  %s(표 · 칸 · 사유 · 수 · 행 좌표):\n", title)
+	for _, g := range groups {
+		fmt.Fprintf(out, "    %s.%s  %s  %d건\n", g.Table, g.Column, g.Fault, g.Count)
+		for _, k := range g.Keys {
+			fmt.Fprintf(out, "      %s\n", k)
+		}
+		if more := g.Count - len(g.Keys); more > 0 {
+			fmt.Fprintf(out, "      … 그 밖 %d건\n", more)
 		}
 	}
 }

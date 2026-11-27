@@ -1,12 +1,19 @@
 package store
 
 // SQLite → Postgres 이관(ImportSQLite)과 대조(VerifySQLite)를 실물 두 원장으로 잰다: 표 전부를 채운 원본의 왕복,
-// 사전 검사 갈래마다의 거절(아무것도 안 쓴다), 판 거절, 빈 원장이 아닌 대상의 거절, 지워진 최고 번호 뒤의 순번, 그리고
-// 옮긴 뒤 바뀐 행 · 순번을 대조가 잡는지.
+// 사전 검사 갈래마다의 거절(아무것도 안 쓴다), 판 거절, 빈 원장이 아닌 대상(행 · 번호를 낸 순번)의 거절, 지워진 최고 번호
+// 뒤의 순번, 예행이 본 실행과 같은 거절을 받고 아무것도 안 남기는지, 대조가 어긋나면 커밋하지 않는지, 비지 않은 -wal 과
+// 경로 글자, 그리고 옮긴 뒤 바뀐 행 · 순번 · 이관이 받지 않을 원본을 대조가 잡는지.
 
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"io/fs"
+	"maps"
+	"net/url"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -92,7 +99,7 @@ func importSource(t *testing.T, seed string) string {
 // liteExec 는 SQLite 원장 파일에 문장을 넣는다. FK 를 끈 연결이다 - 고장 난 원본(부모 없는 행)도 만들 수 있게.
 func liteExec(t *testing.T, path, q string) {
 	t.Helper()
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(0)")
+	db, err := sql.Open("sqlite", sqliteURI(path, url.Values{"_pragma": {"foreign_keys(0)"}}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +120,24 @@ func importTarget(t *testing.T) (string, *Store) {
 	t.Cleanup(func() { _ = s.Close() })
 	stamp(t, s, pg.ImportVersion)
 	return dsn, s
+}
+
+// identityStates 는 대상 identity 시퀀스마다 「last_value/is_called」다(순번을 건드렸는가의 잣대). 새 원장은 전부 1/false 다.
+func identityStates(t *testing.T, s *Store) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, tb := range pg.Tables() {
+		c, ok := tb.Identity()
+		if !ok {
+			continue
+		}
+		seq, err := readIdentity(context.Background(), s.db, tb.Name, c.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[tb.Name] = fmt.Sprintf("%d/%v", seq.last, seq.called)
+	}
+	return out
 }
 
 // targetRows 는 대상의 업무 표 전부의 행 수 합이다(아무것도 안 썼는가의 잣대).
@@ -276,17 +301,25 @@ func TestImportSQLiteRefusesFaultsAndWritesNothing(t *testing.T) {
 	}
 }
 
-// 예행은 걸린 것이 없으면 성공하고 아무것도 쓰지 않는다. 대상이 Postgres 가 아니면 원본만 잰다.
+// 예행은 걸린 것이 없으면 성공하고(대조까지 돈다) 아무것도 남기지 않는다 - 행도 순번도. 그래서 예행 뒤의 본 실행이 같은
+// 대상을 빈 원장으로 받는다. 대상이 Postgres 가 아니면 원본만 잰다.
 func TestImportSQLiteDryRunWritesNothing(t *testing.T) {
 	ctx := context.Background()
 	src := importSource(t, importSeed)
 	dsn, dst := importTarget(t)
+	fresh := identityStates(t, dst)
 	rep, err := ImportSQLite(ctx, src, dsn, ImportOptions{DryRun: true}, quietLog())
-	if err != nil || !rep.TargetChecked || rep.Copied != 0 || len(rep.Rows) != len(pg.Tables()) {
+	if err != nil || !rep.TargetChecked || rep.Copied != 0 || len(rep.Rows) != len(pg.Tables()) || !rep.Matched() {
 		t.Fatalf("예행: %v %+v", err, rep)
 	}
 	if n := targetRows(t, dst); n != 0 {
 		t.Fatalf("예행이 대상에 %d 행을 썼다", n)
+	}
+	if got := identityStates(t, dst); !maps.Equal(got, fresh) {
+		t.Fatalf("예행이 순번을 바꿔 놓았다: %v → %v", fresh, got)
+	}
+	if rep, err := ImportSQLite(ctx, src, dsn, ImportOptions{}, quietLog()); err != nil || rep.Copied == 0 {
+		t.Fatalf("예행 뒤 본 실행: %v (옮긴 행 %d)", err, rep.Copied)
 	}
 	other := filepath.Join(t.TempDir(), "not-there.db")
 	rep, err = ImportSQLite(ctx, src, other, ImportOptions{DryRun: true}, quietLog())
@@ -315,6 +348,19 @@ func TestImportSQLiteRefusesATargetThatIsNotEmpty(t *testing.T) {
 	}
 	if after := targetRows(t, dst); after != before {
 		t.Fatalf("거절했는데 대상 행 수가 %d → %d", before, after)
+	}
+
+	// 행을 다 지웠어도 identity 시퀀스가 번호를 냈으면 빈 원장이 아니다. 순번을 원본의 번호로 되감으면 이미 낸 번호를 다시 낸다.
+	dsn2, dst2 := importTarget(t)
+	pgExec(t, dst2, `SELECT nextval(pg_get_serial_sequence('event', 'id'))`)
+	for _, dry := range []bool{true, false} {
+		_, err := ImportSQLite(ctx, src, dsn2, ImportOptions{DryRun: dry}, quietLog())
+		if err == nil || !strings.Contains(err.Error(), "비어 있지 않다") || !strings.Contains(err.Error(), "event.id 순번") {
+			t.Fatalf("예행 %v: 번호를 낸 순번이 있는 대상에 옮겼다: %v", dry, err)
+		}
+	}
+	if n := targetRows(t, dst2); n != 0 {
+		t.Fatalf("거절했는데 대상에 %d 행", n)
 	}
 
 	bare := storetest.NewBare(t, "")
@@ -351,7 +397,7 @@ func TestImportSQLiteRefusesAnOlderSource(t *testing.T) {
 
 func liteQuery(t *testing.T, path, q string, dest ...any) {
 	t.Helper()
-	db, err := sql.Open("sqlite", "file:"+path)
+	db, err := sql.Open("sqlite", sqliteURI(path, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,6 +447,26 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 			}
 		})
 	}
+	// 대상 값이 값 검사에 걸리면 어긋남과 따로 그 칸 · 사유 · 행을 적는다(대상에서 읽은 값을 버리지 않는다).
+	t.Run("대상 값 검사", func(t *testing.T) {
+		dsn, dst := importTarget(t)
+		if _, err := ImportSQLite(ctx, src, dsn, ImportOptions{}, quietLog()); err != nil {
+			t.Fatalf("이관: %v", err)
+		}
+		pgExec(t, dst, `UPDATE item SET labels = '["\u0000"]' WHERE id = 'i1'`)
+		rep, err := VerifySQLite(ctx, src, dsn, quietLog())
+		if err == nil || !strings.Contains(err.Error(), "대상 값 검사") {
+			t.Fatalf("대상 값 검사에 걸린 칸을 판정에 넣지 않았다: %v", err)
+		}
+		if len(rep.TargetFaults) != 1 {
+			t.Fatalf("대상 값 검사 갈래: %+v", rep.TargetFaults)
+		}
+		g := rep.TargetFaults[0]
+		if g.Table != "item" || g.Column != "labels" || g.Fault != pg.FaultJSONNUL || g.Count != 1 ||
+			len(g.Keys) != 1 || !strings.Contains(g.Keys[0], `id="i1"`) {
+			t.Fatalf("대상 값 검사 갈래: %+v", g)
+		}
+	})
 	t.Run("순번", func(t *testing.T) {
 		dsn, dst := importTarget(t)
 		if _, err := ImportSQLite(ctx, src, dsn, ImportOptions{}, quietLog()); err != nil {
@@ -417,4 +483,194 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 			}
 		}
 	})
+}
+
+// 예행은 본 실행과 같은 트랜잭션을 돈다: 사전 검사가 못 보는 거절(역할 권한 · 대상의 CHECK · 커밋 때 잴 미룬 FK)을 예행도
+// 본 실행과 똑같이 받고, 어느 쪽도 행 · 순번을 남기지 않는다.
+func TestImportSQLiteDryRunMatchesTheRealRun(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		name, seed, errHas string
+		// login 이 있으면 대상에 그 역할의 구성원으로 붙는다. target 은 이관 전에 대상에 거는 문장이다.
+		login, target string
+	}{
+		// 앱 역할은 소유 역할로 바꿔 타지 못한다(시퀀스를 다시 시작하는 것은 주인의 일이다).
+		{"앱 역할", importSeed, "소유 역할", pg.AppRole, ""},
+		// 길이 0 BLOB 은 SQLite 의 CHECK (body <> '') 를 지난다(BLOB 은 어느 글보다 크다). Cell 은 그것을 빈 글로 옮기고
+		// 사전 검사도 받지만, 기준선의 같은 CHECK 는 빈 글을 거절한다.
+		{"대상의 CHECK", importSeed + `INSERT INTO judgment(id, project, session_id, at, kind, title, body) VALUES
+			('j3', NULL, NULL, ` + importAt + `, 'now', NULL, X'');`, "judgment_body_check", "", ""},
+		// 카탈로그가 모르는 미룰 수 있는 FK 는 사전 검사가 못 보고 커밋 때 걸린다. 예행은 커밋하지 않으므로 그 검사를 앞당겨야
+		// 본 실행과 같이 거절한다(session.label '' 은 machine 에 없다).
+		{"커밋 때 잴 FK", importSeed, "t_label_fk", "", `ALTER TABLE session ADD CONSTRAINT t_label_fk
+			FOREIGN KEY (label) REFERENCES machine(id) DEFERRABLE`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			src := importSource(t, c.seed)
+			dsn, dst := importTarget(t)
+			if c.target != "" {
+				pgExec(t, dst, c.target)
+			}
+			to := dsn
+			if c.login != "" {
+				to, _ = loginAs(t, dst, dsn, c.login)
+			}
+			fresh := identityStates(t, dst)
+			for _, dry := range []bool{true, false} {
+				rep, err := ImportSQLite(ctx, src, to, ImportOptions{DryRun: dry}, quietLog())
+				if err == nil || !strings.Contains(err.Error(), c.errHas) || rep.Copied != 0 {
+					t.Fatalf("예행 %v: %q 로 거절하지 않았다: %v (옮긴 행 %d)", dry, c.errHas, err, rep.Copied)
+				}
+			}
+			if n := targetRows(t, dst); n != 0 {
+				t.Fatalf("거절했는데 대상에 %d 행", n)
+			}
+			if got := identityStates(t, dst); !maps.Equal(got, fresh) {
+				t.Fatalf("거절했는데 순번이 바뀌었다: %v → %v", fresh, got)
+			}
+		})
+	}
+}
+
+// 옮긴 값이 대상에서 달라지면(값을 바꾸는 BEFORE INSERT 트리거) 커밋 전 대조가 그 표를 짚고, 이관은 커밋하지 않는다 - 행도
+// 순번도 남지 않는다. 예행도 같은 자리에서 멈춘다.
+func TestImportSQLiteDoesNotCommitAMismatch(t *testing.T) {
+	ctx := context.Background()
+	src := importSource(t, importSeed)
+	dsn, dst := importTarget(t)
+	pgExec(t, dst, `CREATE FUNCTION t_bend_title() RETURNS trigger LANGUAGE plpgsql AS
+		$$ BEGIN NEW.title := NEW.title || '!'; RETURN NEW; END $$`)
+	pgExec(t, dst, `CREATE TRIGGER t_bend_title BEFORE INSERT ON item FOR EACH ROW EXECUTE FUNCTION t_bend_title()`)
+	fresh := identityStates(t, dst)
+	for _, dry := range []bool{true, false} {
+		rep, err := ImportSQLite(ctx, src, dsn, ImportOptions{DryRun: dry}, quietLog())
+		if err == nil || !strings.Contains(err.Error(), "커밋하지 않는다") || rep.Copied != 0 {
+			t.Fatalf("예행 %v: 어긋난 이관이 끝났다: %v (옮긴 행 %d)", dry, err, rep.Copied)
+		}
+		for _, tc := range rep.Tables {
+			if (tc.Table == "item") == tc.OK() {
+				t.Errorf("예행 %v: %s 의 대조가 %v 다", dry, tc.Table, tc.OK())
+			}
+		}
+	}
+	if n := targetRows(t, dst); n != 0 {
+		t.Fatalf("커밋하지 않았는데 대상에 %d 행", n)
+	}
+	if got := identityStates(t, dst); !maps.Equal(got, fresh) {
+		t.Fatalf("커밋하지 않았는데 순번이 바뀌었다: %v → %v", fresh, got)
+	}
+}
+
+// 대조는 이관이 받지 않을 원본(사전 검사에 걸린 원본)을 맞다고 하지 않는다. 정수 칸의 BLOB X'37' 은 대상의 정수 7 과 바이트가
+// 같다 - 그래도 사전 검사에 걸렸다고 거절하고, 행 지문의 저장 타입 표지가 달라 그 표가 어긋난다.
+func TestVerifySQLiteRefusesASourceTheImportWouldRefuse(t *testing.T) {
+	ctx := context.Background()
+	src := importSource(t, importSeed)
+	dsn, _ := importTarget(t)
+	if _, err := ImportSQLite(ctx, src, dsn, ImportOptions{}, quietLog()); err != nil {
+		t.Fatalf("이관: %v", err)
+	}
+	liteExec(t, src, `UPDATE counter SET value = X'37'`)
+	var typ string
+	liteQuery(t, src, `SELECT typeof(value) FROM counter`, &typ)
+	if typ != "blob" {
+		t.Fatalf("시험 전제: counter.value 가 %s 다(blob 이어야 한다)", typ)
+	}
+	rep, err := VerifySQLite(ctx, src, dsn, quietLog())
+	if err == nil || !strings.Contains(err.Error(), "사전 검사") {
+		t.Fatalf("사전 검사에 걸린 원본을 맞다고 했다: %v", err)
+	}
+	if len(rep.Faults) != 1 || rep.Faults[0].Table != "counter" || rep.Faults[0].Fault != pg.FaultStorage {
+		t.Fatalf("걸린 갈래: %+v", rep.Faults)
+	}
+	for _, tc := range rep.Tables {
+		if (tc.Table == "counter") == tc.OK() {
+			t.Errorf("%s 의 대조가 %v 다 - 바이트가 같은 다른 저장 타입을 갈라야 한다", tc.Table, tc.OK())
+		}
+	}
+}
+
+// 원본 옆 -wal 에 커밋이 남아 있으면(원본에 쓰는 연결이 아직 있다) 예행 · 이관 · 대조가 다 거절하고 처방(VACUUM INTO)을 낸다.
+// 그 처방으로 뜬 사본은 -wal 에만 있던 커밋까지 옮긴다 - `cp` 로 뜬 사본이 말없이 잃는 그것이다.
+func TestImportSQLiteRefusesAPendingWAL(t *testing.T) {
+	ctx := context.Background()
+	src := importSource(t, importSeed)
+	w, err := sql.Open("sqlite", sqliteURI(src, url.Values{"_pragma": {"journal_mode(WAL)"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	if _, err := w.Exec(`INSERT INTO machine(id, hostname, first_seen, last_seen) VALUES ('m-wal', 'h', 'x', 'x')`); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(src + "-wal"); err != nil || fi.Size() == 0 {
+		t.Fatalf("시험 전제: -wal 이 비었다(%v)", err)
+	}
+	dsn, dst := importTarget(t)
+	for name, run := range map[string]func() error{
+		"예행": func() error {
+			_, err := ImportSQLite(ctx, src, dsn, ImportOptions{DryRun: true}, quietLog())
+			return err
+		},
+		"이관": func() error { _, err := ImportSQLite(ctx, src, dsn, ImportOptions{}, quietLog()); return err },
+		"대조": func() error { _, err := VerifySQLite(ctx, src, dsn, quietLog()); return err },
+	} {
+		if err := run(); err == nil || !strings.Contains(err.Error(), "-wal") || !strings.Contains(err.Error(), "VACUUM INTO") {
+			t.Fatalf("%s: 비지 않은 -wal 옆의 원본을 받았거나 처방이 없다: %v", name, err)
+		}
+	}
+	if n := targetRows(t, dst); n != 0 {
+		t.Fatalf("거절했는데 대상에 %d 행", n)
+	}
+	copied := filepath.Join(t.TempDir(), "copy.db")
+	if _, err := w.Exec(`VACUUM INTO '` + copied + `'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ImportSQLite(ctx, copied, dsn, ImportOptions{}, quietLog()); err != nil {
+		t.Fatalf("VACUUM INTO 사본의 이관: %v", err)
+	}
+	if n := pgCount(t, dst, `SELECT count(*) FROM machine WHERE id = 'm-wal'`); n != 1 {
+		t.Fatalf("-wal 에만 있던 행이 %d 개 옮겨졌다", n)
+	}
+}
+
+// 원본 경로는 글자 그대로다: `fd%20copy#1.db` 는 `fd copy#1.db` 도 `fd copy` 도 아니다(SQLite URI 는 경로의 %XX 를 풀고 #
+// 에서 끊는다). 없는 원본은 거절하고 만들지 않는다. 원본은 읽기 전용으로 연다.
+func TestImportSQLiteOpensTheNamedFileOnly(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	name := "fd%20copy#1.db"
+	src := filepath.Join(dir, name)
+	mustMigrate(t, src)
+	liteExec(t, src, importSeed)
+	dsn, dst := importTarget(t)
+	if _, err := ImportSQLite(ctx, src, dsn, ImportOptions{}, quietLog()); err != nil {
+		t.Fatalf("이관: %v", err)
+	}
+	if n := targetRows(t, dst); n == 0 {
+		t.Fatal("원본 행이 하나도 안 옮겨졌다 - 다른 파일을 읽었다")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), name) {
+			t.Errorf("원본 디렉토리에 다른 이름의 파일 %q 가 생겼다", e.Name())
+		}
+	}
+	missing := filepath.Join(dir, "none.db")
+	if _, err := VerifySQLite(ctx, missing, dsn, quietLog()); err == nil || !strings.Contains(err.Error(), "없다") {
+		t.Fatalf("없는 원본을 받았다: %v", err)
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("없는 원본을 만들었다: %v", err)
+	}
+	q, err := url.ParseQuery(importSourceDSN(src)[strings.IndexByte(importSourceDSN(src), '?')+1:])
+	if err != nil || q.Get("mode") != "ro" {
+		t.Fatalf("이관 원본이 읽기 전용이 아니다: %q", importSourceDSN(src))
+	}
+	if got, want := sqliteURI("/a/b%c?d#e.db", nil), "file:/a/b%25c%3fd%23e.db?"; got != want {
+		t.Fatalf("sqliteURI = %q, 기대 %q", got, want)
+	}
 }

@@ -16,19 +16,25 @@ import (
 // MaxListed 는 대조 · 사전 검사가 갈래마다 늘어놓는 행 좌표의 상한이다. 나머지는 수로만 낸다.
 const MaxListed = 20
 
-// RowHash 는 행 하나의 전 칸 지문이다. 칸을 선언 순서로 잇고, 칸마다 NULL 은 0x00 한 바이트, 값은 0x01 · 길이(8바이트
-// 빅엔디언) · 바이트다. 정수는 10진 글, 글과 bytea 는 원문 바이트다 - 시각 · JSON 도 원문 그대로라 바뀐 자리 하나가 지문을
-// 바꾼다. 길이를 앞에 두므로 칸 경계가 밀린 두 행(「ab」+「c」와 「a」+「bc」)이 같은 지문을 갖지 않고, NULL 과 빈 글이 갈린다.
+// RowHash 는 행 하나의 전 칸 지문이다. 칸을 선언 순서로 잇고, 칸마다 저장 타입 표지 한 바이트(NULL · 정수 · 실수 · 글 ·
+// BLOB) 뒤에, NULL 이 아니면 길이(8바이트 빅엔디언) · 바이트를 둔다. 정수는 10진 글, 실수는 가장 짧은 10진 표기, 글과
+// bytea 는 원문 바이트다 - 시각 · JSON 도 원문 그대로라 바뀐 자리 하나가 지문을 바꾼다. 길이를 앞에 두므로 칸 경계가 밀린
+// 두 행(「ab」+「c」와 「a」+「bc」)이 같은 지문을 갖지 않고, 표지가 있으므로 NULL 과 빈 글이, 바이트가 같은 다른 타입(정수
+// 7 · 글 '7' · BLOB X'37')이 갈린다.
+//
+// ★ 두 원장이 같은 규칙으로 잰다. 표지는 Cell 을 지난 값의 타입이다. Cell 은 사전 검사를 지나는 값을 칸 타입으로 옮기고
+// (바이트가 그대로인 두 갈래 - 글 칸의 BLOB · bytea 칸의 TEXT - 뿐이다), 저장 타입이 칸과 달라 걸린 값은 원래 저장 타입을
+// 그대로 둔다. Postgres 는 칸 타입으로 읽는다. 그래서 사전 검사를 지난 원본 행은 대상과 표지가 같고, 저장 타입이 칸과 다른
+// 원본 행은 표지가 달라 어긋난다(import_test.go 의 TestCellKeepsTheColumnType 이 그 짝을 잠근다).
 func RowHash(vals []any) [32]byte {
 	h := sha256.New()
 	var n [8]byte
 	for _, v := range vals {
-		b, null := cellBytes(v)
-		if null {
-			h.Write([]byte{0})
+		tag, b := cellBytes(v)
+		h.Write([]byte{tag})
+		if tag == tagNull {
 			continue
 		}
-		h.Write([]byte{1})
 		binary.BigEndian.PutUint64(n[:], uint64(len(b)))
 		h.Write(n[:])
 		h.Write(b)
@@ -38,19 +44,31 @@ func RowHash(vals []any) [32]byte {
 	return out
 }
 
-func cellBytes(v any) (b []byte, null bool) {
+// 행 지문의 저장 타입 표지. SQLite 의 저장 갈래(storage class) 다섯과, Cell 을 지나지 않은 값 하나다.
+const (
+	tagNull byte = iota
+	tagInt
+	tagReal
+	tagText
+	tagBlob
+	tagOther
+)
+
+func cellBytes(v any) (tag byte, b []byte) {
 	switch x := v.(type) {
 	case nil:
-		return nil, true
+		return tagNull, nil
 	case int64:
-		return strconv.AppendInt(nil, x, 10), false
+		return tagInt, strconv.AppendInt(nil, x, 10)
+	case float64:
+		return tagReal, strconv.AppendFloat(nil, x, 'g', -1, 64)
 	case string:
-		return []byte(x), false
+		return tagText, []byte(x)
 	case []byte:
-		return x, false
+		return tagBlob, x
 	}
 	// Cell 을 지나지 않은 값이다. 타입 이름을 지문에 넣어 어느 쪽과도 우연히 같지 않게 한다.
-	return fmt.Appendf(nil, "%T:%v", v, v), false
+	return tagOther, fmt.Appendf(nil, "%T:%v", v, v)
 }
 
 // RowMark 는 대조가 행 하나에서 들고 있는 것이다: 지문과, 어긋났을 때 사람에게 보일 행 좌표.
@@ -158,15 +176,10 @@ func digest(marks []RowMark) [32]byte {
 	return out
 }
 
-// Sequence 는 identity 칸의 다음 번호를 맞출 setval 의 값이다. floor 는 원본에서 이미 발급된 가장 큰 번호다 -
-// AUTOINCREMENT 표는 greatest(max(칸), sqlite_sequence.seq)(지워진 최고 번호도 다시 내지 않는다), 아닌 표는 max(rowid).
-// 발급된 번호가 있으면 setval(floor, true)로 다음이 floor+1 이고, 없으면 setval(1, false)로 다음이 1 이다(새 시퀀스와 같다).
-func Sequence(floor int64) (value int64, called bool) {
-	if floor > 0 {
-		return floor, true
-	}
-	return 1, false
-}
+// Sequence 는 identity 칸의 시퀀스를 다시 시작할 번호(`ALTER SEQUENCE … RESTART WITH`)다 - 다음 nextval 이 이 번호를 낸다.
+// floor 는 원본에서 이미 발급된 가장 큰 번호다. AUTOINCREMENT 표는 greatest(max(칸), sqlite_sequence.seq)(지워진 최고 번호도
+// 다시 내지 않는다), 아닌 표는 max(rowid). 발급된 번호가 없으면 floor 가 0 이라 1 부터 낸다(새 시퀀스와 같다).
+func Sequence(floor int64) int64 { return floor + 1 }
 
 // SequenceCheck 는 identity 하나의 순번 대조다.
 type SequenceCheck struct {

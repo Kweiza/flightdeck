@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,22 +22,28 @@ import (
 //
 // 이관 한 번의 길:
 //
-//	원본 열기(판 18 인가) → 대상 열기 → 실행기 세션(잠금 둘) → 대상 확인(판 18 · 업무 표 전부 0행 · 로케일)
-//	→ 원본 스냅숏 하나에서: 1차 훑기(사전 검사 · 행 표지 · 행 수 · 발급 번호) → 걸린 것이 있으면 아무것도 안 쓰고 끝
-//	→ 대상 트랜잭션 하나에서: 소유 역할 · FK 미루기 → 표마다 묶음 INSERT(2차 훑기) → setval → 전 칸 대조 → 커밋
+//	원본 열기(-wal 이 비었나 · 읽기 전용 · 판 18 인가) → 대상 열기
+//	→ 원본 스냅숏 하나에서: 1차 훑기(사전 검사 · 행 표지 · 행 수 · 발급 번호)
+//	→ 실행기 세션(잠금 둘) → 대상 트랜잭션 하나에서: 판 · 소유 역할 · FK 미루기 · 빈 원장(행 · 시퀀스) · 로케일
+//	  (사전 검사와 함께 낸다 - 걸린 것이 있으면 아무것도 안 쓰고 끝) → 표마다 묶음 INSERT(2차 훑기) → 순번 다시 시작
+//	  → 미룬 FK 검사 → 전 칸 대조 → 커밋(예행은 되감기)
 //
 // ★ 대조가 트랜잭션 **안**에 있다. 어긋나면 커밋하지 않는다 - 옮긴 원장이 원본과 다른 채로 남는 길이 없다. 커밋 뒤의
-// 대조는 `fd migrate verify` 가 같은 함수(checkTarget)로 다시 한다.
+// 대조는 `fd migrate verify` 가 같은 함수(checkTarget · verdict)로 다시 한다.
 //
-// ★ 두 훑기가 원본의 한 스냅숏(ReadTx)을 본다. 1차가 잰 행과 2차가 옮긴 행이 같다(서버를 내린 사본이 전제지만, 붙은
+// ★ 예행(--dry-run)은 본 실행과 같은 길을 끝까지 돌고 커밋 대신 되감는다. 그래서 역할 권한 · 대상의 CHECK · 인덱스 항목
+// 상한 · FK 처럼 사전 검사가 못 보는 거절도 예행이 본 실행과 똑같이 받는다.
+//
+// ★ 두 훑기가 원본의 한 스냅숏(ReadTx)을 본다. 1차가 잰 행과 2차가 옮긴 행이 같다(서버를 내린 원본이 전제지만, 붙은
 // 연결이 있어도 같은 시점이다).
 //
-// ★ setval 은 트랜잭션이 아니다(되감겨도 남는다). 대상이 빈 원장이라 남는 번호는 해가 없고, 다시 돌리면 다시 맞춘다.
+// ★ 순번은 `ALTER SEQUENCE … RESTART WITH` 로 맞춘다. setval 과 달리 트랜잭션에 묶여, 되감기면(예행 · 실패한 이관) 순번도
+// 함께 되감긴다 - 실패한 뒤 다시 돌린 이관이 「번호를 낸 시퀀스」에 막히지 않는다.
 
 // ImportOptions 는 이관 한 번의 선택이다.
 type ImportOptions struct {
-	// DryRun 은 아무것도 쓰지 않는다: 원본의 판 · 모양 · 사전 검사와, 대상이 Postgres 면 그 판 · 빈 원장 · 로케일을 잰다.
-	// 잠그지 않는다.
+	// DryRun 은 본 실행과 같은 트랜잭션(역할 전환 · 빈 대상 검사 · INSERT · 대조)을 돈 뒤 커밋하지 않고 되감는다. 실행기
+	// 잠금도 본 실행처럼 쥔다. 대상이 Postgres 접속 URL 이 아니면 원본만 잰다.
 	DryRun bool
 }
 
@@ -61,16 +69,19 @@ type ImportReport struct {
 	DryRun   bool
 	// TargetChecked 는 대상 원장을 쟀는가다. 예행의 대상이 Postgres 접속 URL 이 아니면 거짓이다.
 	TargetChecked bool
-	Faults        []FaultGroup
+	// Faults 는 원본의 사전 검사에 걸린 것이다.
+	Faults []FaultGroup
+	// TargetFaults 는 대상에서 읽은 값이 같은 검사(pg.Cell)에 걸린 것이다. 대조가 대상 값을 읽을 때 잰다.
+	TargetFaults []FaultGroup
 	// Rows 는 원본 표마다 행 수다(pg.Tables 순서).
 	Rows      []TableRows
 	Tables    []pg.TableCheck
 	Sequences []pg.SequenceCheck
-	// Copied 는 대상에 넣은 행 수다(이관이 커밋했을 때만 0 이 아니다).
+	// Copied 는 대상에 넣은 행 수다. 이관이 커밋한 뒤에만 채운다(예행 · 실패면 0 이다).
 	Copied int
 }
 
-// Matched 는 대조가 돌았고 표 전부 · 순번 전부가 맞았는가다.
+// Matched 는 대조가 돌았고 표 전부 · 순번 전부가 맞았는가다. 값 검사에 걸린 것까지 보는 판정은 verdict 다.
 func (r ImportReport) Matched() bool {
 	if len(r.Tables) == 0 {
 		return false
@@ -88,7 +99,29 @@ func (r ImportReport) Matched() bool {
 	return true
 }
 
-// ImportSQLite 는 SQLite 원장 from 을 빈 Postgres 원장 to 로 옮긴다(opt.DryRun 이면 재기만 한다).
+// verdict 는 보고가 「두 원장이 같다」를 말하는가다(nil 이면 같다). 원본의 사전 검사, 대상 값의 검사, 대조 셋 중 걸린 것을
+// 함께 낸다. 이관의 커밋 전 대조와 `fd migrate verify` 가 이 하나로 판정한다.
+//
+// ★ 사전 검사에 걸린 원본은 대조가 맞아도 같지 않다. 걸린 값은 이관이 받지 않는 값이다 - 대상과 바이트가 같아 보여도
+// 그 행은 이관으로 생긴 것일 수 없다.
+func (r ImportReport) verdict() error {
+	var why []string
+	if n := faultCount(r.Faults); n > 0 {
+		why = append(why, fmt.Sprintf("원본 사전 검사에 %d 건(%d 갈래)이 걸렸다", n, len(r.Faults)))
+	}
+	if n := faultCount(r.TargetFaults); n > 0 {
+		why = append(why, fmt.Sprintf("대상 값 검사에 %d 건(%d 갈래)이 걸렸다", n, len(r.TargetFaults)))
+	}
+	if !r.Matched() {
+		why = append(why, "대조가 어긋났다")
+	}
+	if len(why) == 0 {
+		return nil
+	}
+	return errors.New("두 원장이 맞지 않는다: " + strings.Join(why, " · ") + "(위 표를 보라)")
+}
+
+// ImportSQLite 는 SQLite 원장 from 을 빈 Postgres 원장 to 로 옮긴다(opt.DryRun 이면 같은 길을 돌고 되감는다).
 func ImportSQLite(ctx context.Context, from, to string, opt ImportOptions, log *slog.Logger) (ImportReport, error) {
 	if log == nil {
 		log = slog.Default()
@@ -100,8 +133,15 @@ func ImportSQLite(ctx context.Context, from, to string, opt ImportOptions, log *
 		return rep, err
 	}
 	defer src.Close()
-	if opt.DryRun {
-		return rep, dryRunImport(ctx, src, tt, log, &rep)
+	if opt.DryRun && !tt.Postgres() {
+		return rep, src.ReadTx(ctx, func(q Reader) error {
+			sc, err := scanSource(ctx, q)
+			if err != nil {
+				return err
+			}
+			sc.report(&rep)
+			return sc.refusal()
+		})
 	}
 	tgt, err := openImportTarget(tt, log)
 	if err != nil {
@@ -110,46 +150,28 @@ func ImportSQLite(ctx context.Context, from, to string, opt ImportOptions, log *
 	defer tgt.Close()
 	rep.TargetChecked = true
 	start := time.Now()
-	if err := tgt.importInto(ctx, src, &rep); err != nil {
+	if err := tgt.importInto(ctx, src, opt.DryRun, &rep); err != nil {
 		return rep, err
 	}
-	log.Info("SQLite 이관 완료", "from", rep.From, "to", rep.To, "rows", rep.Copied,
-		"duration", time.Since(start).Seconds())
+	if !opt.DryRun {
+		log.Info("SQLite 이관 완료", "from", rep.From, "to", rep.To, "rows", rep.Copied,
+			"duration", time.Since(start).Seconds())
+	}
 	return rep, nil
 }
 
-// dryRunImport 는 쓰지 않는 이관이다. 원본의 사전 검사와 대상의 확인을 둘 다 잰 뒤 걸린 것을 함께 낸다.
-func dryRunImport(ctx context.Context, src *Store, tt Target, log *slog.Logger, rep *ImportReport) error {
-	srcErr := src.ReadTx(ctx, func(q Reader) error {
-		sc, err := scanSource(ctx, q)
-		if err != nil {
-			return err
-		}
-		sc.report(rep)
-		return sc.refusal()
-	})
-	if !tt.Postgres() {
-		return srcErr
-	}
-	tgt, err := openImportTarget(tt, log)
-	if err != nil {
-		return errors.Join(srcErr, err)
-	}
-	defer tgt.Close()
-	rep.TargetChecked = true
-	return errors.Join(srcErr, targetReady(ctx, tgt.db))
-}
+// errDryRun 은 예행의 body 가 커밋 대신 되감으려고 내는 표지다. importInto 밖으로 나가지 않는다.
+var errDryRun = errors.New("예행 - 커밋하지 않고 되감는다")
 
-// importInto 는 이 원장(대상)에 src 를 옮긴다. 실행기 세션이 판 확인부터 커밋까지 잠금 둘을 쥔다 - 다른 실행기와 업무
-// 쓰기가 그 사이에 이 원장을 바꾸지 못하므로 확인한 「빈 원장」이 커밋 때도 그대로다.
-func (s *Store) importInto(ctx context.Context, src *Store, rep *ImportReport) error {
-	sess, err := s.openMigrateSession(ctx)
-	if err != nil {
-		return err
-	}
-	defer sess.release()
-	if err := targetReady(ctx, sess); err != nil {
-		return err
+// importInto 는 이 원장(대상)에 src 를 옮긴다(dryRun 이면 끝에 되감는다). 실행기 세션이 대상 확인부터 커밋까지 잠금 둘을
+// 쥔다 - 다른 실행기와 업무 쓰기가 그 사이에 이 원장을 바꾸지 못하므로 확인한 「빈 원장」이 커밋 때도 그대로다.
+//
+// ★ 세션은 원본을 다 훑은 뒤에 연다. 전역 업무 잠금은 대상 트랜잭션 동안만 쥔다 - 잘못 고른 대상(서버가 쓰는 원장)이면
+// 「비어 있지 않다」로 곧장 놓는다. 원본을 훑는 동안 그 서버의 쓰기를 세워 두지 않는다.
+func (s *Store) importInto(ctx context.Context, src *Store, dryRun bool, rep *ImportReport) error {
+	what := "SQLite 이관"
+	if dryRun {
+		what += " 예행"
 	}
 	return src.ReadTx(ctx, func(q Reader) error {
 		sc, err := scanSource(ctx, q)
@@ -157,37 +179,54 @@ func (s *Store) importInto(ctx context.Context, src *Store, rep *ImportReport) e
 			return err
 		}
 		sc.report(rep)
-		if err := sc.refusal(); err != nil {
-			return err
+		sess, err := s.openMigrateSession(ctx)
+		if err != nil {
+			return errors.Join(err, sc.refusal())
 		}
-		return s.sessionTx(ctx, sess, "SQLite 이관", func(ctx context.Context, tx *txConn) error {
-			eng := tx.dialect()
-			for _, stmt := range []string{eng.stepRole(), eng.deferForeignKeys()} {
-				if _, err := tx.ExecContext(ctx, stmt); err != nil {
-					return fmt.Errorf("이관 트랜잭션 준비(%s) 실패: %w", stmt, err)
-				}
+		defer sess.release()
+		var copied int
+		err = s.sessionTx(ctx, sess, what, func(ctx context.Context, tx *txConn) error {
+			// 대상의 거절과 원본의 사전 검사를 함께 낸다 - 한 번 돌려 고칠 것을 다 본다.
+			if err := errors.Join(prepareTarget(ctx, tx), sc.refusal()); err != nil {
+				return err
 			}
 			n, err := copyTables(ctx, q, tx)
 			if err != nil {
 				return err
 			}
-			if err := setSequences(ctx, tx, sc.floors); err != nil {
+			if err := restartSequences(ctx, tx, sc.floors); err != nil {
 				return err
 			}
-			if rep.Tables, rep.Sequences, err = checkTarget(ctx, tx, sc); err != nil {
+			// 미뤄 둔 FK 를 지금 잰다(커밋 때 잴 것을 앞당긴다). 예행은 커밋하지 않으므로 이것이 없으면 본 실행이 커밋에서
+			// 받을 거절을 못 본다. Postgres 문장이다 - 대상은 늘 Postgres 다(openImportTarget).
+			if _, err := tx.ExecContext(ctx, `SET CONSTRAINTS ALL IMMEDIATE`); err != nil {
+				return fmt.Errorf("미뤄 둔 FK 검사에 걸렸다: %w", err)
+			}
+			if err := checkTarget(ctx, tx, sc, rep); err != nil {
 				return err
 			}
-			if !rep.Matched() {
-				return errors.New("옮긴 원장이 원본과 맞지 않는다 - 커밋하지 않는다(대조표를 보라)")
+			if err := rep.verdict(); err != nil {
+				return fmt.Errorf("%w - 커밋하지 않는다", err)
 			}
-			rep.Copied = n
+			if dryRun {
+				return errDryRun
+			}
+			copied = n
 			return nil
 		})
+		switch {
+		case dryRun && errors.Is(err, errDryRun):
+			return nil
+		case err != nil:
+			return err
+		}
+		rep.Copied = copied // 커밋이 성공했다
+		return nil
 	})
 }
 
 // VerifySQLite 는 SQLite 원장 from 과 Postgres 원장 to 를 맞댄다(표마다 행 수 · 전 칸 행 지문, identity 순번). 쓰지 않는다.
-// 어긋나면 보고와 함께 오류를 낸다.
+// 원본이 사전 검사에 걸리거나, 대상 값이 검사에 걸리거나, 대조가 어긋나면 보고와 함께 오류를 낸다(verdict).
 func VerifySQLite(ctx context.Context, from, to string, log *slog.Logger) (ImportReport, error) {
 	if log == nil {
 		log = slog.Default()
@@ -213,26 +252,20 @@ func VerifySQLite(ctx context.Context, from, to string, log *slog.Logger) (Impor
 			return err
 		}
 		sc.report(&rep)
-		return tgt.ReadTx(ctx, func(r Reader) error {
-			rep.Tables, rep.Sequences, err = checkTarget(ctx, r, sc)
-			return err
-		})
+		return tgt.ReadTx(ctx, func(r Reader) error { return checkTarget(ctx, r, sc, &rep) })
 	})
 	if err != nil {
 		return rep, err
 	}
-	if !rep.Matched() {
-		return rep, errors.New("두 원장이 맞지 않는다(대조표를 보라)")
-	}
-	return rep, nil
+	return rep, rep.verdict()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 두 원장 열기
 // ─────────────────────────────────────────────────────────────────────────────
 
-// openImportSource 는 이관 원본을 읽으려고 연다. 판이 이관 판(pg.ImportVersion)이어야 한다. 파일을 바꾸지 않는다
-// (openSQLiteReader).
+// openImportSource 는 이관 · 대조의 원본을 읽기 전용으로 연다(importSourceDSN). 옆의 -wal 이 비어 있어야 하고
+// (sourceWALRefusal), 판이 이관 판(pg.ImportVersion)이어야 한다. 파일을 바꾸지 않는다.
 //
 // ★ 더 낮은 판은 이 명령이 올리지 않는다. SQLite 증분은 판 18 에서 멈췄고, SQLite 실행 경로가 빠진 뒤의 fd 는 그 증분을
 // 갖지 않는다 - 그 판을 아는 fd 로 사본을 먼저 올리라고 안내한다.
@@ -240,7 +273,10 @@ func openImportSource(ctx context.Context, path string, log *slog.Logger) (*Stor
 	if err := sqliteOnly(path, "이관 원본(--from)"); err != nil {
 		return nil, err
 	}
-	s, err := openSQLiteReader(ctx, path, log)
+	if err := sourceWALRefusal(path); err != nil {
+		return nil, err
+	}
+	s, err := openSQLiteReader(ctx, path, importSourceDSN(path), log)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +306,29 @@ func sourceRefusal(plan MigrationPlan, v int) error {
 	return fmt.Errorf("원본을 이관하지 않는다: %s", plan.Reason)
 }
 
-// openImportTarget 은 이관 · 대조의 대상(Postgres 원장)을 판 재기 없이 연다. 판은 부르는 쪽이 잰다(targetReady ·
+// sourceWALRefusal 은 원본 path 옆의 -wal 에 바이트가 있으면 거절한다. 없거나 비었으면 nil 이다.
+//
+// ★ WAL 원장은 커밋을 먼저 -wal 에 쓰고 체크포인트 때 본 파일로 옮긴다. 비지 않은 -wal 은 원본에 쓰는 서버가 아직 돌거나
+// (옮긴 뒤에도 쓰기가 이어져 이관이 그것을 잃는다) 비정상 종료로 체크포인트가 안 된 것이다. 어느 쪽이든 여기서 멈춘다.
+// 거꾸로 `cp fd.db` 로 뜬 사본은 -wal 을 안 데려가 그 커밋을 잃는데, 이관과 대조가 둘 다 그 사본을 읽으므로 둘 다 맞다고
+// 한다 - 이 검사도 그것은 못 본다. 그래서 처방이 VACUUM INTO 다(README 「SQLite 원장을 Postgres 로 옮기기」).
+func sourceWALRefusal(path string) error {
+	wal := path + "-wal"
+	fi, err := os.Stat(wal)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case err != nil:
+		return fmt.Errorf("원본의 -wal 을 재지 못했다(path=%q): %w", clip(wal, 200), err)
+	case fi.Size() == 0:
+		return nil
+	}
+	return fmt.Errorf("원본 옆 -wal 에 %d 바이트가 있다(path=%q) - 원본에 쓰는 서버가 아직 돌거나, 비정상 종료로 본 파일에 "+
+		"안 옮긴 커밋이다. 서버를 내린 뒤 다시 돌리고, 그래도 남으면 `sqlite3 <원본> \"VACUUM INTO '<사본>'\"` 으로 뜬 사본을 "+
+		"--from 에 준다(cp 로 뜬 사본은 -wal 의 커밋을 잃는다)", fi.Size(), clip(wal, 200))
+}
+
+// openImportTarget 은 이관 · 대조의 대상(Postgres 원장)을 판 재기 없이 연다. 판은 부르는 쪽이 잰다(prepareTarget ·
 // targetVersion) - 이관은 기동과 다른 조건(빈 원장)을 본다.
 func openImportTarget(t Target, log *slog.Logger) (*Store, error) {
 	if !t.Postgres() {
@@ -297,14 +355,34 @@ func targetVersion(ctx context.Context, q dbtx) error {
 	return fmt.Errorf("대상이 이관 판(%d)이 아니다: %s", pg.ImportVersion, plan.Reason)
 }
 
-// targetReady 는 대상 원장이 이관을 받을 수 있는가다: 이관 판이고, 로케일 관문을 지나고, 업무 표가 전부 비었다.
+// prepareTarget 은 이관 트랜잭션 tx 를 대상에 맞춘다: 판을 재고, 소유 역할로 바꿔 타고, FK 검사를 미루고, 대상이 이관을
+// 받을 수 있는지 잰다(targetReady). 본 실행과 예행이 이 하나를 지난다.
+//
+// ★ 판은 역할을 바꾸기 전에 잰다. 기준선을 안 깐 DB 에는 소유 역할이 없을 수 있고, 그때의 처방은 「기준선을 깔아라」다.
+// ★ 소유 역할이어야 하는 까닭: identity 시퀀스를 다시 시작하는 것(ALTER SEQUENCE)은 시퀀스의 주인만 하고, 순번을 읽는
+// 권한(SELECT)도 앱 역할에는 없다. 앱 역할로 붙으면 여기서 거절한다 - 예행도 같다.
+func prepareTarget(ctx context.Context, tx *txConn) error {
+	if err := targetVersion(ctx, tx); err != nil {
+		return err
+	}
+	eng := tx.dialect()
+	if _, err := tx.ExecContext(ctx, eng.stepRole()); err != nil {
+		return fmt.Errorf("소유 역할(%s)로 바꿔 타지 못했다 - 접속 계정이 초사용자나 그 역할의 멤버여야 한다: %w", pg.OwnerRole, err)
+	}
+	if _, err := tx.ExecContext(ctx, eng.deferForeignKeys()); err != nil {
+		return fmt.Errorf("FK 검사 미루기 실패: %w", err)
+	}
+	return targetReady(ctx, tx)
+}
+
+// targetReady 는 대상 원장이 이관을 받을 수 있는가다: 로케일 관문을 지나고, 업무 표가 전부 비었고, identity 시퀀스가
+// 번호를 낸 적이 없다. q 는 소유 역할로 바꿔 탄 이관 트랜잭션이다(시퀀스를 읽는 권한).
 //
 // ★ 빈 원장에만 쓴다. 행이 있는 원장에 얹으면 무엇이 원본의 것인지 가를 수 없고, 추가 전용 표(judgment · event ·
 // item_revision)는 잘못 얹은 행을 지울 수도 없다.
+// ★ 행을 다 지운 원장도 시퀀스가 번호를 냈으면 빈 원장이 아니다. 이미 낸 번호는 원장 밖(받아 간 쪽)에 남아 있을 수
+// 있는데, 이관이 순번을 원본의 번호로 되감으면 그 번호를 다시 낸다.
 func targetReady(ctx context.Context, q dbtx) error {
-	if err := targetVersion(ctx, q); err != nil {
-		return err
-	}
 	if err := localeGate(ctx, q); err != nil {
 		return err
 	}
@@ -317,9 +395,20 @@ func targetReady(ctx context.Context, q dbtx) error {
 		if has {
 			busy = append(busy, t.Name)
 		}
+		c, ok := t.Identity()
+		if !ok {
+			continue
+		}
+		seq, err := readIdentity(ctx, q, t.Name, c.Name)
+		if err != nil {
+			return err
+		}
+		if seq.called {
+			busy = append(busy, fmt.Sprintf("%s.%s 순번(%d 까지 냈다)", t.Name, c.Name, seq.last))
+		}
 	}
 	if len(busy) > 0 {
-		return fmt.Errorf("대상이 비어 있지 않다(행이 있는 표: %s) - 이관은 빈 원장에만 쓴다", strings.Join(busy, ", "))
+		return fmt.Errorf("대상이 비어 있지 않다(행이 있는 표 · 번호를 낸 순번: %s) - 이관은 빈 원장에만 쓴다", strings.Join(busy, ", "))
 	}
 	return nil
 }
@@ -330,12 +419,18 @@ func targetReady(ctx context.Context, q dbtx) error {
 
 // sourceScan 은 원본 1차 훑기의 결과다.
 type sourceScan struct {
-	faults []FaultGroup
-	at     map[faultAt]int // faults 안의 자리
+	faults faultTally
 	rows   []TableRows
 	marks  map[string][]pg.RowMark
 	// floors 는 identity 가 있는 표마다 원본에서 발급된 가장 큰 번호다(pg.Sequence 의 floor).
 	floors map[string]int64
+}
+
+// faultTally 는 값 검사(pg.Cell 의 Fault)에 걸린 칸을 갈래(표 · 칸 · 사유)마다 센다. 원본의 사전 검사와 대조가 읽은 대상
+// 값이 같은 셈을 쓴다.
+type faultTally struct {
+	groups []FaultGroup
+	at     map[faultAt]int // groups 안의 자리
 }
 
 type faultAt struct {
@@ -343,36 +438,53 @@ type faultAt struct {
 	fault         pg.Fault
 }
 
-func (sc *sourceScan) fault(table, column string, f pg.Fault, key string) {
+func (ft *faultTally) add(table, column string, f pg.Fault, key string) {
 	at := faultAt{table, column, f}
-	i, ok := sc.at[at]
+	i, ok := ft.at[at]
 	if !ok {
-		i = len(sc.faults)
-		sc.at[at] = i
-		sc.faults = append(sc.faults, FaultGroup{Table: table, Column: column, Fault: f})
+		if ft.at == nil {
+			ft.at = map[faultAt]int{}
+		}
+		i = len(ft.groups)
+		ft.at[at] = i
+		ft.groups = append(ft.groups, FaultGroup{Table: table, Column: column, Fault: f})
 	}
-	g := &sc.faults[i]
+	g := &ft.groups[i]
 	g.Count++
 	if len(g.Keys) < pg.MaxListed {
 		g.Keys = append(g.Keys, key)
 	}
 }
 
+// cells 는 표 t 의 행 하나에서 걸린 칸(faults - 칸 선언 순서)을 센다. key 는 그 행의 좌표다.
+func (ft *faultTally) cells(t pg.Table, faults []pg.Fault, key string) {
+	for i, f := range faults {
+		if f != "" {
+			ft.add(t.Name, t.Cols[i].Name, f, key)
+		}
+	}
+}
+
+func faultCount(groups []FaultGroup) int {
+	n := 0
+	for _, g := range groups {
+		n += g.Count
+	}
+	return n
+}
+
 func (sc *sourceScan) report(rep *ImportReport) {
-	rep.Faults, rep.Rows = sc.faults, sc.rows
+	rep.Faults, rep.Rows = sc.faults.groups, sc.rows
 }
 
 // refusal 은 사전 검사에 걸린 것이 있으면 그 수를 담은 오류다.
 func (sc *sourceScan) refusal() error {
-	n := 0
-	for _, g := range sc.faults {
-		n += g.Count
-	}
+	n := faultCount(sc.faults.groups)
 	if n == 0 {
 		return nil
 	}
 	return fmt.Errorf("사전 검사에 %d 건(%d 갈래)이 걸렸다 - 아무것도 쓰지 않는다. 원본 사본에서 걸린 행을 고친 뒤 다시 돌려라",
-		n, len(sc.faults))
+		n, len(sc.faults.groups))
 }
 
 // scanSource 는 원본을 한 번 훑는다: 모양을 재고, 표마다 행을 읽어 칸마다 사전 검사(pg.Cell)를 하고, 행 표지와 발급
@@ -385,7 +497,7 @@ func scanSource(ctx context.Context, q Reader) (*sourceScan, error) {
 	if err != nil {
 		return nil, err
 	}
-	sc := &sourceScan{at: map[faultAt]int{}, marks: map[string][]pg.RowMark{}, floors: map[string]int64{}}
+	sc := &sourceScan{marks: map[string][]pg.RowMark{}, floors: map[string]int64{}}
 	for _, t := range pg.Tables() {
 		if err := sc.table(ctx, q, t, seqs[t.Name]); err != nil {
 			return nil, err
@@ -406,14 +518,10 @@ func (sc *sourceScan) table(ctx context.Context, q Reader, t pg.Table, seq int64
 	var marks []pg.RowMark
 	err := eachCells(ctx, q, t, true, func(vals []any, faults []pg.Fault) error {
 		m := t.Mark(vals)
-		for i, f := range faults {
-			if f != "" {
-				sc.fault(t.Name, t.Cols[i].Name, f, m.Key)
-			}
-		}
+		sc.faults.cells(t, faults, m.Key)
 		if pk, ok := t.DigestPK(vals); ok {
 			if pks[pk] {
-				sc.fault(t.Name, t.DigestKey, pg.FaultDigest, m.Key)
+				sc.faults.add(t.Name, t.DigestKey, pg.FaultDigest, m.Key)
 			}
 			pks[pk] = true
 		}
@@ -519,7 +627,7 @@ func foreignKeyFaults(ctx context.Context, q Reader, sc *sourceScan) error {
 			return fmt.Errorf("원본 %s 의 FK 칸: %w", m.table, err)
 		}
 		key := "rowid=" + strconv.FormatInt(m.rowid.Int64, 10) + " → " + m.parent
-		sc.fault(m.table, strings.Join(cols, ","), pg.FaultForeignKey, key)
+		sc.faults.add(m.table, strings.Join(cols, ","), pg.FaultForeignKey, key)
 	}
 	return nil
 }
@@ -617,64 +725,87 @@ func copyTables(ctx context.Context, q Reader, tx *txConn) (int, error) {
 	return total, nil
 }
 
-// setSequences 는 identity 시퀀스마다 원본의 발급 번호 다음부터 내게 맞춘다(pg.Sequence). 발급된 적 없는 표도 맞춘다 -
-// 대조(checkTarget)가 모든 identity 를 같은 규칙으로 잰다.
-func setSequences(ctx context.Context, tx *txConn, floors map[string]int64) error {
+// restartSequences 는 identity 시퀀스마다 다음 번호를 원본에서 발급된 번호 다음으로 다시 시작한다(pg.Sequence). 발급된 적 없는
+// 표도 맞춘다 - 대조(checkTarget)가 모든 identity 를 같은 규칙으로 잰다.
+//
+// ★ setval 이 아니라 ALTER SEQUENCE 다. setval 은 트랜잭션 밖의 일이라 되감기지 않는다 - 예행이나 대조에 걸려 되감긴 이관이
+// 순번만 바꿔 놓고, 다시 돌린 이관은 그 순번을 「번호를 낸 시퀀스」로 보고 거절한다. ALTER SEQUENCE 는 트랜잭션에 묶인다.
+func restartSequences(ctx context.Context, tx *txConn, floors map[string]int64) error {
 	for _, t := range pg.Tables() {
 		c, ok := t.Identity()
 		if !ok {
 			continue
 		}
-		v, called := pg.Sequence(floors[t.Name])
-		if _, err := tx.ExecContext(ctx, `SELECT setval(pg_get_serial_sequence(?, ?), ?, ?)`, t.Name, c.Name, v, called); err != nil {
+		seq, err := readIdentity(ctx, tx, t.Name, c.Name)
+		if err != nil {
+			return err
+		}
+		// DDL 은 자리표시를 못 받는다. 이름은 카탈로그가 준 것이고(pg_get_serial_sequence 가 필요하면 따옴표를 붙인다)
+		// 번호는 정수다.
+		stmt := "ALTER SEQUENCE " + seq.name + " RESTART WITH " + strconv.FormatInt(pg.Sequence(floors[t.Name]), 10)
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("%s.%s 순번 맞추기 실패: %w", t.Name, c.Name, err)
 		}
 	}
 	return nil
 }
 
-// checkTarget 은 대상 r 을 원본 훑기 sc 와 맞댄다: 표마다 행 지문의 다중집합(pg.Compare), identity 마다 다음 번호.
-// 이관의 커밋 전 대조와 `fd migrate verify` 가 이 하나를 쓴다.
-func checkTarget(ctx context.Context, r Reader, sc *sourceScan) ([]pg.TableCheck, []pg.SequenceCheck, error) {
+// checkTarget 은 대상 r 을 원본 훑기 sc 와 맞대 rep 에 싣는다: 표마다 행 지문의 다중집합(pg.Compare), identity 마다 다음
+// 번호, 그리고 읽은 대상 값이 값 검사(pg.Cell)에 걸린 것(rep.TargetFaults). 판정은 rep.verdict 다. 이관의 커밋 전 대조와
+// `fd migrate verify` 가 이 하나를 쓴다.
+func checkTarget(ctx context.Context, r Reader, sc *sourceScan, rep *ImportReport) error {
 	var tables []pg.TableCheck
 	var seqs []pg.SequenceCheck
+	var faults faultTally
 	for _, t := range pg.Tables() {
 		var marks []pg.RowMark
-		err := eachCells(ctx, r, t, false, func(vals []any, _ []pg.Fault) error {
-			marks = append(marks, t.Mark(vals))
+		err := eachCells(ctx, r, t, false, func(vals []any, fs []pg.Fault) error {
+			m := t.Mark(vals)
+			faults.cells(t, fs, m.Key)
+			marks = append(marks, m)
 			return nil
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("대상 %w", err)
+			return fmt.Errorf("대상 %w", err)
 		}
 		tables = append(tables, pg.Compare(t.Name, sc.marks[t.Name], marks))
 		c, ok := t.Identity()
 		if !ok {
 			continue
 		}
-		next, err := nextIdentity(ctx, r, t.Name, c.Name)
+		seq, err := readIdentity(ctx, r, t.Name, c.Name)
 		if err != nil {
-			return nil, nil, err
+			return err
 		}
-		seqs = append(seqs, pg.SequenceCheck{Table: t.Name, Column: c.Name, Floor: sc.floors[t.Name], Next: next})
+		seqs = append(seqs, pg.SequenceCheck{Table: t.Name, Column: c.Name, Floor: sc.floors[t.Name],
+			Next: pg.NextValue(seq.last, seq.called)})
 	}
-	return tables, seqs, nil
+	rep.Tables, rep.Sequences, rep.TargetFaults = tables, seqs, faults.groups
+	return nil
 }
 
-// nextIdentity 는 대상 identity 시퀀스가 다음에 낼 번호다. 시퀀스 이름은 카탈로그가 준다(pg_get_serial_sequence 는
-// 필요하면 따옴표를 붙여 낸다).
-func nextIdentity(ctx context.Context, r Reader, table, col string) (int64, error) {
+// identitySeq 는 대상 identity 칸 하나의 시퀀스다.
+type identitySeq struct {
+	// name 은 카탈로그가 준 시퀀스 이름이다(pg_get_serial_sequence - 필요하면 따옴표가 붙어 있어 문장에 그대로 넣는다).
+	name string
+	// last · called 는 시퀀스의 last_value · is_called 다. called 가 거짓이면 아직 번호를 낸 적이 없다(다음이 last 다).
+	last   int64
+	called bool
+}
+
+// readIdentity 는 대상 표 table 의 identity 칸 col 의 시퀀스를 읽는다. 시퀀스를 읽는 권한(SELECT)이 있어야 한다 - 소유
+// 역할에는 있고 앱 역할에는 없다.
+func readIdentity(ctx context.Context, r Reader, table, col string) (identitySeq, error) {
 	var name sql.NullString
 	if err := r.QueryRowContext(ctx, `SELECT pg_get_serial_sequence(?, ?)`, table, col).Scan(&name); err != nil {
-		return 0, fmt.Errorf("%s.%s 의 시퀀스를 찾지 못했다: %w", table, col, err)
+		return identitySeq{}, fmt.Errorf("%s.%s 의 시퀀스를 찾지 못했다: %w", table, col, err)
 	}
 	if !name.Valid {
-		return 0, fmt.Errorf("%s.%s 에 identity 시퀀스가 없다", table, col)
+		return identitySeq{}, fmt.Errorf("%s.%s 에 identity 시퀀스가 없다", table, col)
 	}
-	var last int64
-	var called bool
-	if err := r.QueryRowContext(ctx, `SELECT last_value, is_called FROM `+name.String).Scan(&last, &called); err != nil {
-		return 0, fmt.Errorf("%s.%s 의 순번을 읽지 못했다: %w", table, col, err)
+	seq := identitySeq{name: name.String}
+	if err := r.QueryRowContext(ctx, `SELECT last_value, is_called FROM `+seq.name).Scan(&seq.last, &seq.called); err != nil {
+		return identitySeq{}, fmt.Errorf("%s.%s 의 순번을 읽지 못했다(시퀀스를 읽는 권한은 소유 역할에 있다): %w", table, col, err)
 	}
-	return pg.NextValue(last, called), nil
+	return seq, nil
 }

@@ -289,27 +289,41 @@ ever issued); mismatched rows are listed by primary key. Exit codes: 0 = moved �
 2 = usage.
 
 ```bash
-# 1. Stop the server that writes the source and copy the ledger file. The import reads only the copy.
+# 1. Stop the server that writes the source. Pass the ledger file itself to --from, or, to keep a copy, take one with
+#    VACUUM INTO. Do not copy it with cp (see below).
+sqlite3 fd.db "VACUUM INTO 'fd-copy.db'"
 # 2. Lay the baseline on the target database, stopping at the import version (18).
 fd migrate --db <URL> --to 18
-# 3. Dry run: only the pre-checks and the target checks; nothing is written.
-fd migrate import-sqlite --from <copy> --db <URL> --dry-run
+# 3. Dry run: runs the same transaction as the real import to the end and rolls it back instead of committing.
+fd migrate import-sqlite --from fd-copy.db --db <URL> --dry-run
 # 4. Move. On success it prints the comparison table and the number of rows moved.
-fd migrate import-sqlite --from <copy> --db <URL>
+fd migrate import-sqlite --from fd-copy.db --db <URL>
 # 5. (Optional) compare again before starting the server on the new ledger. Once the server writes, they differ.
-fd migrate verify --from <copy> --db <URL>
+fd migrate verify --from fd-copy.db --db <URL>
 ```
 
-- The account must be a superuser or a member of `fd_owner`. The import inserts the old identity numbers as they are and
-  sets each sequence above the source's highest number (a deleted top number is never issued again), which only the owner
-  role may do.
+- Do not take the copy with `cp fd.db`. The SQLite ledger runs in WAL mode, so a commit lives only in `fd.db-wal` until it
+  is checkpointed into the main file, and a `cp` copy loses it. The import and the comparison then both read the same copy
+  and both say it matches; nothing reports the loss. `VACUUM INTO` (or `sqlite3 fd.db ".backup fd-copy.db"`) takes a
+  consistent copy that includes the -wal.
+- The source is opened read-only. If the `-wal` next to it holds any bytes (the server still runs, or it stopped abnormally
+  before a checkpoint), the import refuses. Stop the server and run it again; if the bytes remain, take a copy with the
+  `VACUUM INTO` above and pass that.
+- The account must be a superuser or a member of `fd_owner`. The import restarts each sequence above the source's highest
+  number (a deleted top number is never issued again), which only the owner role may do. Connected as the app role, the
+  dry run refuses just as the real import does.
+- Run `fd migrate verify` with the same account. The app role has no privilege (SELECT) to read the identity sequences, so
+  it cannot compare them.
 - A source older than version 18 is refused. First upgrade the copy with this version of fd (`fd migrate --db <copy>`).
 - A source whose tables or columns differ from version 18 (a hand-edited ledger) is refused.
-- A target with even one row in a business table is refused, as is one not at version 18 or one that fails the locale gate.
+- A target with even one row in a business table is refused, as is one whose identity sequence has ever issued a number
+  (even after the rows were deleted), one not at version 18, or one that fails the locale gate.
 - Pre-checks: NUL bytes and broken UTF-8 in text columns, broken JSON and `\u0000` in JSON columns, a storage type that does
   not match the column, NULL primary keys, colliding snapshot key digests, and foreign keys pointing at missing rows. If
   anything hits, nothing is written and each hit is listed by table · column · reason · primary key. Fix those rows in the
-  copy and run it again.
+  copy and run it again. `fd migrate verify` does not report a match for a source that fails the pre-checks either.
+- Refusals the pre-checks cannot see (a CHECK on the target, the index entry size limit, privileges) hit the dry run exactly
+  as they hit the real import. The dry run also holds the migration locks as the real import does.
 
 ## Several repositories
 

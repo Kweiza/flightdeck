@@ -4,6 +4,12 @@ package pg_test
 // importsqlite_test.go 다.
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -12,7 +18,8 @@ import (
 )
 
 // 손으로 적은 이관 카탈로그가 두 엔진의 살아 있는 카탈로그와 같다: 표 목록(옮기지 않는 것을 뺀), 칸 이름 · 순서 · 타입 ·
-// NOT NULL · 행 좌표 칸(SQLite 기본키) · identity · AUTOINCREMENT, 그리고 FK 순서(부모가 먼저).
+// NOT NULL · 행 좌표 칸(SQLite 기본키) · identity · AUTOINCREMENT, 그리고 FK 순서(부모가 먼저). 옮기지 않는 표의 이름
+// 목록(LeftBehindNames)도 판 18 원본에 실제로 있는 표다.
 func TestImportCatalogMatchesBothEngines(t *testing.T) {
 	if pg.ImportVersion != store.SchemaVersion {
 		t.Fatalf("이관 판 %d 이 SQLite 의 마지막 판 %d 과 다르다 - SQLite 판이 오르면 카탈로그를 그 판으로 다시 적어야 한다",
@@ -29,9 +36,18 @@ func TestImportCatalogMatchesBothEngines(t *testing.T) {
 	}
 
 	var liteTables []string
+	liteAll := map[string]bool{}
 	for _, r := range strs(t, lite, `SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`) {
+		liteAll[r[0]] = true
 		if !pg.LeftBehind(r[0]) {
 			liteTables = append(liteTables, r[0])
+		}
+	}
+	// 이름 그대로 적은 목록에 낡은 이름이 없다 - 스키마가 FTS 선택지를 바꿔 그림자 표가 달라지면 여기서 빨갛다(남은 표는
+	// 위 목록에 섞여 표 수가 어긋난다).
+	for _, n := range pg.LeftBehindNames() {
+		if !liteAll[n] {
+			t.Errorf("옮기지 않는 표 %s 가 판 %d SQLite 원본에 없다 - 목록이 낡았다", n, pg.ImportVersion)
 		}
 	}
 	var pgTables []string
@@ -52,7 +68,16 @@ func TestImportCatalogMatchesBothEngines(t *testing.T) {
 		}
 	}
 
-	kinds := map[string]pg.Kind{"INTEGER": pg.Int, "TEXT": pg.Text, "BLOB": pg.Bytes, "bigint": pg.Int, "text": pg.Text, "bytea": pg.Bytes}
+	known := map[string]pg.Kind{"INTEGER": pg.Int, "TEXT": pg.Text, "BLOB": pg.Bytes, "bigint": pg.Int, "text": pg.Text, "bytea": pg.Bytes}
+	// 모르는 타입은 어느 Kind 와도 같지 않게 한다(맵의 0 값이 pg.Text 라 모르는 타입이 글 칸으로 지나가면 안 된다).
+	kindOf := func(table, col, typ string) pg.Kind {
+		k, ok := known[typ]
+		if !ok {
+			t.Errorf("%s.%s 의 타입 %q 를 이 시험이 모른다 - 이관 카탈로그의 Kind 로 옮길 수 없다", table, col, typ)
+			return pg.Kind(-1)
+		}
+		return k
+	}
 	for _, tb := range pg.Tables() {
 		// SQLite: 선언된 칸(rowid 자리는 빼고).
 		ddl := strs(t, lite, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, tb.Name)
@@ -77,7 +102,7 @@ func TestImportCatalogMatchesBothEngines(t *testing.T) {
 		for i, c := range cols {
 			w := src[i]
 			inPK := c[3] != "0"
-			if c[0] != w.Name || kinds[strings.ToUpper(c[1])] != w.Kind || (c[2] == "1" || inPK) != w.NotNull || inPK != w.Key {
+			if c[0] != w.Name || kindOf(tb.Name, c[0], strings.ToUpper(c[1])) != w.Kind || (c[2] == "1" || inPK) != w.NotNull || inPK != w.Key {
 				t.Errorf("%s.%s: SQLite (이름 %s 타입 %s notnull %s pk %s), 카탈로그 %+v", tb.Name, w.Name, c[0], c[1], c[2], c[3], w)
 			}
 		}
@@ -107,7 +132,7 @@ func TestImportCatalogMatchesBothEngines(t *testing.T) {
 		}
 		for i, c := range pgCols {
 			w := tb.Cols[i]
-			if c[0] != w.Name || kinds[c[1]] != w.Kind || (c[2] == "NO") != w.NotNull || (c[3] == "ALWAYS") != w.Identity {
+			if c[0] != w.Name || kindOf(tb.Name, c[0], c[1]) != w.Kind || (c[2] == "NO") != w.NotNull || (c[3] == "ALWAYS") != w.Identity {
 				t.Errorf("%s.%s: PG (이름 %s 타입 %s nullable %s identity %s), 카탈로그 %+v", tb.Name, w.Name, c[0], c[1], c[2], c[3], w)
 			}
 		}
@@ -163,6 +188,9 @@ func TestCellFaults(t *testing.T) {
 		{"JSON 글 안의 \\u0000", doc, `{"a":"x\u0000"}`, `{"a":"x\u0000"}`, pg.FaultJSONNUL},
 		{"JSON 키 안의 \\u0000", doc, `{"\u0000":1}`, `{"\u0000":1}`, pg.FaultJSONNUL},
 		{"이스케이프된 백슬래시 뒤 u0000 은 글자다", doc, `["\\u0000"]`, `["\\u0000"]`, ""},
+		// float64 로 못 옮기는 수 뒤에 있어도 \u0000 을 잰다(수를 글 그대로 읽는다).
+		{"범위 밖 수 뒤의 \\u0000", doc, `[1e400,"\u0000"]`, `[1e400,"\u0000"]`, pg.FaultJSONNUL},
+		{"범위 밖 수는 받는다", doc, `{"n":1e400,"s":"\\u0000"}`, `{"n":1e400,"s":"\\u0000"}`, ""},
 		{"JSON 은 받는다", doc, `{"a":[1,"b"]}`, `{"a":[1,"b"]}`, ""},
 	} {
 		got, fault := pg.Cell(c.col, c.in)
@@ -172,7 +200,8 @@ func TestCellFaults(t *testing.T) {
 	}
 }
 
-// 행 지문은 NULL 과 빈 글을 가르고, 칸 경계가 밀린 행을 가르고, 바이트 하나의 차이를 가른다.
+// 행 지문은 NULL 과 빈 글을 가르고, 칸 경계가 밀린 행을 가르고, 바이트 하나의 차이를 가르고, 바이트가 같은 다른 저장
+// 타입(정수 7 · 글 '7' · BLOB X'37' · 실수 7)을 가른다.
 func TestRowHashSeparates(t *testing.T) {
 	for _, p := range [][2][]any{
 		{{nil}, {""}},
@@ -181,6 +210,11 @@ func TestRowHashSeparates(t *testing.T) {
 		{{"2026-01-01T00:00:00.000000Z"}, {"2026-01-01T00:00:00.000001Z"}},
 		{{[]byte{}}, {nil}},
 		{{int64(10)}, {int64(1)}},
+		{{"7"}, {int64(7)}},
+		{{[]byte("7")}, {int64(7)}},
+		{{"7"}, {[]byte("7")}},
+		{{7.0}, {int64(7)}},
+		{{""}, {[]byte{}}},
 	} {
 		if pg.RowHash(p[0]) == pg.RowHash(p[1]) {
 			t.Errorf("%#v 와 %#v 의 지문이 같다", p[0], p[1])
@@ -189,9 +223,61 @@ func TestRowHashSeparates(t *testing.T) {
 	if got, fault := pg.Cell(pg.Column{Name: "b", Kind: pg.Bytes, NotNull: true}, []byte(nil)); fault != "" || got.([]byte) == nil {
 		t.Errorf("길이 0 BLOB(nil 조각)이 빈 bytea 가 아니다: (%#v, %q) - pgx 는 nil 조각을 NULL 로 보낸다", got, fault)
 	}
-	// 칸 타입은 표가 정하므로 같은 바이트의 글과 bytea 는 같은 값이다(Cell 이 그 둘을 서로 옮긴다).
-	if pg.RowHash([]any{"x"}) != pg.RowHash([]any{[]byte("x")}) {
-		t.Error("같은 바이트의 글과 bytea 의 지문이 다르다")
+	// 바이트가 그대로인 두 갈래는 Cell 이 칸 타입으로 옮긴 뒤 대상에서 읽은 값과 지문이 같다.
+	for _, c := range []struct {
+		col    pg.Column
+		src    any
+		target any
+	}{
+		{pg.Column{Name: "t", Kind: pg.Text}, []byte("x"), "x"},
+		{pg.Column{Name: "b", Kind: pg.Bytes}, "x", []byte("x")},
+	} {
+		got, fault := pg.Cell(c.col, c.src)
+		if fault != "" || pg.RowHash([]any{got}) != pg.RowHash([]any{c.target}) {
+			t.Errorf("%s 칸의 %#v: Cell 뒤 (%#v, %q) 가 대상 값 %#v 와 지문이 다르다", c.col.Kind, c.src, got, fault, c.target)
+		}
+	}
+}
+
+// 사전 검사를 지난 값(Fault 가 빈)은 Cell 뒤 NULL 이거나 칸 타입의 꼴이고, 저장 타입이 칸과 달라 걸린 값은 원래 타입을
+// 그대로 둔다. 행 지문의 표지가 이것에 기댄다 - 원본은 Cell 뒤의 타입, 대상은 칸 타입이라 지난 행은 표지가 같고 걸린 행은
+// 다르다(RowHash 의 ★).
+func TestCellKeepsTheColumnType(t *testing.T) {
+	goType := map[pg.Kind]string{pg.Text: "string", pg.Int: "int64", pg.Bytes: "[]uint8"}
+	stored := []any{nil, int64(7), 7.5, "7", []byte("7"), []byte(nil), "", "[]", "\xff"}
+	typeName := func(v any) string {
+		switch v.(type) {
+		case nil:
+			return "nil"
+		case int64:
+			return "int64"
+		case float64:
+			return "float64"
+		case string:
+			return "string"
+		case []byte:
+			return "[]uint8"
+		}
+		return "?"
+	}
+	for _, kind := range []pg.Kind{pg.Text, pg.Int, pg.Bytes} {
+		for _, json := range []bool{false, true} {
+			if json && kind != pg.Text {
+				continue
+			}
+			col := pg.Column{Name: "c", Kind: kind, JSON: json}
+			for _, v := range stored {
+				got, fault := pg.Cell(col, v)
+				switch {
+				case fault == "" && got != nil && typeName(got) != goType[kind]:
+					t.Errorf("%s 칸(JSON %v)이 %#v 를 받아 %s 로 냈다 - 칸 타입(%s)이 아니다", kind, json, v, typeName(got), goType[kind])
+				case fault == pg.FaultStorage && typeName(got) != typeName(v):
+					t.Errorf("%s 칸이 걸린 %#v 를 %s 로 바꿨다 - 원래 저장 타입을 둬야 한다", kind, v, typeName(got))
+				case fault == "" && v == nil && got != nil:
+					t.Errorf("%s 칸이 NULL 을 %#v 로 냈다", kind, got)
+				}
+			}
+		}
 	}
 }
 
@@ -218,13 +304,14 @@ func TestCompare(t *testing.T) {
 }
 
 // 순번: 발급된 최고 번호가 있으면 그 다음부터, 없으면 1 부터 낸다. 대조는 다음 번호가 그 번호보다 커야 맞다.
+// RESTART WITH n 뒤의 시퀀스는 last_value = n · is_called = 거짓이다.
 func TestSequence(t *testing.T) {
 	for _, c := range []struct {
 		floor, next int64
 	}{{0, 1}, {1, 2}, {41, 42}} {
-		v, called := pg.Sequence(c.floor)
-		if got := pg.NextValue(v, called); got != c.next {
-			t.Errorf("floor %d: setval(%d, %v) 뒤 다음 번호 %d, 기대 %d", c.floor, v, called, got, c.next)
+		restart := pg.Sequence(c.floor)
+		if got := pg.NextValue(restart, false); got != c.next {
+			t.Errorf("floor %d: RESTART WITH %d 뒤 다음 번호 %d, 기대 %d", c.floor, restart, got, c.next)
 		}
 		if !(pg.SequenceCheck{Floor: c.floor, Next: c.next}).OK() {
 			t.Errorf("floor %d · 다음 %d 가 어긋남으로 나왔다", c.floor, c.next)
@@ -275,6 +362,71 @@ func TestInsertSQL(t *testing.T) {
 		}
 		if n := strings.Count(q, "?"); n != 3*len(tb.Cols) {
 			t.Errorf("%s: 자리표시 %d, 기대 %d", tb.Name, n, 3*len(tb.Cols))
+		}
+	}
+}
+
+// InsertSQL 을 부르는(가리키는) 자리는 SQLite 이관의 옮기기(store 의 copyTables) 하나다. 그 함수의 INSERT 는 identity 칸에
+// 옛 번호를 넣는 구절(OVERRIDING SYSTEM VALUE)을 붙이는데, 그 구절이 이 패키지 안에 있어서 서버 코드의 OVERRIDING 을
+// 훑는 시험(TestServerCodeNeverOverridesIdentity)이 앱 코드의 호출을 못 본다. 그래서 부르는 자리를 소스에서 잠근다.
+// 함수 값으로 넘기는 자리(`f := t.InsertSQL`)와 패키지 수준 초기화도 센다.
+func TestInsertSQLIsCalledOnlyByTheImport(t *testing.T) {
+	root, err := filepath.Abs("../../..") // server 모듈 뿌리
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var got []string
+	scanned := 0
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		switch {
+		case err != nil:
+			return err
+		case d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go"):
+			return nil
+		}
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			return err
+		}
+		scanned++
+		rel, _ := filepath.Rel(root, path)
+		for _, decl := range f.Decls {
+			where := "(패키지 수준)"
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				where = fn.Name.Name
+			}
+			ast.Inspect(decl, func(n ast.Node) bool {
+				if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "InsertSQL" {
+					got = append(got, filepath.ToSlash(rel)+" "+where)
+				}
+				return true
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanned < 50 {
+		t.Fatalf("훑은 Go 파일이 %d 개다 - 뿌리(%s)를 잘못 잡았다", scanned, root)
+	}
+	slices.Sort(got)
+	if want := []string{"internal/store/importsqlite.go copyTables"}; !slices.Equal(got, want) {
+		t.Errorf("InsertSQL(OVERRIDING SYSTEM VALUE 를 붙인 INSERT)을 부르는 자리가 다르다\n 얻음 %v\n 기대 %v", got, want)
+	}
+}
+
+// 옮기지 않는 표는 이름이 정확히 맞아야 한다 - judgment_fts 로 시작하는 다른 표는 옮긴다(모르는 표면 이관이 거절한다).
+func TestLeftBehindIsExact(t *testing.T) {
+	for name, want := range map[string]bool{
+		"schema_version": true, "sqlite_sequence": true, "sqlite_stat1": true,
+		"judgment_fts": true, "judgment_fts_data": true, "judgment_fts_idx": true, "judgment_fts_docsize": true,
+		"judgment_fts_config":  true,
+		"judgment_fts_content": false, "judgment_fts2": false, "judgment_ftsx": false, "judgment": false, "schema_versions": false,
+	} {
+		if got := pg.LeftBehind(name); got != want {
+			t.Errorf("LeftBehind(%q) = %v, 기대 %v", name, got, want)
 		}
 	}
 }

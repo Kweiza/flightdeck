@@ -404,15 +404,7 @@ func TestPGEmptyMeansEverySchema(t *testing.T) {
 func TestPGServerAccountCanJudgeTheLedger(t *testing.T) {
 	ctx := context.Background()
 	dsn, s := pgMigrated(t)
-	role := "t_srv_" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	pgExec(t, s, `CREATE ROLE `+role+` LOGIN IN ROLE `+pg.AppRole)
-	t.Cleanup(func() { _, _ = s.db.ExecContext(context.Background(), `DROP ROLE IF EXISTS `+role) })
-	u, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	u.User = url.User(role)
-	app := u.String()
+	app, role := loginAs(t, s, dsn, pg.AppRole)
 
 	if plan, err := ProbeMigration(ctx, app); err != nil || plan.Action != MigrateNone {
 		t.Fatalf("서버 계정의 판 재기: %+v, %v", plan, err)
@@ -429,6 +421,21 @@ func TestPGServerAccountCanJudgeTheLedger(t *testing.T) {
 	if err := opened.db.QueryRowContext(ctx, `SELECT current_user`).Scan(&who); err != nil || who != role {
 		t.Fatalf("서버 계정으로 붙지 않았다: %q, %v", who, err)
 	}
+}
+
+// loginAs 는 역할 member 의 구성원인 새 로그인 역할(서버 계정 꼴)을 만들고, dsn 의 DB 에 그 역할로 붙는 접속 URL 과 역할
+// 이름을 낸다. 역할은 시험이 끝나면 s 로 지운다.
+func loginAs(t *testing.T, s *Store, dsn, member string) (string, string) {
+	t.Helper()
+	role := "t_login_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	pgExec(t, s, `CREATE ROLE `+role+` LOGIN IN ROLE `+member)
+	t.Cleanup(func() { _, _ = s.db.ExecContext(context.Background(), `DROP ROLE IF EXISTS `+role) })
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.User(role)
+	return u.String(), role
 }
 
 // dsnDB 는 시험 접속 URL 의 DB 이름이다.
