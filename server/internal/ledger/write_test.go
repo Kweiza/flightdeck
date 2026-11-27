@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kweiza/flightdeck/internal/nulesc"
 	"github.com/kweiza/flightdeck/internal/store"
 )
 
@@ -211,6 +212,50 @@ func TestReadRejectsCountMismatch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "sessions") {
 		t.Errorf("어느 표가 안 맞는지 안 적는다: %v", err)
+	}
+}
+
+// 줄은 풀기 전에 원문으로 잰다 - 풀면 짝 없는 서로게이트 · 깨진 UTF-8 이 U+FFFD 로, 키의 U+0000 이 다른 이름으로 바뀌어
+// 가져오기의 사전 검사가 흔적을 못 본다. 어느 파일 몇째 줄인지와 거절 갈래를 낸다.
+func TestReadRefusesLinesThatDecodingWouldAlter(t *testing.T) {
+	for _, c := range []struct {
+		name, from, to string
+		want           error
+	}{
+		{"짝 없는 서로게이트", `"body":"`, `"body":"\ud800`, nulesc.ErrSurrogate},
+		{"깨진 UTF-8", `"body":"`, "\"body\":\"\xff", nulesc.ErrUTF8},
+		{"키의 U+0000", `"body":"`, `"bo\u0000dy":"`, nulesc.ErrKeyNUL},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			files, _, err := Encode(sampleDump(), 4, "2026-08-06T00:00:00.000000Z")
+			if err != nil {
+				t.Fatalf("Encode 실패: %v", err)
+			}
+			if _, err := Write(files, dir); err != nil {
+				t.Fatalf("Write 실패: %v", err)
+			}
+			path := filepath.Join(dir, judgmentsFile)
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.SplitN(string(body), "\n", 3)
+			if len(lines) < 2 || !strings.Contains(lines[1], c.from) {
+				t.Fatalf("픽스처 둘째 줄에 %q 가 없다 - 이 시험이 아무것도 안 본다: %q", c.from, lines)
+			}
+			lines[1] = strings.Replace(lines[1], c.from, c.to, 1)
+			if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = Read(dir)
+			if !errors.Is(err, c.want) {
+				t.Fatalf("Read = %v, 바라는 것 %v 거절", err, c.want)
+			}
+			if !strings.Contains(err.Error(), judgmentsFile) || !strings.Contains(err.Error(), "2번째 줄") {
+				t.Errorf("어느 파일 몇째 줄인지 안 적는다: %v", err)
+			}
+		})
 	}
 }
 

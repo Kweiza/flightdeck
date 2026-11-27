@@ -464,13 +464,14 @@ func (s *Store) WriteLedger(ctx context.Context, d LedgerDump) error {
 // 적용과 같은 판정을 내도록. 관문이 거절할 글이 있으면 그 첫 거절(적용이면 트랜잭션 전체가 되돌아간다)이고, 없으면 `\x00`
 // 표기로 바꿔 넣을 칸 수다. 순수 함수다.
 func ScreenLedger(d LedgerDump) (rewrites int, err error) {
-	g := &cellGate{}
 	for _, r := range ledgerRows(d) {
-		if _, err := g.args(r.q, r.args); err != nil {
+		_, pend, err := gateArgs(r.q, r.args)
+		if err != nil {
 			return 0, fmt.Errorf("%s: %w", r.what, err)
 		}
+		rewrites += len(pend) // 되쓰기는 행마다 한 행을 넣거나 트랜잭션 전체가 되돌아간다 - 문장마다 원장에 닿는다
 	}
-	return len(g.rewrites), nil
+	return rewrites, nil
 }
 
 // ledgerRow 는 되쓰기 문장 하나와 그 인자, 실패 문구의 머리다.

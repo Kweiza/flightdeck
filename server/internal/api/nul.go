@@ -85,7 +85,7 @@ func classifyRefusal(err error) (Classified, bool) {
 	}
 	var cell *store.CellRefusal
 	if errors.As(err, &cell) && cell.Unwrap() != nil {
-		return classifyInput(cell.Unwrap(), fmt.Sprintf("원장 칸 %s.%s(%s)", cell.Table, cell.Column, cell.Where)), true
+		return classifyInput(cell.Unwrap(), fmt.Sprintf("%s(%s)", cell.Place(), cell.Where)), true
 	}
 	return Classified{}, false
 }

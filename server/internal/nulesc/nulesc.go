@@ -142,7 +142,7 @@ func EscapeJSON(doc string) (string, []string, error) {
 	if !json.Valid([]byte(doc)) {
 		return doc, nil, ErrSyntax
 	}
-	if !strings.Contains(doc, `\u`) { // `\u` 단위가 없으면 U+0000 도 서로게이트도 없다
+	if nul, sur := suspects(doc); !nul && !sur { // U+0000 · 서로게이트 단위가 없으면 고칠 글도 거절할 글도 없다
 		return doc, nil, nil
 	}
 	w := &walker{s: doc}

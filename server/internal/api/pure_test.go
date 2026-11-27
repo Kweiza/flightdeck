@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kweiza/flightdeck/internal/buildinfo"
+	"github.com/kweiza/flightdeck/internal/nulesc"
 	"github.com/kweiza/flightdeck/internal/service"
 	"github.com/kweiza/flightdeck/internal/store"
 )
@@ -155,6 +156,27 @@ func TestJudgeIdempotencyKey(t *testing.T) {
 				t.Fatal("사유가 비었다")
 			}
 		})
+	}
+}
+
+// 키는 원장의 이름 칸에 담기므로 이름 자리의 규칙으로 잰다: 깨진 UTF-8 · NUL 은 거절이고 그 갈래(Bad)를 함께 낸다.
+// 깨진 바이트는 제어문자가 아니라(U+FFFD 로 읽힌다) 문자 검사만으로는 지나간다.
+func TestJudgeIdempotencyKeyRefusesWhatTheLedgerCannotHold(t *testing.T) {
+	for _, c := range []struct {
+		name, key string
+		want      error
+	}{
+		{"깨진 UTF-8", "s1:\xff", nulesc.ErrUTF8},
+		{"자른 다바이트 글자", "s1:\xc3", nulesc.ErrUTF8},
+		{"NUL", "s1:\x00", nulesc.ErrNUL},
+	} {
+		v := JudgeIdempotencyKey(http.MethodPost, c.key)
+		if v.OK || !errors.Is(v.Bad, c.want) || v.Reason == "" {
+			t.Errorf("%s: %+v, 바라는 것 거절 · 갈래 %v", c.name, v, c.want)
+		}
+	}
+	if v := JudgeIdempotencyKey(http.MethodPost, "s1:한글"); !v.OK || v.Bad != nil {
+		t.Errorf("올바른 UTF-8 키를 거절했다: %+v", v)
 	}
 }
 

@@ -476,7 +476,8 @@ func TestPGPanicInTxReleasesTheLock(t *testing.T) {
 // ★ 실행기의 길(migrateTo) 그대로 돌린다. 실행기 세션이 판을 읽기 전부터 끝까지 자기 잠금(migrateLockKey, 실행기끼리)과
 // 업무 쓰기의 전역 잠금(globalLockKey)을 함께 쥐고, 증분 트랜잭션은 같은 세션에서 전역 잠금을 다시 잡는다(같은 세션이라
 // 안 막힌다). 키가 하나만 있으면 DDL 도중에 업무 쓰기가 끼어 반쯤 바뀐 스키마 위에서 커밋한다 - 그 쓰기가 판 19 · 새 열을
-// 보는 것이 그것이 안 끼었다는 증거다. 덤프를 뜨는 동안의 쓰기는 TestPGWriteWaitsForTheDump 가 잰다.
+// 보는 것이 그것이 안 끼었다는 증거다. 새 열은 읽어서 잰다: 원장 칸 관문은 이관 카탈로그에 없는 칸에 쓰는 문장을 거절하는데
+// 시험 증분의 열은 카탈로그에 없다. 덤프를 뜨는 동안의 쓰기는 TestPGWriteWaitsForTheDump 가 잰다.
 func TestPGWriteWaitsForSchemaStep(t *testing.T) {
 	dsn, s := pgMigrated(t)
 	ctx := context.Background()
@@ -511,7 +512,7 @@ func TestPGWriteWaitsForSchemaStep(t *testing.T) {
 			return err
 		}
 		_, err := x.tx.ExecContext(x.ctx,
-			`INSERT INTO machine(id, hostname, first_seen, last_seen, t_probe) VALUES ('m1', 'h', 't', 't', 'after')`)
+			`INSERT INTO machine(id, hostname, first_seen, last_seen) VALUES ('m1', 'h', 't', 't')`)
 		return err
 	})
 	if aErr := <-aDone; aErr != nil {

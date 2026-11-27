@@ -321,16 +321,17 @@ func (t *Tx) Savepoint(fn func(*Tx) error) error {
 	if _, err := t.tx.ExecContext(t.ctx, "SAVEPOINT "+name); err != nil {
 		return t.savepointBroke(name, "만들기", nil, err)
 	}
+	mark := t.tx.cells.mark()
 	returned := false
 	defer func() {
 		if !returned {
-			_ = t.undoSavepoint(name, errors.New("패닉"))
+			_ = t.undoSavepoint(name, mark, errors.New("패닉"))
 		}
 	}()
 	err := fn(t)
 	returned = true
 	if err != nil {
-		if uerr := t.undoSavepoint(name, err); uerr != nil {
+		if uerr := t.undoSavepoint(name, mark, err); uerr != nil {
 			return uerr
 		}
 		return err
@@ -357,11 +358,13 @@ func SavepointValue[T any](t *Tx, fn func(*Tx) (T, error)) (T, error) {
 	return v, nil
 }
 
-// undoSavepoint 는 저장점까지 되돌리고 푼다. ROLLBACK TO 는 저장점을 남기므로, 안 풀면 같은 트랜잭션 안에 쌓인다.
-func (t *Tx) undoSavepoint(name string, cause error) error {
+// undoSavepoint 는 저장점까지 되돌리고 푼다. ROLLBACK TO 는 저장점을 남기므로, 안 풀면 같은 트랜잭션 안에 쌓인다. 저장점 안의
+// 문장이 남긴 원장 칸 관문의 바꿔 넣기(mark 뒤의 것)도 버린다 - 원장에서 사라진 쓰기다.
+func (t *Tx) undoSavepoint(name string, mark int, cause error) error {
 	if _, err := t.tx.ExecContext(t.ctx, "ROLLBACK TO SAVEPOINT "+name); err != nil {
 		return t.savepointBroke(name, "되돌리기", cause, err)
 	}
+	t.tx.cells.undo(mark)
 	if _, err := t.tx.ExecContext(t.ctx, "RELEASE SAVEPOINT "+name); err != nil {
 		return t.savepointBroke(name, "풀기", cause, err)
 	}
@@ -408,13 +411,18 @@ func (e *SavepointError) Unwrap() error { return e.Err }
 // liveKey 는 「살아 있는 것은 하나」를 지키는 부분 유니크 인덱스의 정의 그대로다(칸과 WHERE). 두 엔진 모두 그 정의와
 // 맞는 인덱스가 없으면 문장을 거절하므로(42P10 · SQLite 의 「ON CONFLICT clause does not match」) 어긋나면 시험이 잡는다.
 func (t *Tx) insertUnlessTaken(insert, liveKey string, args ...any) (id int64, inserted bool, err error) {
-	err = t.tx.QueryRowContext(t.ctx, insert+`
-		ON CONFLICT `+liveKey+` DO NOTHING
-		RETURNING id`, args...).Scan(&id)
+	err = t.tx.QueryRowContext(t.ctx, unlessTaken(insert, liveKey), args...).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
 	}
 	return id, err == nil, err
+}
+
+// unlessTaken 은 insertUnlessTaken 이 보내는 완성문이다. 이어 붙여 짓는 문장이라 원장 칸 관문의 꼴 시험이 이것으로 완성문을 잰다.
+func unlessTaken(insert, liveKey string) string {
+	return insert + `
+		ON CONFLICT ` + liveKey + ` DO NOTHING
+		RETURNING id`
 }
 
 // Open 은 DB 를 연다. **마이그레이션을 적용하지 않는다**(설계 §7 처방 ①).

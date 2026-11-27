@@ -288,12 +288,16 @@ func (h *handler) drop(w http.ResponseWriter, r *http.Request) {
 		//   claim.force_reason 은 지금 어느 화면도 안 읽으므로(page.go·dashboard.gohtml 전수
 		//   확인) 원장에만 두면 선점을 잃은 세션 쪽에서는 그 사실이 영영 안 보인다.
 		//   판단은 이 폐기의 서사를 담는 자리이고 커밋된 사실만 담기므로 여기가 맞다.
+		//
+		// ★ 본문에 항목 제목을 안 붙인다. 제목은 원장에서 읽은 글이라 이미 원장의 꼴(NUL 이 `\x00` 표기)이고, 받은 사유에
+		//   NUL 이 있으면 관문이 본문 전체를 한 글로 바꾸면서 제목 안의 `\x00` 를 `\\x00` 로 한 번 더 옮긴다 - 이관이 SQLite
+		//   판 본문을 옮긴 값과 갈린다. 항목은 id 와 링크로 가리키고, 제목은 항목에서 읽는다.
 		_, err := t.AddJudgment(model.Judgment{
 			Project: in.Project, Kind: model.JudgmentDecision,
 			Title: "항목 폐기: " + in.Item,
-			Body: fmt.Sprintf("대시보드에서 항목을 폐기했다.\n항목: %s (%s)\n사유: %s\n%s\n"+
+			Body: fmt.Sprintf("대시보드에서 항목을 폐기했다.\n항목: %s\n사유: %s\n%s\n"+
 				"행위자: 대시보드(사람). 세션이 아니라 사람이 누른 것이므로 session_id 는 비어 있다.",
-				in.Item, Clip(it.Title, 200), in.Reason, claimLine),
+				in.Item, in.Reason, claimLine),
 			Links: []model.JudgmentLink{{TargetKind: "item", TargetID: in.Item}},
 		})
 		return err

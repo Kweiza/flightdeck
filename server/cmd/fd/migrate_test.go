@@ -465,6 +465,50 @@ func TestImportJudgmentsRestoresIntoEmptyDB(t *testing.T) {
 	}
 }
 
+// 원장 줄의 짝 없는 서로게이트는 풀기 전에 거절한다 - 고치기 전에는 풀기가 U+FFFD 로 바꾼 뒤라 사전 검사(ScreenLedger)가 흔적을
+// 못 보고 바뀐 글을 넣었다. 예행 · 적용 모두 DB 를 만들지 않고 어느 파일 몇째 줄인지 말한다.
+func TestImportJudgmentsRefusesALineDecodingWouldAlter(t *testing.T) {
+	h := newHarness(t)
+	if rc, out := h.run("", "note", "--kind", "decision", "--body", "서로게이트 앞"); rc != 0 {
+		t.Fatalf("판단 등록 실패: %s", out)
+	}
+	h.closeStore()
+	defer h.openStore()
+
+	outDir := filepath.Join(t.TempDir(), "ledger-out")
+	if rc, out := h.run("", "export", "--judgments", "--out", outDir, "--db", h.db); rc != 0 {
+		t.Fatalf("내보내기 실패: %s", out)
+	}
+	path := filepath.Join(outDir, "judgments.jsonl")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := strings.Replace(string(body), "서로게이트 앞", `서로게이트 앞\ud800`, 1)
+	if bad == string(body) {
+		t.Fatalf("픽스처에 판단 본문이 없다 - 이 시험이 아무것도 안 본다: %s", body)
+	}
+	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, apply := range []bool{false, true} {
+		fresh := filepath.Join(t.TempDir(), "restored.db")
+		args := []string{"import", "--judgments", "--from", outDir, "--db", fresh}
+		if apply {
+			args = append(args, "--apply")
+		}
+		rc, out := h.run("", args...)
+		if rc == 0 {
+			t.Fatalf("짝 없는 서로게이트가 든 원장을 받았다(apply=%v): %s", apply, out)
+		}
+		mustContain(t, "거절 문구", out, "짝 없는 서로게이트", "judgments.jsonl")
+		if _, err := os.Stat(fresh); !os.IsNotExist(err) {
+			t.Errorf("거절했는데 DB 를 만들었다(apply=%v): %v", apply, err)
+		}
+	}
+}
+
 // 예행은 **DB 를 열지도 않는다**. 여는 것만으로 파일이 생기면 "안 건드린다"가 거짓이다.
 func TestImportJudgmentsDryRunDoesNotCreateDB(t *testing.T) {
 	h := newHarness(t)

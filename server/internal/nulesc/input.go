@@ -96,22 +96,33 @@ func checkDoc(doc []byte) (nul bool, err error) {
 	return nul, nil
 }
 
-// suspects 는 doc 에 U+0000 단위(`\u0000`)와 서로게이트 단위(`\uD800`-`\uDFFF`, 대소문자 무관)가 있을 수 있는가다. 틀릴 때는
-// 늘 있다는 쪽이다(역슬래시 묶음 뒤의 글자 `u0000` 도 있다고 본다) - 없다고 하면 정말 없다. 할당하지 않는다.
-func suspects(doc []byte) (nul, sur bool) {
+// suspects 는 JSON 문서 doc 에 U+0000 단위(`\u0000`)와 서로게이트 단위(`\uD800`-`\uDFFF`, 대소문자 무관)가 있을 수 있는가다. 틀릴
+// 때는 늘 있다는 쪽이다(역슬래시 묶음 뒤의 글자 `u0000` 도 있다고 본다) - 없다고 하면 정말 없다. 할당하지 않는다.
+//
+// 받은 문서(checkDoc - 바이트)와 원장에 담을 JSON 칸(EscapeJSON - 글)이 이 한 벌을 문턱으로 쓴다: 둘 다 그 단위가 없으면 문서를
+// 걷지 않는다. Go 의 json.Marshal 은 `<>&` 를 `\u003c` 꼴로 쓰므로 「`\u` 가 있다」를 문턱으로 쓰면 보통 문서 대부분이 느린 길을 탄다.
+func suspects[T string | []byte](doc T) (nul, sur bool) {
 	for i := 0; ; {
-		j := bytes.Index(doc[i:], []byte(`\u`))
+		j := indexEscape(doc[i:])
 		if j < 0 || nul && sur {
 			return nul, sur
 		}
 		k := i + j + 2
 		if k+4 <= len(doc) {
-			h := doc[k : k+4]
-			nul = nul || string(h) == "0000"
-			sur = sur || (h[0] == 'd' || h[0] == 'D') && strings.IndexByte("89abcdefABCDEF", h[1]) >= 0
+			h0, h1 := doc[k], doc[k+1]
+			nul = nul || h0 == '0' && h1 == '0' && doc[k+2] == '0' && doc[k+3] == '0'
+			sur = sur || (h0 == 'd' || h0 == 'D') && strings.IndexByte("89abcdefABCDEF", h1) >= 0
 		}
 		i = k
 	}
+}
+
+// indexEscape 는 s 에서 처음 나온 `\u` 의 자리다(없으면 -1). 바이트 · 글 어느 쪽이든 옮겨 담지 않는다.
+func indexEscape[T string | []byte](s T) int {
+	if b, ok := any(s).([]byte); ok {
+		return bytes.Index(b, []byte(`\u`))
+	}
+	return strings.Index(string(s), `\u`)
 }
 
 // badUTF8At 은 doc 에서 처음 깨진 UTF-8 이 나온 바이트 자리를 사람이 읽는 말로 낸다(JSON Pointer 를 잴 수 없는 원문이라).

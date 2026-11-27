@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/kweiza/flightdeck/internal/nulesc"
 	"github.com/kweiza/flightdeck/internal/store"
 )
 
@@ -23,10 +24,12 @@ import (
 // 자발적 규율이 되고, 그 규율은 반드시 뒤쪽부터 빠진다. 훅은 타임아웃으로 끊고
 // 다시 부르는 경로가 정상 동작이라 이 축이 없으면 신호·발자국·항목이 조용히 두 번 들어간다.
 
-// IdemVerdict 는 키 검사 결과다. 사유를 항상 채운다.
+// IdemVerdict 는 키 검사 결과다. 사유를 항상 채운다. Bad 는 키가 원장에 담길 수 없는 글일 때의 거절 갈래(nulesc 의
+// ErrUTF8 · ErrNUL)다 - API 는 그것을 다른 입력 거절과 같은 400(classifyInput)으로 낸다.
 type IdemVerdict struct {
 	OK     bool
 	Reason string
+	Bad    error
 }
 
 // JudgeIdempotencyKey 는 쓰기 요청의 키가 성립하는지 본다. 순수 함수다.
@@ -38,6 +41,10 @@ type IdemVerdict struct {
 // 면제하면 key 가 "" 인 채로 표에 들어가 서로 무관한 요청들이 한 슬롯을 공유한다).
 // 그 건너뛰기를 지우면 이 함수까지 오지만, 여기서 면제해도 이미 표에 올라간 뒤라
 // 늦다 — 그래서 면제 갈래를 이 함수에 두지 않는다. 미들웨어의 그 판정이 유일한 자리다.
+//
+// ★ 키는 원장(멱등 표의 이름 칸)에 담기는 글이라 이름 자리의 규칙(nulesc.CheckName)을 **키 조회 · 업무 전에** 잰다.
+// 깨진 UTF-8 키를 들이면 업무(판단 · 발번)는 커밋되고 따로 도는 멱등 기록만 Postgres 에서 거절돼, 재기동 뒤 같은 요청이
+// 다시 실행된다. 원장에 닿는 요청 머리는 이 키 하나다(X-Request-Id 는 로그 · 응답에만, 나머지는 판정에만 쓴다).
 func JudgeIdempotencyKey(method, key string) IdemVerdict {
 	if !isWrite(method) {
 		return IdemVerdict{OK: true, Reason: "읽기 요청이라 키를 요구하지 않는다"}
@@ -48,6 +55,9 @@ func JudgeIdempotencyKey(method, key string) IdemVerdict {
 		return IdemVerdict{Reason: "Idempotency-Key 헤더가 없다 — 모든 쓰기에 필요하다"}
 	case len(k) > 200:
 		return IdemVerdict{Reason: fmt.Sprintf("Idempotency-Key 가 %d자다 — 200자 이하여야 한다", len(k))}
+	}
+	if err := nulesc.CheckName(k); err != nil {
+		return IdemVerdict{Reason: fmt.Sprintf("Idempotency-Key 를 원장에 담을 수 없다(%v)", err), Bad: err}
 	}
 	for _, r := range k {
 		if unicode.IsControl(r) || r == ' ' {

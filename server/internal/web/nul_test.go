@@ -61,3 +61,35 @@ func TestFormsTakeTheWritePathInputRuleOnBothEngines(t *testing.T) {
 		})
 	}
 }
+
+// 폐기 판단 본문은 원장에서 읽은 글(항목 제목)을 받은 사유와 잇지 않는다. 제목은 원장의 꼴(NUL 이 `\x00` 표기)로 읽히므로,
+// 사유에 NUL 이 있어 관문이 본문을 한 글로 바꾸면 제목의 `\x00` 가 `\\x00` 로 한 번 더 옮겨져 이관이 SQLite 판 본문을 옮긴
+// 값과 갈렸다. 본문은 받은 글과 서버가 지은 글로만 짓고, 그 한 글이 관문을 한 번 지난다 - 두 엔진 모두.
+func TestDropJudgmentBodyIsOneImportCellOnBothEngines(t *testing.T) {
+	for _, eng := range []freshstore.Engine{freshstore.SQLite, freshstore.Postgres} {
+		t.Run(string(eng), func(t *testing.T) {
+			f := newFixture(t, withEngine(eng)).withRepo("feat")
+			f.openSession("cc-1", "트랙2")
+			f.addItem("t5-d", "제목\x00끝", nil, nil)
+			const reason = "사유\x00가 충분히 길다"
+			if rec := f.post("/actions/drop", url.Values{"project": {testProject}, "item": {"t5-d"}, "reason": {reason}}); rec.Code != http.StatusSeeOther {
+				t.Fatalf("폐기: %d %s, 바라는 것 303", rec.Code, rec.Body.String())
+			}
+			var body string
+			if err := f.st.DB().QueryRow(`SELECT body FROM judgment WHERE title = '항목 폐기: t5-d'`).Scan(&body); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(body, "제목") || strings.Contains(body, `\\x00`) {
+				t.Errorf("폐기 본문에 원장에서 읽은 제목이 다시 실렸다(그 `\\x00` 가 두 번 옮겨진다): %q", body)
+			}
+			orig := nulesc.Unescape(body)
+			if !strings.Contains(orig, "\n사유: "+reason+"\n") {
+				t.Errorf("폐기 본문을 되돌린 글에 받은 사유 %q 가 없다: %q", reason, orig)
+			}
+			tb, _ := pg.TableOf("judgment")
+			if want, fault, _ := pg.Cell(*tb.Col("body"), orig); fault != "" || body != want {
+				t.Errorf("폐기 본문 = %q, 이관이 되돌린 글을 옮긴 값 %q(%s)", body, want, fault)
+			}
+		})
+	}
+}

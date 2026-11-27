@@ -22,11 +22,17 @@ func TestApplyLabels(t *testing.T) {
 		{"cur 의 중복은 정리된다", []string{"a", "a"}, nil, nil, []string{"a"}},
 		{"공백은 다듬고 빈 값은 버린다", nil, []string{"  tickler  ", "", "   "}, nil, []string{"tickler"}},
 		{"전부 비면 빈 슬라이스", []string{"a"}, nil, []string{"a"}, []string{}},
-		// 같은가는 원장의 꼴로 잰다(LabelKey): 원장의 `\x00` 표기 · 앞 판이 남긴 NUL · 받은 NUL 은 한 꼬리표다.
+		// 빼기는 원장에 그대로 있는 값부터 지우고, 그런 값이 없을 때만 원장의 꼴(LabelKey)로 맞댄다: 원장의 `\x00` 표기 ·
+		// 앞 판이 남긴 NUL · 받은 NUL 은 같은 꼴이다.
 		{"받은 NUL 로 원장 표기를 뺀다", []string{`a\x00`, "b"}, nil, []string{"a\x00"}, []string{"b"}},
 		{"원장 표기로 앞 판의 NUL 을 뺀다", []string{"a\x00", "b"}, nil, []string{`a\x00`}, []string{"b"}},
-		{"함께 있던 둘이 함께 빠진다", []string{"a\x00", `a\x00`, "b"}, nil, []string{"a\x00"}, []string{"b"}},
+		{"함께 있던 둘 중 부른 NUL 만 빠진다", []string{"a\x00", `a\x00`, "b"}, nil, []string{"a\x00"}, []string{`a\x00`, "b"}},
+		{"함께 있던 둘 중 부른 표기만 빠진다", []string{"a\x00", `a\x00`, "b"}, nil, []string{`a\x00`}, []string{"a\x00", "b"}},
+		{"함께 있던 둘을 다 부르면 다 빠진다", []string{"a\x00", `a\x00`, "b"}, nil, []string{`a\x00`, "a\x00"}, []string{"b"}},
+		{"함께 있던 둘은 다른 고침에도 남는다", []string{"a\x00", `a\x00`}, []string{"c"}, nil, []string{"a\x00", `a\x00`, "c"}},
+		{"이관이 겹쳐 놓은 표기는 받은 NUL 로 함께 빠진다", []string{`a\x00`, `a\x00`, "b"}, nil, []string{"a\x00"}, []string{"b"}},
 		{"원장 표기가 있으면 받은 NUL 을 더하지 않는다", []string{`a\x00`}, []string{"a\x00"}, nil, []string{`a\x00`}},
+		{"빼기는 꼴로 더하기를 이긴다", nil, []string{"a\x00"}, []string{`a\x00`}, []string{}},
 	}
 	for _, c := range cases {
 		got := ApplyLabels(c.cur, c.add, c.rm)

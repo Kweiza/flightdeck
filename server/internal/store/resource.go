@@ -99,9 +99,7 @@ func (t *Tx) AcquireResource(project, resource string, h Holder, at time.Time) (
 		return model.ResourceHold{}, err
 	}
 	at = atStamp(at)
-	id, inserted, err := t.insertUnlessTaken(`
-		INSERT INTO resource_hold(project, resource, session_id, job_id, acquired_at, released_at, force_reason)
-		VALUES (?, ?, ?, ?, ?, NULL, NULL)`, resourceOneHolder,
+	id, inserted, err := t.insertUnlessTaken(resourceAcquire, resourceOneHolder,
 		project, resource, nullStr(h.SessionID), nullStr(h.JobID), fmtTime(at))
 	if err == nil && !inserted {
 		// 배타 인덱스에 막혀 안 들어갔다 - 트랜잭션은 멀쩡하니 점유자를 읽어 담는다.
@@ -151,6 +149,11 @@ func (s *Store) AcquireResource(ctx context.Context, project, resource string, h
 // resourceOneHolder 는 resource_hold 의 배타 인덱스 resource_one_holder 의 정의 그대로다(schema.sql · pg/001_baseline.sql).
 // AcquireResource 의 ON CONFLICT 대상이다 - 이 인덱스에 막힌 것만 「남이 쥐었다」이고, PK 충돌 등은 오류로 온다.
 const resourceOneHolder = `(project, resource) WHERE released_at IS NULL`
+
+// resourceAcquire 는 자원 획득의 넣기 문장이다(insertUnlessTaken 이 resourceOneHolder 충돌 꼬리를 붙인다).
+const resourceAcquire = `
+		INSERT INTO resource_hold(project, resource, session_id, job_id, acquired_at, released_at, force_reason)
+		VALUES (?, ?, ?, ?, ?, NULL, NULL)`
 
 // heldBy 는 살아 있는 점유 행을 읽는다. 없으면 ErrNotFound.
 func heldBy(ctx context.Context, q dbtx, project, resource string) (model.ResourceHold, error) {

@@ -377,18 +377,19 @@ func TestWriteNULRefusesNamesOnBothEngines(t *testing.T) {
 	}
 }
 
-// 꼬리표 rm 은 원장의 꼬리표와 **원장의 꼴**로 맞댄다. 고치기 전 SQLite 원장에 남은 실제 NUL 꼬리표(`"a\u0000"`)는 받은 rm 을
-// 먼저 `\x00` 표기로 바꾼 탓에 못 지웠고, 같은 행에 있던 `\x00` 네 글자 꼬리표가 대신 지워졌다. 원장은 두 값을 가를 바이트가
-// 없으므로(이관도 같은 값으로 옮긴다) 한 꼬리표로 보고 함께 지운다 - 어느 쪽으로 불러도, 두 엔진 모두.
+// 꼬리표 rm 은 원장에 그대로 있는 값부터 지우고, 그런 값이 없을 때만 **원장의 꼴**로 맞댄다. 고치기 전 SQLite 원장에 남은 행은
+// 실제 NUL 꼬리표(`"a\u0000"`)와 `\x00` 네 글자 꼬리표를 따로 담는다 - 하나를 부르면 그것만 빠지고 다른 하나는 남는다(남은
+// NUL 꼬리표는 다시 쓰면서 관문이 원장의 꼴로 옮긴다). Postgres 원장에는 이관이 두 값을 같은 표기로 옮겨 두었으므로 어느 쪽으로
+// 불러도 그 표기가 빠진다 - 받은 NUL 은 원장에 그대로 없어 꼴로 맞댄다.
 func TestLabelRmMatchesTheLedgerFormOnBothEngines(t *testing.T) {
 	legacy := `["a\u0000","a\\x00","keep"]` // 고치기 전 SQLite 서버가 담은 문서: NUL 꼬리표와 `\x00` 네 글자 꼬리표가 함께 있다
 	for _, eng := range nulEngines {
 		t.Run(string(eng), func(t *testing.T) {
 			e := newEnvOn(t, eng, nil)
 			sess := e.openSession("cc-label")
-			seed := legacy
+			seed, want := legacy, `["a\\x00","keep"]`
 			if eng == freshstore.Postgres {
-				seed = importCell(t, "item", "labels", legacy) // Postgres 원장에는 이관이 옮긴 값으로 있다
+				seed, want = importCell(t, "item", "labels", legacy), `["keep"]` // Postgres 원장에는 이관이 옮긴 값으로 있다
 			}
 			for _, rm := range []struct{ id, label string }{{"lr-nul", "a\x00"}, {"lr-lit", `a\x00`}} {
 				mustWrite(t, e.write(http.MethodPost, "/api/v1/items", map[string]any{
@@ -398,10 +399,14 @@ func TestLabelRmMatchesTheLedgerFormOnBothEngines(t *testing.T) {
 				w := mustWrite(t, e.write(http.MethodPost, "/api/v1/items/"+rm.id+"/label", map[string]any{
 					"project": testProject, "session_id": sess, "rm": []string{rm.label},
 				}), "label rm "+rm.id)
-				if got := e.rawCell("SELECT labels FROM item WHERE id = '" + rm.id + "'"); got != `["keep"]` {
-					t.Errorf("rm %q 뒤 꼬리표 = %s, 바라는 것 [\"keep\"]", rm.label, got)
+				if got := e.rawCell("SELECT labels FROM item WHERE id = '" + rm.id + "'"); got != want {
+					t.Errorf("rm %q 뒤 꼬리표 = %s, 바라는 것 %s", rm.label, got, want)
 				}
-				if removed, _ := decodeBody(t, w)["removed"].([]any); len(removed) == 0 {
+				removed, _ := decodeBody(t, w)["removed"].([]any)
+				if eng == freshstore.SQLite && (len(removed) != 1 || removed[0] != rm.label) {
+					t.Errorf("rm %q 의 응답이 지운 것 = %v, 바라는 것 부른 값 하나", rm.label, removed)
+				}
+				if len(removed) == 0 {
 					t.Errorf("rm %q 의 응답이 지운 것이 없다고 한다: %s", rm.label, w.Body.String())
 				}
 			}
@@ -430,6 +435,84 @@ func TestIdempotencyFingerprintsTheRawRequestOnBothEngines(t *testing.T) {
 			w := e.do(http.MethodPost, "/api/v1/items", body(`제목\x00`), withKey("nul:1"))
 			if w.Code != http.StatusConflict || errorOf(t, w)["code"] != "idempotency_conflict" {
 				t.Errorf("원장의 표기로 같은 키를 부르면 409 여야 한다: %d %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// 랜딩 보고(ok · fail)의 상세에 든 NUL 은 두 엔진 모두 이관과 같은 값으로 left_detail 에 담기고, 보고는 레인을 놓는다 - 다음
+// 세션이 곧바로 차례를 받고 앞 세션의 자원 점유는 닫혀 있다. 레인 회수(관리자)의 상세는 ComposedCells 시험이 잰다.
+func TestLandReportStoresTheNULDetailAndReleasesOnBothEngines(t *testing.T) {
+	const detail = "상세\x00끝"
+	for _, eng := range nulEngines {
+		t.Run(string(eng), func(t *testing.T) {
+			e := newEnvOn(t, eng, nil)
+			land := func(sess, mode, kind string) map[string]any {
+				return e.okBody(t, e.write(http.MethodPost, "/api/v1/landing", map[string]any{
+					"project": testProject, "session_id": sess, "mode": mode, "kind": kind, "detail": detail,
+				}), "land "+mode+" "+kind)
+			}
+			holder := e.openSession("cc-land-0")
+			if got := land(holder, LandModeAcquire, "")["state"]; got != "turn" {
+				t.Fatalf("첫 줄 서기 = %v, 바라는 것 turn", got)
+			}
+			for i, kind := range []string{"ok", "fail"} {
+				row := land(holder, LandModeAcquire, "")
+				if row["state"] != "turn" {
+					t.Fatalf("%s 보고 전 차례가 아니다: %v", kind, row)
+				}
+				id := itoa(intOf(t, row, "row_id"))
+				land(holder, LandModeReport, kind)
+				if v, want := e.rawCell("SELECT left_detail FROM landing_queue WHERE id = "+id), importCell(t, "landing_queue", "left_detail", detail); v != want {
+					t.Errorf("%s 보고 left_detail = %q, 이관이 옮긴 값 %q", kind, v, want)
+				}
+				if v := e.rawCell("SELECT left_kind FROM landing_queue WHERE id = " + id); v != kind {
+					t.Errorf("%s 보고 left_kind = %q", kind, v)
+				}
+				if n := e.rawCell("SELECT count(*) FROM resource_hold WHERE session_id = '" + holder + "' AND released_at IS NULL"); n != "0" {
+					t.Errorf("%s 보고 뒤 앞 세션의 자원 점유가 %s 개 남았다", kind, n)
+				}
+				next := e.openSession("cc-land-" + itoa(i+1))
+				if got := land(next, LandModeAcquire, "")["state"]; got != "turn" {
+					t.Errorf("%s 보고 뒤 다음 세션의 줄 서기 = %v, 바라는 것 turn(레인이 풀렸다)", kind, got)
+				}
+				holder = next
+			}
+		})
+	}
+}
+
+// 멱등 키는 원장(멱등 표)에 담기는 이름이라 키 조회 · 업무 전에 잰다. 고치기 전에는 깨진 UTF-8 키가 지나가 발번 · 항목이 커밋된
+// 뒤 Postgres 가 따로 도는 멱등 기록만 거절했다 - 재기동 뒤 같은 요청이 다시 실행되어 수가 두 번 탄다. 두 엔진 모두 400 이고
+// 아무것도 쓰지 않는다(수가 안 탔다 - 다음 발번이 1 이다).
+func TestIdempotencyKeyRefusesWhatTheLedgerCannotHoldOnBothEngines(t *testing.T) {
+	for _, eng := range nulEngines {
+		t.Run(string(eng), func(t *testing.T) {
+			e := newEnvOn(t, eng, nil)
+			sess := e.openSession("cc-idemkey")
+			items, idem := e.rawCount("item"), e.rawCount("idempotency")
+			for _, c := range []struct {
+				what, path, key string
+				body            map[string]any
+			}{
+				{"발번", "/api/v1/counters/rev/next", "k\xff", map[string]any{"project": testProject}},
+				{"항목", "/api/v1/items", "k\xc3", map[string]any{
+					"project": testProject, "session_id": sess, "id": "ik1", "title": "t", "body": "b"}},
+			} {
+				w := e.do(http.MethodPost, c.path, c.body, withKey(c.key))
+				if w.Code != http.StatusBadRequest || errorOf(t, w)["code"] != "bad_utf8" {
+					t.Errorf("%s: 깨진 UTF-8 멱등 키에 %d %s, 바라는 것 400 bad_utf8", c.what, w.Code, w.Body.String())
+				}
+			}
+			if n := e.rawCount("counter"); n != 0 {
+				t.Errorf("거절한 발번이 수를 태웠다: counter %d 행", n)
+			}
+			if n, m := e.rawCount("item"), e.rawCount("idempotency"); n != items || m != idem {
+				t.Errorf("거절했는데 썼다: item %d→%d · idempotency %d→%d", items, n, idem, m)
+			}
+			got := e.okBody(t, e.write(http.MethodPost, "/api/v1/counters/rev/next", map[string]any{"project": testProject}), "발번")
+			if intOf(t, got, "value") != 1 {
+				t.Errorf("거절 뒤 첫 발번 = %v, 바라는 것 1", got["value"])
 			}
 		})
 	}

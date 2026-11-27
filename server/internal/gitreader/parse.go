@@ -241,7 +241,7 @@ func parseForEachRef(out []byte, observedAt time.Time) ([]model.RefState, error)
 		if err := checkSHA(sha); err != nil {
 			return nil, fmt.Errorf("for-each-ref: ref %q: %w", name, err)
 		}
-		refs = append(refs, model.RefState{Ref: name, SHA: sha, Subject: subject, At: observedAt})
+		refs = append(refs, model.RefState{Ref: name, SHA: sha, Subject: subjectText(subject), At: observedAt})
 	}
 	// 3의 배수로 안 떨어지는 꼬리는 **조용히 버리지 않는다.** 여기를 버리면
 	// 포맷이 바뀐 날 목록이 짧아진 채 초록으로 지나간다.
@@ -270,8 +270,14 @@ func parseLogRecord(out []byte) (sha, subject string, err error) {
 	if err := checkSHA(toks[0]); err != nil {
 		return "", "", err
 	}
-	return toks[0], toks[1], nil
+	return toks[0], subjectText(toks[1]), nil
 }
+
+// subjectText 는 커밋 제목을 원장에 담을 글로 옮긴다: 깨진 UTF-8 바이트 묶음을 U+FFFD 하나로. git 은 제목을 커밋에 적힌
+// 바이트 그대로 내고(옛 인코딩의 커밋), 원장 칸 관문은 깨진 UTF-8 을 거절한다 - 그대로 넘기면 서버가 지은 글이 400 입력 오류로
+// 분류되고 그 저장소의 ref 상태가 갱신되지 않아 낡는다. 제목은 입력이 아니라 표시용 관측이라 바꿔도 가리키는 것이 없다
+// (ref 이름 · sha 는 식별자라 건드리지 않는다). NUL 은 필드 경계라 제목에 올 수 없다.
+func subjectText(s string) string { return strings.ToValidUTF8(s, "\uFFFD") }
 
 // checkSHA 는 sha 자리에 sha 가 왔는지 본다.
 // 길이를 고정하지 않는다 — sha256 저장소는 64자다. 오탐보다 미탐이 비싸므로 문자 집합만 본다.

@@ -141,6 +141,11 @@ func ValidateResourceName(name string) error {
 // (migrations/003_landing_queue.sql · pg/001_baseline.sql). EnqueueLanding 의 ON CONFLICT 대상이다.
 const landingOneLivePerSession = `(project, session_id) WHERE left_at IS NULL`
 
+// landingEnqueue 는 줄 서기의 넣기 문장이다(insertUnlessTaken 이 landingOneLivePerSession 충돌 꼬리를 붙인다).
+const landingEnqueue = `
+		INSERT INTO landing_queue(project, session_id, enqueued_at, left_at, left_kind, left_detail)
+		VALUES (?, ?, ?, NULL, NULL, NULL)`
+
 // EnqueueLanding 은 랜딩 줄에 선다. **재진입 안전하다** — 이미 살아 있는 줄 행이 있으면
 // 새로 넣지 않고 그것을 그대로 돌려준다.
 //
@@ -181,9 +186,7 @@ func (t *Tx) EnqueueLanding(project, sessionID string, resources []string, at ti
 		}
 	}
 	at = atStamp(at)
-	id, inserted, err := t.insertUnlessTaken(`
-		INSERT INTO landing_queue(project, session_id, enqueued_at, left_at, left_kind, left_detail)
-		VALUES (?, ?, ?, NULL, NULL, NULL)`, landingOneLivePerSession,
+	id, inserted, err := t.insertUnlessTaken(landingEnqueue, landingOneLivePerSession,
 		project, sessionID, fmtTime(at))
 	if err == nil && !inserted {
 		// 이미 서 있다. **자원 집합까지 채워** 그대로 낸다(liveLandingRow 가

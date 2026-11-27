@@ -249,3 +249,29 @@ func deepCopy(t *testing.T, f form) string {
 	}
 	return string(b)
 }
+
+// 원장에 담을 JSON 칸(store 의 원장 칸 관문 → pg.Cell → EscapeJSON)도 U+0000 · 서로게이트 단위가 없으면 문서를 걷지 않는다 - 받은
+// 그대로 내고 할당하지 않는다. `\u` 하나(json.Marshal 의 `<` 꼴)를 문턱으로 쓰면 보통 문서마다 글 토큰을 다 풀어 다시 쓴다.
+func TestEscapeJSONFastPath(t *testing.T) {
+	doc := string(bigDoc(1 << 20))
+	if n := testing.AllocsPerRun(5, func() {
+		if out, changes, err := nulesc.EscapeJSON(doc); err != nil || changes != nil || out != doc {
+			t.Fatal(changes, err)
+		}
+	}); n != 0 {
+		t.Fatalf("1 MiB 보통 문서의 EscapeJSON 할당 = %v, 바라는 것 0", n)
+	}
+}
+
+// 저장 길(store 의 원장 칸 관문 → pg.Cell → EscapeJSON)이 JSON 칸 하나에 쓰는 몫이다. U+0000 이 없는 1 MiB 문서(`\u003c` 꼴이 가득)
+// 는 문서를 걷지 않는다.
+func BenchmarkEscapeJSON1MiB(b *testing.B) {
+	doc := string(bigDoc(1 << 20))
+	b.SetBytes(int64(len(doc)))
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, changes, err := nulesc.EscapeJSON(doc); err != nil || changes != nil {
+			b.Fatal(changes, err)
+		}
+	}
+}

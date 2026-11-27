@@ -79,6 +79,12 @@ func (e *MoveRefusedError) Error() string {
 // 이 목록에 없어서 amend 된 항목의 이동이 FK 787 로 거절됐다(2026-09-24 실측).
 var itemKeyedTables = []string{"item_after", "claim", "job", "item_revision"}
 
+// itemKeyedMove 는 딸린 표 tbl 의 행을 옮기는 문장이다(인자: 새 프로젝트 · 옛 프로젝트 · 항목). 표 이름을 이어 짓는 문장이라 원장 칸
+// 관문의 꼴 시험이 이것으로 완성문을 잰다.
+func itemKeyedMove(tbl string) string {
+	return fmt.Sprintf(`UPDATE %s SET project = ? WHERE project = ? AND item_id = ?`, tbl)
+}
+
 // MoveItem 은 항목과 **그 항목을 (project, item_id) 로 가리키는 모든 행**을 함께 옮긴다.
 //
 // ★ 항목 행만 옮기면 안 된다. item_after·claim 은 item(project, id) 에 복합 FK 를 걸고
@@ -105,9 +111,7 @@ func (t *Tx) MoveItem(project, itemID, toProject, sessionID string) error {
 		return err
 	}
 	for _, tbl := range itemKeyedTables {
-		if _, err := t.tx.ExecContext(t.ctx,
-			fmt.Sprintf(`UPDATE %s SET project = ? WHERE project = ? AND item_id = ?`, tbl),
-			toProject, project, itemID); err != nil {
+		if _, err := t.tx.ExecContext(t.ctx, itemKeyedMove(tbl), toProject, project, itemID); err != nil {
 			return fmt.Errorf("딸린 행 이동 실패(table=%s project=%q id=%q): %w",
 				tbl, clip(project, 64), clip(itemID, 64), err)
 		}

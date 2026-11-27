@@ -944,10 +944,14 @@ fd migrate verify --from fd-copy.db --db <URL>
   actor and the reason, the whole joined text) becomes `\x00` just before it is stored, byte for byte what moving a SQLite
   ledger holding the same text produces. It does not matter where the write comes from (MCP · CLI · hooks · dashboard
   forms, and `fd import --apply` · `--judgments`, which do not go through REST). A NUL in a name place (ids, kinds, states,
-  paths, JSON keys, the URL), a lone surrogate and broken UTF-8 are refused with 400 (`nul_refused` · `lone_surrogate` ·
-  `bad_utf8`) and nothing is written. From the dry run on, `fd import` lists such records as refused and `--judgments` refuses the whole rewrite. Length limits and
-  responses use the text as sent. Each rewritten cell leaves one server log line after the commit with the table, the
-  column and the row coordinates (not the text).
+  paths, JSON keys, the URL, the `Idempotency-Key` header), a lone surrogate and broken UTF-8 are refused with 400
+  (`nul_refused` · `lone_surrogate` · `bad_utf8`) and nothing is written. From the dry run on, `fd import` lists such
+  records as refused and `--judgments` refuses the whole rewrite (it checks each line of the ledger files before decoding
+  it). Length limits and responses use the text as sent. Removing a label removes the value that is in the ledger as it
+  is first: when an item that an earlier server wrote to a SQLite ledger holds both a NUL label and a label made of the four characters
+  `\x00`, only the one named goes. Each rewritten cell that reached the ledger (not a zero-row update, not a savepoint that
+  was rolled back) leaves one server log line after the commit with the table, the column and the row coordinates (not
+  the text).
 - After moving and leaving the moved marker, the import moves the source's pre-upgrade copies (`<source>.bak-*`, with their
   side files) into a new directory `<source>.pre-import-<time>.bak/` (it does not delete them). That file is no longer the
   ledger, and those copies are not copies of whatever ledger is put there later. A dry run, a refusal, or a failure moves

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/kweiza/flightdeck/internal/nulesc"
 	"github.com/kweiza/flightdeck/internal/store"
 )
 
@@ -97,6 +98,10 @@ func JudgeRestoreSchema(ledgerVersion, codeVersion int) error {
 // nil 을 낸다. 즉 DB 쪽 원본과 이 되읽기가 "표가 비었다"를 같은 값(nil)으로 표현하므로
 // reflect.DeepEqual 왕복이 저절로 닫힌다. 여기서 인위적으로 빈 non-nil 슬라이스로
 // 바꾸면 오히려 실제 DB 원본과의 대칭이 깨진다(TestReadRoundTripsEmptyLedger 참고).
+//
+// ★ 줄마다 **풀기 전에** 원문을 잰다(nulesc.CheckDoc). 풀기(encoding/json)는 깨진 UTF-8 · 짝 없는 서로게이트를 U+FFFD 로
+// 바꾸고 키의 U+0000 을 다른 이름으로 만든다 - 그 뒤에는 가져오기의 사전 검사(store.ScreenLedger)가 흔적을 못 본 채 바뀐
+// 글을 원장에 넣는다. 요청 본문 · MCP 인자와 같은 입구 규칙이다.
 func readLines[T any](dir, name string) ([]T, error) {
 	f, err := os.Open(filepath.Join(dir, name))
 	if err != nil {
@@ -112,6 +117,9 @@ func readLines[T any](dir, name string) ([]T, error) {
 		raw := bytes.TrimSpace(sc.Bytes())
 		if len(raw) == 0 {
 			continue
+		}
+		if err := nulesc.CheckDoc(raw); err != nil {
+			return nil, fmt.Errorf("원장 행을 풀 수 없는 글이다(%s 의 %d번째 줄): %w", clip(name, 64), line+1, err)
 		}
 		var v T
 		if err := json.Unmarshal(raw, &v); err != nil {

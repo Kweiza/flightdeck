@@ -266,6 +266,11 @@ func TestParseForEachRef(t *testing.T) {
 	if _, err := parseForEachRef([]byte("main\x00refs/heads/main\x00주제\x00\n"), now); err == nil {
 		t.Error("sha 자리의 비16진수를 안 걸렀다")
 	}
+	// 표 밖: 옛 인코딩 커밋의 제목은 깨진 UTF-8 로 온다 - 원장 칸 관문이 거절하지 않게 U+FFFD 로 옮긴다(ref 이름은 그대로).
+	latin := "main\x00" + strings.Repeat("b", 40) + "\x00caf\xe9 \xff\xfe끝\x00\n"
+	if refs, err := parseForEachRef([]byte(latin), now); err != nil || len(refs) != 1 || refs[0].Subject != "caf\uFFFD \uFFFD끝" {
+		t.Errorf("깨진 UTF-8 제목 = %+v %v, 바라는 것 %q", refs, err, "caf\uFFFD \uFFFD끝")
+	}
 	// 표 밖: 제목에 개행이 들어와도 필드 경계는 NUL 이므로 제목 안에 남아야 한다.
 	nl := "main\x00" + strings.Repeat("b", 40) + "\x00두\n줄\x00\n"
 	refs, err := parseForEachRef([]byte(nl), now)
@@ -283,6 +288,10 @@ func TestParseLogRecord(t *testing.T) {
 	// 빈 커밋 메시지는 유효하다 — 오류가 아니다.
 	if _, s, err := parseLogRecord([]byte(sha + "\x00\n")); err != nil || s != "" {
 		t.Errorf("빈 제목을 오류로 냈다: %q %v", s, err)
+	}
+	// 표 밖: 옛 인코딩 커밋의 깨진 UTF-8 제목은 U+FFFD 로 옮긴다.
+	if _, s, err := parseLogRecord([]byte(sha + "\x00caf\xe9\n")); err != nil || s != "caf\uFFFD" {
+		t.Errorf("깨진 UTF-8 제목 = %q %v, 바라는 것 %q", s, err, "caf\uFFFD")
 	}
 	// 표 밖: 구조가 다르면 조용히 0값을 내지 않는다.
 	for _, bad := range []string{"", "\n", sha, sha + "\x00a\x00b", "zzz\x00제목"} {

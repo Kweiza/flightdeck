@@ -305,7 +305,12 @@ func (s *server) withIdempotency(next http.Handler) http.Handler {
 			return
 		}
 		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-		if v := JudgeIdempotencyKey(r.Method, key); !v.OK {
+		v := JudgeIdempotencyKey(r.Method, key)
+		if v.Bad != nil {
+			s.writeError(w, r, classifyInput(v.Bad, "Idempotency-Key 헤더"))
+			return
+		}
+		if !v.OK {
 			s.writeError(w, r, badRequest("idempotency_key_required", v.Reason,
 				"Idempotency-Key: <session>:<seq> 를 실어라 — 훅은 타임아웃으로 끊고 다시 부르는 것이 정상 동작이라, "+
 					"이 키가 없으면 같은 신호·항목이 조용히 두 번 들어간다."))

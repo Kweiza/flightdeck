@@ -664,9 +664,19 @@ func (c *conn) Close() error { return c.raw.Close() }
 type rowSet struct {
 	raw *sql.Rows
 	eng engine
+	// onRow 는 첫 행을 받았을 때 한 번 부른다. 원장 칸 관문이 INSERT · UPDATE … RETURNING 의 바꿔 넣기를 그 문장이 행을 썼을
+	// 때만 남기는 자리다(txConn.QueryContext) - 행을 안 돌려준 문장(insertUnlessTaken 의 충돌)은 원장에 닿지 않았다.
+	onRow func()
 }
 
-func (r *rowSet) Next() bool { return r.raw.Next() }
+func (r *rowSet) Next() bool {
+	ok := r.raw.Next()
+	if ok && r.onRow != nil {
+		r.onRow()
+		r.onRow = nil
+	}
+	return ok
+}
 
 // Scan 의 오류는 두 갈래다. Next 가 드라이버에게서 받은 오류(그때 Err 가 같은 것을 낸다 - Next 가 false 를 낸 뒤 부른
 // 결함이다)와, 받은 값을 dest 로 옮기다 난 database/sql 의 변환 오류다. 앞쪽만 드라이버 본문을 싣는다 - 뒤쪽은 우리
@@ -726,8 +736,9 @@ type txConn struct {
 	// 흡수하고 이어 가도 아무것도 쓰이지 않게 여기서 막는다. 롤백은 막지 않는다.
 	broken error
 
-	// cells 는 원장 칸 관문이다(cellgate.go). 업무 쓰기 트랜잭션(runTx)만 단다 - 차 있으면 INSERT · UPDATE 의 칸 값 인자에
-	// 이관과 같은 칸 규칙을 걸고, 거절이면 문장을 보내지 않고 트랜잭션을 망가진 것으로 표시한다.
+	// cells 는 원장 칸 관문이다(cellgate.go). 업무 쓰기 트랜잭션(runTx)만 단다 - 차 있으면 문장마다 인자에 그것이 닿는 자리의
+	// 규칙(칸 값이면 이관과 같은 칸 규칙, 그 밖의 글이면 이름 규칙)을 걸고, 거절이면 문장을 보내지 않고 트랜잭션을 망가진
+	// 것으로 표시한다. 바꿔 넣기는 그 문장이 원장에 닿았을 때만 남긴다(영향 행 · 돌려받은 행).
 	cells *cellGate
 }
 
@@ -738,34 +749,51 @@ func (t *txConn) poison(err error) {
 	}
 }
 
+// ExecContext 는 관문을 지나 문장을 보낸다. 바꿔 넣기는 문장이 성공하고 행을 하나라도 바꿨을 때만 남긴다(영향 행 수를 못 읽는
+// 드라이버면 남긴다 - 바꿔 넣은 칸을 빠뜨리는 쪽보다 낫다).
 func (t *txConn) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
-	args, err := t.ready(q, args)
+	args, pend, err := t.ready(q, args)
 	if err != nil {
 		return nil, err
 	}
-	return t.eng.exec(ctx, t.raw, q, args)
+	res, err := t.eng.exec(ctx, t.raw, q, args)
+	if err == nil && len(pend) > 0 {
+		if n, rerr := res.RowsAffected(); rerr != nil || n > 0 {
+			t.cells.keep(pend)
+		}
+	}
+	return res, err
 }
 
-// QueryContext 도 관문을 지난다 - 쓰기 문장이 행을 돌려받는 자리(INSERT … RETURNING, insertUnlessTaken)가 이리로 온다.
+// QueryContext 도 관문을 지난다 - 쓰기 문장이 행을 돌려받는 자리(INSERT … RETURNING, insertUnlessTaken)가 이리로 온다. 바꿔
+// 넣기는 첫 행을 받았을 때 남긴다(rowSet.onRow).
 func (t *txConn) QueryContext(ctx context.Context, q string, args ...any) (*rowSet, error) {
-	args, err := t.ready(q, args)
+	args, pend, err := t.ready(q, args)
 	if err != nil {
 		return nil, err
 	}
-	return t.eng.query(ctx, t.raw, q, args)
+	rs, err := t.eng.query(ctx, t.raw, q, args)
+	if err == nil && len(pend) > 0 {
+		rs.onRow = func() { t.cells.keep(pend) }
+	}
+	return rs, err
 }
 
 // ready 는 문장을 보내기 전의 몫이다: 망가진 트랜잭션이면 그 까닭이고, 원장 칸 관문이 거절하면 트랜잭션을 망가뜨리고 그 거절이다.
-func (t *txConn) ready(q string, args []any) ([]any, error) {
+// 관문이 있으면 규칙을 건 인자와 그 문장이 원장에 닿으면 남길 바꿔 넣기를 낸다.
+func (t *txConn) ready(q string, args []any) ([]any, []cellRewrite, error) {
 	if t.broken != nil {
-		return nil, t.broken
+		return nil, nil, t.broken
 	}
-	args, err := t.cells.args(q, args)
+	if t.cells == nil {
+		return args, nil, nil
+	}
+	args, pend, err := gateArgs(q, args)
 	if err != nil {
 		t.poison(err)
-		return nil, err
+		return nil, nil, err
 	}
-	return args, nil
+	return args, pend, nil
 }
 
 func (t *txConn) QueryRowContext(ctx context.Context, q string, args ...any) *row {
