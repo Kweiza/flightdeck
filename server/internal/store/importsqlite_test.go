@@ -297,6 +297,9 @@ func TestImportSQLiteRefusesFaultsAndWritesNothing(t *testing.T) {
 		{"JSON 의 \\u0000", `UPDATE item SET labels = '["a\u0000"]' WHERE id = 'i1'`, "item", "labels", `id="i1"`, pg.FaultJSONNUL},
 		{"부모 없는 행", `INSERT INTO claim(project, item_id, session_id, at) VALUES ('p', 'i2', 'nobody', 'x')`,
 			"claim", "session_id", "→ session", pg.FaultForeignKey},
+		// 글자 수(700)는 상한 아래지만 바이트(2100)는 넘는다 - 인덱스는 바이트로 받는다.
+		{"인덱스 키 상한을 넘는 글", `INSERT INTO event(at, project, kind, payload) VALUES ('x', '` + strings.Repeat("가", 700) + `', 'k3', '{}')`,
+			"event", "project", "id=3", pg.FaultTooLong},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -418,9 +421,10 @@ func TestImportSQLiteRefusesATargetThatIsNotEmpty(t *testing.T) {
 func TestImportSQLiteRefusesAnOlderSource(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "old.db")
-	mustMigrateTo(t, path, pg.ImportVersion-1)
+	below := pg.ImportFloor() - 1
+	mustMigrateTo(t, path, below)
 	dsn, dst := importTarget(t)
-	older := fmt.Sprintf("판 %d", pg.ImportVersion-1)
+	older := fmt.Sprintf("판 %d", below)
 	for _, dry := range []bool{true, false} {
 		_, err := importLedger(t, ctx, path, dsn, TransferOptions{DryRun: dry})
 		if err == nil || !strings.Contains(err.Error(), older) || !strings.Contains(err.Error(), "fd migrate --db") {
@@ -436,8 +440,76 @@ func TestImportSQLiteRefusesAnOlderSource(t *testing.T) {
 	// 원본을 바꾸지 않았다 - 여전히 이관 판 아래다.
 	var v int
 	liteQuery(t, path, `SELECT max(version) FROM schema_version`, &v)
-	if v != pg.ImportVersion-1 {
+	if v != below {
 		t.Fatalf("거절한 원본의 판이 %d 로 바뀌었다", v)
+	}
+}
+
+// 이관 판 범위(pg.ImportFloor-ImportVersion) 안이면 원본과 대상의 판이 서로 달라도 옮기고 맞댄다. 「켜기 전에 섰을 때」에서 이어 가는
+// 갈래가 이것이다: 판 18 에서 옮긴 SQLite 원장(표지가 있어 판을 못 올린다)을 이 판의 실행기가 19 로 올린 Postgres 원장과 맞댄다.
+// 반대(판 19 원본 · 판 18 대상)와 역이관(판 18 원본)도 받는다.
+func TestTransferAcceptsTheVersionRange(t *testing.T) {
+	ctx := context.Background()
+	floor := pg.ImportFloor()
+	if floor >= pg.ImportVersion {
+		t.Skip("이관 판 범위가 한 판이다 - 서로 다른 판이 없다")
+	}
+	at := func(v int) string {
+		path := filepath.Join(t.TempDir(), "fd.db")
+		mustMigrateTo(t, path, v)
+		liteExec(t, path, importSeed)
+		return path
+	}
+
+	t.Run("판 18 원본 → 판 19 대상", func(t *testing.T) {
+		src := at(floor)
+		dsn, dst := importTarget(t)
+		for _, dry := range []bool{true, false} {
+			if _, err := importLedger(t, ctx, src, dsn, TransferOptions{DryRun: dry}); err != nil {
+				t.Fatalf("예행 %v: 범위 안의 원본을 거절했다: %v", dry, err)
+			}
+		}
+		settleLedger(t, dsn)
+		if _, err := VerifySQLite(ctx, src, dsn, quietLog()); err != nil {
+			t.Fatalf("범위 안의 원본을 대조가 거절했다: %v", err)
+		}
+		if n := targetRows(t, dst); n == 0 {
+			t.Fatal("옮긴 행이 없다")
+		}
+	})
+
+	t.Run("판 19 원본 → 판 18 대상 → 역이관", func(t *testing.T) {
+		src := at(pg.ImportVersion)
+		dsn, _ := pgAtBaseline(t)
+		if _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil {
+			t.Fatalf("범위 안의 대상을 거절했다: %v", err)
+		}
+		back := exportBack(t)
+		if _, err := exportLedger(t, ctx, dsn, back, TransferOptions{}); err != nil {
+			t.Fatalf("판 18 원장의 역이관을 거절했다: %v", err)
+		}
+		var v int
+		liteQuery(t, back, `SELECT max(version) FROM schema_version`, &v)
+		if v != pg.ImportVersion {
+			t.Fatalf("역이관이 낸 원장의 판이 %d 다(이관 판 %d 이어야 한다)", v, pg.ImportVersion)
+		}
+	})
+}
+
+// transferPlan 은 판 범위 규칙을 세 문에 똑같이 건다: 범위 안이면 받고(MigrateNone), 아래면 올리라 하고, 위면 거절한다.
+func TestTransferPlanFollowsTheRange(t *testing.T) {
+	for v, want := range map[int]MigrationAction{
+		pg.ImportFloor() - 1: MigrateUpgrade,
+		pg.ImportFloor():     MigrateNone,
+		pg.ImportVersion:     MigrateNone,
+		pg.ImportVersion + 1: MigrateReject,
+	} {
+		if got := transferPlan(true, v, 30).Action; got != want {
+			t.Errorf("판 %d: %s(기대 %s)", v, got, want)
+		}
+	}
+	if got := transferRange(); got != fmt.Sprintf("%d-%d", pg.ImportFloor(), pg.ImportVersion) {
+		t.Errorf("범위 표기가 %q 다", got)
 	}
 }
 

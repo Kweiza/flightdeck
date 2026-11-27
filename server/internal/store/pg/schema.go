@@ -7,6 +7,7 @@
 //     SQLite 판 18 과 같은 뜻이고 판 번호도 18 이다(BaselineVersion).
 //   - Steps(019_*.sql …): 기준선 위 증분. 소유 역할로 하나씩 돈다. SQLite 원장이 운영 원장인 동안은 SQLite 에 오르는
 //     증분을 같은 판 번호 · 같은 뜻으로 여기에도 싣는다(019 가 그 첫째다) - 두 판이 갈리면 store 의 시험이 빨갛다.
+//     인덱스만 더한 증분(IndexOnly)은 이관 판 범위(ImportFloor)와 기록을 잃지 않는 내림의 바탕이다.
 //
 // ★ 판(schema_version 행)을 적는 것은 이 SQL 이 아니라 이전 실행기다 — SQLite 의 schema.sql 이 판 행을 안
 // 적고 실행기가 적는 것과 같다.
@@ -32,6 +33,7 @@ package pg
 
 import (
 	_ "embed"
+	"regexp"
 	"strings"
 )
 
@@ -62,6 +64,42 @@ type Step struct {
 var Steps = []Step{
 	{To: 19, Name: "event 를 (project, kind, id) 로 찾는다", SQL: stepEventByProjectKind},
 }
+
+// IndexOnly 는 증분 SQL 이 인덱스를 더하기만 하는가와, 그렇다면 더한 인덱스의 이름(적힌 순서)이다. 순수 함수다. 두 엔진의 증분에
+// 같은 규칙을 쓴다(store 는 SQLite 증분에도 이것을 부른다).
+//
+// ★ 이것이 판 범위 규칙의 바탕이다. 인덱스만 더한 증분은 표 · 칸 · 행을 바꾸지 않으므로 (1) 그 아래 판의 원장도 이관 · 역이관 ·
+// 대조가 같은 모양으로 받고(ImportFloor), (2) 그 인덱스를 지우고 판 행을 지우면 기록을 잃지 않고 아래 판으로 내린다(store 의
+// DownSteps). 내림 SQL 을 손으로 따로 적지 않는다 - 올림에서 읽어 내므로 두 벌이 없다.
+// ★ 받는 문장은 `CREATE INDEX <이름> ON …` 꼴뿐이다. 문장마다 그 꼴이어야 하고, 줄 전체가 `--` 주석인 줄과 빈 줄은 건너뛴다(줄
+// 끝 주석이 붙은 문장은 안 받는다 - 모르는 꼴은 「인덱스만」이 아니다). UNIQUE 는 안 받는다: 아래 판이 받던 행을 거절하므로
+// 옮길 것이 같지 않다. CONCURRENTLY 는 트랜잭션 안에서 못 돈다. IF NOT EXISTS 는 이미 있던 같은 이름의 인덱스를 내림이 지우게
+// 된다. 이름은 따옴표 없는 식별자만 받는다.
+func IndexOnly(sql string) ([]string, bool) {
+	var body []string
+	for _, line := range strings.Split(sql, "\n") {
+		if t := strings.TrimSpace(line); t != "" && !strings.HasPrefix(t, "--") {
+			body = append(body, line)
+		}
+	}
+	var names []string
+	for _, st := range strings.Split(strings.Join(body, "\n"), ";") {
+		st = strings.TrimSpace(st)
+		if st == "" {
+			continue
+		}
+		m := createIndex.FindStringSubmatch(st)
+		if m == nil {
+			return nil, false
+		}
+		names = append(names, m[1])
+	}
+	return names, len(names) > 0
+}
+
+// createIndex 는 IndexOnly 가 받는 문장 하나의 꼴이다. 이름 뒤에 곧바로 ON 이 와야 한다 - CONCURRENTLY · IF NOT EXISTS 는 그
+// 자리에서 어긋난다.
+var createIndex = regexp.MustCompile(`(?is)^CREATE\s+INDEX\s+([a-z_][a-z0-9_]*)\s+ON\s+\S`)
 
 // 역할 이름. SQL 파일이 이 이름을 그대로 쓴다.
 const (

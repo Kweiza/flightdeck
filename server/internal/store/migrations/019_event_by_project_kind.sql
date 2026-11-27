@@ -1,9 +1,14 @@
 -- 019 · event 를 (project, kind, id) 로 찾는다 (schema_version 18 → 19)
 --
 -- ★ 무엇을 위한 인덱스인가: 「이 프로젝트의 이 종류 이벤트를 id 순으로」 읽는 문장이다 - 종료 선언 조회
---   (closeDeclarationsByItem, pick 마다 돈다) · 재생산율(QueueReproduction 의 마무리 창과 추가 셈)이 그 꼴이고,
---   project + kind 로 거르는 다른 문장(AckReach 의 처방 셈 · ClaimHolderAt)도 앞 두 칸을 탄다. 문장 목록과
---   각 문장이 이 인덱스를 타는지는 event_project_kind_plan_test.go 가 두 엔진에서 잰다.
+--   (CloseDeclarationsByItem, pick 마다 돈다) · 재생산율(QueueReproduction 의 마무리 창과 추가 셈 - 추가 셈은 셋째
+--   칸 id 의 하한까지 범위로 쓴다)이 그 꼴이다. AckReach 의 처방 셈(보드마다 돈다)은 「전체」 셈이 앞 두 칸의 범위를
+--   타고, 창 셈은 SQLite 에서 (kind, at) 의 창 범위를 탄다.
+--   이 인덱스의 대상이 아닌 것: ConversationLifecycle 의 마무리 읽기(convFinishesSQL)는 대화의 창(세션 · at)이 범위를
+--   자른다 - 이 인덱스로만 읽으면 그 프로젝트의 마무리 이력을 다 읽는다. ClaimHolderAt(진단용, 업무 경로의 호출자가 없다)은
+--   (project = ? OR project IS NULL) 이라 SQLite 에서 (kind, at) 로 그 종류를 다 읽는다.
+--   project + kind 로 거르는 문장 목록과 문장마다 지킬 계획은 event_project_kind_plan_test.go 가 두 엔진에서 잰다
+--   (ClaimHolderAt 은 까닭과 함께 목록 밖에 둔다).
 --
 -- ★ 왜 지금인가: 그 전까지 event 인덱스는 (kind, at) · (session_id, at) 뿐이었다. SQLite 는 (kind, at) 로
 --   그 종류를 다 읽고 project 로 거른 뒤 정렬했고, Postgres 는 문 캐시가 돌리는 일반 계획(generic plan)에서
@@ -13,6 +18,8 @@
 -- ★ id 를 셋째 칸에 적는 까닭: SQLite 에서 id 는 rowid 라 인덱스 끝에 어차피 붙지만, Postgres 는 적어야
 --   id 순서를 인덱스에서 받는다. 두 엔진에 같은 정의를 둔다(pg/019_event_by_project_kind.sql).
 --
--- ★ 순수 가산이다(CREATE INDEX 하나): migrate_guard_test.go 의 파괴 축에 안 걸린다.
+-- ★ 순수 가산이다(CREATE INDEX 하나): migrate_guard_test.go 의 파괴 축에 안 걸린다. 그래서 판 18 원장도 같은 표 · 칸으로
+--   옮기고(이관 판 범위, pg.ImportFloor) 기록을 잃지 않고 18 로 내린다(`fd migrate --to 18` - 이 인덱스와 판 19 행을 지운다,
+--   store 의 DownSteps).
 
 CREATE INDEX event_by_project_kind ON event(project, kind, id);

@@ -164,6 +164,7 @@ func TestCellFaults(t *testing.T) {
 	num := pg.Column{Name: "i", Kind: pg.Int}
 	blob := pg.Column{Name: "b", Kind: pg.Bytes}
 	doc := pg.Column{Name: "j", Kind: pg.Text, JSON: true}
+	capped := pg.Column{Name: "p", Kind: pg.Text, MaxBytes: 4}
 	for _, c := range []struct {
 		name  string
 		col   pg.Column
@@ -193,6 +194,10 @@ func TestCellFaults(t *testing.T) {
 		{"범위 밖 수 뒤의 \\u0000", doc, `[1e400,"\u0000"]`, `[1e400,"\u0000"]`, pg.FaultJSONNUL},
 		{"범위 밖 수는 받는다", doc, `{"n":1e400,"s":"\\u0000"}`, `{"n":1e400,"s":"\\u0000"}`, ""},
 		{"JSON 은 받는다", doc, `{"a":[1,"b"]}`, `{"a":[1,"b"]}`, ""},
+		{"상한까지는 받는다", capped, "abcd", "abcd", ""},
+		{"상한을 넘는 글", capped, "abcde", "abcde", pg.FaultTooLong},
+		{"상한은 글자가 아니라 바이트다", capped, "가나", "가나", pg.FaultTooLong},
+		{"상한 칸의 BLOB 도 바이트로 잰다", capped, []byte("abcde"), "abcde", pg.FaultTooLong},
 	} {
 		got, fault := pg.Cell(c.col, c.in)
 		if fault != c.fault || pg.RowHash([]any{got}) != pg.RowHash([]any{c.want}) {
@@ -474,6 +479,77 @@ func TestLeftBehindIsExact(t *testing.T) {
 	} {
 		if got := pg.LeftBehind(name); got != want {
 			t.Errorf("LeftBehind(%q) = %v, 기대 %v", name, got, want)
+		}
+	}
+}
+
+// 「인덱스만 더한 증분」 판정(IndexOnly)은 `CREATE INDEX <이름> ON …` 문장만 받는다: 주석 줄 · 빈 줄은 건너뛰고, 이름을 적힌 순서로
+// 낸다. 아래 판의 원장이 받던 행을 거절하는 것(UNIQUE), 트랜잭션 안에서 못 도는 것(CONCURRENTLY), 내림이 남의 인덱스를 지우게 되는 것
+// (IF NOT EXISTS), 모르는 꼴(따옴표 이름 · 줄 끝 주석 · 다른 문장)은 「인덱스만」이 아니다.
+func TestIndexOnly(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		sql  string
+		want []string
+	}{
+		{"하나", "-- 머리말\n\nCREATE INDEX a_by_x ON a(x);\n", []string{"a_by_x"}},
+		{"둘", "CREATE INDEX a_by_x ON a(x);\ncreate index b_by_y on b (y, id);", []string{"a_by_x", "b_by_y"}},
+		{"여러 줄", "CREATE INDEX a_by_x\n  ON a(x, y);", []string{"a_by_x"}},
+		{"빈 증분", "-- 주석만\n", nil},
+		{"UNIQUE", "CREATE UNIQUE INDEX a_by_x ON a(x);", nil},
+		{"CONCURRENTLY", "CREATE INDEX CONCURRENTLY a_by_x ON a(x);", nil},
+		{"IF NOT EXISTS", "CREATE INDEX IF NOT EXISTS a_by_x ON a(x);", nil},
+		{"따옴표 이름", `CREATE INDEX "A" ON a(x);`, nil},
+		{"줄 끝 주석", "CREATE INDEX a_by_x ON a(x); -- 끝", nil},
+		{"다른 문장이 섞였다", "CREATE INDEX a_by_x ON a(x);\nALTER TABLE a ADD COLUMN z text;", nil},
+		{"표 만들기", "CREATE TABLE a(x text);", nil},
+		{"이름 없는 인덱스", "CREATE INDEX ON a(x);", nil},
+	} {
+		got, ok := pg.IndexOnly(c.sql)
+		if wantOK := c.want != nil; ok != wantOK || !slices.Equal(got, c.want) {
+			t.Errorf("%s: IndexOnly = %v, %v(기대 %v, %v)", c.name, got, ok, c.want, wantOK)
+		}
+	}
+}
+
+// 이관 판 범위는 ImportFloor 하나에서 온다: 이관 판에서 아래로 인덱스만 더한 증분을 거슬러 닿는 판이고 기준선 아래로는 안 간다. 지금
+// 증분은 019(인덱스 하나)뿐이라 범위는 기준선(18)부터 19 다.
+func TestImportFloorFollowsTheIndexOnlySteps(t *testing.T) {
+	if got := pg.ImportFloor(); got != pg.BaselineVersion || pg.BaselineVersion != 18 || pg.ImportVersion != 19 {
+		t.Fatalf("ImportFloor = %d(기준선 %d, 이관 판 %d) - 판 18-19 이어야 한다", got, pg.BaselineVersion, pg.ImportVersion)
+	}
+	for v, want := range map[int]bool{17: false, 18: true, 19: true, 20: false} {
+		if got := pg.Transferable(v); got != want {
+			t.Errorf("Transferable(%d) = %v(기대 %v)", v, got, want)
+		}
+	}
+	for _, s := range pg.Steps {
+		if _, ok := pg.IndexOnly(s.SQL); !ok {
+			t.Errorf("증분 %d(%s)가 인덱스만 더한 것이 아니다 - 범위가 그 아래로 내려가지 않는다", s.To, s.Name)
+		}
+	}
+
+	// 규칙 자체는 지금 목록과 떼어 잰다: 꼭대기에서 아래로 인덱스만 더한 증분만 거스르고, 표를 바꾼 증분 · 빈칸 · 기준선에서 선다.
+	idx := func(to int) pg.Step { return pg.Step{To: to, SQL: "CREATE INDEX x" + fmt.Sprint(to) + " ON a(x);"} }
+	tbl := func(to int) pg.Step {
+		return pg.Step{To: to, SQL: "ALTER TABLE a ADD COLUMN y" + fmt.Sprint(to) + " text;"}
+	}
+	for _, c := range []struct {
+		name      string
+		steps     []pg.Step
+		top, want int
+	}{
+		{"인덱스 하나", []pg.Step{idx(19)}, 19, 18},
+		{"표를 바꾼 꼭대기", []pg.Step{tbl(19)}, 19, 19},
+		{"인덱스 둘", []pg.Step{idx(19), idx(20)}, 20, 18},
+		{"인덱스 위의 표", []pg.Step{idx(19), tbl(20)}, 20, 20},
+		{"표 위의 인덱스", []pg.Step{tbl(19), idx(20)}, 20, 19},
+		{"꼭대기가 목록보다 낮다", []pg.Step{idx(19), tbl(20)}, 19, 18},
+		{"빈칸", []pg.Step{idx(19), idx(21)}, 21, 20},
+		{"증분 없음", nil, 18, 18},
+	} {
+		if got := pg.FloorOf(c.steps, c.top, 18); got != c.want {
+			t.Errorf("%s: 바닥 %d(기대 %d)", c.name, got, c.want)
 		}
 	}
 }

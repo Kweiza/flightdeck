@@ -3,14 +3,20 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/kweiza/flightdeck/internal/store/pg"
 )
 
 // 판단 원장 내보내기 — `fd export --judgments` 의 저장 계층.
@@ -597,6 +603,8 @@ func openSQLiteReader(ctx context.Context, path, connStr string, log *slog.Logge
 type RollbackOutcome struct {
 	// Backup 은 고른 백업이다(SQLite 는 원장 옆 사본, Postgres 는 판올림 전 덤프).
 	Backup string
+	// Kept 는 덮기 전의 원장을 남긴 이름이다(SQLite, <db>.pre-rollback-<시각> 과 그 옆 파일). 되돌리기는 지금 원장을 지우지 않는다.
+	Kept string
 	// Steps 는 사람이 돌 절차의 설명이다. 비어 있으면 이 명령이 원장을 이미 갈았다(SQLite). Postgres 는 살아 있는 DB 를
 	// 덮지 않고, 덤프를 새 DB 로 복원하는 절차를 낸다(pgRollbackSteps).
 	Steps string
@@ -607,7 +615,7 @@ type RollbackOutcome struct {
 
 // Rollback 은 판올림 전 백업 중 **가장 최근 것**으로 되돌린다. `fd migrate --rollback` 의 본체다. 엔진은 path 로 가른다.
 //
-//   - SQLite: <db>.bak-* 중 최신을 원장 위에 덮는다(rollbackSQLite).
+//   - SQLite: <db>.bak-* 중 최신이 이 원장의 온전한 사본일 때만 원장 위에 덮는다(rollbackSQLite).
 //   - Postgres: 원장에 붙어 식별과 판을 읽고, backupDir 의 덤프 중 그 원장의 최신(fd-<원장>-from<판>-<시각>.dump)을 고른다.
 //     머리를 재고, 덤프 뒤로 커밋된 판올림이 있을 때만 복원 절차를 낸다(rollbackPG). 원장은 바꾸지 않는다.
 func Rollback(ctx context.Context, path, backupDir string, log *slog.Logger) (RollbackOutcome, error) {
@@ -617,28 +625,73 @@ func Rollback(ctx context.Context, path, backupDir string, log *slog.Logger) (Ro
 	if ParseTarget(path).Postgres() {
 		return rollbackPG(ctx, ParseTarget(path), backupDir)
 	}
-	src, err := rollbackSQLite(path, log)
-	return RollbackOutcome{Backup: src}, err
+	return rollbackSQLite(ctx, path, log)
 }
 
-// rollbackSQLite 는 <db>.bak-* 중 가장 최근 것으로 DB 를 되돌린다. 되돌린 백업 경로를 낸다.
+// rollbackSQLite 는 <db>.bak-* 중 가장 최근 것으로 DB 를 되돌린다. 고른 백업과 지금 원장을 남긴 이름을 낸다.
 //
-// ★ 절차는 RollbackHint 가 사람에게 내던 것과 **글자 그대로 같다**: 백업을 원본 위에 덮고
-// -wal·-shm 을 지운다. 백업은 VACUUM INTO 로 뜬 일관 사본이라 WAL 이 없는데, 옛 -wal 을
-// 남기면 되돌린 파일 위에 반쯤 적용된 상태가 되살아난다. 손으로 하던 절차에서 정확히 그
-// 단계가 빠지기 쉬웠고, 그것이 이 명령이 존재하는 이유다.
+// ★ 덮기 전에 후보를 잰다(rollbackCandidate) - 다 뜬 사본이고(integrity_check · 옆 저널 없음) **이 원장의** 판올림 전 사본이어야
+// 한다. 덜 뜬 사본이나 남의 원장의 사본으로 덮으면 되돌리기가 원장을 잃는 자리가 된다.
+// ★ **지금 원장을 지우지 않는다.** 덮기 전에 원장 파일을 <db>.pre-rollback-<시각> 으로 베끼고 -wal · -shm · -journal 을 그
+// 이름 옆으로 옮긴다(옆 파일까지 한 벌이라 그 이름으로 열면 덮기 직전 상태다). 앞선 판은 -wal 을 지웠다 - 체크포인트 안 된 커밋이
+// 거기 있으면 되돌리기와 함께 사라졌다. 옆 파일은 원장 자리에서는 치워야 한다: 백업은 VACUUM INTO 로 뜬 일관 사본이라 WAL 이
+// 없는데, 옛 -wal 을 남기면 되돌린 파일 위에 반쯤 적용된 상태가 되살아난다(RollbackHint).
+// ★ 순서: 후보를 원장 옆 임시 파일로 베껴 굳히고 → 지금 원장을 베껴 남기고 → 옆 파일을 남긴 이름으로 옮기고 → 임시 파일을 원장
+// 이름으로 바꾼다. 어디서 끊겨도 원장 자리에 파일이 없는 순간이 없고(이름 바꾸기 하나로 갈린다), 지금 원장은 남긴 이름에 있다.
 //
 // ★ **서버가 멈춰 있어야 한다.** 이 함수는 그것을 강제하지 못한다 — 파일을 쥔 프로세스를
 // 이 자리에서 알 방법이 없다. 도는 서버 밑에서 파일을 갈면 그 프로세스는 옛 페이지 캐시
 // 위에서 계속 돌고, 그 상태는 어디에도 안 나타난다.
-func rollbackSQLite(path string, log *slog.Logger) (string, error) {
+func rollbackSQLite(ctx context.Context, path string, log *slog.Logger) (RollbackOutcome, error) {
+	var out RollbackOutcome
 	// 옮긴 원장(이관 표지)의 판을 되돌리면 SQLite 원장이 다시 살아난다 - 표지는 README 의 두 절차만 손으로 지운다(moved.go 머리말).
 	if err := movedRefusal(path); err != nil {
-		return "", err
+		return out, err
 	}
-	backups, err := filepath.Glob(path + ".bak-*")
+	src, err := rollbackCandidate(ctx, path)
+	if err != nil {
+		return out, err
+	}
+	staged, err := stageCopy(src, path)
+	if err != nil {
+		return out, fmt.Errorf("백업을 원장 옆에 베끼지 못했다(%q): %w", clip(src, 200), err)
+	}
+	defer os.Remove(staged) // 이름을 바꾼 뒤면 지울 것이 없다
+	kept := path + ".pre-rollback-" + time.Now().UTC().Format("20060102T150405Z")
+	if err := keepLedger(path, kept); err != nil {
+		return out, fmt.Errorf("덮기 전에 지금 원장을 남기지 못했다(%q) - 덮지 않는다: %w", clip(kept, 200), err)
+	}
+	if err := os.Rename(staged, path); err != nil {
+		return out, fmt.Errorf("백업을 되돌리지 못했다(%q → %q): %w - 지금 원장은 %q 에 있다(옆 파일 포함)",
+			clip(src, 200), clip(path, 200), err, clip(kept, 200))
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return out, fmt.Errorf("되돌린 원장의 디렉토리를 굳히지 못했다(%q): %w", clip(path, 200), err)
+	}
+	log.Info("백업으로 되돌렸다", "path", path, "backup", src, "kept", kept)
+	return RollbackOutcome{Backup: src, Kept: kept}, nil
+}
+
+// rollbackCandidate 는 되돌릴 백업을 고른다: <db>.bak-* 중 가장 최근의 보통 파일이고, 다 뜬 원장이고(checkLedgerCopy), 이 바이너리가
+// 여는 판이고, **이 원장의** 판올림 전 사본이어야 한다. 하나라도 아니면 고르지 않고 사유를 낸다 - 그보다 옛 사본으로 내려가 고르지
+// 않는다(그 사이의 기록을 잃는다).
+//
+// ★ 옆 파일(-journal · -wal · -shm)은 후보가 아니다. 뜨는 도중 끊긴 옛 판의 사본은 <db>.bak-<시각>-journal 을 남기는데, 이름이
+// 사본보다 뒤에 정렬돼 「가장 최근」으로 골라졌다.
+// ★ 「이 원장의 사본」은 판 기록(schema_version 의 판 · 적용 시각)으로 잰다: 사본의 판 기록이 지금 원장의 판 기록 앞부분과 같아야
+// 한다. 판올림은 원장의 옛 판 행을 고치지 않고 위에 더하기만 하므로 이 원장을 올리기 전에 뜬 사본이면 늘 같다. 원장을 바꿔 놓은 뒤
+// (역이관이 낸 파일을 둔 72시간 되돌리기 · 손으로 되살리기) 남은 옛 원장의 사본은 판 행을 새로 적은 원장과 어긋난다 - 그 사본으로
+// 덮으면 맞대기를 마친 원장이 그 뒤의 기록 없이 옛 판으로 돌아간다. 판만 내리려면 `fd migrate --to N` 이다(DownSteps).
+func rollbackCandidate(ctx context.Context, path string) (string, error) {
+	found, err := filepath.Glob(path + ".bak-*")
 	if err != nil {
 		return "", fmt.Errorf("백업을 찾지 못했다(path=%q): %w", clip(path, 200), err)
+	}
+	var backups []string
+	for _, b := range found {
+		if fi, err := os.Lstat(b); err == nil && fi.Mode().IsRegular() && !isSidecar(b) {
+			backups = append(backups, b)
+		}
 	}
 	if len(backups) == 0 {
 		return "", fmt.Errorf("되돌릴 백업이 없다 — %s.bak-* 이 하나도 없다. "+
@@ -648,20 +701,143 @@ func rollbackSQLite(path string, log *slog.Logger) (string, error) {
 	// 파일명의 스탬프는 폭이 고정된 UTC 라 사전순이 곧 시간순이다(timeLayout 과 같은 규율).
 	sort.Strings(backups)
 	src := backups[len(backups)-1]
-
-	if err := copyFileAtomic(src, path); err != nil {
-		return "", fmt.Errorf("백업을 되돌리지 못했다(%q → %q): %w", clip(src, 200), clip(path, 200), err)
+	refuse := func(why string, args ...any) error {
+		return fmt.Errorf("가장 최근 백업 %s 으로 되돌리지 않는다 - "+why+". 그보다 옛 백업으로 되돌리려면(그 사이의 기록을 잃는다) "+
+			"이 파일을 다른 이름으로 옮긴 뒤 다시 돈다", append([]any{clip(src, 200)}, args...)...)
 	}
-	// ★ 순서가 중요하다. 원본을 먼저 갈고 저널을 지운다 — 반대로 하면 지운 뒤 복사 전에
-	//   죽었을 때 옛 DB 가 저널 없이 남아 더 나쁜 상태가 된다.
-	for _, side := range []string{path + "-wal", path + "-shm"} {
-		if err := os.Remove(side); err != nil && !os.IsNotExist(err) {
-			return "", fmt.Errorf("저널을 지우지 못했다(%q): %w — "+
-				"이 상태로 열면 반쯤 적용된 것이 되살아난다", clip(side, 200), err)
+	rows, err := checkLedgerCopy(ctx, src)
+	if err != nil {
+		return "", refuse("다 뜬 원장이 아니다(%v)", err)
+	}
+	if v := topVersion(rows); v < BaseSchemaVersion || v > SchemaVersion {
+		return "", refuse("그 사본은 판 %d 이다(이 바이너리는 %d-%d 판을 연다)", v, BaseSchemaVersion, SchemaVersion)
+	}
+	cur, err := ledgerVersionRows(ctx, path)
+	if err != nil {
+		return "", refuse("지금 원장의 판 기록을 읽지 못해 이 원장의 사본인지 모른다(%v)", err)
+	}
+	if !isPrefix(rows, cur) {
+		return "", refuse("이 원장의 판올림 전 사본이 아니다(판 기록이 지금 원장과 다르다 - 원장을 바꿔 놓은 뒤 남은 옛 원장의 사본이다: " +
+			"역이관 · 되살리기). 덮으면 그 뒤의 기록을 잃는다. 판만 내리려면 `fd migrate --to <판>` 이 인덱스만 더한 판을 기록을 잃지 " +
+			"않고 내린다(README 「72시간 안에 되돌리기」)")
+	}
+	return src, nil
+}
+
+// isSidecar 는 p 가 SQLite 원장 옆 파일(-wal · -shm · -journal, pg.Sidecars)의 이름인가다.
+func isSidecar(p string) bool {
+	for _, side := range pg.Sidecars("") {
+		if strings.HasSuffix(p, side) {
+			return true
 		}
 	}
-	log.Info("백업으로 되돌렸다", "path", path, "backup", src)
-	return src, nil
+	return false
+}
+
+// versionRow 는 schema_version 의 한 행이다. 판올림 전 사본이 어느 원장의 것인지 이 행들로 잰다(rollbackCandidate).
+type versionRow struct {
+	Version   int
+	AppliedAt string
+}
+
+// topVersion 은 판 기록의 가장 높은 판이다. 비었으면 0 이다.
+func topVersion(rows []versionRow) int {
+	if len(rows) == 0 {
+		return 0
+	}
+	return rows[len(rows)-1].Version
+}
+
+// isPrefix 는 판 기록 a 가 b 의 앞부분과 같은가다(같아도 된다).
+func isPrefix(a, b []versionRow) bool {
+	return len(a) <= len(b) && slices.Equal(a, b[:len(a)])
+}
+
+// readVersionRows 는 schema_version 의 행 전부를 판 순서로 읽는다. 표가 없으면 오류다.
+func readVersionRows(ctx context.Context, q Reader) ([]versionRow, error) {
+	var out []versionRow
+	err := eachRow(ctx, q, `SELECT version, applied_at FROM schema_version ORDER BY version`, nil, "schema_version",
+		func(r *rowSet) error {
+			var v versionRow
+			if err := r.Scan(&v.Version, &v.AppliedAt); err != nil {
+				return err
+			}
+			out = append(out, v)
+			return nil
+		})
+	return out, err
+}
+
+// checkLedgerCopy 는 판올림 전 사본 path 가 다 뜬 원장인지 재고 그 판 기록을 낸다: 옆 파일(-journal · -wal)이 없고, integrity_check
+// 가 ok 이고, 판 표를 읽는다. 사본을 뜰 때(backup)와 그것으로 덮기 전(rollbackCandidate)이 이 하나로 잰다. 파일을 바꾸지 않는다
+// (읽기 전용 연결, importSourceDSN).
+//
+// ★ 옆 저널이 있으면 끝나지 않은 쓰기다 - 그 사본을 여는 연결이 저널을 되감아 다른 파일이 된다. 읽기 전용 연결은 되감지 못해 열기가
+// 실패하지만, 사유를 먼저 말한다.
+func checkLedgerCopy(ctx context.Context, path string) ([]versionRow, error) {
+	for _, side := range pg.Sidecars(path) {
+		if _, err := os.Lstat(side); err == nil {
+			return nil, fmt.Errorf("옆에 %s 이 있다 - 뜨는 도중 끊긴 사본이다", clip(filepath.Base(side), 200))
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("옆 파일 %s 을 재지 못했다: %w", clip(side, 200), err)
+		}
+	}
+	r, err := openSQLiteReader(ctx, path, importSourceDSN(path), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	var verdict string
+	if err := r.db.QueryRowContext(ctx, `PRAGMA integrity_check(1)`).Scan(&verdict); err != nil {
+		return nil, fmt.Errorf("integrity_check 를 돌리지 못했다: %w", err)
+	}
+	if verdict != "ok" {
+		return nil, fmt.Errorf("integrity_check: %s", clip(verdict, 200))
+	}
+	return readVersionRows(ctx, r.db)
+}
+
+// ledgerVersionRows 는 지금 원장 path 의 판 기록을 읽는다. 기록을 바꾸지 않는다 - 원장 내보내기 · 판 재기와 같은 접속 문자열(ledgerDSN)이고,
+// 남은 -wal 의 커밋까지 읽는다.
+func ledgerVersionRows(ctx context.Context, path string) ([]versionRow, error) {
+	r, err := openSQLiteReader(ctx, path, ledgerDSN(path), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return readVersionRows(ctx, r.db)
+}
+
+// stageCopy 는 src 를 원장 path 옆 임시 파일로 베껴 굳히고 그 이름을 낸다. 부르는 쪽이 이름을 바꾸거나 지운다.
+func stageCopy(src, path string) (string, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".restore-*")
+	if err != nil {
+		return "", err
+	}
+	if err := copyInto(tmp, src); err != nil {
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	return tmp.Name(), nil
+}
+
+// keepLedger 는 원장 path 를 kept 로 남긴다: 원장 파일을 kept 로 베끼고(굳힌 뒤 이름을 붙인다) 옆 파일을 kept 옆으로 옮긴다. 원장
+// 파일이 없으면 옆 파일만 옮긴다. 원장 자리에 파일이 없는 순간을 만들지 않으려고 원장 파일은 옮기지 않고 베낀다(rollbackSQLite 의 ★).
+func keepLedger(path, kept string) error {
+	if _, err := os.Lstat(path); err == nil {
+		if err := copyFileAtomic(path, kept); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	keptSides := pg.Sidecars(kept)
+	for i, side := range pg.Sidecars(path) {
+		if err := os.Rename(side, keptSides[i]); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("옆 파일 %q 을 옮기지 못했다: %w", clip(side, 200), err)
+		}
+	}
+	return syncDir(filepath.Dir(path))
 }
 
 // copyFileAtomic 은 같은 디렉토리의 임시 파일에 쓴 뒤 rename 한다.
@@ -669,27 +845,46 @@ func rollbackSQLite(path string, log *slog.Logger) (string, error) {
 // ★ 직접 덮어쓰면 복사 도중 죽었을 때 **원본도 백업도 아닌 파일**이 남는다. 되돌리기는
 // 이미 무언가 잘못된 상황에서 부르는 명령이라, 그 자리에서 한 번 더 잃으면 남는 것이 없다.
 func copyFileAtomic(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".restore-*")
+	tmp, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".copy-*")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	if _, err := io.Copy(tmp, in); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
+	if err := copyInto(tmp, src); err != nil {
 		return err
 	}
 	return os.Rename(tmpName, dst)
+}
+
+// copyInto 는 src 의 바이트를 열린 파일 dst 에 쓰고 굳힌 뒤 닫는다. 실패해도 dst 를 닫는다.
+func copyInto(dst *os.File, src string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		dst.Close()
+		return err
+	}
+	defer in.Close()
+	if _, err := io.Copy(dst, in); err != nil {
+		dst.Close()
+		return err
+	}
+	if err := dst.Sync(); err != nil {
+		dst.Close()
+		return err
+	}
+	return dst.Close()
+}
+
+// syncFile 은 파일 p 를 굳힌다(fsync).
+func syncFile(p string) error {
+	f, err := os.OpenFile(p, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if cerr := f.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	return err
 }

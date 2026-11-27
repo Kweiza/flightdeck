@@ -23,6 +23,42 @@ type AckCounts struct {
 // convKeySep 은 대화 키(machine_id, cc_session_id)를 한 글로 이을 때의 구분자다(단위 구분자 0x1f).
 const convKeySep = "\x1f"
 
+// ackReachSQL 은 AckReach 의 문장이다. 인자는 구분자(convKeySep) · 프로젝트 · 창의 아래 끝 넷이다.
+//
+// ★ event 는 이 프로젝트의 처방 두 종류만 읽는다 - event_by_project_kind(project, kind, id) 의 (project, kind) 범위다(증분 019).
+// 집계라 순서 · LIMIT 이 없고, 「전체」 셈이 읽는 양은 그 프로젝트의 처방 행 수다. 실측: Postgres 는 ev 를 한 번 떠 그 범위
+// 하나로 읽고, SQLite 는 CTE 를 셈마다 펼쳐 창 셈에는 at 하한을 밀어 넣어 event_by_kind(kind, at) 의 창 범위를 고른다. 보드마다
+// 돈다. 두 엔진의 계획은 event_project_kind_plan_test.go 가 이 상수를 그대로 EXPLAIN 해 잠근다.
+const ackReachSQL = `
+		WITH conv AS (
+		  SELECT id AS sid, machine_id || ? || cc_session_id AS k FROM session
+		),
+		ev AS (
+		  SELECT e.kind AS kind, e.at AS at,
+		         COALESCE(conv.k, 'sid:' || e.session_id) AS k
+		  FROM event e LEFT JOIN conv ON conv.sid = e.session_id
+		  -- ★ kind 목록이 **명시**인 것이 계약이다. 2026-08-09 에 kind 가 하나 늘었는데
+		  --   (prescribe_folded — 접힌 턴의 계측) 이 목록이 그것을 자동으로 안 집었다.
+		  --   접힘은 **발화가 아니다**: 세션은 그 문구를 못 봤으므로 확인할 대상이 없고,
+		  --   분모에 넣으면 확인율이 "본 것 중 몇을 확인했나"가 아니라 "판정된 것 중 몇"이
+		  --   되어 이 수치의 뜻이 바뀐다. 여기에 kind 를 더할 때는 그 축이 **세션이 실제로
+		  --   읽은 것**인지 먼저 물어라.
+		  WHERE e.project = ? AND e.kind IN ('prescribe','prescribe_ack')
+		),
+		judged AS (
+		  SELECT DISTINCT COALESCE(conv.k, 'sid:' || j.session_id) AS k
+		  FROM judgment j LEFT JOIN conv ON conv.sid = j.session_id
+		)
+		SELECT (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe'),
+		       (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe'
+		          AND k IN (SELECT k FROM judged)),
+		       (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe_ack'),
+		       (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe' AND at >= ?),
+		       (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe' AND at >= ?
+		          AND k IN (SELECT k FROM judged)),
+		       (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe_ack' AND at >= ?
+		          AND k IN (SELECT k FROM ev WHERE kind='prescribe' AND at >= ?))`
+
 // AckReach 는 처방 확인율의 **분모를 가른** 세 수를 **두 구간으로** 낸다 —
 // 전 역사 한 벌(all)과 since 이후 한 벌(recent).
 //
@@ -87,35 +123,7 @@ func (s *Store) AckReach(ctx context.Context, project string, since time.Time) (
 	//
 	// ★ 구분자는 자리표시로 넘긴다. 글자 하나를 내는 함수가 엔진마다 이름이 달라(SQLite char · Postgres chr)
 	//   SQL 안에 적으면 한쪽에서 깨진다 - Postgres 는 char(31) 을 형 이름(character(31))으로 읽어 구문 오류다.
-	row := s.db.QueryRowContext(ctx, `
-		WITH conv AS (
-		  SELECT id AS sid, machine_id || ? || cc_session_id AS k FROM session
-		),
-		ev AS (
-		  SELECT e.kind AS kind, e.at AS at,
-		         COALESCE(conv.k, 'sid:' || e.session_id) AS k
-		  FROM event e LEFT JOIN conv ON conv.sid = e.session_id
-		  -- ★ kind 목록이 **명시**인 것이 계약이다. 2026-08-09 에 kind 가 하나 늘었는데
-		  --   (prescribe_folded — 접힌 턴의 계측) 이 목록이 그것을 자동으로 안 집었다.
-		  --   접힘은 **발화가 아니다**: 세션은 그 문구를 못 봤으므로 확인할 대상이 없고,
-		  --   분모에 넣으면 확인율이 "본 것 중 몇을 확인했나"가 아니라 "판정된 것 중 몇"이
-		  --   되어 이 수치의 뜻이 바뀐다. 여기에 kind 를 더할 때는 그 축이 **세션이 실제로
-		  --   읽은 것**인지 먼저 물어라.
-		  WHERE e.project = ? AND e.kind IN ('prescribe','prescribe_ack')
-		),
-		judged AS (
-		  SELECT DISTINCT COALESCE(conv.k, 'sid:' || j.session_id) AS k
-		  FROM judgment j LEFT JOIN conv ON conv.sid = j.session_id
-		)
-		SELECT (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe'),
-		       (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe'
-		          AND k IN (SELECT k FROM judged)),
-		       (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe_ack'),
-		       (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe' AND at >= ?),
-		       (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe' AND at >= ?
-		          AND k IN (SELECT k FROM judged)),
-		       (SELECT count(DISTINCT k) FROM ev WHERE kind='prescribe_ack' AND at >= ?
-		          AND k IN (SELECT k FROM ev WHERE kind='prescribe' AND at >= ?))`,
+	row := s.db.QueryRowContext(ctx, ackReachSQL,
 		convKeySep, project, cut, cut, cut, cut)
 	if err := row.Scan(&all.Emitted, &all.Reachable, &all.Acked,
 		&recent.Emitted, &recent.Reachable, &recent.Acked); err != nil {

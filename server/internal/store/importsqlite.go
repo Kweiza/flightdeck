@@ -23,7 +23,7 @@ import (
 //
 // 옮기기 한 번의 길(transferInto - 이관 · 역이관이 같다):
 //
-//	원본 열기(SQLite: -wal 이 비었나 · 읽기 전용 · 이관 판인가) → 대상 열기
+//	원본 열기(SQLite: -wal 이 비었나 · 읽기 전용 · 이관 판 범위인가) → 대상 열기
 //	→ 원본 스냅숏 하나에서: 판(Postgres) · 표 · 칸 모양, 붙은 다른 연결(Postgres), 1차 훑기(사전 검사 · 행 표지 · 행 수 ·
 //	  발급 번호)
 //	→ 실행기 세션(Postgres 대상이면 잠금 둘) → 대상 트랜잭션 하나에서: 판 · 붙은 다른 연결(Postgres) · 소유 역할 · FK 미루기 ·
@@ -287,9 +287,9 @@ func VerifySQLite(ctx context.Context, from, to string, log *slog.Logger) (Trans
 // ─────────────────────────────────────────────────────────────────────────────
 
 // openImportSource 는 이관 · 대조의 원본을 읽기 전용으로 연다(importSourceDSN). 옆의 -wal 이 비어 있어야 하고
-// (sourceWALRefusal), 판이 이관 판(pg.ImportVersion)이어야 한다. 파일을 바꾸지 않는다.
+// (sourceWALRefusal), 판이 이관 판 범위(transferPlan)여야 한다. 파일을 바꾸지 않는다.
 //
-// ★ 더 낮은 판은 이 명령이 올리지 않는다. 이관이 읽는 SQLite 판은 이관 판 하나이고, SQLite 실행 경로가 빠진 뒤의 fd 는 그
+// ★ 더 낮은 판은 이 명령이 올리지 않는다. 이관이 읽는 SQLite 판은 이관 판 범위이고, SQLite 실행 경로가 빠진 뒤의 fd 는 그
 // 아래 증분을 갖지 않는다 - 그 판을 아는 fd 로 사본을 먼저 올리라고 안내한다.
 func openImportSource(ctx context.Context, path string, log *slog.Logger) (*Store, error) {
 	if err := sqliteOnly(path, "이관 원본(--from)"); err != nil {
@@ -304,7 +304,7 @@ func openImportSource(ctx context.Context, path string, log *slog.Logger) (*Stor
 	}
 	hasTable, v, objects, err := readMigrationState(ctx, s.db)
 	if err == nil {
-		err = sourceRefusal(PlanMigration(hasTable, v, objects, pg.ImportVersion), v)
+		err = sourceRefusal(transferPlan(hasTable, v, objects), v)
 	}
 	if err != nil {
 		s.Close()
@@ -313,15 +313,37 @@ func openImportSource(ctx context.Context, path string, log *slog.Logger) (*Stor
 	return s, nil
 }
 
+// transferPlan 은 이관 · 역이관 · 대조가 원장의 판 상태(판 v)를 어떻게 보는가다. 순수 함수다. 판 범위(pg.Transferable)의 판이면 그
+// 판을 기대 판으로 재고(받는다), 아니면 이관 판(pg.ImportVersion)으로 잰다 - 더 낮으면 MigrateUpgrade, 더 높으면 MigrateReject 다.
+//
+// ★ 판 범위 규칙은 pg.ImportFloor 하나이고, 이 함수가 그것을 세 문(이관 · 대조의 원본 openImportSource, 대상 targetVersion,
+// 역이관 원본 pgSide.shape)에 똑같이 건다. 범위 안이면 원본과 대상의 판이 서로 달라도 받는다 - 범위 안 판끼리는 인덱스만 다르고
+// 옮길 것(pg.Tables)이 같다. 모양은 판과 따로 잰다(checkShape).
+func transferPlan(hasTable bool, v, objects int) MigrationPlan {
+	want := pg.ImportVersion
+	if pg.Transferable(v) {
+		want = v
+	}
+	return PlanMigration(hasTable, v, objects, want)
+}
+
+// transferRange 는 이관 판 범위를 사람에게 적는 꼴이다(「18-19」, 범위가 한 판이면 「19」).
+func transferRange() string {
+	if f := pg.ImportFloor(); f < pg.ImportVersion {
+		return fmt.Sprintf("%d-%d", f, pg.ImportVersion)
+	}
+	return fmt.Sprint(pg.ImportVersion)
+}
+
 // sourceRefusal 은 원본의 판 plan(판 v)을 이관이 받지 않는 사유다. 받으면 nil 이다. 순수 함수다.
 func sourceRefusal(plan MigrationPlan, v int) error {
 	switch plan.Action {
 	case MigrateNone:
 		return nil
 	case MigrateUpgrade:
-		return fmt.Errorf("원본이 SQLite 판 %d 이다 - 이관은 마지막 SQLite 판(%d)만 읽는다. 먼저 이 판의 fd 로 원본 사본을 "+
+		return fmt.Errorf("원본이 SQLite 판 %d 이다 - 이관은 SQLite 판 %s 의 원장만 읽는다. 먼저 이 판의 fd 로 원본 사본을 "+
 			"판올림하라: `fd migrate --db <사본>` 을 돌린 뒤 다시 이관한다(이관은 증분을 스스로 적용하지 않는다)",
-			v, pg.ImportVersion)
+			v, transferRange())
 	case MigrateApply:
 		return fmt.Errorf("원본에 flightdeck 원장이 없다(빈 DB 다) - 옮길 것이 없다: %s", plan.Reason)
 	}
@@ -371,13 +393,13 @@ func openImportTarget(t Target, log *slog.Logger) (*Store, error) {
 	return openPG(t, log, lockTimeout)
 }
 
-// targetVersion 은 대상 원장이 이관 판(기준선)에 있는가다. 이관 카탈로그(pg.Tables)가 그 판의 모양이다.
+// targetVersion 은 대상 원장이 이관 판 범위(transferPlan)에 있는가다. 이관 카탈로그(pg.Tables)가 그 범위의 모양이다.
 func targetVersion(ctx context.Context, q dbtx) error {
 	hasTable, v, objects, err := readMigrationState(ctx, q)
 	if err != nil {
 		return fmt.Errorf("대상의 판을 재지 못했다: %w", err)
 	}
-	plan := PlanMigration(hasTable, v, objects, pg.ImportVersion)
+	plan := transferPlan(hasTable, v, objects)
 	switch plan.Action {
 	case MigrateNone:
 		return nil
@@ -385,7 +407,7 @@ func targetVersion(ctx context.Context, q dbtx) error {
 		return fmt.Errorf("대상이 빈 DB 다 - 먼저 이관 판까지 깔아라: 초사용자나 소유 역할(%s)로 `fd migrate --db <대상> --to %d`",
 			pg.OwnerRole, pg.ImportVersion)
 	}
-	return fmt.Errorf("대상이 이관 판(%d)이 아니다: %s", pg.ImportVersion, plan.Reason)
+	return fmt.Errorf("대상이 이관 판 범위(%s)가 아니다: %s", transferRange(), plan.Reason)
 }
 
 // prepareTarget 은 옮기기 트랜잭션 tx 를 대상에 맞춘다: 판을 재고, 붙은 다른 연결이 없는지 재고(to.alone), 소유 역할로 바꿔
@@ -571,14 +593,14 @@ type pgSide struct{}
 
 func (pgSide) sqlite() bool { return false }
 
-// shape 는 원본(역이관)의 판이 이관 판(pg.ImportVersion)이고 표 · 칸이 그 판의 모양인지 잰다. 원본은 살아 있는 서버의 원장이라 연 때가
+// shape 는 원본(역이관)의 판이 이관 판 범위(transferPlan)이고 표 · 칸이 그 범위의 모양인지 잰다. 원본은 살아 있는 서버의 원장이라 연 때가
 // 아니라 옮기는 스냅숏에서 잰다 - 이관의 prepareTarget 이 대상의 판을 옮기기 트랜잭션 안에서 다시 재는 것과 같은 꼴이다.
 func (pgSide) shape(ctx context.Context, q Reader) error {
 	hasTable, v, objects, err := readMigrationState(ctx, onEngine{q, enginePG})
 	if err != nil {
 		return fmt.Errorf("원본의 판을 재지 못했다: %w", err)
 	}
-	if err := exportSourceRefusal(PlanMigration(hasTable, v, objects, pg.ImportVersion)); err != nil {
+	if err := exportSourceRefusal(transferPlan(hasTable, v, objects)); err != nil {
 		return err
 	}
 	return checkShape(ctx, q, enginePG)
@@ -838,7 +860,7 @@ func scanTable(ctx context.Context, q Reader, t pg.Table, sqlite bool, cell cell
 	return marks, maxID, err
 }
 
-// checkShape 는 원본(엔진 eng)의 표 · 칸이 이관 카탈로그(pg.Tables)와 같은지 잰다. 이관 판이면 같아야 한다 - 다르면 손으로
+// checkShape 는 원본(엔진 eng)의 표 · 칸이 이관 카탈로그(pg.Tables)와 같은지 잰다. 이관 판 범위면 같아야 한다 - 다르면 손으로
 // 고친 원장이고, 모르는 칸을 버리거나 없는 칸을 지어내지 않으려고 거절한다. 카탈로그를 읽는 질의는 엔진마다 하나(tablesQuery ·
 // columnsQuery)이고 맞대는 규칙은 한 벌이다.
 func checkShape(ctx context.Context, q Reader, eng engine) error {
@@ -869,8 +891,8 @@ func checkShape(ctx context.Context, q Reader, eng engine) error {
 		}
 	}
 	if len(bad) > 0 {
-		return fmt.Errorf("원본의 모양이 판 %d 과 다르다(%s) - 손으로 고친 원장은 옮기지 않는다",
-			pg.ImportVersion, strings.Join(bad, "; "))
+		return fmt.Errorf("원본의 모양이 판 %s 과 다르다(%s) - 손으로 고친 원장은 옮기지 않는다",
+			transferRange(), strings.Join(bad, "; "))
 	}
 	return nil
 }

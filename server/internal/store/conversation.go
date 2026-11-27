@@ -54,6 +54,23 @@ func doneFinishItem(payload string) (string, bool) {
 	return item, true
 }
 
+// convFinishesSQL 은 ConversationLifecycle ⑤ 의 문장이다: 대화의 카드들(inClause 는 그 수만큼의 자리표 `?,?,…`)이 창의 아래 끝
+// 이후에 친 마무리를 id 순으로. 인자는 프로젝트 · 세션 id 들 · 창의 아래 끝이다.
+//
+// ★ 증분 019 의 event_by_project_kind 가 범위를 자르는 문장이 아니다 - 그것으로만 읽으면 그 프로젝트의 마무리 이력 전부를 읽고
+// 세션 · 시각으로 거른다(원장과 함께 자란다). 이 문장의 범위는 대화의 창이 자른다: 세션 목록과 at 하한이다. 실측: SQLite(통계
+// 없이 - 서버는 ANALYZE 를 돌리지 않는다)는 카드가 하나면 event_by_session(session_id, at), 여럿이면 event_by_kind(kind, at) 의
+// 창 범위를 탄다. Postgres 의 일반 계획(합성 이벤트 6만 · ANALYZE 뒤)은 event_by_session 의 창 범위와 event_by_project_kind 를
+// BitmapAnd 로 겹친다(힙은 둘이 다 맞는 행만 읽는다). 행이
+// 적어 정렬은 남긴다. 두 엔진이 「창으로 자른 인덱스 범위」를 타는지는 event_project_kind_plan_test.go 가 이 함수로 잠근다. 처방마다
+// 돈다(service 의 Prescribe).
+func convFinishesSQL(inClause string) string {
+	return `
+		SELECT payload FROM event
+		WHERE project = ? AND kind = 'item.finish' AND session_id IN (` + inClause + `) AND at >= ?
+		ORDER BY id`
+}
+
 // ConversationLifecycle 은 세션 하나가 속한 대화 전체의 라이프사이클 관측을 모은다.
 //
 // ★ **관측만 한다 — 판정은 안 한다.** "지금 lane-wait 인가 finish 인가"는
@@ -201,10 +218,7 @@ func (s *Store) ConversationLifecycle(ctx context.Context, project, sessionID st
 	heldRows.Close()
 
 	// ⑤ done 항목: EarliestOpen 이후 이 대화가 done 으로 닫은 항목(롤백 제외). 판독은 doneFinishItem 이다.
-	evRows, err := s.db.QueryContext(ctx, `
-		SELECT payload FROM event
-		WHERE project = ? AND kind = 'item.finish' AND session_id IN (`+inClause+`) AND at >= ?
-		ORDER BY id`, append(append([]any{project}, sidArgs...), sinceStr)...)
+	evRows, err := s.db.QueryContext(ctx, convFinishesSQL(inClause), append(append([]any{project}, sidArgs...), sinceStr)...)
 	if err != nil {
 		return out, fmt.Errorf("대화 종료 선언 조회 실패(project=%q session=%q): %w",
 			clip(project, 64), clip(sessionID, 64), err)

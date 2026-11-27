@@ -925,7 +925,8 @@ func (t *Tx) Ctx() context.Context { return t.ctx }
 //	   `fd migrate` 를 돌고, 서버는 service_completed_successfully 로 그것이 성공으로
 //	   끝난 뒤에만 뜬다. 이 파일의 Open 은 **어떤 적용도 하지 않는다.**
 //	② 기동 전 DB 백업 — PlanMigration 이 판정하고 VACUUM INTO 로 뜬다.
-//	③ 롤백 명령 — `fd migrate --rollback` 이 <db>.bak-* 중 최신으로 되돌린다.
+//	③ 롤백 명령 — `fd migrate --rollback` 이 <db>.bak-* 중 최신(이 원장의 온전한 사본일 때만)으로 되돌린다.
+//	   인덱스만 더한 판은 `fd migrate --to N` 이 기록을 잃지 않고 내린다(DownSteps).
 //
 // **적용을 기동에 남겼던 옛 판단과 그것이 뒤집힌 경위.** 근거는 한 문장이었다: "적용을 떼면
 // 모든 명령(fail-open 훅 4종 포함)이 '스키마가 아직 안 올라간 DB' 를 만나는 새 경로가 생기고,
@@ -1034,7 +1035,7 @@ func openMigrator(path string, opt MigrateOptions, log *slog.Logger) (*Store, mi
 		return nil, run, err
 	}
 	run.steps = migrations
-	run.backup = func(ctx context.Context, _ *migrateSession, _ int) (string, error) { return s.backup(ctx) }
+	run.backup = func(ctx context.Context, _ *migrateSession, from int) (string, error) { return s.backup(ctx, from) }
 	return s, run, nil
 }
 
@@ -1046,20 +1047,21 @@ func openMigrator(path string, opt MigrateOptions, log *slog.Logger) (*Store, mi
 // 적용 경로(MigrateApply)는 backup=%q 를 실었는데 업그레이드 경로는 안 실었다 —
 // 같은 상황을 다루는 두 경로가 다르게 생겼으면 한쪽이 틀린 것이다.
 //
-// -wal·-shm 을 함께 지우라고 적는 이유: 백업은 VACUUM INTO 로 뜬 **독립된 일관 사본**이라
+// -wal·-shm 을 원장 자리에서 함께 치우라고 적는 이유: 백업은 VACUUM INTO 로 뜬 **독립된 일관 사본**이라
 // WAL 이 딸려 있지 않다. 옛 -wal 을 남긴 채 .db 만 갈아 끼우면 SQLite 가 그 WAL 을
-// 되살려 얹고, 그러면 되돌렸다고 믿는 순간 반쯤 적용된 상태가 부활한다.
+// 되살려 얹고, 그러면 되돌렸다고 믿는 순간 반쯤 적용된 상태가 부활한다. 지우지 않고 남긴 원장 옆으로
+// 옮긴다 - 체크포인트 안 된 커밋이 거기 있을 수 있다(rollbackSQLite 의 ★).
 func RollbackHint(dbPath, backupPath string) string {
 	if strings.TrimSpace(backupPath) == "" {
 		return "이번 적용은 백업을 뜨지 않았다(빈 DB 이거나 메모리 DB 다) — 되돌릴 파일이 없다. " +
 			"옛 백업은 " + clip(dbPath, 200) + ".bak-* 에 있고 `fd migrate --rollback` 이 그중 최신을 쓴다."
 	}
 	db := clip(dbPath, 200)
-	return fmt.Sprintf("되돌리려면 서버를 멈추고: cp -f %q %q && rm -f %q %q "+
-		"(백업은 VACUUM INTO 로 뜬 일관 사본이라 WAL 이 없다 — 옛 -wal 을 남기면 "+
-		"반쯤 적용된 상태가 되살아난다). "+
-		"이 절차는 `fd migrate --rollback` 이 그대로 수행한다.",
-		clip(backupPath, 200), db, db+"-wal", db+"-shm")
+	keep := db + ".pre-rollback"
+	return fmt.Sprintf("되돌리려면 서버를 멈추고 `fd migrate --rollback` 을 돈다 - 백업을 재고(다 뜬 이 원장의 사본인가), 지금 원장을 "+
+		"%s-<시각> 으로 남긴 뒤 덮는다. 손으로 하려면 지금 원장부터 남긴다: cp -f %q %q && { mv -f %q %q; mv -f %q %q; cp -f %q %q; } "+
+		"(백업은 VACUUM INTO 로 뜬 일관 사본이라 WAL 이 없다 — 옛 -wal 을 원장 자리에 남기면 반쯤 적용된 상태가 되살아난다).",
+		keep, db, keep, db+"-wal", keep+"-wal", db+"-shm", keep+"-shm", clip(backupPath, 200), db)
 }
 
 // MigrationAction 은 여는 시점에 무엇을 할지다.
@@ -1215,6 +1217,11 @@ func (s *Store) migrateTo(ctx context.Context, run migrateRun) error {
 	if err != nil {
 		return err
 	}
+	// ★ 이 바이너리가 아는 판에서 더 낮은 --to 는 내림이다(migrateDown). 모르는 판(SchemaVersion 위)은 PlanMigration 이 거절한다 -
+	//   그 판의 증분을 모르면 무엇을 지울지도 모른다.
+	if hasTable && dbVersion > run.target && dbVersion <= SchemaVersion {
+		return s.migrateDown(ctx, sess, dbVersion, run)
+	}
 	plan := PlanMigration(hasTable, dbVersion, objects, run.target)
 
 	switch plan.Action {
@@ -1250,10 +1257,13 @@ func (s *Store) migrateTo(ctx context.Context, run migrateRun) error {
 			"path", s.path, "db_version", dbVersion, "code_version", run.target, "error", err.Error())
 		return fmt.Errorf("스키마 거절: %w", err)
 	}
-	// ★ 로케일은 백업 · 증분 전에 잰다 - 거절될 DB 의 덤프를 뜨고 증분을 얹을 까닭이 없다. 빈 DB 는 기준선 단 안에서
-	//   잰다(pg_trgm 이 거기서 생긴다, stepBody).
+	// ★ 로케일과 인덱스 키 상한(keyLimitGate)은 백업 · 증분 전에 잰다 - 거절될 DB 의 덤프를 뜨고 증분을 얹을 까닭이 없다. 빈 DB 는
+	//   로케일을 기준선 단 안에서 잰다(pg_trgm 이 거기서 생긴다, stepBody).
 	if plan.Action == MigrateUpgrade {
 		if err := localeGate(ctx, sess); err != nil {
+			return err
+		}
+		if err := keyLimitGate(ctx, sess); err != nil {
 			return err
 		}
 	}
@@ -1281,6 +1291,85 @@ func (s *Store) migrateTo(ctx context.Context, run migrateRun) error {
 	}
 	s.log.Info("마이그레이션 완료",
 		"path", s.path, "version", run.target, "duration", time.Since(start).Seconds())
+	return nil
+}
+
+// DownSteps 는 from 판에서 to 판으로 내릴 증분을 내리는 순서(위 판부터)로 고른다. 순수 함수다. `fd migrate --to N`(N 이 지금
+// 판보다 낮다)의 판정이다.
+//
+// ★ 인덱스만 더한 증분(pg.IndexOnly)만 내린다. 그 인덱스를 지우고 판 행을 지우면 표 · 칸 · 행이 그대로라 기록을 하나도 잃지
+// 않는다 - 판올림 전 사본으로 덮는 `fd migrate --rollback` 이 그 사본 뒤의 기록을 잃는 것과 다르다. 내림 SQL 은 따로 적지 않고
+// 올림 SQL 에서 읽는다(pg.IndexOnly 의 ★). 하나라도 다른 증분이 끼거나 증분 목록에 없는 판(기준선)에 닿으면 아무것도 안 바꾸고
+// 사유를 담아 거절한다 - 일부만 내려 두는 일이 없다.
+func DownSteps(from, to int, avail []Migration) ([]Migration, error) {
+	if to >= from {
+		return nil, fmt.Errorf("내림은 더 낮은 판으로만 간다(%d→%d)", from, to)
+	}
+	have := map[int]Migration{}
+	for _, m := range avail {
+		have[m.To] = m
+	}
+	var out []Migration
+	for v := from; v > to; v-- {
+		m, ok := have[v]
+		if !ok {
+			return nil, fmt.Errorf("%d→%d 로 내릴 길이 없다 - 판 %d 은 증분이 아니다(기준선은 내리지 않는다)", from, to, v)
+		}
+		if _, ok := pg.IndexOnly(m.SQL); !ok {
+			return nil, fmt.Errorf("%d→%d 로 내리지 않는다 - 증분 %d(%s)는 인덱스만 더한 것이 아니라 내리면 기록이나 모양을 잃는다. "+
+				"그 판은 판올림 전 사본으로만 되돌린다: `fd migrate --rollback`(그 사본 뒤에 쓴 기록을 잃는다)", from, to, v, m.Name)
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// migrateDown 은 from 판의 원장을 run.target 판으로 내린다(DownSteps). 증분 하나가 트랜잭션 하나다 - 중간에 끊겨도 내린 단까지는
+// 판 기록과 인덱스가 맞고, 다시 돌리면 남은 단부터 내린다.
+//
+// ★ 판올림 전 백업을 뜨지 않는다. 지우는 것이 인덱스뿐이라 잃을 것이 없고, 다시 올리면(판올림) 같은 인덱스를 다시 만든다.
+func (s *Store) migrateDown(ctx context.Context, sess *migrateSession, from int, run migrateRun) error {
+	steps, err := DownSteps(from, run.target, run.steps)
+	if err != nil {
+		s.log.Error("내릴 길이 없어 DB 를 내리지 않는다",
+			"path", s.path, "db_version", from, "target", run.target, "error", err.Error())
+		return fmt.Errorf("스키마 거절: %w", err)
+	}
+	s.log.Info("내림 시작(인덱스만 지운다)", "path", s.path, "from", from, "to", run.target)
+	for _, m := range steps {
+		if err := s.sessionTx(ctx, sess, fmt.Sprintf("증분 %d 내림(%s)", m.To, m.Name), func(ctx context.Context, tx *txConn) error {
+			return downBody(ctx, tx, m)
+		}); err != nil {
+			return err
+		}
+		s.log.Info("증분 내림 완료", "path", s.path, "version", m.To-1, "reason", m.Name)
+	}
+	return nil
+}
+
+// downBody 는 내림 트랜잭션 안의 일이다: 판을 다시 재고 → (소유 역할로) 그 증분이 더한 인덱스를 거꾸로 지우고 → 판 행을 지운다.
+func downBody(ctx context.Context, tx *txConn, m Migration) error {
+	_, v, _, err := readMigrationState(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if v != m.To {
+		return fmt.Errorf("이 증분은 판 %d 에서 내리는데 DB 가 %d판이다 - 판을 잰 뒤에 다른 실행기가 바꿨다. 다시 돌려라", m.To, v)
+	}
+	if role := tx.dialect().stepRole(); role != "" {
+		if _, err := tx.ExecContext(ctx, role); err != nil {
+			return fmt.Errorf("소유 역할로 바꾸지 못했다: %w", err)
+		}
+	}
+	names, _ := pg.IndexOnly(m.SQL)
+	for i := len(names) - 1; i >= 0; i-- {
+		if _, err := tx.ExecContext(ctx, "DROP INDEX "+names[i]); err != nil {
+			return fmt.Errorf("인덱스 %s 를 지우지 못했다: %w", names[i], err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM schema_version WHERE version = ?`, m.To); err != nil {
+		return fmt.Errorf("판 기록을 지우지 못했다: %w", err)
+	}
 	return nil
 }
 
@@ -1454,30 +1543,71 @@ func BackupSuffix(at time.Time) string {
 	return ".bak-" + at.UTC().Format("20060102T150405Z")
 }
 
-// backup 은 마이그레이션 직전 스냅숏을 뜬다.
+// backup 은 마이그레이션 직전 스냅숏을 뜬다. from 은 뜨는 원장의 판이다 - 사본이 그 판인지 잰다.
 //
 // 파일을 그냥 복사하지 않고 VACUUM INTO 를 쓴다 — WAL 모드에서는 .db 파일만 베끼면
 // -wal 에 남은 커밋이 빠져 **조용히 낡은 사본**이 된다. VACUUM INTO 는 그 시점의
 // 일관된 DB 하나를 만든다.
-func (s *Store) backup(ctx context.Context) (string, error) {
+//
+// ★ **최종 이름(<db>.bak-*)에 바로 쓰지 않는다.** 그 이름이 곧 `fd migrate --rollback` 의 후보라, 뜨는 도중 프로세스 · 전원이
+// 끊기면 덜 쓴 사본(과 그 옆 -journal)이 가장 최근 백업으로 골라진다. 같은 디렉토리의 숨은 임시 이름(.<db>.bak-*.partial-*)에
+// 뜨고, 다 뜬 원장인지(checkLedgerCopy - integrity_check · 판) 잰 뒤 굳히고(fsync) 이름을 바꾸고 디렉토리를 굳힌다. 끊기면 숨은
+// 이름만 남는다 - 후보가 아니다(rollbackCandidate). 이 실행이 실패로 끝나면 그 자리에서 지운다.
+func (s *Store) backup(ctx context.Context, from int) (string, error) {
 	if s.path == "" || strings.Contains(s.path, ":memory:") {
 		return "", nil // 메모리 DB 는 뜰 것이 없다. 무해한 무시라 여기 적는다
 	}
 	dst := s.path + BackupSuffix(time.Now())
 	if _, err := os.Stat(dst); err == nil {
-		// VACUUM INTO 는 대상이 있으면 실패한다. 같은 초에 두 번 열린 것이므로 이름을 벌린다.
+		// 같은 초에 두 번 열린 것이므로 이름을 벌린다.
 		dst = fmt.Sprintf("%s-%d", dst, os.Getpid())
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return "", fmt.Errorf("백업 디렉토리 생성 실패(dir=%q): %w", filepath.Dir(dst), err)
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("백업 디렉토리 생성 실패(dir=%q): %w", dir, err)
 	}
-	// VACUUM INTO 는 파라미터 바인딩을 안 받는다. 경로는 사용자 입력이 아니라
-	// 서버 설정에서 온 값이고, 작은따옴표만 이스케이프하면 리터럴로 안전하다.
-	q := "VACUUM INTO '" + strings.ReplaceAll(dst, "'", "''") + "'"
-	if _, err := s.db.ExecContext(ctx, q); err != nil {
-		return "", fmt.Errorf("마이그레이션 전 백업 실패(dst=%q): %w", dst, err)
+	// VACUUM INTO 는 대상이 없거나 빈 파일이어야 한다. 겹치지 않는 빈 파일을 먼저 잡는다(모드는 원장과 같다).
+	f, err := createExclusive(dir, "."+filepath.Base(dst)+".partial-", ledgerFileMode)
+	if err != nil {
+		return "", fmt.Errorf("마이그레이션 전 백업의 임시 파일을 만들지 못했다(dir=%q): %w", dir, err)
+	}
+	tmp := f.Name()
+	if err := f.Close(); err != nil {
+		removeLedgerFiles(tmp, s.log)
+		return "", fmt.Errorf("마이그레이션 전 백업의 임시 파일을 닫지 못했다(%q): %w", tmp, err)
+	}
+	if err := s.sealBackup(ctx, tmp, dst, from); err != nil {
+		removeLedgerFiles(tmp, s.log)
+		return "", err
 	}
 	return dst, nil
+}
+
+// sealBackup 은 임시 이름 tmp 에 원장을 뜨고, 다 뜬 from 판 원장인지 잰 뒤 굳혀 dst 로 이름을 바꾼다(backup 의 ★).
+func (s *Store) sealBackup(ctx context.Context, tmp, dst string, from int) error {
+	// VACUUM INTO 는 파라미터 바인딩을 안 받는다. 경로는 사용자 입력이 아니라
+	// 서버 설정에서 온 값이고, 작은따옴표만 이스케이프하면 리터럴로 안전하다.
+	q := "VACUUM INTO '" + strings.ReplaceAll(tmp, "'", "''") + "'"
+	if _, err := s.db.ExecContext(ctx, q); err != nil {
+		return fmt.Errorf("마이그레이션 전 백업 실패(dst=%q): %w", dst, err)
+	}
+	rows, err := checkLedgerCopy(ctx, tmp)
+	if err != nil {
+		return fmt.Errorf("마이그레이션 전 백업을 뜬 사본이 온전하지 않다(dst=%q) - 판을 올리지 않는다: %w", dst, err)
+	}
+	if v := topVersion(rows); v != from {
+		return fmt.Errorf("마이그레이션 전 백업을 뜬 사본의 판이 %d 인데 원장은 %d판이다(dst=%q) - 판을 올리지 않는다", v, from, dst)
+	}
+	if err := syncFile(tmp); err != nil {
+		return fmt.Errorf("마이그레이션 전 백업을 굳히지 못했다(dst=%q): %w", dst, err)
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		return fmt.Errorf("마이그레이션 전 백업에 이름을 붙이지 못했다(dst=%q): %w", dst, err)
+	}
+	if err := syncDir(filepath.Dir(dst)); err != nil {
+		return fmt.Errorf("마이그레이션 전 백업의 디렉토리를 굳히지 못했다(dst=%q): %w", dst, err)
+	}
+	return nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

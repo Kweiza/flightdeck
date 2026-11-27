@@ -14,9 +14,10 @@ import (
 // store 의 importsqlite.go 다. 거꾸로 옮기는 역이관(`fd migrate export-sqlite`)도 같은 표 목록 · 값 검사 · 행 지문을 쓰고,
 // 그쪽에만 있는 규칙은 export.go 다.
 //
-// ★ 표 목록(tables)은 이관 판(ImportVersion)의 표 · 칸을 손으로 적은 것이다. 이관은 그 판 하나만 안다 - 두 원장이 같은
-// 판이어야 받는다. 판 18 위의 증분(019 인덱스)은 표 · 칸을 안 바꿨으므로 목록은 기준선 18 의 것 그대로다. 표나 칸을 바꾸는
-// 증분이 두 엔진에 함께 오르면 이 목록도 같이 고친다. 손으로 적은 목록이 두 엔진의 살아 있는 카탈로그와 같은지는
+// ★ 표 목록(tables)은 이관 판(ImportVersion)의 표 · 칸을 손으로 적은 것이다. 이관은 그 목록이 그대로 맞는 판 범위
+// (ImportFloor..ImportVersion)만 받는다 - 범위 안 판끼리는 인덱스만 다르다. 판 18 위의 증분(019 인덱스)은 표 · 칸을 안 바꿨으므로
+// 목록은 기준선 18 의 것 그대로다. 표나 칸을 바꾸는 증분이 두 엔진에 함께 오르면 이 목록도 같이 고치고, 그 증분은 인덱스만
+// 더한 것이 아니므로 범위의 아래 끝이 그 판으로 오른다. 손으로 적은 목록이 두 엔진의 살아 있는 카탈로그와 같은지는
 // import_test.go 가 잰다(칼럼 이름 · 순서 · 타입 · NOT NULL · 기본키 · identity).
 //
 // ★ 옮기지 않는 것은 LeftBehind 다. 그 밖의 표는 전부 옮긴다 - idempotency 도다(재기동 너머로 판단 · 발번 · 항목
@@ -24,11 +25,42 @@ import (
 // 만든다). 만료된 행도 옮긴다 - 만료는 서버의 보존 기한(설정값)이 정하는 것이라 이관이 시계를 보고 거를 자리가 아니고,
 // 서버가 다음 기록 때 그 기한으로 청소한다.
 
-// ImportVersion 은 이관 · 역이관 · 대조가 받는 판이다. 두 엔진이 함께 오른 마지막 판이다(SQLite 의 마지막 판 = 기준선과
-// 그 위 Steps 가 같은 뜻으로 닿는 판) - 원본 SQLite 와 대상 Postgres 가 둘 다 이 판이어야 받는다. 더 낮은 원장은 먼저 이
-// 판을 아는 fd 로 올린다(이 명령은 증분을 스스로 적용하지 않는다). 빈 Postgres 원장은 `fd migrate --to ImportVersion` 이
-// 이 판까지만 깐다. 이 수가 store.SchemaVersion 과 같은지는 import_test.go 가 잰다.
+// ImportVersion 은 이관 · 역이관 · 대조가 아는 가장 높은 판이다. 두 엔진이 함께 오른 마지막 판이다(SQLite 의 마지막 판 = 기준선과
+// 그 위 Steps 가 같은 뜻으로 닿는 판). 역이관이 내는 SQLite 파일이 이 판이고, 빈 Postgres 원장은 `fd migrate --to ImportVersion`
+// 이 이 판까지만 깐다. 이 수가 store.SchemaVersion 과 같은지는 import_test.go 가 잰다. 받는 판은 이 하나가 아니라 범위다
+// (Transferable).
 const ImportVersion = 19
+
+// ImportFloor 는 이관 · 역이관 · 대조가 받는 가장 낮은 판이다. ImportVersion 에서 아래로 인덱스만 더한 증분(IndexOnly)을 거슬러
+// 닿는 판이고, 기준선(BaselineVersion) 아래로는 내려가지 않는다 - Postgres 원장에는 그 아래 판이 없다.
+//
+// ★ 판 범위 규칙은 이것 하나다. 인덱스만 더한 증분은 표 · 칸 · 행을 안 바꾸므로 그 아래 판의 원장도 옮길 것(Tables)이 같고, 같은
+// 까닭으로 기록을 잃지 않고 내릴 수 있다(store 의 DownSteps). 그래서 원본과 대상의 판이 범위 안에서 서로 달라도 받는다: 판 18 에서
+// 옮긴 SQLite 원장(표지가 있어 판을 못 올린다)을 판 19 로 오른 Postgres 원장과 맞대는 것이 그 갈래다(README 「켜기 전에 섰을
+// 때」). 인덱스가 받는 값의 상한(MaxBytes)은 사전 검사가 범위 전체에 똑같이 잰다 - 범위의 꼭대기가 그 인덱스를 갖기 때문이다.
+func ImportFloor() int { return floorOf(Steps, ImportVersion, BaselineVersion) }
+
+// floorOf 는 증분 목록 steps 위에서 판 top 부터 아래로 인덱스만 더한 증분을 거슬러 닿는 판이다(base 아래로는 안 간다). 순수
+// 함수다 - ImportFloor 의 규칙을 지금 증분 목록과 떼어 잰다(import_test.go).
+func floorOf(steps []Step, top, base int) int {
+	v := top
+	for i := len(steps) - 1; i >= 0 && v > base; i-- {
+		if steps[i].To > v {
+			continue
+		}
+		if steps[i].To < v {
+			break // 판 v 에 이르는 증분이 없다 - 빈칸 아래로는 내려가지 않는다
+		}
+		if _, ok := IndexOnly(steps[i].SQL); !ok {
+			break
+		}
+		v--
+	}
+	return v
+}
+
+// Transferable 은 판 v 의 원장을 이관 · 역이관 · 대조가 받는가다(ImportFloor 이상 ImportVersion 이하). 순수 함수다.
+func Transferable(v int) bool { return v >= ImportFloor() && v <= ImportVersion }
 
 // Kind 는 칸이 기준선에서 갖는 타입이다. SQLite 는 칸 타입을 강제하지 않으므로 읽은 값이 이 타입으로 옮겨지는지를
 // 사전 검사가 잰다(Cell).
@@ -68,7 +100,20 @@ type Column struct {
 	// Rowid 는 SQLite 에서 이 칸 대신 rowid 를 읽는다는 뜻이다. item_after.seq 가 그것이다 - 그 표에는 기본키가 없어
 	// SQLite 는 rowid 로 순서를 읽고, 기준선은 그 자리를 seq 로 둔다.
 	Rowid bool
+	// MaxBytes 는 글 칸 값의 바이트 상한이다(0 이면 없다). Postgres 의 B-tree 인덱스는 한 항목이 페이지의 약 1/3(2704 바이트)을
+	// 넘으면 넣기를 거절하는데, SQLite 는 상한이 없다. 그 인덱스의 키 칸에만 둔다(event_by_project_kind 의 project · kind,
+	// EventProjectMaxBytes). 사전 검사가 넘는 값을 FaultTooLong 으로 거절하고, Postgres 판올림은 그 인덱스를 만들기 전에 같은
+	// 상한으로 잰다(store 의 keyLimitGate).
+	MaxBytes int
 }
+
+// event_by_project_kind(project, kind, id) 의 키 칸 상한이다(Column.MaxBytes). 둘을 다 채워도 항목(머리 8 · 길이 머리 · 정렬 ·
+// id 8 바이트)이 압축 없이 2704 바이트 안에 든다 - 압축이 안 되는 값으로 시험이 잰다(store 의 keylimit_test.go). 정상 원장의
+// 값은 이보다 훨씬 작다(프로젝트는 저장소 디렉토리 이름, kind 는 서버의 상수다).
+const (
+	EventProjectMaxBytes = 2048
+	EventKindMaxBytes    = 512
+)
 
 // Table 은 옮기는 표 하나다.
 type Table struct {
@@ -170,8 +215,9 @@ var tables = []Table{
 		txt("branch"), txt("recipe"), nn(txt("state")), txt("fail_kind"), nn(txt("queued_at")), txt("started_at"),
 		txt("ended_at"), txt("beat_at"), txt("base_sha"), txt("head_sha"), txt("landed_sha"), txt("image_tag"),
 		txt("ack_at"), txt("log_tail")}},
-	{Name: "event", AutoIncrement: true, Cols: []Column{ident(num("id")), nn(txt("at")), txt("project"), txt("session_id"),
-		nn(txt("kind")), doc(nn(txt("payload")))}},
+	{Name: "event", AutoIncrement: true, Cols: []Column{ident(num("id")), nn(txt("at")),
+		capped(EventProjectMaxBytes, txt("project")), txt("session_id"), capped(EventKindMaxBytes, nn(txt("kind"))),
+		doc(nn(txt("payload")))}},
 	{Name: "idempotency", Cols: []Column{key(txt("key")), nn(txt("fingerprint")), nn(num("status")), nn(txt("ctype")),
 		nn(blob("body")), nn(txt("at"))}},
 	{Name: "landing_queue", AutoIncrement: true, Cols: []Column{ident(num("id")), nn(txt("project")), nn(txt("session_id")),
@@ -193,6 +239,8 @@ func key(c Column) Column     { c.Key, c.NotNull = true, true; return c }
 func doc(c Column) Column     { c.JSON = true; return c }
 func ident(c Column) Column   { c.Identity = true; return key(c) }
 func rowid(c Column) Column   { c.Rowid = true; return c }
+
+func capped(n int, c Column) Column { c.MaxBytes = n; return c }
 
 // Fault 는 사전 검사가 칸 하나를 거절한 갈래다. 하나라도 걸리면 이관은 아무것도 안 쓰고, 걸린 행을 표 · 행 좌표 · 칸으로 낸다.
 // 고치는 것은 원본 사본에서 사람이 한다 - 이관이 값을 바꿔 넣으면 전 칸 대조가 설 자리가 없다.
@@ -218,6 +266,8 @@ const (
 	FaultDigest Fault = "snapshot 키 지문 겹침"
 	// FaultForeignKey: 부모가 없는 행. 기준선은 커밋 때 거절한다.
 	FaultForeignKey Fault = "FK 부모가 없다"
+	// FaultTooLong: 칸 상한(Column.MaxBytes)을 넘는 글. Postgres 의 B-tree 인덱스가 그 항목을 못 받는다(SQLite 는 받는다).
+	FaultTooLong Fault = "인덱스 키 상한을 넘는 글"
 )
 
 // Cell 은 한 원장에서 읽은 값 v 를 칸 c 의 기준선 값으로 옮긴다. 옮긴 값은 nil · int64 · string · []byte 중 하나다.
@@ -306,6 +356,8 @@ func textFault(c Column, s string) Fault {
 		return FaultNUL
 	case !utf8.ValidString(s):
 		return FaultUTF8
+	case c.MaxBytes > 0 && len(s) > c.MaxBytes:
+		return FaultTooLong
 	case c.JSON:
 		return jsonFault(s)
 	}

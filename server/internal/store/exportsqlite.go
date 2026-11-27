@@ -113,8 +113,8 @@ func openExportSource(t Target, log *slog.Logger) (*Store, error) {
 	return openPG(t, log, lockTimeout)
 }
 
-// exportSourceRefusal 은 원본의 판 plan 을 역이관이 받지 않는 사유다. 받으면 nil 이다. 순수 함수다. 판이 이관 판
-// (pg.ImportVersion)이어야 한다 - SQLite 판에는 그 뒤 판의 자리가 없다.
+// exportSourceRefusal 은 원본의 판 plan(transferPlan)을 역이관이 받지 않는 사유다. 받으면 nil 이다. 순수 함수다. 판이 이관 판
+// 범위여야 한다 - SQLite 판에는 그 뒤 판의 자리가 없다. 범위 안 어느 판이든 낸 파일은 이관 판(pg.ImportVersion)이다.
 func exportSourceRefusal(plan MigrationPlan) error {
 	switch plan.Action {
 	case MigrateNone:
@@ -122,17 +122,17 @@ func exportSourceRefusal(plan MigrationPlan) error {
 	case MigrateApply:
 		return fmt.Errorf("원본에 flightdeck 원장이 없다(빈 DB 다) - 옮길 것이 없다: %s", plan.Reason)
 	}
-	return fmt.Errorf("원본이 판 %d 이 아니다(%s) - 역이관은 SQLite 의 마지막 판과 같은 판(%d)의 원장만 옮긴다",
-		pg.ImportVersion, plan.Reason, pg.ImportVersion)
+	return fmt.Errorf("원본이 판 %s 이 아니다(%s) - 역이관은 SQLite 판과 표 · 칸이 같은 판(%s)의 원장만 옮긴다",
+		transferRange(), plan.Reason, transferRange())
 }
 
 // newExportFile 은 to 와 같은 디렉토리에 임시 SQLite 파일을 만들어 판 pg.ImportVersion 스키마를 깐다. 실패하면 남기지 않는다.
 //
-// ★ 모드는 SQLite 가 새 원장을 만들 때와 같다 - exportFileMode(0644)를 만들 때 주고 umask 가 거른다(createExclusive).
+// ★ 모드는 SQLite 가 새 원장을 만들 때와 같다 - ledgerFileMode(0644)를 만들 때 주고 umask 가 거른다(createExclusive).
 // os.CreateTemp 는 0600 고정이라 서버가 다른 uid 면 못 읽고, 만든 뒤 Chmod 하면 umask(예: 077)를 무시하고 넓힌다.
 // 스키마를 깔기 전에 정해진다 - SQLite 는 옆 파일(-wal · -shm)을 본 파일의 모드로 만든다.
 func newExportFile(ctx context.Context, to string, log *slog.Logger) (string, error) {
-	f, err := createExclusive(filepath.Dir(to), "."+filepath.Base(to)+".export-", exportFileMode)
+	f, err := createExclusive(filepath.Dir(to), "."+filepath.Base(to)+".export-", ledgerFileMode)
 	if err != nil {
 		return "", fmt.Errorf("역이관 임시 파일을 만들지 못했다(대상 디렉토리가 있고 쓸 수 있어야 한다): %w", err)
 	}
@@ -148,8 +148,9 @@ func newExportFile(ctx context.Context, to string, log *slog.Logger) (string, er
 	return tmp, nil
 }
 
-// exportFileMode 는 역이관이 내는 원장 파일을 만들 때 주는 모드다 - SQLite 가 새 원장을 만들 때와 같다(0644, umask 가 거른다).
-const exportFileMode fs.FileMode = 0o644
+// ledgerFileMode 는 이 패키지가 내는 원장 파일(역이관이 낸 원장 · 판올림 전 사본)을 만들 때 주는 모드다 - SQLite 가 새 원장을
+// 만들 때와 같다(0644, umask 가 거른다).
+const ledgerFileMode fs.FileMode = 0o644
 
 // createExclusive 는 dir 안에 prefix 로 시작하는 겹치지 않는 이름의 새 파일을 mode 로 만든다(O_EXCL - 있는 파일은 안 연다).
 // os.CreateTemp 와 같지만 모드를 받는다 - 프로세스 umask 가 그 모드를 거른다.

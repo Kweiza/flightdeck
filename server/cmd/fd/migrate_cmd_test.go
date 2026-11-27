@@ -105,6 +105,36 @@ func TestMigrateToStopsAtTheRequestedVersion(t *testing.T) {
 	s.Close()
 }
 
+// 지금보다 낮은 --to 는 인덱스만 더한 판을 내린다(기록을 잃지 않는다): 19→18 은 되고, 서버는 그 원장을 (판이 낮아) 거절하고, 다시
+// 올리면 연다. 표를 바꾼 판(18→17)은 거절하고 판올림 전 사본으로 되돌리는 길을 말한다.
+func TestMigrateToLowersAnIndexOnlyStep(t *testing.T) {
+	h := newHarness(t)
+	path := filepath.Join(t.TempDir(), "fd.db")
+	if rc, out := h.run("", "migrate", "--db", path); rc != 0 {
+		t.Fatalf("적용 실패(rc=%d): %s", rc, out)
+	}
+	rc, out := h.run("", "migrate", "--db", path, "--to", itoa(int64(store.SchemaVersion-1)))
+	if rc != 0 || !strings.Contains(out, "맞췄다: 스키마 "+itoa(int64(store.SchemaVersion-1))+"판") {
+		t.Fatalf("내림이 rc=%d 로 끝났거나 판을 안 말한다: %s", rc, out)
+	}
+	if s, err := store.Open(path); err == nil {
+		s.Close()
+		t.Fatal("내렸다는데 서버가 그대로 연다")
+	}
+	rc, out = h.run("", "migrate", "--db", path, "--to", itoa(int64(store.SchemaVersion-2)))
+	if rc == 0 || !strings.Contains(out, "인덱스만 더한 것이 아니라") || !strings.Contains(out, "fd migrate --rollback") {
+		t.Fatalf("표를 바꾼 판을 내렸거나 사유가 없다(rc=%d): %s", rc, out)
+	}
+	if rc, out := h.run("", "migrate", "--db", path); rc != 0 {
+		t.Fatalf("다시 올리기 실패(rc=%d): %s", rc, out)
+	}
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("다시 올린 원장을 못 연다: %v", err)
+	}
+	s.Close()
+}
+
 // --rollback 은 판올림 전 백업으로 되돌린다.
 //
 // ★ §7 이 "롤백 명령" 자리를 비워 두고 문구(RollbackHint)로 메워 온 자리다. 문구는 사람이
@@ -136,9 +166,9 @@ func TestMigrateRollbackRestoresThePreUpgradeBackup(t *testing.T) {
 		s.Close()
 		t.Fatal("되돌렸다는데 서버가 그대로 연다 — 아무것도 안 되돌아갔다")
 	}
-	// 어느 파일에서 되돌렸는지 말해야 한다.
-	if !strings.Contains(out, ".bak-") {
-		t.Errorf("되돌린 백업 파일을 안 말한다: %s", out)
+	// 어느 파일에서 되돌렸는지, 덮기 전의 원장을 어디 남겼는지 말해야 한다.
+	if !strings.Contains(out, ".bak-") || !strings.Contains(out, "fd.db.pre-rollback-") {
+		t.Errorf("되돌린 백업 파일 · 남긴 원장을 안 말한다: %s", out)
 	}
 }
 

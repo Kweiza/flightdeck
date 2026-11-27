@@ -77,7 +77,7 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 	}
 	fs := newFlagSet("migrate")
 	dbPath := fs.String("db", "", "원장: SQLite 파일 경로 또는 Postgres 접속 URL(비면 자동)")
-	to := fs.Int("to", 0, "이 버전까지만 올린다(0 이면 이 바이너리가 아는 최신)")
+	to := fs.Int("to", 0, "이 판으로 맞춘다: 지금보다 높으면 거기까지만 올리고, 낮으면 인덱스만 더한 판을 기록을 잃지 않고 내린다(0 이면 이 바이너리가 아는 최신)")
 	rollback := fs.Bool("rollback", false, "판올림 전 백업 중 최신 것으로 되돌린다(Postgres 는 복원 절차를 낸다)")
 	backupDir := fs.String("backup-dir", "", "Postgres 판올림 전 덤프 자리(비면 "+backupDirEnv+", 그것도 비면 "+defaultBackupDir+" 가 있을 때 그곳)")
 	if err := fs.Parse(args); err != nil {
@@ -108,7 +108,8 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 			return 1
 		}
 		if got.Steps == "" {
-			fmt.Fprintf(out, "fd migrate --rollback · %s\n\n  %s 에서 되돌렸다\n", shown, got.Backup)
+			fmt.Fprintf(out, "fd migrate --rollback · %s\n\n  %s 에서 되돌렸다\n  덮기 전의 원장은 %s 에 남겼다(옆 파일 포함)\n",
+				shown, got.Backup, got.Kept)
 			return 0
 		}
 		// ★ Postgres 는 살아 있는 DB 를 덮지 않는다. 덤프를 고르고 머리를 잰 것까지가 이 명령이고, 복원은 사람이 서버를
@@ -154,6 +155,11 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 		fmt.Fprintf(out, "적용 실패: %s\n", err)
 		return 1
 	}
-	fmt.Fprintf(out, "fd migrate · %s\n\n  올렸다: 스키마 %d판\n", shown, target)
+	// --to 가 최신보다 낮으면 올렸는지 내렸는지(store.DownSteps) 이 자리는 모른다 - 판만 말한다.
+	verb := "올렸다"
+	if target != store.SchemaVersion {
+		verb = "맞췄다"
+	}
+	fmt.Fprintf(out, "fd migrate · %s\n\n  %s: 스키마 %d판\n", shown, verb, target)
 	return 0
 }

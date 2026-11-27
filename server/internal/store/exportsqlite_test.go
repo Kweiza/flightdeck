@@ -278,7 +278,7 @@ func TestExportSQLiteDryRunLeavesNoFile(t *testing.T) {
 	if fi, err := os.Stat(back); err != nil {
 		t.Fatal(err)
 	} else if want := umaskedMode(t, filepath.Dir(back)); fi.Mode().Perm() != want {
-		t.Fatalf("낸 원장의 모드 %v - 같은 디렉토리에 %v 로 만든 파일(umask 적용)과 같은 %v 여야 한다", fi.Mode().Perm(), exportFileMode, want)
+		t.Fatalf("낸 원장의 모드 %v - 같은 디렉토리에 %v 로 만든 파일(umask 적용)과 같은 %v 여야 한다", fi.Mode().Perm(), ledgerFileMode, want)
 	}
 	if targetRows(t, dst) != rows || !maps.Equal(identityStates(t, dst), seqs) {
 		t.Fatalf("역이관이 원본을 바꿨다")
@@ -326,7 +326,7 @@ func TestExportSQLiteRefusesASourceItCannotMove(t *testing.T) {
 	}{
 		{"SQLite 원본", importSource(t, importSeed), "Postgres 접속 URL"},
 		{"빈 DB", storetest.NewBare(t, ""), "빈 DB"},
-		{"판이 오른 원장", newer, fmt.Sprintf("판 %d 이 아니다", pg.ImportVersion)},
+		{"판이 오른 원장", newer, "판 " + transferRange() + " 이 아니다"},
 		{"깨진 JSON", broken, "사전 검사"},
 	} {
 		for _, dry := range []bool{true, false} {
@@ -387,7 +387,7 @@ func TestExportSQLiteMeasuresTheSourceInTheCopySnapshot(t *testing.T) {
 	ctx := context.Background()
 	for _, c := range []struct{ name, change, want string }{
 		{"판이 오른 원본", fmt.Sprintf(`INSERT INTO schema_version(version, applied_at) VALUES (%d, 'x')`, pg.ImportVersion+1),
-			fmt.Sprintf("판 %d 이 아니다", pg.ImportVersion)},
+			"판 " + transferRange() + " 이 아니다"},
 		{"칸이 붙은 원본", `ALTER TABLE item ADD COLUMN t_extra text`, "item 의 칸"},
 		{"표가 붙은 원본", `CREATE TABLE t_extra(id bigint)`, "모르는 표 t_extra"},
 	} {
@@ -642,11 +642,11 @@ func TestNameExportDryRunProbesTheLink(t *testing.T) {
 	}
 }
 
-// umaskedMode 는 dir 에 exportFileMode 로 새 파일을 만들었을 때 실제로 얻는 모드다(이 프로세스의 umask 가 거른 값).
+// umaskedMode 는 dir 에 ledgerFileMode 로 새 파일을 만들었을 때 실제로 얻는 모드다(이 프로세스의 umask 가 거른 값).
 func umaskedMode(t *testing.T, dir string) fs.FileMode {
 	t.Helper()
 	p := filepath.Join(dir, ".umask-probe")
-	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_EXCL, exportFileMode)
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_EXCL, ledgerFileMode)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,7 +662,7 @@ func umaskedMode(t *testing.T, dir string) fs.FileMode {
 // 넓은 umask 를 무시하고 모드를 넓히지 않는다 - umask 077 이면 낸 원장도 남이 못 읽는다.
 func TestCreateExclusiveRespectsUmask(t *testing.T) {
 	dir := t.TempDir()
-	f, err := createExclusive(dir, ".x.export-", exportFileMode)
+	f, err := createExclusive(dir, ".x.export-", ledgerFileMode)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -674,7 +674,7 @@ func TestCreateExclusiveRespectsUmask(t *testing.T) {
 	if want := umaskedMode(t, dir); fi.Mode().Perm() != want {
 		t.Fatalf("임시 파일 모드 %v - umask 를 거친 %v 여야 한다", fi.Mode().Perm(), want)
 	}
-	if fi.Mode().Perm()&^exportFileMode != 0 {
-		t.Fatalf("임시 파일 모드 %v 가 %v 보다 넓다", fi.Mode().Perm(), exportFileMode)
+	if fi.Mode().Perm()&^ledgerFileMode != 0 {
+		t.Fatalf("임시 파일 모드 %v 가 %v 보다 넓다", fi.Mode().Perm(), ledgerFileMode)
 	}
 }

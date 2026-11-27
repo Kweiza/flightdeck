@@ -711,6 +711,11 @@ func checkRollback(t *testing.T, shell procShell, procs readmeProcs) {
 	resume := func(r *procRig) string { return "p=newp w='" + r.work + "'; export FD_REPOS='/repos/one'" }
 	t.Run("끝까지 돈다", func(t *testing.T) {
 		r := rollbackRig(t, shell, procs)
+		// 옮긴 SQLite 원장의 판올림 전 사본 둘 - 낸 원장의 사본이 아니라 `fd migrate --rollback` 이 고를 자리에 남으면 안 된다.
+		baks := []string{"fd.db.bak-20260101T000000Z", "fd.db.bak-20260102T000000Z"}
+		for _, b := range baks {
+			r.write(r.data(b), "old-bak")
+		}
 		rc, calls, out := r.run(r.old, "fdwhere", procs.rollback)
 		if rc != "0" {
 			t.Fatalf("덩이가 %s 로 섰다:\n%s", rc, out)
@@ -736,9 +741,17 @@ func checkRollback(t *testing.T, shell procShell, procs readmeProcs) {
 		if r.exists(r.on()) || !r.exists(r.off()) || r.exists(r.data("fd.db.moved-to-postgres")) || r.read(r.data("fd.db")) != "back" {
 			t.Fatal("끝난 뒤 선택 파일 · 표지 · 원장이 맞지 않다")
 		}
-		kept, _ := filepath.Glob(r.data("fd.db.pre-back-*"))
+		kept, _ := filepath.Glob(r.data("fd.db.pre-back-*Z"))
 		if len(kept) != 1 || r.read(kept[0]) != "old" {
 			t.Fatalf("옛 원장이 옆 이름으로 하나 남지 않았다: %v", kept)
+		}
+		if left, _ := filepath.Glob(r.data("fd.db.bak-*")); len(left) != 0 {
+			t.Fatalf("옛 원장의 판올림 전 사본이 원장 옆에 남았다(--rollback 이 고른다): %v", left)
+		}
+		for _, b := range baks {
+			if p := filepath.Join(kept[0]+".bak", b); !r.exists(p) || r.read(p) != "old-bak" {
+				t.Errorf("판올림 전 사본 %s 이 옛 원장 옆 디렉토리(%s.bak)로 옮지 않았다", b, filepath.Base(kept[0]))
+			}
 		}
 	})
 	t.Run("앞 실행이 낸 파일이 있으면 시작하지 않는다", func(t *testing.T) {
@@ -796,6 +809,9 @@ func checkRollback(t *testing.T, shell procShell, procs readmeProcs) {
 		}
 		if r.read(r.data("fd.db")) != "back" || r.exists(r.data("fd.db.moved-to-postgres")) || called(calls, "-p newp up -d --build") == "" {
 			t.Fatal("다시 붙여 넣은 덩이가 낸 파일을 놓고 띄우지 않았다")
+		}
+		if dirs, _ := filepath.Glob(r.data("fd.db.pre-back-*.bak")); len(dirs) != 0 {
+			t.Errorf("옮길 판올림 전 사본이 없는데 디렉토리를 만들었다: %v", dirs)
 		}
 	})
 	t.Run("5 뒤에서 이을 때 맞대기가 서면 아무것도 안 놓는다", func(t *testing.T) {

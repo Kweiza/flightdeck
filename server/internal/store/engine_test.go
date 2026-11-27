@@ -542,8 +542,8 @@ func TestTxKindsAreFour(t *testing.T) {
 func TestWritesOutsideTxAreListed(t *testing.T) {
 	src := parseStoreSource(t)
 	allowed := map[site]string{
-		{"store.go", "applyBase"}: "SQLite schema.sql 적용 - PRAGMA 가 있어 트랜잭션 밖이어야 한다",
-		{"store.go", "backup"}:    "SQLite 판올림 전 VACUUM INTO",
+		{"store.go", "applyBase"}:  "SQLite schema.sql 적용 - PRAGMA 가 있어 트랜잭션 밖이어야 한다",
+		{"store.go", "sealBackup"}: "SQLite 판올림 전 VACUUM INTO(임시 이름에 뜬다)",
 	}
 
 	// 쓰는 도우미에 s.db 를 넘기는 길. 지금 dbtx 도우미는 다 읽기라 실제 소스에선 0건이 정상이다 -
