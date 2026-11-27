@@ -10,7 +10,8 @@
 // 적고 실행기가 적는 것과 같다.
 //
 // ★ 이관(SQLite → PG)이 지켜야 할 것. 저장 계층을 PG 로 옮기는 쪽도 여기를 본다. 이관의 순수 규칙은 import.go ·
-// verify.go 이고(옮기는 표 목록 · 칸의 뜻 · 사전 검사 · 행 지문 · 순번), 실행은 store 의 ImportSQLite 다.
+// verify.go 이고(옮기는 표 목록 · 칸의 뜻 · 사전 검사 · 행 지문 · 순번), 실행은 store 의 ImportSQLite 다. 거꾸로
+// 옮기는 역이관(PG → SQLite, store 의 ExportSQLite)도 같은 규칙을 쓰고 그쪽에만 있는 것은 export.go 다.
 //   - identity 칼럼 다섯(pick_eval · resource_hold · event · landing_queue 의 id, item_after.seq)은
 //     GENERATED ALWAYS 다. 옛 번호를 그대로 넣으려면 OwnerRole 로 `INSERT … OVERRIDING SYSTEM VALUE` 하고,
 //     같은 트랜잭션에서 표마다 `ALTER SEQUENCE <pg_get_serial_sequence('<표>', '<칼럼>')> RESTART WITH n+1` 로 번호를

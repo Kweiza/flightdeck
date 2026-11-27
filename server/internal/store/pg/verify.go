@@ -176,17 +176,33 @@ func digest(marks []RowMark) [32]byte {
 	return out
 }
 
-// Sequence 는 identity 칸의 시퀀스를 다시 시작할 번호(`ALTER SEQUENCE … RESTART WITH`)다 - 다음 nextval 이 이 번호를 낸다.
-// floor 는 원본에서 이미 발급된 가장 큰 번호다. AUTOINCREMENT 표는 greatest(max(칸), sqlite_sequence.seq)(지워진 최고 번호도
-// 다시 내지 않는다), 아닌 표는 max(rowid). 발급된 번호가 없으면 floor 가 0 이라 1 부터 낸다(새 시퀀스와 같다).
+// Floor 는 원장의 표 t 에서 이미 발급된 가장 큰 번호 - 옮긴 원장이 다시 내면 안 되는 바닥이다. maxID 는 지금 있는 행의
+// identity 칸 최고값, held 는 원장이 행과 따로 기억하는 발급 번호(SQLite 의 sqlite_sequence.seq, Postgres 시퀀스가 마지막에
+// 낸 번호)다. 둘 다 없으면 0 이다.
+//
+//   - AUTOINCREMENT 표: greatest(maxID, held). 지워진 최고 번호도 다시 내지 않는다.
+//   - 아닌 표(item_after): maxID. SQLite rowid 표는 지워진 최고 번호를 기억하지 못해 다음 번호가 max(rowid)+1 이다. 이관은
+//     그 원본이 실제로 낼 번호를 잇고, 역이관이 만든 SQLite 원장도 이 규칙으로 번호를 낸다 - Postgres 시퀀스가 그보다 앞서
+//     있었어도(맨 끝 행을 지웠다) 그 번호는 SQLite 에 옮길 자리가 없다. 순서의 축(seq 값)은 행에 실려 그대로 옮는다.
+func Floor(t Table, maxID, held int64) int64 {
+	if t.AutoIncrement {
+		return max(maxID, held)
+	}
+	return maxID
+}
+
+// Sequence 는 바닥 floor(Floor) 다음 번호다 - 옮긴 원장이 다음에 낼 번호. Postgres 대상은 이 번호로 시퀀스를 다시 시작하고
+// (`ALTER SEQUENCE … RESTART WITH`), SQLite 대상은 sqlite_sequence 가 floor 를 들어 다음 번호가 이것이 된다. 발급된 번호가
+// 없으면 floor 가 0 이라 1 부터 낸다(새 시퀀스와 같다).
 func Sequence(floor int64) int64 { return floor + 1 }
 
 // SequenceCheck 는 identity 하나의 순번 대조다.
 type SequenceCheck struct {
 	Table, Column string
-	// Floor 는 원본에서 발급된 가장 큰 번호다(Sequence 의 floor).
+	// Floor 는 원본에서 발급된 가장 큰 번호다(Floor).
 	Floor int64
-	// Next 는 대상 시퀀스가 다음에 낼 번호다(last_value, is_called 로 계산 - NextValue).
+	// Next 는 대상이 다음에 낼 번호다. Postgres 는 시퀀스의 last_value · is_called 로(NextValue), SQLite 는 대상 행과
+	// sqlite_sequence 로(Sequence(Floor(…))) 잰다.
 	Next int64
 }
 

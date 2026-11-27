@@ -1307,7 +1307,7 @@ func (s *Store) stepTx(ctx context.Context, sess *migrateSession, m Migration, b
 }
 
 // sessionTx 는 실행기 세션(sess) 위 쓰기 트랜잭션 하나의 수명이다: 열고 → body → 커밋, 실패하면 되감는다. 증분 적용
-// (stepTx)과 SQLite 이관(importInto)이 쓴다 - 둘 다 실행기가 쥔 두 세션 잠금과 같은 연결에서 돌아야 한다(txSpec.on).
+// (stepTx)과 원장 옮기기(transferInto - 이관 · 역이관)가 쓴다 - 둘 다 실행기가 쥔 두 세션 잠금과 같은 연결에서 돌아야 한다(txSpec.on).
 // what 은 오류 문구의 머리다. 끝에서 오류를 한 번 옮긴다(asFault) - 잠금 대기 초과(55P03)도 Tx 와 같은 *TxFault 로 나간다.
 //
 // ★ 열자마자 되감기를 미뤄 둔다(defer). body 가 패닉이면 명시 롤백을 건너뛰는데, 그러면 트랜잭션이 열린 채로 세션 해제

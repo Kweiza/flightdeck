@@ -11,7 +11,8 @@ import (
 
 // SQLite 원장을 이 기준선으로 옮기는 규칙이다 - `fd migrate import-sqlite` · `fd migrate verify` 의 순수한 몫.
 // 무엇을 어떤 순서로 옮기고, 어떤 값을 거절하고, 행을 어떻게 재는지(verify.go)만 정한다. 두 원장을 열고 읽고 쓰는 실행은
-// store 의 importsqlite.go 다.
+// store 의 importsqlite.go 다. 거꾸로 옮기는 역이관(`fd migrate export-sqlite`)도 같은 표 목록 · 값 검사 · 행 지문을 쓰고,
+// 그쪽에만 있는 규칙은 export.go 다.
 //
 // ★ 표 목록(tables)은 SQLite 판 18 = 기준선 18 의 모양을 손으로 적은 것이다. 그 판은 더 안 바뀐다 - SQLite 쪽 증분은
 // 18 에서 멈췄고 이후 증분은 Postgres 에만 쓴다. 그래서 이관의 모양은 이 판 하나로 굳는다. 손으로 적은 목록이 두 엔진의
@@ -341,6 +342,12 @@ func (t Table) DigestPK(vals []any) (string, bool) {
 
 // SelectSQL 은 표의 칸을 선언 순서로 읽는 질의다. sqlite 면 Rowid 칸 자리에 rowid 를 읽는다.
 func (t Table) SelectSQL(sqlite bool) string {
+	return "SELECT " + strings.Join(t.columnNames(sqlite), ", ") + " FROM " + t.Name
+}
+
+// columnNames 는 표의 칸 이름을 선언 순서로 낸다. sqlite 면 Rowid 칸 자리가 rowid 다 - 읽기(SelectSQL)와 넣기(InsertSQL)가
+// 같은 자리를 같은 이름으로 부른다.
+func (t Table) columnNames(sqlite bool) []string {
 	names := make([]string, len(t.Cols))
 	for i, c := range t.Cols {
 		names[i] = c.Name
@@ -348,7 +355,7 @@ func (t Table) SelectSQL(sqlite bool) string {
 			names[i] = "rowid"
 		}
 	}
-	return "SELECT " + strings.Join(names, ", ") + " FROM " + t.Name
+	return names
 }
 
 // SourceColumns 는 SQLite 원본에 선언돼 있어야 할 칸 이름이다(rowid 자리는 선언된 칸이 아니다).
@@ -362,20 +369,20 @@ func (t Table) SourceColumns() []string {
 	return out
 }
 
-// InsertSQL 은 표에 rows 행을 한 문장으로 넣는 INSERT 다(`?` 자리표시, 행마다 칸 수만큼). identity 칸이 있으면
-// OVERRIDING SYSTEM VALUE 를 붙인다 - GENERATED ALWAYS 칸에 옛 번호를 그대로 넣는 길은 그것뿐이다.
+// InsertSQL 은 표에 rows 행을 한 문장으로 넣는 INSERT 다(`?` 자리표시, 행마다 칸 수만큼). 칸 이름은 SelectSQL 과 같다.
 //
-// ★ 그 구절이 이 함수 안에 있어서 서버 코드의 OVERRIDING 을 훑는 시험(TestServerCodeNeverOverridesIdentity)이 이 함수를
-// 부르는 자리를 못 본다. 부르는 자리는 SQLite 이관의 옮기기(store 의 copyTables) 하나여야 한다 - import_test.go 의
-// TestInsertSQLIsCalledOnlyByTheImport 가 소스에서 잠근다.
-func (t Table) InsertSQL(rows int) string {
-	names := make([]string, len(t.Cols))
-	for i, c := range t.Cols {
-		names[i] = c.Name
-	}
+//   - Postgres(sqlite 가 거짓): identity 칸이 있으면 OVERRIDING SYSTEM VALUE 를 붙인다 - GENERATED ALWAYS 칸에 옛 번호를
+//     그대로 넣는 길은 그것뿐이다.
+//   - SQLite: Rowid 칸 자리에 rowid 를 넣는다 - item_after 의 seq 값이 그 행의 rowid 로 돌아온다(순서의 축이 값 그대로다).
+//     AUTOINCREMENT 표의 id 는 INTEGER PRIMARY KEY 라 넣은 값이 곧 rowid 다.
+//
+// ★ OVERRIDING 구절이 이 함수 안에 있어서 서버 코드의 OVERRIDING 을 훑는 시험(TestServerCodeNeverOverridesIdentity)이 이
+// 함수를 부르는 자리를 못 본다. 부르는 자리는 원장 옮기기(store 의 copyTables - 이관과 역이관이 함께 쓴다) 하나여야 한다 -
+// import_test.go 의 TestInsertSQLIsCalledOnlyByTheImport 가 소스에서 잠근다.
+func (t Table) InsertSQL(rows int, sqlite bool) string {
 	var b strings.Builder
-	b.WriteString("INSERT INTO " + t.Name + " (" + strings.Join(names, ", ") + ")")
-	if _, ok := t.Identity(); ok {
+	b.WriteString("INSERT INTO " + t.Name + " (" + strings.Join(t.columnNames(sqlite), ", ") + ")")
+	if _, ok := t.Identity(); ok && !sqlite {
 		b.WriteString(" OVERRIDING SYSTEM VALUE")
 	}
 	b.WriteString(" VALUES ")

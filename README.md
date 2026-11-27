@@ -325,6 +325,42 @@ fd migrate verify --from fd-copy.db --db <URL>
 - Refusals the pre-checks cannot see (a CHECK on the target, the index entry size limit, privileges) hit the dry run exactly
   as they hit the real import. The dry run also holds the migration locks as the real import does.
 
+### Moving a Postgres ledger back to SQLite
+
+`fd migrate export-sqlite` is the reverse of the import. It moves a Postgres ledger at version 18 into a **new** SQLite file
+(version 18) - the way back to the SQLite build, carrying the items, claims, events and judgments written on Postgres since
+the import. It runs the same transaction and the same comparison as the import (row counts, fingerprints over every column,
+sequences), writes into a temporary file next to the target, and gives it the `--to` name only when the comparison matches.
+On a mismatch or failure (and always on a dry run) no file is left behind. Exit codes are the same as the import's.
+
+```bash
+# 1. Stop the server that writes the Postgres ledger. The source is only read, in one snapshot (REPEATABLE READ READ ONLY).
+# 2. Dry run: runs the same path to the end in a temporary file, then deletes that file.
+fd migrate export-sqlite --db <URL> --to fd-back.db --dry-run
+# 3. Move. On success it prints the comparison table and "moved N rows, the comparison matched -> fd-back.db".
+fd migrate export-sqlite --db <URL> --to fd-back.db
+# 4. (Optional) compare again before starting a server on the new file. This is the import's verify, unchanged.
+fd migrate verify --from fd-back.db --db <URL>
+```
+
+- If a file already sits at `--to`, or a `-wal` · `-shm` · `-journal` sits next to it, the export refuses. It never
+  overwrites, and a leftover `-wal` cannot be replayed into the new file.
+- The source must be at version 18. A Postgres ledger upgraded past it has no place in the SQLite build and is refused. The
+  account is the same as for the import (a superuser or a member of `fd_owner` - it reads the sequences).
+- A source holding a value the import's pre-checks would refuse (broken JSON and the like) is refused, since the exported
+  file could not be imported again.
+- Sequences: the AUTOINCREMENT tables (pick_eval · resource_hold · event · landing_queue) get the highest number Postgres
+  issued back into `sqlite_sequence`, so it is never issued again. item_after is a SQLite rowid table and cannot remember a
+  deleted top number - its seq values (the order) move into rowid unchanged, and the next number is max(rowid)+1 as in the
+  SQLite build.
+- The judgment search index (judgment_fts) does not exist on Postgres, so it is not moved. It is rebuilt from the moved
+  judgment rows and checked against them.
+
+**Rehearsing the way back.** Before the real move, run the round trip once: a copy of the ledger → `import-sqlite` into a
+test Postgres ledger → start a server on it and write a few things (an item, a claim, a judgment) → stop the server and
+`export-sqlite` → check that `fd migrate verify --from <exported file> --db <URL>` matches, and that a SQLite-build server
+started on the exported file shows those writes and finds the judgment by search.
+
 ## Several repositories
 
 When one product spans several repositories, declare the members in a root `.flightdeck.yaml` and

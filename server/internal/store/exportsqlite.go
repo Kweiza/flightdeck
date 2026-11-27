@@ -1,0 +1,191 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/kweiza/flightdeck/internal/store/pg"
+)
+
+// Postgres 원장을 같은 판(pg.ImportVersion)의 새 SQLite 파일로 옮긴다(`fd migrate export-sqlite`) - 이관의 역이다. 이관 뒤
+// 되돌리기 창 안에 Postgres 에 쌓인 항목 · 선점 · 이벤트 · 판단을 들고 SQLite 판으로 돌아가는 길이다. 옮기기 · 대조 · 판정은
+// 이관과 같은 길(transferInto)이고, 여기는 새 파일을 만들고 이름을 붙이는 것뿐이다.
+//
+// 역이관 한 번의 길:
+//
+//	대상 자리 재기(파일 · 옆 파일이 없어야) → 원본 열기(Postgres · 판 18) → 대상 디렉토리에 임시 파일 · 판 18 스키마
+//	→ transferInto(원본 스냅숏 하나 · 대상 트랜잭션 하나 · 커밋 전 대조) → 임시 파일 닫기(-wal 이 본 파일로 옮았나)
+//	→ 새 이름 붙이기
+//
+// ★ 커밋 전 대조가 맞은 임시 파일만 이름을 얻는다. 어긋나거나 실패하거나 예행이면 임시 파일과 그 옆 파일을 지운다 - 대상
+// 자리에는 아무것도 남지 않는다.
+// ★ 이름은 하드 링크로 붙인다(os.Link). rename 은 그 사이에 생긴 같은 이름의 파일을 말없이 덮는다 - 링크는 이미 있으면
+// 실패한다. 임시 파일이 대상과 같은 디렉토리에 있어 같은 파일 시스템이다.
+// ★ 원본은 읽기만 한다(ReadTx - REPEATABLE READ READ ONLY 스냅숏 하나). 서버를 내린 원본이 전제다 - 붙은 서버가 스냅숏 뒤에
+// 쓴 것은 옮기지 않는다.
+
+// ExportSQLite 는 Postgres 원장 from 을 새 SQLite 파일 to 로 옮긴다(opt.DryRun 이면 같은 길을 임시 파일에 돌고 지운다).
+func ExportSQLite(ctx context.Context, from, to string, opt TransferOptions, log *slog.Logger) (TransferReport, error) {
+	if log == nil {
+		log = slog.Default()
+	}
+	ft := ParseTarget(from)
+	rep := TransferReport{From: ft.Shown(), To: ParseTarget(to).Shown(), DryRun: opt.DryRun}
+	if err := exportTargetRefusal(to); err != nil {
+		return rep, err
+	}
+	src, err := openExportSource(ctx, ft, log)
+	if err != nil {
+		return rep, err
+	}
+	defer src.Close()
+	tmp, err := newExportFile(ctx, to, log)
+	if err != nil {
+		return rep, err
+	}
+	// 이름을 붙인 뒤에도 지운다 - 그때 tmp 는 같은 파일의 두 번째 이름일 뿐이다.
+	defer removeLedgerFiles(tmp, log)
+	rep.TargetChecked = true
+	start := time.Now()
+	if err := exportInto(ctx, src, tmp, opt.DryRun, &rep, log); err != nil {
+		rep.Copied = 0
+		return rep, err
+	}
+	if opt.DryRun {
+		return rep, nil
+	}
+	if err := publishExport(tmp, to); err != nil {
+		rep.Copied = 0
+		return rep, err
+	}
+	log.Info("SQLite 역이관 완료", "from", rep.From, "to", rep.To, "rows", rep.Copied,
+		"duration", time.Since(start).Seconds())
+	return rep, nil
+}
+
+// exportTargetRefusal 은 역이관의 대상 자리 to 가 새 원장을 받을 수 없는 사유다. 받으면 nil 이다.
+//
+// ★ 파일만이 아니라 옆 파일(pg.Sidecars)도 없어야 한다. 남은 -wal 은 새 파일을 처음 여는 연결이 그 파일의 것으로 알고
+// 되살린다 - 옮긴 원장 위에 옛 원장의 쪽들이 덮인다.
+func exportTargetRefusal(to string) error {
+	if strings.TrimSpace(to) == "" {
+		return errors.New("역이관 대상(--to)이 비었다 - 새로 만들 SQLite 원장 파일 경로를 준다")
+	}
+	if err := sqliteOnly(to, "역이관 대상(--to)"); err != nil {
+		return err
+	}
+	for _, p := range append([]string{to}, pg.Sidecars(to)...) {
+		_, err := os.Lstat(p)
+		switch {
+		case err == nil:
+			return fmt.Errorf("%s 가 이미 있다 - 역이관은 새 파일에만 쓴다(있는 원장을 덮지 않고, 옆에 남은 -wal 을 새 원장에 "+
+				"되살리지 않는다). 다른 이름을 주거나 그 파일을 옮겨 둔 뒤 다시 돌려라", clip(p, 200))
+		case !errors.Is(err, fs.ErrNotExist):
+			return fmt.Errorf("역이관 대상 자리를 재지 못했다(path=%q): %w", clip(p, 200), err)
+		}
+	}
+	return nil
+}
+
+// openExportSource 는 역이관의 원본(Postgres 원장)을 연다. 판이 이관 판(pg.ImportVersion)이어야 한다 - SQLite 판에는 그 뒤
+// 판의 자리가 없다.
+func openExportSource(ctx context.Context, t Target, log *slog.Logger) (*Store, error) {
+	if !t.Postgres() {
+		return nil, fmt.Errorf("역이관 원본은 Postgres 접속 URL 이어야 한다(--db 또는 FD_DB, 지금 %s)", clip(t.Shown(), 200))
+	}
+	s, err := openPG(t, log, lockTimeout)
+	if err != nil {
+		return nil, err
+	}
+	hasTable, v, objects, err := readMigrationState(ctx, s.db)
+	if err != nil {
+		err = fmt.Errorf("원본의 판을 재지 못했다: %w", err)
+	} else {
+		err = exportSourceRefusal(PlanMigration(hasTable, v, objects, pg.ImportVersion))
+	}
+	if err != nil {
+		s.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// exportSourceRefusal 은 원본의 판 plan 을 역이관이 받지 않는 사유다. 받으면 nil 이다. 순수 함수다.
+func exportSourceRefusal(plan MigrationPlan) error {
+	switch plan.Action {
+	case MigrateNone:
+		return nil
+	case MigrateApply:
+		return fmt.Errorf("원본에 flightdeck 원장이 없다(빈 DB 다) - 옮길 것이 없다: %s", plan.Reason)
+	}
+	return fmt.Errorf("원본이 판 %d 이 아니다(%s) - 역이관은 SQLite 의 마지막 판과 같은 판(%d)의 원장만 옮긴다",
+		pg.ImportVersion, plan.Reason, pg.ImportVersion)
+}
+
+// newExportFile 은 to 와 같은 디렉토리에 임시 SQLite 파일을 만들어 판 pg.ImportVersion 스키마를 깐다. 실패하면 남기지 않는다.
+func newExportFile(ctx context.Context, to string, log *slog.Logger) (string, error) {
+	f, err := os.CreateTemp(filepath.Dir(to), "."+filepath.Base(to)+".export-*")
+	if err != nil {
+		return "", fmt.Errorf("역이관 임시 파일을 만들지 못했다(대상 디렉토리가 있고 쓸 수 있어야 한다): %w", err)
+	}
+	tmp := f.Name()
+	if err := f.Close(); err != nil {
+		removeLedgerFiles(tmp, log)
+		return "", fmt.Errorf("역이관 임시 파일을 닫지 못했다: %w", err)
+	}
+	if err := MigrateTo(ctx, tmp, pg.ImportVersion, log); err != nil {
+		removeLedgerFiles(tmp, log)
+		return "", fmt.Errorf("역이관 임시 파일에 판 %d 스키마를 깔지 못했다: %w", pg.ImportVersion, err)
+	}
+	return tmp, nil
+}
+
+// exportInto 는 임시 파일 tmp 를 열어 src 를 옮기고(transferInto) 닫는다. 본 실행이면 닫은 뒤 커밋이 본 파일에 다 옮았는지
+// 잰다 - 이름은 본 파일에만 붙고 -wal 에 남은 커밋은 따라가지 않는다.
+func exportInto(ctx context.Context, src *Store, tmp string, dryRun bool, rep *TransferReport, log *slog.Logger) error {
+	tgt, err := openRaw(tmp, log)
+	if err != nil {
+		return err
+	}
+	err = tgt.transferInto(ctx, src, "SQLite 역이관", dryRun, rep)
+	if cerr := tgt.Close(); cerr != nil && err == nil {
+		err = fmt.Errorf("역이관 임시 파일을 닫지 못했다: %w", cerr)
+	}
+	if err != nil || dryRun {
+		return err
+	}
+	for _, p := range pg.Sidecars(tmp) {
+		if fi, err := os.Stat(p); err == nil && fi.Size() > 0 {
+			return fmt.Errorf("역이관 임시 파일을 닫았는데 %s 에 %d 바이트가 남았다 - 커밋이 본 파일에 다 옮지 않았다. 새 원장을 "+
+				"내지 않는다", filepath.Base(p), fi.Size())
+		}
+	}
+	return nil
+}
+
+// publishExport 는 대조를 지난 임시 파일 tmp 에 이름 to 를 붙인다. 그 사이에 대상 자리에 무엇이 생겼으면 거절한다.
+func publishExport(tmp, to string) error {
+	if err := exportTargetRefusal(to); err != nil {
+		return err
+	}
+	if err := os.Link(tmp, to); err != nil {
+		return fmt.Errorf("옮긴 원장에 이름을 붙이지 못했다(path=%q) - 새 원장을 내지 않았다: %w", clip(to, 200), err)
+	}
+	return nil
+}
+
+// removeLedgerFiles 는 SQLite 원장 파일 path 와 그 옆 파일을 지운다. 없는 것은 넘어가고, 못 지운 것은 로그에 남긴다.
+func removeLedgerFiles(path string, log *slog.Logger) {
+	for _, p := range append([]string{path}, pg.Sidecars(path)...) {
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			log.Warn("역이관 임시 파일을 지우지 못했다", "path", p, "error", err.Error())
+		}
+	}
+}

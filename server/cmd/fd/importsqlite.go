@@ -10,7 +10,8 @@ import (
 	"github.com/kweiza/flightdeck/internal/store"
 )
 
-// `fd migrate import-sqlite` · `fd migrate verify` - SQLite 원장을 빈 Postgres 원장으로 옮기고 두 원장을 맞댄다.
+// `fd migrate import-sqlite` · `fd migrate verify` - SQLite 원장을 빈 Postgres 원장으로 옮기고 두 원장을 맞댄다. 거꾸로 옮기는
+// `fd migrate export-sqlite` 는 exportsqlite.go 이고 보고(printTransferReport)를 함께 쓴다.
 //
 // ★ 판정 · 옮기기 · 대조는 전부 store(ImportSQLite · VerifySQLite)와 그 순수 규칙(store/pg 의 import.go · verify.go)이
 // 진다. 이 파일은 플래그를 읽고 결과를 사람에게 말하는 것뿐이다 - runMigrate 와 같은 규율이다.
@@ -21,6 +22,7 @@ import (
 var migrateSubcommands = map[string]func(a *App, ctx context.Context, args []string, out io.Writer) int{
 	"import-sqlite": (*App).runImportSQLite,
 	"verify":        (*App).runVerifySQLite,
+	"export-sqlite": (*App).runExportSQLite,
 }
 
 // importFlags 는 두 동사가 같이 받는 플래그다. 대상의 기본값은 판올림과 같은 규칙(resolveDBPath)이다.
@@ -47,12 +49,12 @@ func (a *App) runImportSQLite(ctx context.Context, args []string, out io.Writer)
 	if !ok {
 		return 2
 	}
-	rep, err := store.ImportSQLite(ctx, f.from, f.to, store.ImportOptions{DryRun: f.dryRun}, a.log)
+	rep, err := store.ImportSQLite(ctx, f.from, f.to, store.TransferOptions{DryRun: f.dryRun}, a.log)
 	head := "fd migrate import-sqlite"
 	if f.dryRun {
 		head += " --dry-run"
 	}
-	printImportReport(out, head, rep)
+	printTransferReport(out, head, rep)
 	switch {
 	case err != nil:
 		a.log.Error("SQLite 이관 실패", "from", rep.From, "to", rep.To, "dry_run", f.dryRun, "error", err.Error())
@@ -75,7 +77,7 @@ func (a *App) runVerifySQLite(ctx context.Context, args []string, out io.Writer)
 		return 2
 	}
 	rep, err := store.VerifySQLite(ctx, f.from, f.to, a.log)
-	printImportReport(out, "fd migrate verify", rep)
+	printTransferReport(out, "fd migrate verify", rep)
 	if err != nil {
 		a.log.Error("SQLite 대조 실패", "from", rep.From, "to", rep.To, "error", err.Error())
 		fmt.Fprintf(out, "\n  어긋남 · 실패: %s\n", err)
@@ -85,8 +87,8 @@ func (a *App) runVerifySQLite(ctx context.Context, args []string, out io.Writer)
 	return 0
 }
 
-// printImportReport 는 이관 · 대조 보고를 사람 말로 낸다. 접속 URL 원문은 보고에 없다(표시값뿐이다).
-func printImportReport(out io.Writer, head string, rep store.ImportReport) {
+// printTransferReport 는 이관 · 역이관 · 대조 보고를 사람 말로 낸다. 접속 URL 원문은 보고에 없다(표시값뿐이다).
+func printTransferReport(out io.Writer, head string, rep store.TransferReport) {
 	fmt.Fprintf(out, "%s · %s → %s\n", head, rep.From, rep.To)
 	printFaults(out, "사전 검사에 걸린 원본 행", rep.Faults)
 	printFaults(out, "값 검사에 걸린 대상 행", rep.TargetFaults)

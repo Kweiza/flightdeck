@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,8 +13,9 @@ import (
 	"github.com/kweiza/flightdeck/internal/store/storetest"
 )
 
-// `fd migrate import-sqlite` · `fd migrate verify` 의 표면: 예행은 아무것도 안 쓰고 0, 옮기기 0, 같은 대상에 다시 옮기기는
-// 거절 1, 대조 0, 사용법 오류 2. 출력에 접속 URL 의 어떤 조각도 없다. 옮기기 · 거절의 뜻은 store 시험이 잰다.
+// `fd migrate import-sqlite` · `fd migrate verify` · `fd migrate export-sqlite` 의 표면: 예행은 아무것도 안 쓰고 0, 옮기기 0,
+// 같은 대상에 다시 옮기기는 거절 1, 대조 0, 사용법 오류 2. 역이관은 새 파일을 내고 0(예행은 파일을 안 남긴다), 있는 파일에는
+// 거절 1, 낸 파일과 Postgres 원장의 대조 0. 출력에 접속 URL 의 어떤 조각도 없다. 옮기기 · 거절의 뜻은 store 시험이 잰다.
 func TestMigrateImportSQLiteSurface(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t)
@@ -55,6 +57,17 @@ func TestMigrateImportSQLiteSurface(t *testing.T) {
 	step(0, "두 원장이 맞다", "verify", "--from", src, "--db", dsn)
 	step(2, "", "import-sqlite", "--db", dsn) // --from 없음
 	step(2, "", "verify", "--from", src, "extra")
+
+	back := filepath.Join(t.TempDir(), "back.db")
+	step(0, "아무 파일도 남기지 않았다", "export-sqlite", "--to", back, "--db", dsn, "--dry-run")
+	if entries, err := os.ReadDir(filepath.Dir(back)); err != nil || len(entries) != 0 {
+		t.Fatalf("역이관 예행이 파일을 남겼다: %v %v", entries, err)
+	}
+	step(0, "옮겼다: 1 행", "export-sqlite", "--to", back, "--db", dsn)
+	step(1, "이미 있다", "export-sqlite", "--to", back, "--db", dsn)
+	step(0, "두 원장이 맞다", "verify", "--from", back, "--db", dsn)
+	step(1, "Postgres 접속 URL", "export-sqlite", "--to", filepath.Join(t.TempDir(), "x.db"), "--db", src)
+	step(2, "", "export-sqlite", "--db", dsn) // --to 없음
 	for _, out := range outs {
 		if strings.Contains(out, dsn) || strings.Contains(out, name) || strings.Contains(out, u.Host) {
 			t.Fatalf("출력에 접속 URL 조각이 실렸다:\n%s", out)

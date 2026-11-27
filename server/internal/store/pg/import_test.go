@@ -352,23 +352,40 @@ func TestDigestPK(t *testing.T) {
 	}
 }
 
-// INSERT 는 identity 가 있는 표에만 OVERRIDING SYSTEM VALUE 를 붙이고, 행마다 칸 수만큼 자리표시를 둔다.
+// INSERT 는 Postgres 쪽에서 identity 가 있는 표에만 OVERRIDING SYSTEM VALUE 를 붙이고(SQLite 쪽은 어느 표에도 붙이지
+// 않는다), 행마다 칸 수만큼 자리표시를 둔다. 칸 이름은 같은 엔진의 SelectSQL 과 같다 - SQLite 쪽 item_after 는 seq 자리가
+// rowid 다(역이관이 seq 를 rowid 로 되돌리는 축).
 func TestInsertSQL(t *testing.T) {
 	for _, tb := range pg.Tables() {
-		q := tb.InsertSQL(3)
-		_, id := tb.Identity()
-		if strings.Contains(q, "OVERRIDING SYSTEM VALUE") != id {
-			t.Errorf("%s: identity %v 인데 %q", tb.Name, id, q)
+		for _, sqlite := range []bool{false, true} {
+			q := tb.InsertSQL(3, sqlite)
+			_, id := tb.Identity()
+			if strings.Contains(q, "OVERRIDING SYSTEM VALUE") != (id && !sqlite) {
+				t.Errorf("%s(sqlite %v): identity %v 인데 %q", tb.Name, sqlite, id, q)
+			}
+			if n := strings.Count(q, "?"); n != 3*len(tb.Cols) {
+				t.Errorf("%s(sqlite %v): 자리표시 %d, 기대 %d", tb.Name, sqlite, n, 3*len(tb.Cols))
+			}
+			cols := strings.TrimPrefix(tb.SelectSQL(sqlite), "SELECT ")
+			cols = strings.TrimSuffix(cols, " FROM "+tb.Name)
+			if !strings.HasPrefix(q, "INSERT INTO "+tb.Name+" ("+cols+")") {
+				t.Errorf("%s(sqlite %v): 넣는 칸이 읽는 칸(%s)과 다르다: %q", tb.Name, sqlite, cols, q)
+			}
 		}
-		if n := strings.Count(q, "?"); n != 3*len(tb.Cols) {
-			t.Errorf("%s: 자리표시 %d, 기대 %d", tb.Name, n, 3*len(tb.Cols))
-		}
+	}
+	after := pg.Tables()[slices.IndexFunc(pg.Tables(), func(tb pg.Table) bool { return tb.Name == "item_after" })]
+	if q := after.InsertSQL(1, true); !strings.Contains(q, "(rowid, ") && !strings.Contains(q, ", rowid") {
+		t.Errorf("SQLite 쪽 item_after INSERT 에 rowid 가 없다: %q", q)
+	}
+	if q := after.InsertSQL(1, false); strings.Contains(q, "rowid") {
+		t.Errorf("Postgres 쪽 item_after INSERT 에 rowid 가 있다: %q", q)
 	}
 }
 
-// InsertSQL 을 부르는(가리키는) 자리는 SQLite 이관의 옮기기(store 의 copyTables) 하나다. 그 함수의 INSERT 는 identity 칸에
-// 옛 번호를 넣는 구절(OVERRIDING SYSTEM VALUE)을 붙이는데, 그 구절이 이 패키지 안에 있어서 서버 코드의 OVERRIDING 을
-// 훑는 시험(TestServerCodeNeverOverridesIdentity)이 앱 코드의 호출을 못 본다. 그래서 부르는 자리를 소스에서 잠근다.
+// InsertSQL 을 부르는(가리키는) 자리는 원장 옮기기(store 의 copyTables - 이관 · 역이관이 함께 쓴다) 하나다. 그 함수의
+// Postgres 쪽 INSERT 는 identity 칸에 옛 번호를 넣는 구절(OVERRIDING SYSTEM VALUE)을 붙이는데, 그 구절이 이 패키지 안에
+// 있어서 서버 코드의 OVERRIDING 을 훑는 시험(TestServerCodeNeverOverridesIdentity)이 앱 코드의 호출을 못 본다. 그래서
+// 부르는 자리를 소스에서 잠근다.
 // 함수 값으로 넘기는 자리(`f := t.InsertSQL`)와 패키지 수준 초기화도 센다.
 func TestInsertSQLIsCalledOnlyByTheImport(t *testing.T) {
 	root, err := filepath.Abs("../../..") // server 모듈 뿌리

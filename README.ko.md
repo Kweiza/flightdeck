@@ -306,6 +306,37 @@ fd migrate verify --from fd-copy.db --db <URL>
 - 사전 검사가 못 보는 거절(대상의 CHECK, 인덱스 항목 크기 상한, 권한)은 예행이 본 실행과 똑같이 받는다. 예행은 실행기 잠금도
   본 실행처럼 쥔다.
 
+### Postgres 원장을 SQLite 로 되돌리기
+
+`fd migrate export-sqlite` 는 이관의 역이다. 판 18 의 Postgres 원장을 **새** SQLite 파일(판 18)로 옮긴다 - 이관한 뒤 Postgres
+에 쌓인 항목 · 선점 · 이벤트 · 판단을 들고 SQLite 판으로 돌아가는 길이다. 이관과 같은 트랜잭션 · 같은 대조(행 수 · 전 칸 지문 ·
+순번)를 돌고, 대상 옆 임시 파일에 쓴 뒤 대조가 맞아야 `--to` 이름을 붙인다. 어긋나거나 실패하면(예행은 늘) 아무 파일도 남지
+않는다. 종료 코드는 이관과 같다.
+
+```bash
+# 1. Postgres 원장에 쓰는 서버를 내린다. 원본은 스냅숏 하나(REPEATABLE READ READ ONLY)로 읽기만 한다.
+# 2. 예행: 본 실행과 같은 길을 임시 파일에 끝까지 돌고 그 파일을 지운다.
+fd migrate export-sqlite --db <URL> --to fd-back.db --dry-run
+# 3. 옮긴다. 성공하면 대조표와 함께 「옮겼다: N 행, 대조가 맞았다 → fd-back.db」를 낸다.
+fd migrate export-sqlite --db <URL> --to fd-back.db
+# 4. (선택) 낸 파일로 서버를 띄우기 전에 다시 맞댄다. 이관의 verify 를 그대로 쓴다.
+fd migrate verify --from fd-back.db --db <URL>
+```
+
+- `--to` 자리에 파일이 있거나 그 옆에 `-wal` · `-shm` · `-journal` 이 있으면 거절한다. 덮지 않고, 남은 `-wal` 이 새 파일에
+  되살아나지 않게 한다.
+- 원본은 판 18 이어야 한다. 그 뒤 판으로 올린 Postgres 원장은 SQLite 판에 자리가 없어 거절한다. 접속 계정은 이관과 같다
+  (초사용자나 `fd_owner` 의 멤버 - 시퀀스를 읽는다).
+- 이관의 사전 검사가 받지 않을 값(깨진 JSON 등)이 원본에 있으면 거절한다 - 낸 파일을 다시 이관할 수 없게 되기 때문이다.
+- 순번: AUTOINCREMENT 표(pick_eval · resource_hold · event · landing_queue)는 Postgres 가 낸 최고 번호를 `sqlite_sequence` 에
+  되살려 그 번호를 다시 내지 않는다. item_after 는 SQLite rowid 표라 지워진 최고 번호를 기억하지 못한다 - seq 값(순서)은 rowid 로
+  그대로 옮고, 다음 번호는 SQLite 판 그대로 max(rowid)+1 이다.
+- 판단 검색 색인(judgment_fts)은 Postgres 에 없어 옮기지 않는다. 옮긴 판단 행에서 다시 짓고 판단 행과 맞는지 잰다.
+
+**되돌리기 예행.** 실제로 옮기기 전에 왕복을 한 번 돌려 둔다: 원장 사본 → `import-sqlite` 로 시험용 Postgres 원장 → 그 원장으로
+서버를 띄워 몇 가지를 쓴다(항목 · 선점 · 판단) → 서버를 내리고 `export-sqlite` → `fd migrate verify --from <낸 파일> --db <URL>`
+이 맞는지, 낸 파일로 띄운 SQLite 판 서버에서 그 쓰기가 보이고 판단 검색이 되는지 본다.
+
 ## 여러 저장소
 
 한 제품이 저장소 여럿으로 갈리면 루트 폴더에 `.flightdeck.yaml` 로 멤버를 선언하고 루트에서 한 번만
