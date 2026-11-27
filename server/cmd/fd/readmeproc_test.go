@@ -727,7 +727,7 @@ func checkRollback(t *testing.T, shell procShell, procs readmeProcs) {
 		}
 		for _, want := range []struct{ args, env string }{
 			{"-p newp run --rm --no-deps migrate migrate export-sqlite --to /data/fd-back.db", r.on()},
-			{"-p newp run --rm migrate migrate verify --from /data/fd-back.db", r.on()},
+			{"-p newp run --rm migrate migrate verify --from /data/fd-back.db --exported", r.on()},
 			{"-p newp down", r.off()},
 			{"-p newp up -d --build", ""},
 		} {
@@ -735,7 +735,7 @@ func checkRollback(t *testing.T, shell procShell, procs readmeProcs) {
 				t.Errorf("`%s` 가 선택 파일 %q 로 안 돌았다: %q", want.args, want.env, c)
 			}
 		}
-		if calledAt(calls, "-p newp run --rm migrate migrate verify --from /data/fd-back.db") > calledAt(calls, "-p newp down") {
+		if calledAt(calls, "-p newp run --rm migrate migrate verify --from /data/fd-back.db --exported") > calledAt(calls, "-p newp down") {
 			t.Error("맞대기 전에 겹을 내렸다")
 		}
 		if r.exists(r.on()) || !r.exists(r.off()) || r.exists(r.data("fd.db.moved-to-postgres")) || r.read(r.data("fd.db")) != "back" {
@@ -778,7 +778,7 @@ func checkRollback(t *testing.T, shell procShell, procs readmeProcs) {
 	})
 	t.Run("맞대기가 서면 선택 파일을 안 끄고 아무것도 안 놓는다", func(t *testing.T) {
 		r := rollbackRig(t, shell, procs)
-		r.env["FDT_FAIL"] = "verify --from /data/fd-back.db$"
+		r.env["FDT_FAIL"] = "verify --from /data/fd-back.db --exported$"
 		rc, calls, _ := r.run(r.old, "fdwhere", procs.rollback)
 		if rc == "0" || called(calls, "-p newp down") != "" {
 			t.Fatalf("맞대기가 섰는데 덩이가 내리기로 갔다(rc=%s):\n%s", rc, strings.Join(calls, "\n"))
@@ -803,7 +803,7 @@ func checkRollback(t *testing.T, shell procShell, procs readmeProcs) {
 		if rc != "0" {
 			t.Fatalf("다시 붙여 넣은 덩이가 %s 로 섰다:\n%s", rc, out)
 		}
-		v, d := calledAt(calls, "-p newp run --rm migrate migrate verify --from /data/fd-back.db"), calledAt(calls, "-p newp down")
+		v, d := calledAt(calls, "-p newp run --rm migrate migrate verify --from /data/fd-back.db --exported"), calledAt(calls, "-p newp down")
 		if v < 0 || d < 0 || v > d || !ran(composeCalls(calls)[v], r.work, r.off()) || strings.Contains(strings.Join(calls, "\n"), "export-sqlite") {
 			t.Fatalf("다시 붙여 넣은 덩이가 꺼 둔 선택 파일로 다시 맞댄 뒤에 놓지 않았다:\n%s", strings.Join(calls, "\n"))
 		}
@@ -816,7 +816,7 @@ func checkRollback(t *testing.T, shell procShell, procs readmeProcs) {
 	})
 	t.Run("5 뒤에서 이을 때 맞대기가 서면 아무것도 안 놓는다", func(t *testing.T) {
 		r := offRig(t, shell, procs)
-		r.env["FDT_FAIL"] = "verify --from /data/fd-back.db$"
+		r.env["FDT_FAIL"] = "verify --from /data/fd-back.db --exported$"
 		rc, calls, _ := r.run(r.old, resume(r), procs.rollback)
 		if rc == "0" || called(calls, "-p newp down") != "" || called(calls, "-p newp up -d --build") != "" {
 			t.Fatalf("맞대기가 섰는데 덩이가 내리기 · 띄우기로 갔다(rc=%s):\n%s", rc, strings.Join(calls, "\n"))
@@ -851,7 +851,7 @@ func checkRollback(t *testing.T, shell procShell, procs readmeProcs) {
 		if rc != "0" || strings.Contains(strings.Join(calls, "\n"), "export-sqlite") {
 			t.Fatalf("5 뒤에서 잇지 않았다(rc=%s):\n%s\n%s", rc, strings.Join(calls, "\n"), out)
 		}
-		if c := called(calls, "-p newp run --rm migrate migrate verify --from /data/fd-back.db"); !ran(c, r.work, r.off()) {
+		if c := called(calls, "-p newp run --rm migrate migrate verify --from /data/fd-back.db --exported"); !ran(c, r.work, r.off()) {
 			t.Fatalf("5 뒤에서 이은 덩이가 꺼 둔 선택 파일로 맞대지 않았다: %q", c)
 		}
 		if r.read(r.data("fd.db")) != "back" || r.exists(r.data("fd.db.moved-to-postgres")) || !ran(called(calls, "-p newp up -d --build"), r.work, "") {

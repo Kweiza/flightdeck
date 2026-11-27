@@ -11,8 +11,9 @@ import (
 )
 
 // 이관 대조의 순수한 몫이다: 행 하나의 지문, 표 하나의 대조, 순번 하나의 판정. 두 원장에서 같은 규칙으로 잰다 - 읽은 값은
-// SQLite 원본이면 Cell, 이미 기준선 꼴이어야 하는 쪽이면 SettledCell 을 지나 같은 꼴(nil · int64 · string · []byte)이 된 뒤
-// 여기에 온다. 원본의 NUL 은 Cell 이 바꿔 넣는 값(EscapeNUL)으로 재므로 지문도 옮긴 값과 같은 값을 잰다.
+// 이관의 SQLite 원본이면 Cell, 변환 없이 맞대는 쪽(옮긴 대상 · 역이관의 원본 · 역이관이 낸 파일)이면 SettledCell 을 지나 같은
+// 꼴(nil · int64 · string · []byte)이 된 뒤 여기에 온다. 이관 원본의 NUL 은 Cell 이 바꿔 넣는 값(nulesc)으로 재므로 지문도 옮긴
+// 값과 같은 값을 잰다.
 
 // MaxListed 는 대조 · 사전 검사가 갈래마다 늘어놓는 행 좌표의 상한이다. 나머지는 수로만 낸다.
 const MaxListed = 20

@@ -88,10 +88,15 @@ type TransferReport struct {
 	// TargetFaults 는 대상에서 읽은 값이 값 검사(pg.SettledCell - 원본의 검사에 바꿔 넣을 값 · 저장 갈래까지)에 걸린 것이다.
 	// 대조가 대상 값을 읽을 때 잰다.
 	TargetFaults []FaultGroup
-	// Rewrites 는 원본 값을 정해진 규칙으로 바꿔 옮긴 칸이다(pg.Rewrite - SQLite 원본의 NUL). 이관은 그 값을 넣고, 대조는 같은
-	// 규칙을 건 원본 값으로 맞댄다. RewrittenRows 는 그런 칸이 하나라도 있는 원본 행의 수다. 역이관에는 늘 비었다(SettledCell).
+	// Rewrites 는 원본 값을 정해진 규칙으로 바꿔 옮긴 칸이다(pg.Rewrite - SQLite 원본의 NUL). 이관은 그 값을 넣고, 이관 원본의
+	// 대조는 같은 규칙을 건 원본 값으로 맞댄다. RewrittenRows 는 그런 칸이 하나라도 있는 원본 행의 수다. 역이관과 역이관이 낸
+	// 파일의 대조(VerifyOptions.Exported)에는 늘 비었다(SettledCell - 변환하지 않는다).
 	Rewrites      []RewriteGroup
 	RewrittenRows int
+	// RewriteRecord 는 이관이 바꾼 칸 전부(행의 전체 키 · 칸 · 규칙 · JSON 자리 · 원래 바이트)를 남긴 기록 파일이다
+	// (<원본>.rewritten-<시각>.jsonl - writeRewriteRecord). 바꾼 칸이 없거나 커밋하지 않았으면 비었다. 그 칸의 원래 바이트는 이
+	// 파일이 정본이다 - 화면 보고(Rewrites)는 갈래마다 행 좌표를 pg.MaxListed 개만 싣는다.
+	RewriteRecord string
 	// Rows 는 원본 표마다 행 수다(pg.Tables 순서).
 	Rows      []TableRows
 	Tables    []pg.TableCheck
@@ -180,13 +185,23 @@ func ImportSQLite(ctx context.Context, from, to string, opt TransferOptions, log
 	defer tgt.Close()
 	rep.TargetChecked = true
 	start := time.Now()
-	if err := tgt.transferInto(ctx, src, "SQLite 이관", opt.DryRun, &rep); err != nil {
+	// 바꾼 칸의 기록은 커밋 **전에** 남긴다 - 못 남기면 커밋하지 않는다. 원래 바이트를 잃은 채 옮긴 원장이 남는 길이 없다.
+	seal := func(sc *ledgerScan) (err error) {
+		rep.RewriteRecord, err = writeRewriteRecord(from, sc.cells.rewritten, start)
+		return err
+	}
+	if err := tgt.transferInto(ctx, src, "SQLite 이관", opt.DryRun, seal, &rep); err != nil {
+		// 남긴 기록은 오류가 댄다. 보고의 기록 칸은 커밋한 이관의 것만 싣는다(TransferReport.RewriteRecord).
+		if rep.RewriteRecord != "" {
+			err = fmt.Errorf("%w (바꾼 칸 기록 %s 는 남겼다 - 커밋이 안 됐으면 쓰이지 않는 파일이다)", err, rep.RewriteRecord)
+			rep.RewriteRecord = ""
+		}
 		return rep, err
 	}
 	if opt.DryRun {
 		return rep, nil
 	}
-	if err := tgt.leaveMovedMark(ctx, mark, rep.Copied); err != nil {
+	if err := tgt.leaveMovedMark(ctx, mark, rep.Copied, rep.RewriteRecord); err != nil {
 		return rep, err
 	}
 	if rep.Quarantined, err = quarantineBackups(from, "import", time.Now()); err != nil {
@@ -194,21 +209,24 @@ func ImportSQLite(ctx context.Context, from, to string, opt TransferOptions, log
 			"%s.pre-import-<시각>.bak/ 같은 새 디렉토리로 옮긴다: %w", clip(from, 200), clip(from, 200), err)
 	}
 	log.Info("SQLite 이관 완료", "from", rep.From, "to", rep.To, "rows", rep.Copied, "rewritten_rows", rep.RewrittenRows,
-		"marker", mark.path, "duration", time.Since(start).Seconds())
+		"rewrite_record", rep.RewriteRecord, "marker", mark.path, "duration", time.Since(start).Seconds())
 	return rep, nil
 }
 
 // errDryRun 은 예행의 body 가 커밋 대신 되감으려고 내는 표지다. transferInto 밖으로 나가지 않는다.
 var errDryRun = errors.New("예행 - 커밋하지 않고 되감는다")
 
-// transferInto 는 이 원장(대상)에 src 를 옮긴다(dryRun 이면 끝에 되감는다). what 은 오류 문구의 머리다. 이관(SQLite →
-// Postgres)과 역이관(Postgres → SQLite)이 이 하나를 탄다 - 엔진마다 다른 몫은 두 원장의 ledgerSide 가 진다. 실행기 세션이
+// transferInto 는 이 원장(대상)에 src 를 옮긴다(dryRun 이면 끝에 되감는다). what 은 오류 문구의 머리다. seal 이 있으면 대조가
+// 맞은 뒤 커밋 직전에 원본 훑기를 넘겨 부르고, 그것이 실패하면 커밋하지 않는다(예행은 부르지 않는다 - 이관이 바꾼 칸의 기록을
+// 남기는 자리다). 이관(SQLite → Postgres)과 역이관(Postgres → SQLite)이 이 하나를 탄다 - 엔진마다 다른 몫은 두 원장의
+// ledgerSide 가 진다. 실행기 세션이
 // 대상 확인부터 커밋까지 잠금 둘을 쥔다(Postgres 대상) - 다른 실행기와 업무 쓰기가 그 사이에 이 원장을 바꾸지 못하므로
 // 확인한 「빈 원장」이 커밋 때도 그대로다. SQLite 대상(역이관이 만든 임시 파일)은 쓰기 트랜잭션(BEGIN IMMEDIATE)이 그 자리다.
 //
 // ★ 세션은 원본을 다 훑은 뒤에 연다. 전역 업무 잠금은 대상 트랜잭션 동안만 쥔다 - 잘못 고른 대상(서버가 쓰는 원장)이면
 // 「비어 있지 않다」로 곧장 놓는다. 원본을 훑는 동안 그 서버의 쓰기를 세워 두지 않는다.
-func (s *Store) transferInto(ctx context.Context, src *Store, what string, dryRun bool, rep *TransferReport) error {
+func (s *Store) transferInto(ctx context.Context, src *Store, what string, dryRun bool, seal func(*ledgerScan) error,
+	rep *TransferReport) error {
 	if dryRun {
 		what += " 예행"
 	}
@@ -251,6 +269,11 @@ func (s *Store) transferInto(ctx context.Context, src *Store, what string, dryRu
 			if dryRun {
 				return errDryRun
 			}
+			if seal != nil {
+				if err := seal(sc); err != nil {
+					return fmt.Errorf("바꾼 칸의 기록을 남기지 못했다 - 커밋하지 않는다: %w", err)
+				}
+			}
 			copied = n
 			return nil
 		})
@@ -267,9 +290,18 @@ func (s *Store) transferInto(ctx context.Context, src *Store, what string, dryRu
 	})
 }
 
+// VerifyOptions 는 대조 한 번의 선택이다.
+type VerifyOptions struct {
+	// Exported 는 SQLite 원장 from 이 역이관(`fd migrate export-sqlite`)이 낸 파일이라는 뜻이다. 그 파일은 Postgres 값을 그대로
+	// 담았으므로 두 쪽을 다 변환 없이(pg.SettledCell) 맞댄다 - 글 칸의 NUL 은 거절이다(낸 뒤에 무엇이 넣은 것이다). 거짓이면 from
+	// 은 이관의 원본이라 그 값에 이관의 규칙(pg.Cell - NUL 바꿔 넣기)을 건 뒤 맞댄다. 낸 파일을 이관 원본처럼 재면 그 파일에 넣은
+	// NUL 이 Postgres 의 `\x00` 네 글자와 같다고 나온다.
+	Exported bool
+}
+
 // VerifySQLite 는 SQLite 원장 from 과 Postgres 원장 to 를 맞댄다(표마다 행 수 · 전 칸 행 지문, identity 순번). 쓰지 않는다.
 // 원본이 사전 검사에 걸리거나, 대상 값이 검사에 걸리거나, 대조가 어긋나면 보고와 함께 오류를 낸다(verdict).
-func VerifySQLite(ctx context.Context, from, to string, log *slog.Logger) (TransferReport, error) {
+func VerifySQLite(ctx context.Context, from, to string, opt VerifyOptions, log *slog.Logger) (TransferReport, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -288,10 +320,14 @@ func VerifySQLite(ctx context.Context, from, to string, log *slog.Logger) (Trans
 	if err := targetVersion(ctx, tgt.db); err != nil {
 		return rep, err
 	}
+	// 대조는 원문을 맞댄다 - 인덱스 키 상한(pg.ImportCell)은 옮겨 넣을 때만 잰다. 이미 두 원장에 있는 긴 값으로 대조가 막히면
+	// 남는 처방이 감사 행을 자르는 것뿐이다.
+	rule := cellRule(pg.Cell)
+	if opt.Exported {
+		rule = pg.SettledCell
+	}
 	err = src.ReadTx(ctx, func(q Reader) error {
-		// 대조는 원문을 맞댄다 - 인덱스 키 상한(pg.ImportCell)은 옮겨 넣을 때만 잰다. 이미 두 원장에 있는 긴 값으로 대조가 막히면
-		// 남는 처방이 감사 행을 자르는 것뿐이다.
-		sc, err := scanLedger(ctx, q, sideOf(src), pg.Cell)
+		sc, err := scanLedger(ctx, q, sideOf(src), rule)
 		if err != nil {
 			return err
 		}
@@ -778,23 +814,26 @@ type ledgerScan struct {
 	floors map[string]int64
 }
 
-// cellTally 는 훑기 한 번이 칸 규칙(cellRule)에서 센 것이다: 걸린 칸(faults), 바꿔 넣은 칸(rewrites), 바꿔 넣은 칸이 하나라도
-// 있는 행의 수(rewrittenRows). 원본의 사전 검사와 대조가 읽은 대상 값이 같은 셈을 쓴다.
+// cellTally 는 훑기 한 번이 칸 규칙(cellRule)에서 센 것이다: 걸린 칸(faults), 바꿔 넣은 칸의 갈래(rewrites)와 그 칸 전부
+// (rewritten - 상한 없이, 원래 바이트와 함께), 바꿔 넣은 칸이 하나라도 있는 행의 수(rewrittenRows). 원본의 사전 검사와 대조가
+// 읽은 대상 값이 같은 셈을 쓴다.
 type cellTally struct {
 	faults        tally[pg.Fault]
 	rewrites      tally[pg.Rewrite]
+	rewritten     []rewrittenCell
 	rewrittenRows int
 }
 
-// row 는 표 t 의 행 하나에서 걸린 칸(faults)과 바꿔 넣은 칸(rewrites - 둘 다 칸 선언 순서)을 센다. key 는 그 행의 좌표다.
-func (ct *cellTally) row(t pg.Table, faults []pg.Fault, rewrites []pg.Rewrite, key string) {
+// row 는 표 t 의 행 하나(r)에서 걸린 칸과 바꿔 넣은 칸을 센다. key 는 그 행의 좌표다.
+func (ct *cellTally) row(t pg.Table, r cellRow, key string) {
 	rewritten := false
 	for i, c := range t.Cols {
-		if f := faults[i]; f != "" {
+		if f := r.faults[i]; f != "" {
 			ct.faults.add(t.Name, c.Name, f, key)
 		}
-		if r := rewrites[i]; r != "" {
-			ct.rewrites.add(t.Name, c.Name, r, key)
+		if rw := r.rewrites[i]; rw != "" {
+			ct.rewrites.add(t.Name, c.Name, rw, key)
+			ct.rewritten = append(ct.rewritten, newRewrittenCell(t, r, i))
 			rewritten = true
 		}
 	}
@@ -877,8 +916,8 @@ func (sc *ledgerScan) refusal() error {
 
 // scanLedger 는 원본을 한 번 훑는다: 판 · 모양과 붙은 다른 연결을 재고, 표마다 행을 읽어 칸마다 규칙 cell(사전 검사 · 바꿔
 // 넣기)을 걸고, 행 표지와 발급 번호를 모은다. 끝에 부모 없는 행을 잰다. q 는 원본의 읽기 트랜잭션, from 은 원본의 몫이다. cell 은
-// 옮겨 넣을 쪽이 원본 값에 거는 규칙이다(ledgerSide.intake - 이관은 NUL 을 바꿔 넣고 인덱스 키 상한까지 잰다). 대조는 pg.Cell
-// 이다 - 이미 두 원장에 있는 원문을 맞댄다.
+// 옮겨 넣을 쪽이 원본 값에 거는 규칙이다(ledgerSide.intake - 이관은 NUL 을 바꿔 넣고 인덱스 키 상한까지 잰다). 대조는 이관
+// 원본이면 pg.Cell(이미 두 원장에 있는 원문에 이관의 바꿔 넣기만 건다), 역이관이 낸 파일이면 pg.SettledCell(변환 없이)이다.
 func scanLedger(ctx context.Context, q Reader, from ledgerSide, cell cellRule) (*ledgerScan, error) {
 	if err := from.shape(ctx, q); err != nil {
 		return nil, err
@@ -909,23 +948,38 @@ func scanLedger(ctx context.Context, q Reader, from ledgerSide, cell cellRule) (
 }
 
 // scanTable 은 표 t 를 읽어 행 표지(칸 선언 순서 · cell 을 지난 값)와 identity 칸의 최고값을 내고, 칸 규칙에 걸리거나 바뀐
-// 칸과 지문 기본키가 겹치는 행을 ct 에 센다. 원본 훑기(받는 쪽의 ledgerSide.intake, 대조는 pg.Cell)와 대상 대조(pg.SettledCell)가
-// 이 하나로 읽는다 - 대조의 두 쪽이 같은 꼴을 잰다. 원본 쪽 값은 바꿔 넣은 값이라 행 표지 · 지문 기본키도 옮긴 값으로 잰다.
+// 칸과 기본키 · UNIQUE 칸 묶음이 앞 행과 겹치는 행(pg.FaultUnique)을 ct 에 센다. 원본 훑기(받는 쪽의 ledgerSide.intake, 대조는
+// pg.Cell · pg.SettledCell)와 대상 대조(pg.SettledCell)가 이 하나로 읽는다 - 대조의 두 쪽이 같은 꼴을 잰다. 원본 쪽 값은 바꿔 넣은
+// 값이라 행 표지 · 겹침도 옮긴 값으로 잰다.
+//
+// ★ 겹침은 글 · bytea 칸이 든 묶음만 잰다(pg.Table.Mergeable). SQLite 의 제약이 원본 값의 겹침은 이미 막았고, 옮기며 다른 두 값이
+// 같아지는 자리는 그 칸뿐이다(NUL 바꿔 넣기 · 글 칸의 BLOB). 정수 기본키뿐인 큰 표(event)의 지문을 들고 있지 않는다.
 func scanTable(ctx context.Context, q Reader, t pg.Table, sqlite bool, cell cellRule, ct *cellTally) (marks []pg.RowMark, maxID int64, err error) {
 	id, hasID := t.Identity()
 	idAt := t.Index(id.Name)
-	pks := map[string]bool{} // 지문 기본키(pg.Table.DigestPK) - 지문 칸이 있는 표만 찬다
-	err = eachCells(ctx, q, t, sqlite, cell, func(vals []any, faults []pg.Fault, rewrites []pg.Rewrite) error {
-		m := t.Mark(vals)
-		ct.row(t, faults, rewrites, m.Key)
-		if pk, ok := t.DigestPK(vals); ok {
-			if pks[pk] {
-				ct.faults.add(t.Name, t.DigestKey, pg.FaultDigest, m.Key)
+	var uniques []pg.Unique
+	for _, u := range t.Uniques() {
+		if t.Mergeable(u) {
+			uniques = append(uniques, u)
+		}
+	}
+	seen := make([]map[[32]byte]bool, len(uniques))
+	for i := range seen {
+		seen[i] = map[[32]byte]bool{}
+	}
+	err = eachCells(ctx, q, t, sqlite, cell, func(r cellRow) error {
+		m := t.Mark(r.vals)
+		ct.row(t, r, m.Key)
+		for i, u := range uniques {
+			if h, ok := t.UniquePrint(u, r.vals); ok {
+				if seen[i][h] {
+					ct.faults.add(t.Name, strings.Join(u.Cols, ","), pg.FaultUnique, m.Key)
+				}
+				seen[i][h] = true
 			}
-			pks[pk] = true
 		}
 		if hasID {
-			if n, ok := vals[idAt].(int64); ok {
+			if n, ok := r.vals[idAt].(int64); ok {
 				maxID = max(maxID, n)
 			}
 		}
@@ -1036,32 +1090,37 @@ func strings1(ctx context.Context, q Reader, query string, args ...any) ([]strin
 }
 
 // cellRule 은 읽은 칸 하나를 기준선 값으로 옮기고 거절 사유나 바꿔 넣은 갈래를 내는 규칙이다: 이관의 SQLite 원본은 pg.Cell
-// (Postgres 로 옮겨 넣을 때는 키 상한까지 재는 pg.ImportCell - ledgerSide.intake), 이미 기준선 꼴이어야 하는 쪽(옮긴 대상,
-// 역이관의 Postgres 원본)은 pg.SettledCell.
+// (Postgres 로 옮겨 넣을 때는 키 상한까지 재는 pg.ImportCell - ledgerSide.intake), 변환 없이 맞대는 쪽(옮긴 대상, 역이관의
+// Postgres 원본, 역이관이 낸 파일)은 pg.SettledCell.
 type cellRule func(pg.Column, any) (any, pg.Fault, pg.Rewrite)
+
+// cellRow 는 eachCells 가 읽은 행 하나다(칸 선언 순서): 원장에서 읽은 그대로(read), 칸 규칙을 지난 값(vals), 그 거절 사유와
+// 바꿔 넣은 갈래.
+type cellRow struct {
+	read, vals []any
+	faults     []pg.Fault
+	rewrites   []pg.Rewrite
+}
 
 // eachCells 는 표 t 의 행을 차례로 읽어 칸마다 기준선 값으로 옮긴 것(cell)과 그 거절 사유 · 바꿔 넣은 갈래를 fn 에 준다.
 // sqlite 면 rowid 자리 칸을 rowid 로 읽는다. 두 원장이 이 하나로 읽는다 - 대조의 두 쪽이 같은 꼴을 잰다.
 //
-// ★ vals 는 행마다 새로 만든다. fn 이 그것을 붙들어도(묶음 INSERT) 다음 행이 덮지 않는다.
-func eachCells(ctx context.Context, q Reader, t pg.Table, sqlite bool, cell cellRule,
-	fn func(vals []any, faults []pg.Fault, rewrites []pg.Rewrite) error) error {
-	raw := make([]any, len(t.Cols))
-	ptrs := make([]any, len(t.Cols))
-	for i := range raw {
-		ptrs[i] = &raw[i]
-	}
-	return eachRow(ctx, q, t.SelectSQL(sqlite), nil, t.Name, func(r *rowSet) error {
-		if err := r.Scan(ptrs...); err != nil {
+// ★ 행(cellRow)의 조각은 행마다 새로 만든다. fn 이 그것을 붙들어도(묶음 INSERT · 바꾼 칸의 기록) 다음 행이 덮지 않는다.
+func eachCells(ctx context.Context, q Reader, t pg.Table, sqlite bool, cell cellRule, fn func(cellRow) error) error {
+	return eachRow(ctx, q, t.SelectSQL(sqlite), nil, t.Name, func(rs *rowSet) error {
+		r := cellRow{read: make([]any, len(t.Cols)), vals: make([]any, len(t.Cols)),
+			faults: make([]pg.Fault, len(t.Cols)), rewrites: make([]pg.Rewrite, len(t.Cols))}
+		ptrs := make([]any, len(t.Cols))
+		for i := range r.read {
+			ptrs[i] = &r.read[i]
+		}
+		if err := rs.Scan(ptrs...); err != nil {
 			return err
 		}
-		vals := make([]any, len(t.Cols))
-		faults := make([]pg.Fault, len(t.Cols))
-		rewrites := make([]pg.Rewrite, len(t.Cols))
 		for i, c := range t.Cols {
-			vals[i], faults[i], rewrites[i] = cell(c, raw[i])
+			r.vals[i], r.faults[i], r.rewrites[i] = cell(c, r.read[i])
 		}
-		return fn(vals, faults, rewrites)
+		return fn(r)
 	})
 }
 
@@ -1098,10 +1157,10 @@ func copyTables(ctx context.Context, q Reader, from ledgerSide, tx *txConn, to l
 			args, rows, size = args[:0], 0, 0
 			return nil
 		}
-		err := eachCells(ctx, q, t, from.sqlite(), to.intake(), func(vals []any, _ []pg.Fault, _ []pg.Rewrite) error {
-			args = append(args, vals...)
+		err := eachCells(ctx, q, t, from.sqlite(), to.intake(), func(r cellRow) error {
+			args = append(args, r.vals...)
 			rows++
-			for _, v := range vals {
+			for _, v := range r.vals {
 				switch x := v.(type) {
 				case string:
 					size += len(x)
@@ -1125,8 +1184,8 @@ func copyTables(ctx context.Context, q Reader, from ledgerSide, tx *txConn, to l
 }
 
 // checkTarget 은 대상 r(to)을 원본 훑기 sc 와 맞대 rep 에 싣는다: 표마다 행 지문의 다중집합(pg.Compare), identity 마다 다음
-// 번호(to.next), 그리고 읽은 대상 값이 값 검사(pg.SettledCell - 바꿔 넣을 값이 없고 저장 갈래까지 칸 타입이어야 한다)에 걸린
-// 것(rep.TargetFaults). 원본 쪽 표지는 원본의 규칙을 지난 값이라, NUL 을 바꿔 넣은 행도 옮긴 값끼리 맞댄다. 판정은
+// 번호(to.next), 그리고 읽은 대상 값이 값 검사(pg.SettledCell - 변환 없이, 글 칸의 NUL 이 없고 저장 갈래까지 칸 타입이어야
+// 한다)에 걸린 것(rep.TargetFaults). 원본 쪽 표지는 원본의 규칙을 지난 값이라, NUL 을 바꿔 넣은 행도 옮긴 값끼리 맞댄다. 판정은
 // rep.verdict 다. 이관 · 역이관의 커밋 전 대조와 `fd migrate verify` 가 이 하나를 쓴다.
 func checkTarget(ctx context.Context, r Reader, to ledgerSide, sc *ledgerScan, rep *TransferReport) error {
 	held, err := to.held(ctx, r)

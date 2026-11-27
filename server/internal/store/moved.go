@@ -47,7 +47,9 @@ type movedNote struct {
 	Ledger string `json:"ledger,omitempty"`
 	Schema int    `json:"schema"`
 	Rows   int    `json:"rows"`
-	Undo   string `json:"undo"`
+	// Rewritten 은 이관이 바꾼 칸의 기록 파일이다(TransferReport.RewriteRecord). 바꾼 칸이 없었으면 비었다.
+	Rewritten string `json:"rewritten,omitempty"`
+	Undo      string `json:"undo"`
 }
 
 // movedNoteLimit 는 거절 문구에 실으려고 표지에서 읽는 바이트 상한이다. 이관이 쓰는 내용은 그보다 작다.
@@ -204,27 +206,29 @@ func (m *movedMark) release(log *slog.Logger) {
 	}
 }
 
-// leaveMovedMark 는 이 Postgres 원장으로 rows 행을 옮겨 커밋한 이관의 표지를 mark 자리에 남긴다.
+// leaveMovedMark 는 이 Postgres 원장으로 rows 행을 옮겨 커밋한 이관의 표지를 mark 자리에 남긴다. record 는 바꾼 칸의 기록
+// 파일이다(없으면 빈 값).
 //
 // ★ 커밋한 뒤에만 부른다. 못 남기면 실패로 내되 커밋은 이미 됐다고 말하고 손으로 남기는 길(touch)을 같이 낸다 - 그대로 두면
 // SQLite 쪽 관문이 이 원장에 안 서고, Postgres 판올림은 표지 없는 원장을 보고 선다(UnmovedSQLiteRefusal).
-func (s *Store) leaveMovedMark(ctx context.Context, mark *movedMark, rows int) error {
-	if err := mark.publish(s.movedNoteFor(ctx, rows)); err != nil {
+func (s *Store) leaveMovedMark(ctx context.Context, mark *movedMark, rows int, record string) error {
+	if err := mark.publish(s.movedNoteFor(ctx, rows, record)); err != nil {
 		return fmt.Errorf("옮겼다(%d 행, 커밋했다) - 그런데 원본 옆에 이관 표지를 남기지 못했다: %w. 서버를 띄우기 전에 손으로 "+
 			"남긴다: touch %s", rows, err, shellQuote(mark.path))
 	}
 	return nil
 }
 
-// movedNoteFor 는 Postgres 원장 s 로 rows 행을 옮긴 이관의 표지 내용이다. 원장 식별은 못 읽으면 비운다 - 커밋은 이미 끝났고
-// 표지는 내용 없이도 표지다(머리말의 ★). 취소된 ctx 여도 표지는 남겨야 하므로 식별 읽기만 ctx 를 탄다.
-func (s *Store) movedNoteFor(ctx context.Context, rows int) movedNote {
+// movedNoteFor 는 Postgres 원장 s 로 rows 행을 옮긴 이관의 표지 내용이다(record 는 바꾼 칸의 기록 파일). 원장 식별은 못 읽으면
+// 비운다 - 커밋은 이미 끝났고 표지는 내용 없이도 표지다(머리말의 ★). 취소된 ctx 여도 표지는 남겨야 하므로 식별 읽기만 ctx 를 탄다.
+func (s *Store) movedNoteFor(ctx context.Context, rows int, record string) movedNote {
 	n := movedNote{
 		Note: "이 SQLite 원장은 Postgres 원장으로 옮겼다. 이 파일이 있는 동안 SQLite 판(fd migrate · fd serve)은 이 원장을 " +
 			"열지도 새로 만들지도 않는다.",
-		MovedAt: time.Now().UTC().Format(time.RFC3339),
-		Schema:  pg.ImportVersion,
-		Rows:    rows,
+		MovedAt:   time.Now().UTC().Format(time.RFC3339),
+		Schema:    pg.ImportVersion,
+		Rows:      rows,
+		Rewritten: record,
 		Undo: "72시간 안에 되돌리려면 README 「72시간 안에 되돌리기」: fd migrate export-sqlite 가 낸 파일을 이 원장 자리에 두고 " +
 			"이 파일을 지운다(rm). 선택 파일을 켜기 전에 선 업그레이드를 거두려면 README 「켜기 전에 섰을 때」.",
 	}

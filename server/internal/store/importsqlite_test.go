@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -16,10 +17,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/kweiza/flightdeck/internal/model"
+	"github.com/kweiza/flightdeck/internal/nulesc"
 	"github.com/kweiza/flightdeck/internal/store/pg"
 	"github.com/kweiza/flightdeck/internal/store/storetest"
 )
@@ -214,7 +218,7 @@ func TestImportSQLiteRoundTrip(t *testing.T) {
 		t.Fatalf("보고의 대상 표시값이 %q 다", rep.To)
 	}
 
-	again, err := VerifySQLite(ctx, src, dsn, quietLog())
+	again, err := VerifySQLite(ctx, src, dsn, VerifyOptions{}, quietLog())
 	if err != nil || !again.Matched() {
 		t.Fatalf("옮긴 뒤 대조: %v\n%+v", err, again.Tables)
 	}
@@ -297,6 +301,20 @@ func TestImportSQLiteRefusesFaultsAndWritesNothing(t *testing.T) {
 		{"JSON 칸의 날 NUL", `UPDATE item SET labels = CAST(X'5B226100225D' AS TEXT) WHERE id = 'i1'`, "item", "labels", `id="i1"`, pg.FaultJSON},
 		{"부모 없는 행", `INSERT INTO claim(project, item_id, session_id, at) VALUES ('p', 'i2', 'nobody', 'x')`,
 			"claim", "session_id", "→ session", pg.FaultForeignKey},
+		// 짝 없는 서러게이트는 jsonb 가 받지 않는다. 디코드해 다시 쓰면 U+FFFD 가 되어 다른 두 키가 하나가 된다 - 거절한다.
+		{"JSON 의 짝 없는 서러게이트", `UPDATE item SET labels = '{"\ud800\u0000":1,"\ufffd\u0000":2}' WHERE id = 'i1'`,
+			"item", "labels", `id="i1"`, pg.FaultJSONSurrogate},
+		// 옮기며 같아지는 기본키 · UNIQUE 칸: NUL 을 바꿔 넣은 id 가 원래 `\x00` 네 글자를 담은 id 와, 글 칸의 BLOB 가 같은 바이트의
+		// 글과 같아진다(대상이 커밋 때 거절할 것을 좌표와 함께 먼저 낸다). 부분 인덱스는 그 조건 안의 행끼리만 잰다 - 놓은 점유는
+		// 살아 있는 점유와 겹쳐도 된다.
+		{"NUL 을 바꿔 넣어 겹치는 기본키", `INSERT INTO judgment(id, project, session_id, at, kind, title, body) VALUES
+				('a\x00', 'p', 's1', 'x', 'decision', 't', 'b'), (CAST(X'6100' AS TEXT), 'p', 's1', 'x', 'decision', 't', 'b')`,
+			"judgment", "id", `id="a\\x00"`, pg.FaultUnique},
+		{"BLOB 로 겹치는 지문 키", `INSERT INTO snapshot(project, key, value, method, computed_at) VALUES ('p', X'6B31', 'v', 'command', 'x')`,
+			"snapshot", "project,key", `key="k1"`, pg.FaultUnique},
+		{"BLOB 로 겹치는 살아 있는 점유", `INSERT INTO resource_hold(project, resource, session_id, acquired_at, released_at) VALUES
+				('p', X'656E763A6462', 's1', 'x', NULL), ('p', X'656E763A6462', 's1', 'x', 'x')`,
+			"resource_hold", "project,resource", "id=3", pg.FaultUnique},
 		// 글자 수(700)는 상한 아래지만 바이트(2100)는 넘는다 - 인덱스는 바이트로 받는다.
 		{"인덱스 키 상한을 넘는 글", `INSERT INTO event(at, project, kind, payload) VALUES ('x', '` + strings.Repeat("가", 700) + `', 'k3', '{}')`,
 			"event", "project", "id=3", pg.FaultTooLong},
@@ -336,10 +354,11 @@ func TestImportSQLiteRefusesFaultsAndWritesNothing(t *testing.T) {
 	}
 }
 
-// NUL 이 든 원본은 거절하지 않고 정해진 규칙(pg.EscapeNUL)으로 바꿔 옮긴다: 글 칸의 NUL 바이트(판단 본문 - 같은 칸에 원래
-// 있던 \x00 표기와 함께, 항목 본문)와 JSON 칸의 \u0000(항목 라벨 - 같은 행, 이벤트 내용). 예행 · 이관 · 대조가 바꾼 칸을 표 ·
-// 칸 · 규칙 · 행 좌표와 바꾼 행 수로 내고(조용히 바꾸지 않는다), 대조는 바꾼 값으로 맞대 맞다. 옮긴 JSON 은 jsonb 로 읽힌다.
-// 역이관은 Postgres 값을 그대로 낸다 - 낸 파일에는 NUL 이 없고, 그 파일과 Postgres 의 대조는 바꿀 것 없이 맞다.
+// NUL 이 든 원본은 거절하지 않고 정해진 규칙(nulesc)으로 바꿔 옮긴다: 글 칸의 NUL 바이트(판단 본문 - 같은 칸에 원래 있던 \x00
+// 표기와 함께, 항목 본문)와 JSON 칸의 \u0000(항목 라벨 - 같은 행, 이벤트 내용 - U+0000 이 든 글만, 같은 문서의 \x00 표기는
+// 그대로). 예행 · 이관 · 대조가 바꾼 칸을 표 · 칸 · 규칙 · 행 좌표와 바꾼 행 수로 내고(조용히 바꾸지 않는다), 이관은 바꾼 칸
+// 전부를 원래 바이트와 함께 기록 파일로 남기고 이관 표지가 그 파일을 댄다. 대조는 바꾼 값으로 맞대 맞다. 옮긴 JSON 은 jsonb 로
+// 읽힌다. 역이관은 Postgres 값을 그대로 낸다 - 낸 파일에는 NUL 이 없고, 그 파일과 Postgres 의 변환 없는 대조가 맞다.
 func TestImportSQLiteRewritesNULAndReportsIt(t *testing.T) {
 	ctx := context.Background()
 	src := importSource(t, importSeed)
@@ -396,18 +415,52 @@ func TestImportSQLiteRewritesNULAndReportsIt(t *testing.T) {
 	if n := targetRows(t, dst); n != 0 {
 		t.Fatalf("예행이 대상에 %d 행을 썼다", n)
 	}
+	if left, _ := filepath.Glob(src + rewrittenSuffix + "*"); rep.RewriteRecord != "" || len(left) != 0 {
+		t.Fatalf("예행이 바꾼 칸의 기록을 남겼다: %q %v", rep.RewriteRecord, left)
+	}
 	rep, err = importLedger(t, ctx, src, dsn, TransferOptions{})
 	if err != nil || !rep.Matched() || rep.Copied == 0 {
 		t.Fatalf("이관: %v\n%+v", err, rep)
 	}
 	checkRewrites("이관", rep)
 
-	// 옮긴 값: NUL 은 \x00 네 글자, 같은 칸에 원래 있던 \x00 표기는 백슬래시가 두 배다. JSON 은 디코드한 글에 같은 규칙을 건다.
+	// 바꾼 칸의 기록: 칸마다 한 줄 - 행의 전체 키 · 칸 · 규칙 · JSON 자리 · 원래 바이트. 이관 표지가 그 파일을 댄다.
+	if !strings.HasPrefix(rep.RewriteRecord, src+rewrittenSuffix+"-") || !strings.HasSuffix(rep.RewriteRecord, ".jsonl") {
+		t.Fatalf("기록 파일 이름 %q", rep.RewriteRecord)
+	}
+	type recordWant struct {
+		key      string
+		original string
+		paths    []nulesc.Change
+	}
+	wantRecord := map[cell]recordWant{
+		{"item", "body", pg.RewriteNUL}:         {`{"id":"i1","project":"p"}`, "a\x00b", nil},
+		{"item", "labels", pg.RewriteJSONNUL}:   {`{"id":"i1","project":"p"}`, `["l\u0000"]`, []nulesc.Change{{Pointer: "/0"}}},
+		{"judgment", "body", pg.RewriteNUL}:     {`{"id":"j3"}`, `표기 \x00 와 날 ` + "\x00" + ` 끝`, nil},
+		{"event", "payload", pg.RewriteJSONNUL}: {`{"id":3}`, `{"m":"x\u0000y","n":"\\x00"}`, []nulesc.Change{{Pointer: "/m"}}},
+	}
+	record := readRecord(t, rep.RewriteRecord)
+	if len(record) != len(wantRecord) {
+		t.Fatalf("기록 %d 줄, 기대 %d 줄: %+v", len(record), len(wantRecord), record)
+	}
+	for _, r := range record {
+		w, ok := wantRecord[cell{r.Table, r.Column, r.Rule}]
+		key, _ := json.Marshal(r.Key)
+		if !ok || string(key) != w.key || string(r.Original) != w.original || !reflect.DeepEqual(r.Paths, w.paths) {
+			t.Errorf("기록 줄 %+v(키 %s · 원래 %q), 기대 %+v", r, key, r.Original, w)
+		}
+	}
+	if note, err := os.ReadFile(MovedMarker(src)); err != nil || !strings.Contains(string(note), `"rewritten": "`+rep.RewriteRecord+`"`) {
+		t.Fatalf("이관 표지가 기록 파일을 대지 않는다: %v\n%s", err, note)
+	}
+
+	// 옮긴 값: NUL 은 \x00 네 글자, 같은 칸에 원래 있던 \x00 표기는 백슬래시가 두 배다. JSON 은 U+0000 이 든 글에만 같은 규칙을
+	// 건다 - 같은 문서의 다른 글(n)은 원래 바이트다.
 	moved := map[string]string{
 		`SELECT body FROM judgment WHERE id = 'j3'`:                   `표기 \\x00 와 날 \x00 끝`,
 		`SELECT body FROM item WHERE id = 'i1'`:                       `a\x00b`,
 		`SELECT labels FROM item WHERE id = 'i1'`:                     `["l\\x00"]`,
-		`SELECT payload FROM event WHERE kind = 'nul'`:                `{"m":"x\\x00y","n":"\\\\x00"}`,
+		`SELECT payload FROM event WHERE kind = 'nul'`:                `{"m":"x\\x00y","n":"\\x00"}`,
 		`SELECT (payload::jsonb)->>'m' FROM event WHERE kind = 'nul'`: `x\x00y`,
 		`SELECT (labels::jsonb)->>0 FROM item WHERE id = 'i1'`:        `l\x00`,
 	}
@@ -417,7 +470,7 @@ func TestImportSQLiteRewritesNULAndReportsIt(t *testing.T) {
 		}
 	}
 
-	again, err := VerifySQLite(ctx, src, dsn, quietLog())
+	again, err := VerifySQLite(ctx, src, dsn, VerifyOptions{}, quietLog())
 	if err != nil || !again.Matched() {
 		t.Fatalf("옮긴 뒤 대조: %v\n%+v", err, again.Tables)
 	}
@@ -446,8 +499,134 @@ func TestImportSQLiteRewritesNULAndReportsIt(t *testing.T) {
 		t.Fatalf("역이관이 NUL 을 되살렸다: %d 행", nul)
 	}
 	settleLedger(t, dsn)
-	if rep, err := VerifySQLite(ctx, back, dsn, quietLog()); err != nil || !rep.Matched() || len(rep.Rewrites) != 0 {
+	if rep, err := VerifySQLite(ctx, back, dsn, VerifyOptions{Exported: true}, quietLog()); err != nil || !rep.Matched() || len(rep.Rewrites) != 0 {
 		t.Fatalf("역이관 파일의 대조: %v, 바꾼 칸 %+v", err, rep.Rewrites)
+	}
+}
+
+// readRecord 는 바꾼 칸의 기록 파일 path 를 줄마다 읽는다. 줄마다 모르는 키 없는 JSON 하나여야 한다.
+func readRecord(t *testing.T, path string) []rewrittenCell {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("기록 파일: %v", err)
+	}
+	var out []rewrittenCell
+	for _, line := range bytes.Split(bytes.TrimSuffix(b, []byte("\n")), []byte("\n")) {
+		var c rewrittenCell
+		dec := json.NewDecoder(bytes.NewReader(line))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&c); err != nil {
+			t.Fatalf("기록 줄 %q: %v", line, err)
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// 바꾼 칸의 기록에는 상한이 없다: 화면 보고(TransferReport.Rewrites)는 갈래마다 행 좌표를 pg.MaxListed 개만, 그것도 줄여서 싣지만
+// 기록 파일은 바꾼 칸 전부를 행의 전체 키(자르지 않은 긴 id)와 원래 바이트로 남긴다.
+func TestImportSQLiteRecordsEveryRewrittenCell(t *testing.T) {
+	ctx := context.Background()
+	n := pg.MaxListed + 5
+	long := strings.Repeat("긴", 200)
+	src := importSource(t, importSeed)
+	liteExec(t, src, fmt.Sprintf(`INSERT INTO judgment(id, project, session_id, at, kind, title, body)
+		WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < %d)
+		SELECT '%s-' || i, 'p', 's1', %s, 'decision', 't', CAST(X'6E00' AS TEXT) || i FROM n`, n, long, importAt))
+	dsn, _ := importTarget(t)
+	rep, err := importLedger(t, ctx, src, dsn, TransferOptions{})
+	if err != nil || len(rep.Rewrites) != 1 {
+		t.Fatalf("이관: %v, 바꾼 칸 %+v", err, rep.Rewrites)
+	}
+	if g := rep.Rewrites[0]; g.Count != n || len(g.Keys) != pg.MaxListed || strings.Contains(g.Keys[0], long) {
+		t.Fatalf("화면 보고 %s.%s: 수 %d · 좌표 %d 개(기대 %d · %d 개, 줄인 좌표)", g.Table, g.Column, g.Count, len(g.Keys), n, pg.MaxListed)
+	}
+	want := map[string]string{}
+	for i := 1; i <= n; i++ {
+		want[fmt.Sprintf("%s-%d", long, i)] = fmt.Sprintf("n\x00%d", i)
+	}
+	record := readRecord(t, rep.RewriteRecord)
+	if len(record) != n {
+		t.Fatalf("기록 %d 줄, 기대 %d 줄", len(record), n)
+	}
+	for _, r := range record {
+		id, _ := r.Key["id"].(string)
+		if orig, ok := want[id]; !ok || r.Table != "judgment" || r.Column != "body" || string(r.Original) != orig || len(r.Key) != 1 {
+			t.Fatalf("기록 줄 %s.%s 키 %d 바이트 · 원래 %q", r.Table, r.Column, len(id), r.Original)
+		}
+		delete(want, id)
+	}
+	if len(want) != 0 {
+		t.Fatalf("기록에 없는 행 %d 개", len(want))
+	}
+}
+
+// 바꾼 칸의 기록을 못 남기면 커밋하지 않는다: 대상은 빈 채이고 이관 표지도, 기록 파일(그 임시 파일까지)도 남지 않는다. 기록을
+// 남길 수 있게 되면 같은 원본을 다시 옮긴다.
+func TestImportSQLiteDoesNotCommitWithoutTheRecord(t *testing.T) {
+	ctx := context.Background()
+	src := importSource(t, importSeed)
+	liteExec(t, src, `UPDATE item SET body = CAST(X'610062' AS TEXT) WHERE id = 'i1'`)
+	dsn, dst := importTarget(t)
+	linkRecord = func(string, string) error { return errors.New("넣은 링크 실패") }
+	t.Cleanup(func() { linkRecord = os.Link })
+	rep, err := importLedger(t, ctx, src, dsn, TransferOptions{})
+	if err == nil || !strings.Contains(err.Error(), "바꾼 칸의 기록을 남기지 못했다 - 커밋하지 않는다") ||
+		!strings.Contains(err.Error(), "넣은 링크 실패") || rep.Copied != 0 || rep.RewriteRecord != "" {
+		t.Fatalf("기록 없이 커밋했거나 다른 오류다: %v (옮긴 행 %d · 기록 %q)", err, rep.Copied, rep.RewriteRecord)
+	}
+	if n := targetRows(t, dst); n != 0 {
+		t.Fatalf("기록을 못 남겼는데 대상에 %d 행이 있다", n)
+	}
+	for _, name := range dirNames(t, filepath.Dir(src)) {
+		if strings.Contains(name, rewrittenSuffix) || name == filepath.Base(MovedMarker(src)) {
+			t.Fatalf("거절 뒤 %s 가 남았다", name)
+		}
+	}
+	linkRecord = os.Link
+	if rep, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil || rep.RewriteRecord == "" || rep.Copied == 0 {
+		t.Fatalf("다시 옮기기: %v, 기록 %q", err, rep.RewriteRecord)
+	}
+}
+
+// 바꾸기는 JSON 글 하나 단위다: 항목 라벨을 바꾼 이벤트(item.label)의 after 와 그 항목의 labels 는 원장에서 같은 글이고, 이관
+// 뒤에도 같다 - 같은 이벤트의 before 에만 U+0000 이 있어도 after 의 `\x00` 네 글자는 그대로 옮긴다. 원장은 앱이 쓴 것이다.
+func TestImportSQLiteKeepsTheLabelEventInStepWithTheItem(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	seed(t, s, "p")
+	sess := mustSession(t, s, "p", "cc")
+	if err := s.AddItem(ctx, model.Item{Project: "p", ID: "it", Title: "제목", Labels: []string{"a\x00"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetLabels(ctx, "p", "it", []string{`\x00z`}, sess.ID); err != nil {
+		t.Fatal(err)
+	}
+	src := s.Path()
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dsn, dst := importTarget(t)
+	rep, err := importLedger(t, ctx, src, dsn, TransferOptions{})
+	if err != nil {
+		t.Fatalf("이관: %v", err)
+	}
+	after := pgString(t, dst, `SELECT ((payload::jsonb)->'after')::text FROM event WHERE kind = 'item.label'`)
+	labels := pgString(t, dst, `SELECT (labels::jsonb)::text FROM item WHERE id = 'it'`)
+	if after != labels || labels != `["\\x00z"]` {
+		t.Fatalf("옮긴 이벤트 after %s · 항목 labels %s, 기대 둘 다 [\"\\\\x00z\"]", after, labels)
+	}
+	if before := pgString(t, dst, `SELECT (payload::jsonb)->'before'->>0 FROM event WHERE kind = 'item.label'`); before != `a\x00` {
+		t.Fatalf("옮긴 이벤트 before %q", before)
+	}
+	// 바꾼 칸은 그 이벤트 하나, 그 안의 글 하나다(항목의 labels 에는 이제 U+0000 이 없다).
+	paths := map[string][]nulesc.Change{}
+	for _, r := range readRecord(t, rep.RewriteRecord) {
+		paths[r.Table+"."+r.Column] = append(paths[r.Table+"."+r.Column], r.Paths...)
+	}
+	if !reflect.DeepEqual(paths["event.payload"], []nulesc.Change{{Pointer: "/before/0"}}) || len(paths) != 1 {
+		t.Fatalf("바꾼 칸의 기록 %+v", paths)
 	}
 }
 
@@ -551,7 +730,7 @@ func TestImportSQLiteRefusesAnOlderSource(t *testing.T) {
 			t.Fatalf("예행 %v: %s 원본을 받았거나 안내가 없다: %v", dry, older, err)
 		}
 	}
-	if _, err := VerifySQLite(ctx, path, dsn, quietLog()); err == nil || !strings.Contains(err.Error(), older) {
+	if _, err := VerifySQLite(ctx, path, dsn, VerifyOptions{}, quietLog()); err == nil || !strings.Contains(err.Error(), older) {
 		t.Fatalf("대조가 %s 원본을 받았다: %v", older, err)
 	}
 	if n := targetRows(t, dst); n != 0 {
@@ -590,7 +769,7 @@ func TestTransferAcceptsTheVersionRange(t *testing.T) {
 			}
 		}
 		settleLedger(t, dsn)
-		if _, err := VerifySQLite(ctx, src, dsn, quietLog()); err != nil {
+		if _, err := VerifySQLite(ctx, src, dsn, VerifyOptions{}, quietLog()); err != nil {
 			t.Fatalf("범위 안의 원본을 대조가 거절했다: %v", err)
 		}
 		if n := targetRows(t, dst); n == 0 {
@@ -670,7 +849,7 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 			for _, q := range strings.Split(c.change, ";") {
 				pgExec(t, dst, q)
 			}
-			rep, err := VerifySQLite(ctx, src, dsn, quietLog())
+			rep, err := VerifySQLite(ctx, src, dsn, VerifyOptions{}, quietLog())
 			if err == nil || rep.Matched() {
 				t.Fatalf("바뀐 대상이 맞다고 나왔다: %v", err)
 			}
@@ -686,15 +865,16 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 			}
 		})
 	}
-	// 대상 값이 값 검사에 걸리면 어긋남과 따로 그 칸 · 사유 · 행을 적는다(대상에서 읽은 값을 버리지 않는다).
+	// 대상 값이 값 검사에 걸리면 어긋남과 따로 그 칸 · 사유 · 행을 적는다(대상에서 읽은 값을 버리지 않는다). 짝 없는 서러게이트는
+	// jsonb 가 거절하는 JSON 이다.
 	t.Run("대상 값 검사", func(t *testing.T) {
 		src := importSource(t, importSeed)
 		dsn, dst := importTarget(t)
 		if _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); err != nil {
 			t.Fatalf("이관: %v", err)
 		}
-		pgExec(t, dst, `UPDATE item SET labels = '["\u0000"]' WHERE id = 'i1'`)
-		rep, err := VerifySQLite(ctx, src, dsn, quietLog())
+		pgExec(t, dst, `UPDATE item SET labels = '["\ud800"]' WHERE id = 'i1'`)
+		rep, err := VerifySQLite(ctx, src, dsn, VerifyOptions{}, quietLog())
 		if err == nil || !strings.Contains(err.Error(), "대상 값 검사") {
 			t.Fatalf("대상 값 검사에 걸린 칸을 판정에 넣지 않았다: %v", err)
 		}
@@ -702,7 +882,7 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 			t.Fatalf("대상 값 검사 갈래: %+v", rep.TargetFaults)
 		}
 		g := rep.TargetFaults[0]
-		if g.Table != "item" || g.Column != "labels" || g.Reason != pg.FaultJSONNUL || g.Count != 1 ||
+		if g.Table != "item" || g.Column != "labels" || g.Reason != pg.FaultJSONSurrogate || g.Count != 1 ||
 			len(g.Keys) != 1 || !strings.Contains(g.Keys[0], `id="i1"`) {
 			t.Fatalf("대상 값 검사 갈래: %+v", g)
 		}
@@ -714,7 +894,7 @@ func TestVerifySQLiteCatchesChangedRows(t *testing.T) {
 			t.Fatalf("이관: %v", err)
 		}
 		pgExec(t, dst, `SELECT setval(pg_get_serial_sequence('pick_eval', 'id'), 2)`)
-		rep, err := VerifySQLite(ctx, src, dsn, quietLog())
+		rep, err := VerifySQLite(ctx, src, dsn, VerifyOptions{}, quietLog())
 		if err == nil {
 			t.Fatal("되감긴 순번이 맞다고 나왔다")
 		}
@@ -817,7 +997,7 @@ func TestVerifySQLiteRefusesASourceTheImportWouldRefuse(t *testing.T) {
 	if typ != "blob" {
 		t.Fatalf("시험 전제: counter.value 가 %s 다(blob 이어야 한다)", typ)
 	}
-	rep, err := VerifySQLite(ctx, src, dsn, quietLog())
+	rep, err := VerifySQLite(ctx, src, dsn, VerifyOptions{}, quietLog())
 	if err == nil || !strings.Contains(err.Error(), "사전 검사") {
 		t.Fatalf("사전 검사에 걸린 원본을 맞다고 했다: %v", err)
 	}
@@ -854,7 +1034,7 @@ func TestImportSQLiteRefusesAPendingWAL(t *testing.T) {
 			return err
 		},
 		"이관": func() error { _, err := importLedger(t, ctx, src, dsn, TransferOptions{}); return err },
-		"대조": func() error { _, err := VerifySQLite(ctx, src, dsn, quietLog()); return err },
+		"대조": func() error { _, err := VerifySQLite(ctx, src, dsn, VerifyOptions{}, quietLog()); return err },
 	} {
 		if err := run(); err == nil || !strings.Contains(err.Error(), "-wal") || !strings.Contains(err.Error(), "VACUUM INTO") {
 			t.Fatalf("%s: 비지 않은 -wal 옆의 원본을 받았거나 처방이 없다: %v", name, err)
@@ -901,7 +1081,7 @@ func TestImportSQLiteOpensTheNamedFileOnly(t *testing.T) {
 		}
 	}
 	missing := filepath.Join(dir, "none.db")
-	if _, err := VerifySQLite(ctx, missing, dsn, quietLog()); err == nil || !strings.Contains(err.Error(), "없다") {
+	if _, err := VerifySQLite(ctx, missing, dsn, VerifyOptions{}, quietLog()); err == nil || !strings.Contains(err.Error(), "없다") {
 		t.Fatalf("없는 원본을 받았다: %v", err)
 	}
 	if _, err := os.Stat(missing); !errors.Is(err, fs.ErrNotExist) {

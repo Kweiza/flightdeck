@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"io"
 	"strings"
@@ -31,13 +32,18 @@ type importFlags struct {
 	dryRun   bool
 }
 
-func (a *App) parseImportFlags(name string, args []string) (importFlags, bool) {
+// parseImportFlags 는 두 동사의 플래그를 읽는다. more 가 있으면 동사만의 플래그를 더 달고 쓰는 법에 붙일 꼬리를 낸다.
+func (a *App) parseImportFlags(name string, args []string, more func(*flag.FlagSet) string) (importFlags, bool) {
 	fs := newFlagSet("migrate " + name)
 	from := fs.String("from", "", "옮길 SQLite 원장 파일(서버를 내린 원본이나 VACUUM INTO 로 뜬 사본. 읽기 전용으로 연다)")
 	to := fs.String("db", "", "대상 Postgres 접속 URL(비면 "+dbEnv+")")
 	dry := fs.Bool("dry-run", false, "원장에 아무것도 쓰지 않고 잰다(원본 디렉토리에 이관 표지를 남길 수 있는지도 잰다)")
+	usage := ""
+	if more != nil {
+		usage = more(fs)
+	}
 	if err := fs.Parse(args); err != nil || fs.NArg() > 0 || strings.TrimSpace(*from) == "" {
-		fmt.Fprintf(fs.Output(), "쓰는 법: fd migrate %s --from <fd.db> [--db <postgres URL>] [--dry-run]\n", name)
+		fmt.Fprintf(fs.Output(), "쓰는 법: fd migrate %s --from <fd.db> [--db <postgres URL>] [--dry-run]%s\n", name, usage)
 		return importFlags{}, false
 	}
 	return importFlags{from: *from, to: resolveDBPath(a.env, *to), dryRun: *dry}, true
@@ -45,7 +51,7 @@ func (a *App) parseImportFlags(name string, args []string) (importFlags, bool) {
 
 // runImportSQLite 는 `fd migrate import-sqlite` 다.
 func (a *App) runImportSQLite(ctx context.Context, args []string, out io.Writer) int {
-	f, ok := a.parseImportFlags("import-sqlite", args)
+	f, ok := a.parseImportFlags("import-sqlite", args, nil)
 	if !ok {
 		return 2
 	}
@@ -59,6 +65,9 @@ func (a *App) runImportSQLite(ctx context.Context, args []string, out io.Writer)
 	case err != nil:
 		a.log.Error("SQLite 이관 실패", "from", rep.From, "to", rep.To, "dry_run", f.dryRun, "error", err.Error())
 		fmt.Fprintf(out, "\n  거절 · 실패: %s\n", err)
+		if rep.Copied > 0 { // 커밋은 됐다(표지 · 사본 치우기에서 섰다) - 바꾼 칸의 기록도 그 이관의 것이다
+			printRewritten(out, rep)
+		}
 		return 1
 	case f.dryRun && !rep.TargetChecked:
 		fmt.Fprintf(out, "\n  원본은 옮길 수 있다. 대상은 재지 않았다(%s 는 Postgres 접속 URL 이 아니다)\n", rep.To)
@@ -75,13 +84,23 @@ func (a *App) runImportSQLite(ctx context.Context, args []string, out io.Writer)
 }
 
 // runVerifySQLite 는 `fd migrate verify` 다. 쓰지 않으므로 --dry-run 을 받아도 하는 일이 같다(두 동사의 플래그가 한 벌이다).
+// --exported 는 이 동사만 받는다(store.VerifyOptions.Exported).
 func (a *App) runVerifySQLite(ctx context.Context, args []string, out io.Writer) int {
-	f, ok := a.parseImportFlags("verify", args)
+	var exported *bool
+	f, ok := a.parseImportFlags("verify", args, func(fs *flag.FlagSet) string {
+		exported = fs.Bool("exported", false, "--from 이 export-sqlite 가 낸 파일이다 - 두 원장을 변환 없이 맞댄다"+
+			"(이관 원본에 거는 NUL 바꿔 넣기를 걸지 않는다)")
+		return " [--exported]"
+	})
 	if !ok {
 		return 2
 	}
-	rep, err := store.VerifySQLite(ctx, f.from, f.to, a.log)
-	printTransferReport(out, "fd migrate verify", rep)
+	rep, err := store.VerifySQLite(ctx, f.from, f.to, store.VerifyOptions{Exported: *exported}, a.log)
+	head := "fd migrate verify"
+	if *exported {
+		head += " --exported"
+	}
+	printTransferReport(out, head, rep)
 	if err != nil {
 		a.log.Error("SQLite 대조 실패", "from", rep.From, "to", rep.To, "error", err.Error())
 		fmt.Fprintf(out, "\n  어긋남 · 실패: %s\n", err)
@@ -92,11 +111,16 @@ func (a *App) runVerifySQLite(ctx context.Context, args []string, out io.Writer)
 	return 0
 }
 
-// printRewritten 은 판정 줄 아래에 원본에서 바꿔 넣은 행의 수를 한 번 더 말한다 - 맞았다는 말이 바꾼 값을 덮지 않게.
+// printRewritten 은 판정 줄 아래에 원본에서 바꿔 넣은 행의 수와, 이관이 남긴 바꾼 칸의 기록 파일을 한 번 더 말한다 - 맞았다는
+// 말이 바꾼 값을 덮지 않게.
 func printRewritten(out io.Writer, rep store.TransferReport) {
 	if rep.RewrittenRows > 0 {
 		fmt.Fprintf(out, "  그중 %d 행은 원본의 NUL 을 %s 표기로 바꾼 값이다(위 「옮기며 바꾼 원본 칸」) - 원본 파일은 그대로다\n",
 			rep.RewrittenRows, `\x00`)
+	}
+	if rep.RewriteRecord != "" {
+		fmt.Fprintf(out, "  바꾼 칸 전부(행 키 · 칸 · JSON 자리 · 원래 바이트)를 %s 에 남겼다 - 그 칸의 원래 바이트는 이 파일이 정본이다(지우지 않는다)\n",
+			rep.RewriteRecord)
 	}
 }
 

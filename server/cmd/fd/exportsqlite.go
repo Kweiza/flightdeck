@@ -46,7 +46,7 @@ func (a *App) runExportSQLite(ctx context.Context, args []string, out io.Writer)
 	case *dry:
 		fmt.Fprintln(out, "\n  옮길 수 있다 - 본 실행과 같은 트랜잭션을 임시 파일에 끝까지 돌고 되감았고, 대상 디렉토리에 하드 링크를 붙였다 지운 뒤 그 파일을 지웠다(아무 파일도 남기지 않았다)")
 	default:
-		fmt.Fprintf(out, "\n  옮겼다: %d 행, 대조가 맞았다 → %s\n  다음: 서버를 띄우기 전에 `fd migrate verify --from %s`(--db 는 이번과 같게)로 원본과 새 스냅숏에서 다시 맞댄다\n", rep.Copied, rep.To, rep.To)
+		fmt.Fprintf(out, "\n  옮겼다: %d 행, 대조가 맞았다 → %s\n  다음: 서버를 띄우기 전에 `fd migrate verify --from %s --exported`(--db 는 이번과 같게)로 원본과 새 스냅숏에서 변환 없이 다시 맞댄다\n", rep.Copied, rep.To, rep.To)
 	}
 	return 0
 }

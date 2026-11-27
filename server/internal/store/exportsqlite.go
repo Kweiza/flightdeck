@@ -185,7 +185,7 @@ func exportInto(ctx context.Context, src *Store, tmp string, dryRun bool, rep *T
 	if err != nil {
 		return err
 	}
-	err = tgt.transferInto(ctx, src, "SQLite 역이관", dryRun, rep)
+	err = tgt.transferInto(ctx, src, "SQLite 역이관", dryRun, nil, rep)
 	if cerr := tgt.Close(); cerr != nil && err == nil {
 		err = fmt.Errorf("역이관 임시 파일을 닫지 못했다: %w", cerr)
 	}

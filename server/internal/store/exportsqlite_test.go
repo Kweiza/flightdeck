@@ -148,7 +148,7 @@ func TestExportSQLiteRoundTripKeepsThePostgresWrites(t *testing.T) {
 	if got := dirNames(t, filepath.Dir(back)); !slices.Equal(got, []string{"back.db"}) {
 		t.Fatalf("역이관 뒤 디렉토리에 %v 가 있다 - 새 원장 하나만 있어야 한다", got)
 	}
-	if again, err := VerifySQLite(ctx, back, dsn, quietLog()); err != nil || !again.Matched() {
+	if again, err := VerifySQLite(ctx, back, dsn, VerifyOptions{Exported: true}, quietLog()); err != nil || !again.Matched() {
 		t.Fatalf("낸 파일과 Postgres 원장의 대조: %v\n%+v", err, again.Tables)
 	}
 
@@ -314,17 +314,17 @@ func TestExportSQLiteRefusesAnExistingTarget(t *testing.T) {
 }
 
 // 옮길 수 없는 원본은 파일을 남기지 않고 거절한다: Postgres 가 아닌 원본, 빈 DB, 이관 판이 아닌 원장, 그리고 이관의 사전 검사가
-// 받지 않을 값(깨진 JSON)이 든 원장 - 낸 파일을 다시 이관할 수 없게 되므로 역이관도 받지 않는다. 이관이라면 바꿔 넣었을
-// 값(JSON 의 \u0000)도 거절한다 - 역이관은 Postgres 값을 그대로 내므로, 바꿔 낸 파일은 원장과 같지 않다.
+// 받지 않을 값(깨진 JSON, 짝 없는 서러게이트가 든 JSON)이 든 원장 - 낸 파일을 다시 이관할 수 없게 되므로 역이관도 받지 않는다.
+// JSON 의 \u0000 은 거절하지 않고 그대로 낸다(TestExportSQLiteCarriesJSONNULVerbatim).
 func TestExportSQLiteRefusesASourceItCannotMove(t *testing.T) {
 	ctx := context.Background()
 	newer, newerStore := importTarget(t)
 	stamp(t, newerStore, pg.ImportVersion+1)
 	_, broken, brokenStore := importedPG(t)
 	pgExec(t, brokenStore, `UPDATE item SET paths = '[깨진' WHERE id = 'i1'`)
-	_, nul, nulStore := importedPG(t)
-	pgExec(t, nulStore, `UPDATE item SET labels = '["\u0000"]' WHERE id = 'i1'`)
-	faults := map[string]pg.Fault{"깨진 JSON": pg.FaultJSON, "JSON 의 \\u0000": pg.FaultJSONNUL}
+	_, lone, loneStore := importedPG(t)
+	pgExec(t, loneStore, `UPDATE item SET labels = '["\ud800"]' WHERE id = 'i1'`)
+	faults := map[string]pg.Fault{"깨진 JSON": pg.FaultJSON, "짝 없는 서러게이트": pg.FaultJSONSurrogate}
 	for _, c := range []struct {
 		name, from, want string
 	}{
@@ -332,7 +332,7 @@ func TestExportSQLiteRefusesASourceItCannotMove(t *testing.T) {
 		{"빈 DB", storetest.NewBare(t, ""), "빈 DB"},
 		{"판이 오른 원장", newer, "판 " + transferRange() + " 이 아니다"},
 		{"깨진 JSON", broken, "사전 검사"},
-		{"JSON 의 \\u0000", nul, "사전 검사"},
+		{"짝 없는 서러게이트", lone, "사전 검사"},
 	} {
 		for _, dry := range []bool{true, false} {
 			back := exportBack(t)
@@ -595,7 +595,7 @@ func TestExportSQLiteCrossesTheBatchLimits(t *testing.T) {
 	if err != nil || !rep.Matched() {
 		t.Fatalf("역이관: %v (대조 %v)", err, rep.Matched())
 	}
-	if again, err := VerifySQLite(ctx, back, dsn, quietLog()); err != nil || !again.Matched() {
+	if again, err := VerifySQLite(ctx, back, dsn, VerifyOptions{Exported: true}, quietLog()); err != nil || !again.Matched() {
 		t.Fatalf("낸 파일과 Postgres 원장의 대조: %v", err)
 	}
 	for q, want := range map[string]int64{
@@ -719,7 +719,7 @@ func TestExportAndVerifyKeepAnOverCapKeyTheIndexTook(t *testing.T) {
 	if err != nil || got != long {
 		t.Fatalf("낸 파일의 project 가 원문과 다르다(%d 바이트, %v)", len(got), err)
 	}
-	if again, err := VerifySQLite(ctx, back, dsn, quietLog()); err != nil || !again.Matched() || len(again.Faults) != 0 {
+	if again, err := VerifySQLite(ctx, back, dsn, VerifyOptions{Exported: true}, quietLog()); err != nil || !again.Matched() || len(again.Faults) != 0 {
 		t.Fatalf("원문 그대로인 두 원장의 대조가 막혔다: %v %+v", err, again.Faults)
 	}
 
@@ -727,5 +727,73 @@ func TestExportAndVerifyKeepAnOverCapKeyTheIndexTook(t *testing.T) {
 	_, err = importLedger(t, ctx, back, other, TransferOptions{DryRun: true})
 	if err == nil || !strings.Contains(err.Error(), "이슈로 알려 달라") {
 		t.Fatalf("상한을 넘는 원문을 다시 옮겨 넣으려 했다: %v", err)
+	}
+}
+
+// 역이관이 낸 파일의 대조(VerifyOptions.Exported)는 두 쪽을 다 변환 없이 맞댄다: 낸 뒤에 파일의 `\x00` 네 글자를 NUL 로 바꿔
+// 놓으면 Postgres 의 `\x00` 와 같다고 하지 않고 그 칸을 값 검사(pg.FaultNUL)로 짚는다. 같은 파일을 이관 원본처럼 재면(Exported
+// 없이) 이관의 규칙이 그 NUL 을 다시 `\x00` 로 바꿔 맞다고 나온다 - 역이관 뒤 대조에 --exported 를 넘기는 까닭이다.
+func TestVerifyExportedComparesVerbatim(t *testing.T) {
+	ctx := context.Background()
+	_, dsn, dst := importedPG(t)
+	pgExec(t, dst, `UPDATE item SET body = 'a\x00b' WHERE id = 'i1'`)
+	back := exportBack(t)
+	if _, err := exportLedger(t, ctx, dsn, back, TransferOptions{}); err != nil {
+		t.Fatalf("역이관: %v", err)
+	}
+	settleLedger(t, dsn)
+	if rep, err := VerifySQLite(ctx, back, dsn, VerifyOptions{Exported: true}, quietLog()); err != nil || !rep.Matched() {
+		t.Fatalf("낸 그대로의 대조: %v", err)
+	}
+	liteExec(t, back, `UPDATE item SET body = CAST(X'610062' AS TEXT) WHERE id = 'i1'`)
+	rep, err := VerifySQLite(ctx, back, dsn, VerifyOptions{Exported: true}, quietLog())
+	if err == nil || rep.Matched() || len(rep.Faults) != 1 || rep.Faults[0].Table != "item" || rep.Faults[0].Column != "body" ||
+		rep.Faults[0].Reason != pg.FaultNUL || !strings.Contains(rep.Faults[0].Keys[0], `id="i1"`) || len(rep.Rewrites) != 0 {
+		t.Fatalf("낸 뒤 넣은 NUL: %v, 걸린 갈래 %+v · 바꾼 칸 %+v", err, rep.Faults, rep.Rewrites)
+	}
+	if rep, err := VerifySQLite(ctx, back, dsn, VerifyOptions{}, quietLog()); err != nil || !rep.Matched() || len(rep.Rewrites) != 1 {
+		t.Fatalf("이관 원본처럼 잰 대조: %v, 바꾼 칸 %+v", err, rep.Rewrites)
+	}
+}
+
+// Postgres 원장의 JSON 칸에 앱이 쓴 \u0000(라벨의 U+0000 - 그 칸은 jsonb 가 아니라 글이라 Postgres 가 받는다)은 역이관이 그대로
+// 낸다: 거절하지 않고(72시간 되돌리기가 서지 않는다) 바꾸지도 않는다. 낸 파일과 원장의 변환 없는 대조가 맞고, 그 파일을 다시
+// 이관하면 그 칸을 바꿔 넣고 기록에 남긴다.
+func TestExportSQLiteCarriesJSONNULVerbatim(t *testing.T) {
+	ctx := context.Background()
+	_, dsn, dst := importedPG(t)
+	if err := dst.SetLabels(ctx, "p", "i1", []string{"l\x00"}, "s1"); err != nil {
+		t.Fatalf("Postgres 원장에 라벨 쓰기: %v", err)
+	}
+	labels := pgString(t, dst, `SELECT labels FROM item WHERE id = 'i1'`)
+	if labels != `["l\u0000"]` {
+		t.Fatalf("Postgres 원장의 labels %q", labels)
+	}
+	back := exportBack(t)
+	rep, err := exportLedger(t, ctx, dsn, back, TransferOptions{})
+	if err != nil || len(rep.Faults) != 0 || len(rep.Rewrites) != 0 {
+		t.Fatalf("역이관: %v, 걸린 갈래 %+v · 바꾼 칸 %+v", err, rep.Faults, rep.Rewrites)
+	}
+	var got string
+	liteQuery(t, back, `SELECT labels FROM item WHERE id = 'i1'`, &got)
+	if got != labels {
+		t.Fatalf("낸 파일의 labels %q, 기대 %q(Postgres 값 그대로)", got, labels)
+	}
+	settleLedger(t, dsn)
+	if again, err := VerifySQLite(ctx, back, dsn, VerifyOptions{Exported: true}, quietLog()); err != nil || !again.Matched() ||
+		len(again.Rewrites) != 0 || len(again.Faults) != 0 {
+		t.Fatalf("낸 파일의 대조: %v, 걸린 갈래 %+v · 바꾼 칸 %+v", err, again.Faults, again.Rewrites)
+	}
+	other, _ := importTarget(t)
+	re, err := importLedger(t, ctx, back, other, TransferOptions{})
+	if err != nil || re.RewriteRecord == "" {
+		t.Fatalf("낸 파일의 이관: %v, 기록 %q", err, re.RewriteRecord)
+	}
+	cells := map[string]int{}
+	for _, r := range readRecord(t, re.RewriteRecord) {
+		cells[r.Table+"."+r.Column]++
+	}
+	if len(cells) != 2 || cells["item.labels"] != 1 || cells["event.payload"] != 1 {
+		t.Fatalf("다시 이관한 기록 %v", cells)
 	}
 }

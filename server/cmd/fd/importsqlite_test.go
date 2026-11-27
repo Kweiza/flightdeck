@@ -15,9 +15,9 @@ import (
 
 // `fd migrate import-sqlite` · `fd migrate verify` · `fd migrate export-sqlite` 의 표면: 예행은 아무것도 안 쓰고 0, 옮기기 0,
 // 옮긴 원본을 다시 옮기기는 거절 1(이관 표지), 대조 0, 사용법 오류 2. 역이관은 새 파일을 내고 0(예행은 파일을 안 남긴다), 있는 파일에는
-// 거절 1, 낸 파일과 Postgres 원장의 대조 0. 원본의 NUL 을 바꿔 옮긴 칸은 예행 · 이관 · 대조가 칸 · 규칙 · 행 수로 말하고(판정 줄
-// 아래에도 한 번 더), 바꿀 것 없는 역이관 · 그 파일의 대조는 말하지 않는다. 출력에 접속 URL 의 어떤 조각도 없다. 옮기기 · 거절의
-// 뜻은 store 시험이 잰다.
+// 거절 1, 낸 파일과 Postgres 원장의 변환 없는 대조(--exported) 0. 원본의 NUL 을 바꿔 옮긴 칸은 예행 · 이관 · 대조가 칸 · 규칙 ·
+// 행 수로 말하고(판정 줄 아래에도 한 번 더), 이관은 바꾼 칸의 기록 파일을 말한다. 바꿀 것 없는 역이관 · 그 파일의 대조는 말하지
+// 않는다. 출력에 접속 URL 의 어떤 조각도 없다. 옮기기 · 거절의 뜻은 store 시험이 잰다.
 func TestMigrateImportSQLiteSurface(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t)
@@ -66,8 +66,9 @@ func TestMigrateImportSQLiteSurface(t *testing.T) {
 	}
 	step(1, "두 원장이 맞지 않는다", "verify", "--from", src, "--db", dsn) // 아직 안 옮겼다 - machine 이 어긋난다
 	step(0, "옮겼다: 1 행", "import-sqlite", "--from", src, "--db", dsn)
-	if !strings.Contains(last(), "이관 표지를 남겼다: "+store.MovedMarker(src)) || !rewrote(last()) {
-		t.Fatalf("옮긴 뒤 이관 표지나 바꿔 옮긴 칸을 말하지 않는다:\n%s", last())
+	if !strings.Contains(last(), "이관 표지를 남겼다: "+store.MovedMarker(src)) || !rewrote(last()) ||
+		!strings.Contains(last(), "바꾼 칸 전부(행 키 · 칸 · JSON 자리 · 원래 바이트)를 "+src+".rewritten-") {
+		t.Fatalf("옮긴 뒤 이관 표지나 바꿔 옮긴 칸 · 그 기록 파일을 말하지 않는다:\n%s", last())
 	}
 	step(1, "다시 옮기지 않는다", "import-sqlite", "--from", src, "--db", dsn)
 	step(0, "두 원장이 맞다", "verify", "--from", src, "--db", dsn)
@@ -84,8 +85,11 @@ func TestMigrateImportSQLiteSurface(t *testing.T) {
 	}
 	step(0, "옮겼다: 1 행", "export-sqlite", "--to", back, "--db", dsn)
 	exported := last()
+	if !strings.Contains(exported, "fd migrate verify --from "+back+" --exported") {
+		t.Fatalf("역이관이 낸 파일을 변환 없이 맞대라고(--exported) 말하지 않는다:\n%s", exported)
+	}
 	step(1, "이미 있다", "export-sqlite", "--to", back, "--db", dsn)
-	step(0, "두 원장이 맞다", "verify", "--from", back, "--db", dsn)
+	step(0, "두 원장이 맞다", "verify", "--from", back, "--db", dsn, "--exported")
 	for _, out := range []string{exported, last()} {
 		if strings.Contains(out, "바꾼") {
 			t.Fatalf("바꿀 것 없는 역이관 · 대조가 바꾼 칸을 말한다:\n%s", out)

@@ -265,7 +265,7 @@ func TestImportSQLiteLeavesTheMovedMarker(t *testing.T) {
 			t.Errorf("옮긴 원본을 %s 가 표지 내용과 함께 거절하지 않았다: %q", door, why)
 		}
 	}
-	if again, err := VerifySQLite(ctx, src, dsn, quietLog()); err != nil || !again.Matched() {
+	if again, err := VerifySQLite(ctx, src, dsn, VerifyOptions{}, quietLog()); err != nil || !again.Matched() {
 		t.Fatalf("옮긴 원본과의 맞대기가 섰다: %v", err)
 	}
 	fresh, dst := importTarget(t)
@@ -320,7 +320,7 @@ func TestLeaveMovedMarkSaysTheCommitHappened(t *testing.T) {
 	}
 	defer mark.release(quietLog())
 	must(t, os.Remove(mark.tmp)) // 잡아 둔 자리가 사라졌다
-	err = dst.leaveMovedMark(context.Background(), mark, 7)
+	err = dst.leaveMovedMark(context.Background(), mark, 7, "")
 	if err == nil || !strings.Contains(err.Error(), "7 행, 커밋했다") || !strings.Contains(err.Error(), "touch "+shellQuote(MovedMarker(src))) {
 		t.Fatalf("표지를 못 남긴 실패가 커밋 · 손 처방을 안 말한다: %v", err)
 	}

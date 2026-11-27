@@ -200,10 +200,14 @@ func TestCellFaults(t *testing.T) {
 		// float64 로 못 옮기는 수 뒤에 있어도 \u0000 을 잰다(수를 글 그대로 읽는다).
 		{"범위 밖 수 뒤의 \\u0000", doc, `[1e400,"\u0000"]`, `[1e400,"\\x00"]`, "", pg.RewriteJSONNUL},
 		{"범위 밖 수는 받는다", doc, `{"n":1e400,"s":"\\u0000"}`, `{"n":1e400,"s":"\\u0000"}`, "", ""},
-		// 바꾼 문서는 바뀐 글만 다시 쓴다: 다른 글의 이스케이프 · 공백 · 수는 원래 바이트다.
-		{"바뀌지 않은 글은 원래 바이트다", doc, `{ "h":"\u003c", "n": "\u0000", "f": 1.50 }`, `{ "h":"\u003c", "n": "\\x00", "f": 1.50 }`, "", pg.RewriteJSONNUL},
-		// U+0000 이 든 문서는 글 전부에 같은 규칙을 건다 - 다른 글의 \x00 표기도 백슬래시가 두 배다(되돌릴 단위가 칸이다).
-		{"같은 문서의 \\x00 표기", doc, `["\u0000","\\x00"]`, `["\\x00","\\\\x00"]`, "", pg.RewriteJSONNUL},
+		// 문서를 디코드해 다시 쓰지 않는다: 다른 글 · 고친 글 안의 다른 이스케이프(다시 쓰면 é · / 가 된다) · 공백 · 수는 원래 바이트다.
+		{"고친 글 밖은 원래 바이트다", doc, `{ "h":"\u00e9\/", "n": "\/\u00e9\u0000", "f": 1.50 }`, `{ "h":"\u00e9\/", "n": "\/\u00e9\\x00", "f": 1.50 }`, "", pg.RewriteJSONNUL},
+		// 바꾸는 단위가 글 하나다: U+0000 이 없는 옆 글의 \x00 표기는 U+0000 이 없는 문서에서처럼 그대로다.
+		{"옆 글의 \\x00 표기는 그대로다", doc, `["\u0000","\\x00"]`, `["\\x00","\\x00"]`, "", pg.RewriteJSONNUL},
+		{"같은 글의 \\x00 표기는 백슬래시가 두 배다", doc, `["\\x00\u0000"]`, `["\\\\x00\\x00"]`, "", pg.RewriteJSONNUL},
+		{"짝 없는 서로게이트", doc, `["\ud800"]`, `["\ud800"]`, pg.FaultJSONSurrogate, ""},
+		// 디코드하면 둘 다 「U+FFFD + U+0000」이라 다른 두 키가 하나가 된다.
+		{"U+FFFD 로 같아질 두 키", doc, `{"\ud800\u0000":1,"\ufffd\u0000":2}`, `{"\ud800\u0000":1,"\ufffd\u0000":2}`, pg.FaultJSONSurrogate, ""},
 		{"U+0000 없는 문서의 \\x00 표기는 그대로다", doc, `["\\x00"]`, `["\\x00"]`, "", ""},
 		{"JSON 은 받는다", doc, `{"a":[1,"b"]}`, `{"a":[1,"b"]}`, "", ""},
 		// 상한은 Cell 이 재지 않는다 - 대조 · 역이관은 원문 그대로 옮기고 맞댄다(ImportCell 만 잰다).
@@ -253,86 +257,6 @@ func TestImportCellAloneCapsTheIndexKey(t *testing.T) {
 	if _, f, _ := pg.ImportCell(pg.Column{Name: "t", Kind: pg.Text}, strings.Repeat("a", 10000)); f != "" {
 		t.Fatalf("상한이 없는 칸을 쟀다: %q", f)
 	}
-}
-
-// EscapeNUL 은 되돌릴 수 있고(단사), 결과에 NUL 이 없고, NUL 도 「x00」도 없는 글은 그대로 둔다(NUL 이 없는 칸을 그대로 두는
-// 것은 Cell 의 몫이다 - TestCellFaults). 「x00」 앞 백슬래시 묶음의 홀짝으로 되돌리는 규칙(unescapeNUL - README 가 사람에게
-// 적은 것)으로 짧은 글 전부를 맞댄다.
-func TestEscapeNULIsReversible(t *testing.T) {
-	alphabet := []byte{'\\', 'x', '0', 0, 'a'}
-	seen := map[string]string{}
-	var walk func(prefix []byte)
-	n := 0
-	walk = func(prefix []byte) {
-		s := string(prefix)
-		e := pg.EscapeNUL(s)
-		n++
-		switch {
-		case strings.IndexByte(e, 0) >= 0:
-			t.Fatalf("EscapeNUL(%q) = %q 에 NUL 이 남았다", s, e)
-		case unescapeNUL(e) != s:
-			t.Fatalf("EscapeNUL(%q) = %q 를 되돌리니 %q 다", s, e, unescapeNUL(e))
-		case strings.IndexByte(s, 0) < 0 && !strings.Contains(s, "x00") && e != s:
-			t.Fatalf("NUL 도 x00 도 없는 %q 를 %q 로 바꿨다", s, e)
-		}
-		if prev, ok := seen[e]; ok {
-			t.Fatalf("%q 와 %q 가 같은 %q 가 된다", prev, s, e)
-		}
-		seen[e] = s
-		if len(prefix) == 7 {
-			return
-		}
-		for _, c := range alphabet {
-			walk(append(prefix[:len(prefix):len(prefix)], c))
-		}
-	}
-	walk(nil)
-	if want := (78125*5 - 1) / 4; n != want { // 5^0 + … + 5^7
-		t.Fatalf("잰 글 %d 개, 기대 %d 개", n, want)
-	}
-	for in, want := range map[string]string{
-		"\x00":           `\x00`,
-		`\` + "\x00":     `\\\x00`,
-		`\x00` + "\x00":  `\\x00\x00`,
-		`\\x00` + "\x00": `\\\\x00\x00`,
-		"\x00" + `\x01`:  `\x00\x01`,
-		`\n` + "\x00":    `\n\x00`,
-	} {
-		if got := pg.EscapeNUL(in); got != want {
-			t.Errorf("EscapeNUL(%q) = %q, 기대 %q", in, got, want)
-		}
-	}
-}
-
-// unescapeNUL 은 EscapeNUL 의 역이다(README 「SQLite 원장을 Postgres 로 옮기기」의 되돌리는 규칙): 「x00」 바로 앞의 백슬래시
-// 묶음이 홀수 개(2k+1)면 k 개 백슬래시 + NUL, 짝수 개(2k)면 k 개 백슬래시 + 「x00」. 그 밖의 바이트는 그대로다.
-func unescapeNUL(e string) string {
-	var b strings.Builder
-	for i := 0; i < len(e); {
-		if e[i] != '\\' {
-			b.WriteByte(e[i])
-			i++
-			continue
-		}
-		j := i
-		for j < len(e) && e[j] == '\\' {
-			j++
-		}
-		n := j - i
-		if !strings.HasPrefix(e[j:], "x00") {
-			b.WriteString(e[i:j])
-			i = j
-			continue
-		}
-		b.WriteString(strings.Repeat(`\`, n/2))
-		if n%2 == 1 {
-			b.WriteByte(0)
-		} else {
-			b.WriteString("x00")
-		}
-		i = j + 3
-	}
-	return b.String()
 }
 
 // 행 지문은 NULL 과 빈 글을 가르고, 칸 경계가 밀린 행을 가르고, 바이트 하나의 차이를 가르고, 바이트가 같은 다른 저장
@@ -416,10 +340,9 @@ func TestCellKeepsTheColumnType(t *testing.T) {
 	}
 }
 
-// SettledCell 은 Cell 이 받는 두 갈래(글 칸의 BLOB, bytea 칸의 TEXT)를 저장 갈래 오류로, Cell 이 바꿔 넣었을 값(NUL ·
-// JSON 의 \u0000)을 그 거절 사유로 걸고 값을 받은 그대로 둔다 - 바꿔 넣지 않는다. 칸 타입 그대로 저장된 바꿀 것 없는 값과
-// NULL 은 Cell 과 같이 잰다.
-func TestSettledCellRefusesWhatCellWouldChange(t *testing.T) {
+// SettledCell 은 값을 바꾸지 않는다(변환 없이 맞댄다): Cell 이 받는 두 갈래(글 칸의 BLOB, bytea 칸의 TEXT)는 저장 갈래 오류,
+// 글 칸의 NUL 은 FaultNUL, Cell 의 거절은 그 사유로 걸고, JSON 글의 \u0000 은 두 엔진이 다 담는 여섯 글자라 원문 그대로 받는다.
+func TestSettledCellComparesVerbatim(t *testing.T) {
 	text, bytes := pg.Column{Name: "c", Kind: pg.Text}, pg.Column{Name: "c", Kind: pg.Bytes}
 	doc := pg.Column{Name: "c", Kind: pg.Text, JSON: true}
 	for _, c := range []struct {
@@ -431,7 +354,8 @@ func TestSettledCellRefusesWhatCellWouldChange(t *testing.T) {
 		{bytes, "x", pg.FaultStorage},
 		{text, "a\x00b", pg.FaultNUL},
 		{text, []byte("a\x00b"), pg.FaultNUL},
-		{doc, `["\u0000"]`, pg.FaultJSONNUL},
+		{doc, `["\u0000"]`, ""},
+		{doc, `["\ud800"]`, pg.FaultJSONSurrogate},
 		{doc, "[\"\x00\"]", pg.FaultJSON},
 		{text, `a\x00b`, ""},
 		{doc, `["\\x00"]`, ""},
@@ -445,11 +369,8 @@ func TestSettledCellRefusesWhatCellWouldChange(t *testing.T) {
 		if fault != c.want || rw != "" {
 			t.Errorf("%s 칸의 %q: (%q, %q), 기대 (%q, \"\")", c.col.Kind, c.v, fault, rw, c.want)
 		}
-		if fault != "" && pg.RowHash([]any{got}) != pg.RowHash([]any{c.v}) {
-			t.Errorf("%s 칸이 걸린 %q 를 %#v 로 바꿨다", c.col.Kind, c.v, got)
-		}
-		if want, wantFault, _ := pg.Cell(c.col, c.v); c.want == "" && (wantFault != "" || fmt.Sprint(got) != fmt.Sprint(want)) {
-			t.Errorf("%s 칸의 %#v: Cell 과 다르다(%#v · %#v)", c.col.Kind, c.v, got, want)
+		if pg.RowHash([]any{got}) != pg.RowHash([]any{c.v}) {
+			t.Errorf("%s 칸이 %q 를 %#v 로 바꿨다", c.col.Kind, c.v, got)
 		}
 	}
 }
@@ -495,33 +416,127 @@ func TestSequence(t *testing.T) {
 	}
 }
 
-// 지문 기본키는 지문 칸 밖의 기본키 칸과 지문으로 정해진다.
-func TestDigestPK(t *testing.T) {
-	var snap pg.Table
-	for _, tb := range pg.Tables() {
-		if tb.DigestKey != "" {
-			snap = tb
+// 칸 묶음의 지문은 그 묶음의 옮길 값으로 정해진다: 지문 칸(snapshot.key)은 KeyDigest 로, 부분 인덱스는 조건 칸이 NULL 인 행만,
+// NULL 이 든 행은 묶음 밖이다. 정수 칸만으로 된 묶음은 사전 검사가 재지 않는다(Mergeable).
+func TestUniquePrint(t *testing.T) {
+	table := func(name string) pg.Table {
+		for _, tb := range pg.Tables() {
+			if tb.Name == name {
+				return tb
+			}
 		}
+		t.Fatalf("표 %s 가 없다", name)
+		return pg.Table{}
 	}
-	row := func(project, key, value string) []any {
-		vals := make([]any, len(snap.Cols))
-		vals[snap.Index("project")], vals[snap.Index("key")], vals[snap.Index("value")] = project, key, value
+	row := func(tb pg.Table, kv ...any) []any {
+		vals := make([]any, len(tb.Cols))
+		for i := 0; i < len(kv); i += 2 {
+			vals[tb.Index(kv[i].(string))] = kv[i+1]
+		}
 		return vals
 	}
-	a, okA := snap.DigestPK(row("p", "k", "1"))
-	b, _ := snap.DigestPK(row("p", "k", "2"))
-	c, _ := snap.DigestPK(row("q", "k", "1"))
-	d, _ := snap.DigestPK(row("p", "k2", "1"))
-	if !okA || a != b || a == c || a == d {
-		t.Fatalf("지문 기본키: 같은 키 %v · 다른 프로젝트 %v · 다른 키 %v", a == b, a == c, a == d)
+	snap := table("snapshot")
+	pk := snap.Uniques()[0]
+	if pk.Name != "snapshot_pkey" || !slices.Equal(pk.Cols, []string{"project", "key"}) {
+		t.Fatalf("snapshot 기본키 %+v", pk)
 	}
-	bad := row("p", "k", "1")
-	bad[snap.Index("key")] = nil // 사전 검사가 이미 거른 값(기본키 NULL)
-	if _, ok := snap.DigestPK(bad); ok {
-		t.Fatal("지문 칸이 글이 아닌 행에서 지문 기본키가 나왔다")
+	fp := func(tb pg.Table, u pg.Unique, vals []any) string {
+		h, ok := tb.UniquePrint(u, vals)
+		if !ok {
+			return "밖"
+		}
+		return fmt.Sprintf("%x", h[:4])
 	}
-	if _, ok := pg.Tables()[0].DigestPK(make([]any, len(pg.Tables()[0].Cols))); ok {
-		t.Fatalf("지문 칸이 없는 표 %s 에서 지문 기본키가 나왔다", pg.Tables()[0].Name)
+	a := fp(snap, pk, row(snap, "project", "p", "key", "k", "value", "1"))
+	if a != fp(snap, pk, row(snap, "project", "p", "key", "k", "value", "2")) ||
+		a == fp(snap, pk, row(snap, "project", "q", "key", "k", "value", "1")) ||
+		a == fp(snap, pk, row(snap, "project", "p", "key", "k2", "value", "1")) {
+		t.Fatal("snapshot 기본키 지문이 기본키 칸만으로 정해지지 않는다")
+	}
+	d := pg.KeyDigest("k")
+	if a == fp(snap, pk, row(snap, "project", "p", "key", d[:])) {
+		t.Fatal("지문 칸을 지문으로 재지 않았다")
+	}
+	if fp(snap, pk, row(snap, "project", "p")) != "밖" || fp(snap, pk, row(snap, "project", "p", "key", []byte("k"))) != "밖" {
+		t.Fatal("지문 칸이 글이 아닌 행이 묶음에 들었다")
+	}
+	hold := table("resource_hold")
+	one := hold.Uniques()[1]
+	if one.Name != "resource_one_holder" || one.WhereNull != "released_at" {
+		t.Fatalf("resource_hold 의 묶음 %+v", hold.Uniques())
+	}
+	live := row(hold, "project", "p", "resource", "env:db")
+	if fp(hold, one, live) == "밖" || fp(hold, one, row(hold, "project", "p", "resource", "env:db", "released_at", "t")) != "밖" {
+		t.Fatal("부분 인덱스의 조건 칸을 재지 않았다")
+	}
+	if hold.Mergeable(hold.Uniques()[0]) || !hold.Mergeable(one) {
+		t.Fatal("정수 칸만으로 된 기본키와 글 칸 묶음을 못 갈랐다")
+	}
+}
+
+// 손으로 적은 기본키 · UNIQUE 칸 묶음(Table.Uniques)이 기준선의 유일 인덱스 전부와 같다: 이름 · 칸(지문 칸은 key_digest) · 부분
+// 인덱스 조건. 사전 검사의 겹침 재기(FaultUnique)가 기준선이 거절할 겹침을 빠짐없이 본다.
+func TestUniquesMatchTheBaseline(t *testing.T) {
+	db := openPG(t)
+	n := 0
+	for _, tb := range pg.Tables() {
+		var want, got []string
+		for _, u := range tb.Uniques() {
+			cols := slices.Clone(u.Cols)
+			for i, c := range cols {
+				if c == tb.DigestKey {
+					cols[i] = c + "_digest"
+				}
+			}
+			pred := ""
+			if u.WhereNull != "" {
+				pred = "(" + u.WhereNull + " IS NULL)"
+			}
+			want = append(want, u.Name+" ("+strings.Join(cols, ",")+") "+pred)
+		}
+		for _, r := range strs(t, db, `SELECT c.relname, coalesce(pg_get_expr(i.indpred, i.indrelid), ''),
+				(SELECT string_agg(a.attname, ',' ORDER BY k.ord) FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+				 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum)
+			FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			WHERE i.indisunique AND i.indrelid = format('%I', $1::text)::regclass`, tb.Name) {
+			got = append(got, r[0]+" ("+r[2]+") "+r[1])
+		}
+		slices.Sort(want)
+		slices.Sort(got)
+		if !slices.Equal(want, got) {
+			t.Errorf("%s 의 유일 묶음: 카탈로그 %q, 기준선 %q", tb.Name, want, got)
+		}
+		n += len(got)
+	}
+	if n != len(pg.Tables())+4 { // 표마다 기본키 하나 + UNIQUE 제약 하나 + 부분 · UNIQUE 인덱스 셋
+		t.Fatalf("기준선의 유일 인덱스 %d 개, 기대 %d 개", n, len(pg.Tables())+4)
+	}
+}
+
+// jsonb 는 이관이 바꿔 넣는 JSON(\u0000)과 거절하는 JSON(짝 없는 서로게이트)을 둘 다 거절하고, 바꿔 넣은 문서 · 짝 맞은
+// 서로게이트는 받는다. JSON 칸은 Postgres 에서 text 지만 jsonb 로 읽는 질의가 있어, 그 하나가 남의 행에 든 것이라도 질의가 통째로
+// 죽는다 - 그래서 Cell 이 jsonb 가 거절할 문서를 그대로 옮기지 않는다.
+func TestJSONBRefusesWhatImportRewritesOrRefuses(t *testing.T) {
+	db := openPG(t)
+	doc := pg.Column{Name: "j", Kind: pg.Text, JSON: true}
+	for in, jsonb := range map[string]bool{
+		`["\u0000"]`: false, `{"\u0000":1}`: false, `["\ud800"]`: false, `["\udc00"]`: false,
+		`["\\x00"]`: true, `["\ud83d\ude00"]`: true, `["\\u0000"]`: true,
+	} {
+		var out string
+		err := db.QueryRow(`SELECT ($1::text)::jsonb::text`, in).Scan(&out)
+		if (err == nil) != jsonb {
+			t.Errorf("jsonb(%s): 받음 %v(%v), 기대 %v", in, err == nil, err, jsonb)
+		}
+		got, fault, rw := pg.Cell(doc, in)
+		if jsonb != (fault == "" && rw == "") {
+			t.Errorf("Cell(%s) = (%s, %q, %q) - jsonb 가 거절할 문서를 그대로 옮기거나 받는 문서를 건드렸다", in, got, fault, rw)
+		}
+		if rw != "" {
+			if err := db.QueryRow(`SELECT ($1::text)::jsonb::text`, got).Scan(&out); err != nil {
+				t.Errorf("바꿔 넣은 %s 를 jsonb 가 거절한다: %v", got, err)
+			}
+		}
 	}
 }
 
