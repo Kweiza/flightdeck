@@ -169,7 +169,7 @@ REST 가 없으면 서버를 만지는 순간 전 세션의 조정이 끊기고,
 
   + compose.postgres.yaml — 선택 파일(/etc/flightdeck/compose.env)이 얹을 때만. 원장은 Postgres 17, 시크릿 = 접속 계정 둘의 pgpass 파일
     db           flightdeck-pg:local(deploy/Dockerfile - postgres:17 에 접속 규칙 · 계정 · 덤프 스크립트를 굽는다, db-roles ·
-                 db-backup 과 같은 이미지). 이름은 배포 이름(FD_PG_INSTANCE, 기본 flightdeck)에서: 컨테이너 flightdeck-db,
+                 db-backup 과 같은 이미지). 이름은 선택 파일의 배포 이름(FD_PG_INSTANCE, 기본 flightdeck)에서: 컨테이너 flightdeck-db,
                  볼륨 flightdeck-pgdata(원장) · flightdeck-pgrun(소켓). 포트를 안 낸다, 접속 규칙 deploy/pg_hba.conf
     migrate      초사용자 · 소켓(trust). 손으로 하는 관리 명령(이관 · 역이관 · 되살리기 · psql)도 여기
     db-roles     one-shot. 서버 계정(fd_app 의 구성원) · 덤프 계정(pg_read_all_data 의 구성원)을 맞춘다
@@ -209,7 +209,10 @@ REST 가 없으면 서버를 만지는 순간 전 세션의 조정이 끊기고,
   빈 원장을 새로 만드는 대신 `up` 이 선다. 같은 까닭으로 `db` 의 container_name 을 고정한다: 두 디렉토리가 한 데이터
   볼륨에 postmaster 둘을 띄우면 PID 이름공간이 달라 postmaster.pid 가 못 막는다. 컨테이너 이름과 두 볼륨 이름은 배포 이름
   `FD_PG_INSTANCE` 하나에서 나온다 — 하나만 바꿔 이름이 다른 둘이 한 볼륨에 붙는 일이 없고, 예행(다른 배포 이름)이 운영
-  원장의 소켓에 초사용자로 붙지 않는다.
+  원장의 소켓에 초사용자로 붙지 않는다. 어느 원장인지를 정하는 값(`FD_PG_INSTANCE` · `FD_PG_DATABASE`)은 **선택 파일에만**
+  적는다 — compose 는 셸 값을 env 파일보다 먼저 쓰므로, 한 셸에서 준 이름으로 옮기고 그 값이 빠진 새 셸에서 이어 띄우면 다른
+  볼륨(빈 원장)을 고른다. 그래서 기동 · 갱신 · `fdc` 가 함께 쓰는 관문(`composeEnvGuard`)이 셸이 그 값을 주면(빈 값도) compose
+  를 부르기 전에 선다.
 - **시크릿은 pgpass 파일 둘뿐이고, 시크릿 · 덤프 · 선택 파일을 모두 서버 마운트 밖에 둔다.** 서버는 같은 uid 로
   `FD_REPOS`(기본 홈 전체)를 읽고 `~/.flightdeck` 에 쓴다 — 홈 안이면 서버가 덤프 계정의 비밀번호와 원장 전체의 덤프를 읽고,
   `~/.flightdeck` 안의 선택 파일은 서버가 고쳐 다음 갱신(사람이, 때로 root 로)이 그 덮개 · 시크릿 자리를 믿는다. 그래서 pgpass
@@ -2298,9 +2301,14 @@ YAML 전체를 들이면 그 파서가 읽는 모든 것(앵커·별칭·태그�
   쓰기 시작했다.
 - **절차는 첫 실패에서 통째로 선다.** 업그레이드 · 켜기 전 거두기 · 72시간 되돌리기의 명령은 README 에 `set -eu` 부분 셸
   하나씩이다 - 단계마다 `&&` 사슬로 두면 앞 단계가 서도 다음 단계가 돌았다. 다시 붙여 넣으면 상태(표지 · 선택 파일 · 낸
-  파일)로 된 단계를 건너뛴다. 되돌리기는 시작에서 앞 실행이 남긴 `fd-back.db` 를 거절해 이번 실행이 낸 파일만 놓는다. 셸
-  함수가 실제로 그렇게 서는지 README 의 덩이를 그대로 떼어 대역 docker 로 돌리는 시험(`TestREADMEProceduresStopWhole`)이
-  잰다.
+  파일)로 된 단계를 건너뛴다 - **맞대기만은 건너뛰지 않는다.** 업그레이드는 띄우기 전에(7), 되돌리기는 낸 파일을 원장
+  자리에 놓기 전에(4) 매번 지금 원장과 맞댄다. 파일이 있다는 것 · 앞 실행이 맞댔다는 것은 관문이 아니다 - 새 셸에서 다른
+  원장을 고르거나 그 사이 원장에 쓰였으면 맞대기가 선다. 되돌리기는 시작에서 앞 실행이 남긴 `fd-back.db` 를 거절해 이번
+  실행이 낸 파일만 놓는다. 셸 값을 읽는 `fdrepos` · `fdwhere` 는 시작에서 그 값을 지우고 못 읽으면 빈 채로 실패한다(앞서 읽은
+  값을 다음 덩이가 이어받지 않는다). 덩이 안의 설명은 `#` 가 아니라 `: '…'` 다 - 대화형 zsh 는 `#` 를 주석으로 읽지 않는다.
+  셸 함수가 실제로 그렇게 서는지 README 의 덩이를 그대로 떼어 대역 docker 로 사람이 붙여 넣는 셸(대화형 zsh · macOS 의 bash
+  3.2)에서 돌리는 시험(`TestREADMEProceduresStopWhole`)이 잰다. fd-update 의 갱신 사슬도 README 의 `fdrepos` 와 같은 글자로
+  마운트를 읽고 같은 셸들에서 돌려 잰다(`TestUpdateSkillChainRunsInEveryShell`).
 - **72시간 되돌리기 창.** `fd migrate export-sqlite` 가 Postgres 원장을 판 18 의 **새** SQLite 파일로 옮기고 같은 대조로
   맞춘 뒤에만 이름을 붙인다 — 옮긴 뒤 Postgres 에 쌓인 쓰기도 같이 돌아온다. 그 창 동안은 Postgres 스키마를 18 위로
   올리지 않는다(역이관은 판 18 만 받는다). 절차는 README 「업그레이드: SQLite 원장을 Postgres 로」 · 「72시간 안에

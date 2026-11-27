@@ -235,22 +235,31 @@ const composeEnvSel = `$([ ! -e ` + composeEnvPath + ` ] || echo ` + composeEnvP
 // ★ 서버를 띄우고 갱신하는 안내가 이 하나를 쓴다(fd setup 의 기동 단계 · fd-update 스킬 - 스킬은 시험이 이 글자와 맞댄다 ·
 // README 의 fdc 는 composeEnvSel 을 쓴다). 안내마다 따로 쓰면 한 곳이 덮개를 빼고, 덮개를 뺀 `up` 은 Postgres 로 옮긴 배포를
 // SQLite 로 띄우려 든다(그 길은 이관 표지가 막지만, 막힌 기동은 서버가 없는 것으로 보인다).
-// ★ 이 머리를 부르는 명령 사슬은 composeEnvLegacyGuard 로 시작한다(아래).
+// ★ 이 머리를 부르는 명령 사슬은 composeEnvGuard 로 시작한다(아래).
 const composeCmd = `COMPOSE_ENV_FILES="` + composeEnvSel + `" docker compose`
 
-// composeEnvLegacyGuard 는 선택 파일의 옛 자리(~/.flightdeck/compose.env)에 파일이 남아 있으면 처방을 내고 거짓으로 끝나는 셸
-// 한 마디다. compose 머리를 부르는 모든 안내(fd setup 의 기동 · fd-update 스킬의 모든 사슬 · README 의 fdc)가 그 앞에 `&&` 로
-// 문다 - 시험(TestComposeGuidanceSharesOneHead · TestDeploySettingsSitOutsideServerMounts)이 그 글자를 맞댄다.
+// composeEnvGuard 는 선택 파일(composeEnvPath)이 이 배포의 고른 것을 정하는 **한 곳**이 아니면 처방을 내고 거짓으로 끝나는 셸
+// 한 마디다. compose 머리를 부르는 모든 안내(fd setup 의 기동 · fd-update 스킬의 모든 사슬 · README 의 fdc)가 그 앞에 문다 -
+// 시험(TestComposeGuidanceSharesOneHead · TestDeploySettingsSitOutsideServerMounts)이 그 글자를 맞댄다. 두 갈래다:
 //
-// ★ 옛 자리는 서버가 쓰는 /data 안이라 읽지 않는다(composeEnvPath 의 ★). 다만 말없이 건너뛰면 그 파일로 고른 Postgres 배포가
-// 기본 compose(SQLite)로 뜨려 들어(이관 표지가 막는다) 서버가 없는 것으로만 보인다 - 그래서 멈추고 옮기는 법을 낸다. 서버가
-// 바꿨을 수 있으니 옮기기 전에 내용을 본다.
+//   - 선택 파일의 옛 자리(~/.flightdeck/compose.env)에 파일이 남아 있다. 옛 자리는 서버가 쓰는 /data 안이라 읽지 않는다
+//     (composeEnvPath 의 ★). 다만 말없이 건너뛰면 그 파일로 고른 Postgres 배포가 기본 compose(SQLite)로 뜨려 들어(이관 표지가
+//     막는다) 서버가 없는 것으로만 보인다 - 그래서 멈추고 옮기는 법을 낸다. 서버가 바꿨을 수 있으니 옮기기 전에 내용을 본다.
+//   - 셸이 어느 원장인지를 정하는 값(FD_PG_INSTANCE - db 컨테이너 · 두 볼륨의 이름, FD_PG_DATABASE)을 준다. compose 는 셸 값을
+//     선택 파일보다 먼저 읽는다 - 한 셸에서 준 값으로 옮기고, 그 값이 빠진 새 셸에서 이어 띄우면 다른 볼륨(빈 원장이나 다른
+//     배포의 원장)을 고른다. 값은 선택 파일에만 둔다(README 준비 4 가 적는다). 같은 값이어도 거절한다 - 비교할 자리를 셸에
+//     두면 그것이 둘째 정본이다. 빈 값도 준 것이다(`+x`): compose 는 셸의 빈 값도 선택 파일보다 먼저 읽는다.
+//
 // ★ if 한 덩이다. `a && [ … ] || { … } && b` 로 이으면 셸이 `((a && [ … ]) || { … }) && b` 로 묶어, a 가 실패해도 이 처방을 낸다.
 // ★ 홑따옴표 없이 쓴다 - ~ 가 풀려야 한다. sh · bash · zsh 가 같게 푼다. 문구 안에는 홑따옴표를 쓰지 않는다.
-const composeEnvLegacyGuard = `if [ -e ~/.flightdeck/compose.env ]; then echo '선택 파일의 옛 자리 ~/.flightdeck/compose.env 는 ` +
+const composeEnvGuard = `if [ -e ~/.flightdeck/compose.env ]; then echo '선택 파일의 옛 자리 ~/.flightdeck/compose.env 는 ` +
 	`서버가 쓸 수 있는 /data 안이라 더는 읽지 않는다 - 내용을 확인한 뒤 ` + composeEnvPath + ` 로 옮기고 다시 돌린다: ` +
 	`sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" /etc/flightdeck && mv -n ~/.flightdeck/compose.env ` + composeEnvPath +
-	` (README 「Postgres 로 띄우기」)' >&2; false; fi`
+	` (README 「Postgres 로 띄우기」)' >&2; false; ` +
+	`elif [ -n "${FD_PG_INSTANCE+x}${FD_PG_DATABASE+x}" ]; then echo 'FD_PG_INSTANCE · FD_PG_DATABASE 는 셸에서 주지 않는다 - ` +
+	`어느 원장(볼륨 · DB)인지는 선택 파일 ` + composeEnvPath + `(꺼 두었으면 .off) 한 곳에 적는다. 셸 값은 선택 파일보다 먼저라 ` +
+	`새 셸에서 빠지면 다른 원장으로 뜬다: 값을 선택 파일에 적고 unset FD_PG_INSTANCE FD_PG_DATABASE 뒤 다시 돌린다 ` +
+	`(README 「Postgres 로 띄우기」)' >&2; false; fi`
 
 // serverStartSteps 는 서버를 띄우는 길이다.
 //
@@ -263,9 +272,12 @@ const composeEnvLegacyGuard = `if [ -e ~/.flightdeck/compose.env ]; then echo '�
 // 지어내지 않고 어디서 돌려야 하는지를 What 에 말로 남긴다.
 // FD_UID·FD_GID 는 compose 가 기본 1000 으로 채우는 값이다 — 호스트 사용자가 아니면 DB 를
 // 열되 못 쓰고 git 이 소유권을 의심한다(compose.yaml 주석).
+// ★ `--build` 로 띄운다(fd-update 의 올리기 · README 의 띄우기와 같다). 이미지 이름이 판을 안 타는 고정 이름이라
+// (flightdeck:local · flightdeck-pg:local) 앞 판이 지은 이미지가 남아 있으면 `up -d` 는 그것으로 뜬다 - 이 판의 접속 규칙 ·
+// 계정 스크립트 대신 옛것으로. 짓기는 캐시가 맞으면 아무것도 안 한다.
 func serverStartSteps(s SetupState) []SetupStep {
 	if s.Docker {
-		const up = composeEnvLegacyGuard + " && FD_UID=$(id -u) FD_GID=$(id -g) " + composeCmd + " up -d"
+		const up = composeEnvGuard + " && FD_UID=$(id -u) FD_GID=$(id -g) " + composeCmd + " up -d --build"
 		if s.PluginRoot != "" {
 			return []SetupStep{{
 				What:    "서버 기동(지원되는 상시 실행 경로)",

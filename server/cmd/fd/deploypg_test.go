@@ -441,7 +441,7 @@ func TestDeploySettingsSitOutsideServerMounts(t *testing.T) {
 			t.Fatal(err)
 		}
 		body := string(raw)
-		// fdc 는 fd setup · fd-update 와 같은 관문으로 시작하고(composeEnvLegacyGuard - 글자째), 같은 판정(composeEnvSel)으로 선택
+		// fdc 는 fd setup · fd-update 와 같은 관문으로 시작하고(composeEnvGuard - 글자째), 같은 판정(composeEnvSel)으로 선택
 		// 파일을 고른다. 꺼 둔 파일은 FDC_ENV 로만 대신 준다. 관문 뒤는 `|| return` 이다 - zsh 는 몸이 `if … fi && …` 로 끝난
 		// 함수가 실패해도 부른 쪽 `set -e` 덩이를 안 세운다(TestREADMEProceduresStopWhole 이 zsh 로 잰다).
 		_, fdc, ok := strings.Cut(body, "\nfdc() {\n")
@@ -449,8 +449,8 @@ func TestDeploySettingsSitOutsideServerMounts(t *testing.T) {
 		if !ok || !closed {
 			t.Fatalf("%s 에 fdc 정의(fdc() { … })가 없다", readme)
 		}
-		if !strings.HasPrefix(strings.TrimSpace(fdc), composeEnvLegacyGuard+" || return\n") {
-			t.Errorf("%s 의 fdc 가 옛 자리 관문(composeEnvLegacyGuard)으로 시작하지 않는다:\n%s", readme, fdc)
+		if !strings.HasPrefix(strings.TrimSpace(fdc), composeEnvGuard+" || return\n") {
+			t.Errorf("%s 의 fdc 가 옛 자리 관문(composeEnvGuard)으로 시작하지 않는다:\n%s", readme, fdc)
 		}
 		if want := `COMPOSE_ENV_FILES="${FDC_ENV:-` + composeEnvSel + `}" docker compose "$@"`; !strings.HasSuffix(fdc, want) {
 			t.Errorf("%s 의 fdc 가 선택 파일 %s 을 fd setup · fd-update 와 같은 판정으로 안 본다(%s)", readme, composeEnvPath, want)
@@ -464,6 +464,10 @@ func TestDeploySettingsSitOutsideServerMounts(t *testing.T) {
 		for _, ln := range strings.Split(block, "\n") {
 			k, v, _ := strings.Cut(ln, "=")
 			set[k] = v
+		}
+		// 어느 원장(db 컨테이너 · 두 볼륨의 이름)인지는 선택 파일에만 적는다 - 셸이 주면 관문이 선다(TestComposeEnvGuard).
+		if set["FD_PG_INSTANCE"] != "flightdeck" {
+			t.Errorf("%s 의 선택 파일이 배포 이름을 FD_PG_INSTANCE=%q 로 적는다 - 원장을 고르는 값은 이 파일 한 곳에 flightdeck 으로 적는다", readme, set["FD_PG_INSTANCE"])
 		}
 		if set["COMPOSE_FILE"] != "compose.yaml:compose.postgres.yaml" {
 			t.Errorf("%s 의 선택 파일이 COMPOSE_FILE=%q 다 - 덮개를 얹어야 한다", readme, set["COMPOSE_FILE"])
@@ -570,6 +574,49 @@ func TestComposeServicesDoNotBindThePluginDirectory(t *testing.T) {
 				t.Errorf("%v 의 시크릿 %s 가 판 디렉토리 아래 %s 다", files, name, sec.File)
 			}
 		}
+	}
+}
+
+// TestComposeEnvGuard 는 기동 · 갱신 · fdc 가 함께 쓰는 선택 파일 관문(composeEnvGuard)을 셸로 돌려, 서는 갈래(옛 자리의 선택 파일 ·
+// 셸이 준 FD_PG_INSTANCE · FD_PG_DATABASE - 빈 값도)와 지나는 갈래를 잰다.
+//
+// ★ 셸 값은 선택 파일보다 먼저다. 한 셸에서 준 배포 이름으로 옮기고 그 값이 빠진 새 셸에서 이어 띄우면 다른 볼륨(빈 원장)을
+//
+//	고른다 - 그래서 어느 원장인지는 선택 파일에만 두고, 셸이 주면 같은 값이어도 선다(`+x` 는 빈 값도 잡는다).
+func TestComposeEnvGuard(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		env   []string
+		old   bool
+		stops bool
+	}{
+		{"아무것도 없으면 지난다", nil, false, false},
+		{"옛 자리에 선택 파일이 있다", nil, true, true},
+		{"셸이 FD_PG_INSTANCE 를 준다", []string{"FD_PG_INSTANCE=flightdeck"}, false, true},
+		{"셸이 빈 FD_PG_INSTANCE 를 준다", []string{"FD_PG_INSTANCE="}, false, true},
+		{"셸이 FD_PG_DATABASE 를 준다", []string{"FD_PG_DATABASE=flightdeck"}, false, true},
+		{"다른 FD_PG_ 값은 지난다", []string{"FD_PG_SERVER_USER=fd_server"}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			if tc.old {
+				if err := os.MkdirAll(filepath.Join(home, ".flightdeck"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(home, ".flightdeck", "compose.env"), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command("sh", "-c", composeEnvGuard+" && echo 지났다")
+			cmd.Env = append([]string{"HOME=" + home, "PATH=/usr/bin:/bin"}, tc.env...)
+			out, err := cmd.CombinedOutput()
+			if passed := err == nil && strings.Contains(string(out), "지났다"); passed == tc.stops {
+				t.Fatalf("관문이 %s(섰다=%v):\n%s", map[bool]string{true: "서야 하는데 지났다", false: "지나야 하는데 섰다"}[tc.stops], !passed, out)
+			}
+			if tc.stops && !strings.Contains(string(out), "README 「Postgres 로 띄우기」") {
+				t.Errorf("선 관문이 처방(README 자리)을 안 냈다:\n%s", out)
+			}
+		})
 	}
 }
 

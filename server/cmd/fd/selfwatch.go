@@ -333,8 +333,8 @@ func containerVerdict(hasDockerEnv, hasDataDir bool) (bool, string) {
 
 // composeUpdate 는 컨테이너 사유 끝의 갱신 경로다. 명령을 따로 내지 않고 fd-update 스킬의 절차를 가리킨다.
 //
-// ★ 갱신 명령은 fd-update 하나에 둔다. 여기서 `docker compose up -d --build` 한 줄을 내면 그 줄은 옛 자리 관문
-// (composeEnvLegacyGuard) · 도는 서버와 선택 파일의 맞대기 · 저장소 마운트(FD_REPOS…FD_REPOS4) · 토큰을 빠뜨린 둘째 갱신
+// ★ 갱신 명령은 fd-update 하나에 둔다. 여기서 `docker compose up -d --build` 한 줄을 내면 그 줄은 선택 파일 관문
+// (composeEnvGuard) · 도는 서버와 선택 파일의 맞대기 · 저장소 마운트(FD_REPOS…FD_REPOS4) · 토큰을 빠뜨린 둘째 갱신
 // 경로다 - 그대로 따르면 옛 자리의 선택 파일만 있는 Postgres 배포를 SQLite 로 띄우려 들고, 좁혀 둔 저장소 마운트를 조용히
 // 홈으로 되돌린다. 시험(TestComposeGuidanceSharesOneHead)이 이 사유에 compose 명령이 없는 것을 잰다.
 const composeUpdate = "갱신은 compose 로 한다 - 저장소 마운트 · 덮개 파일 · 선택 파일 관문까지 묶은 절차가 /fd-update 다(skills/fd-update/SKILL.md)"

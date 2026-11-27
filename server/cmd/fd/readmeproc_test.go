@@ -1,14 +1,18 @@
 package main
 
-// README 의 Postgres 절차(「업그레이드: SQLite 원장을 Postgres 로」 · 「켜기 전에 섰을 때」 · 「72시간 안에 되돌리기」)를 README 의
-// 글자 그대로 떼어, 대역 docker 로 돌리는 시험이다.
+// README 의 Postgres 절차(「업그레이드: SQLite 원장을 Postgres 로」 · 「켜기 전에 섰을 때」 · 「72시간 안에 되돌리기」)와 fd-update
+// 스킬의 갱신 사슬을 글자 그대로 떼어, 대역 docker 로 돌리는 시험이다.
 //
 // ★ 글자가 아니라 **도는 모양**을 잰다. 이 절차들은 한때 단계마다 `&&` 사슬이었다 - 사슬은 그 단계 안에서만 서고, 다음 단계는
 //   앞 단계가 섰어도 돌았다(옛 서버를 못 내렸는데 옮기고, 계정 검사가 섰는데 선택 파일을 켠다). 그래서 셸이 실제로 어디서 서는지,
-//   선 뒤에 무엇이 남는지(선택 파일 · 이관 표지 · 원장 파일)를 실제 셸(bash, 있으면 zsh)로 잰다.
+//   선 뒤에 무엇이 남는지(선택 파일 · 이관 표지 · 원장 파일)를 실제 셸로 잰다.
+// ★ 셸은 사람이 붙여 넣는 꼴 그대로다: 대화형 zsh(`zsh -f -i`, macOS 의 기본 셸)와 대화형 bash(macOS 에서는 /bin/bash 3.2)에
+//   덩이를 표준 입력으로 준다. 비대화형 `-c` 로는 못 보는 것이 있다 - 대화형 zsh 는 `interactivecomments` 가 꺼져 있어 `#` 줄을
+//   명령으로 돌리고(`set -e` 덩이가 그 첫 줄에서 선다), zsh · bash 3.2 에는 `readarray` 가 없다.
 // ★ 셸 함수(fdc · fdrepos · fdwhere · srvsql · nodump)도 README 의 정의를 그대로 쓴다 - 대역은 docker 하나다. 대역은 부른 것을
-//   (자리 · 넘긴 선택 파일 · 인자) 적고, 상태 디렉토리로 도는 서버를 흉내 내고, 이관 · 역이관이 남기는 파일을 만든다. 운영
-//   docker · 운영 자리(/etc/flightdeck · 홈)는 건드리지 않는다: 선택 파일 자리를 시험 자리로 바꿔 쓰고 HOME 을 시험 자리로 준다.
+//   (자리 · 넘긴 선택 파일 · 저장소 마운트 · 인자) 적고, 상태 디렉토리로 서버 컨테이너를 흉내 내고, 이관 · 역이관이 남기는 파일을
+//   만든다. 운영 docker · 운영 자리(/etc/flightdeck · 홈)는 건드리지 않는다: 선택 파일 자리를 시험 자리로 바꿔 쓰고 HOME 을 시험
+//   자리로 준다.
 
 import (
 	"os"
@@ -24,22 +28,31 @@ type readmeProcs struct {
 	defs, upgrade, measure, back, rollback string
 }
 
-// readmeBlocks 는 글의 ```bash 블록들이다.
+// readmeBlocks 는 글의 ```bash 블록들이다. 목록 안에 들여 쓴 블록은 그 들여쓰기만큼 걷어 낸다.
 func readmeBlocks(body string) []string {
 	var out []string
-	for _, m := range regexp.MustCompile("(?s)```bash\n(.*?)\n```").FindAllStringSubmatch(body, -1) {
-		out = append(out, m[1])
+	for _, m := range regexp.MustCompile("(?ms)^([ \t]*)```bash\n(.*?)\n[ \t]*```[ \t]*$").FindAllStringSubmatch(body, -1) {
+		lines := strings.Split(m[2], "\n")
+		for i, ln := range lines {
+			lines[i] = strings.TrimPrefix(ln, m[1])
+		}
+		out = append(out, strings.Join(lines, "\n"))
 	}
 	return out
 }
 
-func loadReadmeProcs(t *testing.T, readme string) readmeProcs {
+func readmeBody(t *testing.T, readme string) string {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(pluginRoot(t), readme))
 	if err != nil {
 		t.Fatal(err)
 	}
-	blocks := readmeBlocks(string(raw))
+	return string(raw)
+}
+
+func loadReadmeProcs(t *testing.T, readme string) readmeProcs {
+	t.Helper()
+	blocks := readmeBlocks(readmeBody(t, readme))
 	one := func(what, marker string) string {
 		t.Helper()
 		var hit []string
@@ -65,17 +78,11 @@ func loadReadmeProcs(t *testing.T, readme string) readmeProcs {
 	p.upgrade = one("업그레이드 2-8", "import-sqlite --from /data/fd.db --dry-run")
 	p.measure = one("켜기 전에 섰을 때 - 재기", "migrate verify --from /data/fd.db; then")
 	p.back = one("켜기 전에 섰을 때 - 돌아가기", `rm -f "$HOME/.flightdeck/fd.db.moved-to-postgres"`)
-	p.rollback = one("72시간 되돌리기 2-6", "export-sqlite --to /data/fd-back.db --dry-run")
+	p.rollback = one("72시간 되돌리기 2-7", "export-sqlite --to /data/fd-back.db --dry-run")
 	// 두 절차의 1 은 fdwhere 한 줄이다 - 시험의 「처음 돌기」가 그 줄을 그대로 앞에 붙인다.
 	n := 0
 	for _, b := range blocks {
-		code := ""
-		for _, ln := range strings.Split(b, "\n") {
-			if !strings.HasPrefix(strings.TrimSpace(ln), "#") {
-				code += ln
-			}
-		}
-		if strings.TrimSpace(code) == "fdwhere" {
+		if strings.TrimSpace(b) == "fdwhere" {
 			n++
 		}
 	}
@@ -85,29 +92,37 @@ func loadReadmeProcs(t *testing.T, readme string) readmeProcs {
 	return p
 }
 
-// fakeDocker 는 대역 docker 다. 부른 것을 FDT_LOG 에 한 줄씩 적는다: `PWD=<자리> ENV=<COMPOSE_ENV_FILES> ARGS=<인자>`.
-// FDT_FAIL(정규식)에 맞는 인자면 1 로 끝난다. FDT_STATE/up 이 있으면 서버 컨테이너(flightdeck)가 돈다.
+// fakeDocker 는 대역 docker 다. 부른 것을 FDT_LOG 에 한 줄씩 적는다:
+// `PWD=<자리> ENV=<COMPOSE_ENV_FILES> REPOS=<FD_REPOS>,<FD_REPOS2> ARGS=<인자>`.
+// FDT_FAIL(정규식)에 맞는 인자면 1 로 끝난다. FDT_STATE/created 가 있으면 서버 컨테이너(flightdeck)가 있고, FDT_STATE/up 이 있으면
+// 그것이 돈다(stop 은 멈추기만, down 은 지운다). FDT_STATE/pgrows 가 있으면 Postgres 원장에 행이 있다 - 이관의 예행이 「대상이 비어
+// 있지 않다」로 선다(본 이관이 커밋하며 만든다).
 const fakeDocker = `#!/bin/sh
-printf 'PWD=%s ENV=%s ARGS=%s\n' "$PWD" "${COMPOSE_ENV_FILES-}" "$*" >> "$FDT_LOG"
+printf 'PWD=%s ENV=%s REPOS=%s,%s ARGS=%s\n' "$PWD" "${COMPOSE_ENV_FILES-}" "${FD_REPOS-}" "${FD_REPOS2-}" "$*" >> "$FDT_LOG"
 if [ -n "${FDT_FAIL-}" ] && printf '%s' "$*" | grep -Eq -- "$FDT_FAIL"; then echo "대역 docker: 실패를 낸다($*)" >&2; exit 1; fi
 st=$FDT_STATE
 case "$1" in
 compose)
   case " $* " in
-  *" import-sqlite "*" --dry-run "*|*" export-sqlite "*" --dry-run "*) ;;
-  *" import-sqlite "*) : > "$HOME/.flightdeck/fd.db.moved-to-postgres" ;;
+  *" import-sqlite "*" --dry-run "*)
+    if [ -e "$st/pgrows" ]; then echo "대상이 비어 있지 않다(item 3 행) - 이관은 빈 원장에만 쓴다" >&2; exit 1; fi ;;
+  *" export-sqlite "*" --dry-run "*) ;;
+  *" import-sqlite "*) : > "$st/pgrows"; : > "$HOME/.flightdeck/fd.db.moved-to-postgres" ;;
   *" export-sqlite "*) [ ! -e "$HOME/.flightdeck/fd-back.db" ] || exit 1; echo back > "$HOME/.flightdeck/fd-back.db" ;;
   *" ps -aq db-roles "*) echo rolesid ;;
-  *" down "*) rm -f "$st/up" ;;
+  *" ps -aq flightdeck "*) [ ! -e "$st/created" ] || echo srvid ;;
+  *" stop flightdeck "*) rm -f "$st/up" ;;
+  *" down "*) rm -f "$st/up" "$st/created" ;;
   esac
-  case "$*" in *" up -d"|*" up -d --build") : > "$st/up" ;; esac
+  case "$*" in *" up -d"|*" up -d --build") : > "$st/up"; : > "$st/created" ;; esac
   exit 0 ;;
 inspect)
-  [ -e "$st/up" ] || { echo "Error: No such object: flightdeck" >&2; exit 1; }
+  [ -e "$st/created" ] || { echo "Error: No such object: flightdeck" >&2; exit 1; }
   case "$*" in
   *working_dir*) echo "$FDT_W" ;;
   *compose.project*) echo "$FDT_P" ;;
   *Mounts*) printf '%s\n' /repos/one /repos/two ;;
+  *Config.Env*) echo "FD_DB=${FDT_FD_DB:-/data/fd.db}" ;;
   esac
   exit 0 ;;
 ps)
@@ -121,17 +136,43 @@ esac
 exit 0
 `
 
+// procShell 은 덩이를 붙여 넣는 셸 하나다. stdin 이면 덩이를 표준 입력으로 준다(대화형 셸에 붙여 넣는 꼴), 아니면 `-c` 로 준다.
+type procShell struct {
+	name  string
+	path  string
+	args  []string
+	stdin bool
+}
+
+// pasteShells 는 사람이 덩이를 붙여 넣는 셸이다 - 대화형 bash(macOS 면 /bin/bash 3.2)와, 있으면 대화형 zsh.
+func pasteShells(t *testing.T) []procShell {
+	t.Helper()
+	bash := "/bin/bash"
+	if _, err := os.Stat(bash); err != nil {
+		p, err := exec.LookPath("bash")
+		if err != nil {
+			t.Fatalf("bash 가 없다 - README 절차를 셸로 재지 못한다: %v", err)
+		}
+		bash = p
+	}
+	out := []procShell{{"bash -i", bash, []string{"--norc", "--noprofile", "--noediting", "-i"}, true}}
+	if zsh, err := exec.LookPath("zsh"); err == nil {
+		out = append(out, procShell{"zsh -f -i", zsh, []string{"-f", "-i"}, true})
+	}
+	return out
+}
+
 // procRig 는 시험 한 판의 자리다: 홈(~/.flightdeck 가 /data 다) · 선택 파일 자리 · 대역 docker · 상태 · 기록.
 type procRig struct {
 	t                          *testing.T
-	shell                      string
+	shell                      procShell
 	procs                      readmeProcs
 	home, etc, state, log, bin string
 	work, old                  string // 이 판의 자리(절차를 돌리는 곳) · 도는 서버의 라벨이 가리키는 자리
 	env                        map[string]string
 }
 
-func newProcRig(t *testing.T, shell string, procs readmeProcs) *procRig {
+func newProcRig(t *testing.T, shell procShell, procs readmeProcs) *procRig {
 	t.Helper()
 	root := t.TempDir()
 	r := &procRig{t: t, shell: shell, procs: procs, env: map[string]string{}}
@@ -181,26 +222,29 @@ func (r *procRig) read(path string) string {
 
 // serverUp 은 도는 서버(라벨 프로젝트 p · 자리 w)를 둔다.
 func (r *procRig) serverUp(p, w string) {
+	r.write(filepath.Join(r.state, "created"), "")
 	r.write(filepath.Join(r.state, "up"), "")
 	r.env["FDT_P"], r.env["FDT_W"] = p, w
 }
 
-// run 은 셸 함수 정의 뒤 cwd 에서 앞줄(prelude)과 덩이(block)를 돌린다. 덩이의 부분 셸이 닫힌 바로 뒤에 그 종료 코드를 찍어
-// 낸다(덩이 뒤의 curl 같은 줄이 코드를 덮지 않게). 이 판의 docker 기록 줄과 출력도 낸다.
-func (r *procRig) run(cwd, prelude, block string) (rc string, calls []string, out string) {
+// sub 는 글의 운영 자리(/etc/flightdeck)를 이 판의 자리로 바꾼다.
+func (r *procRig) sub(s string) string { return strings.ReplaceAll(s, "/etc/flightdeck", r.etc) }
+
+// exec 는 cwd 에서 스크립트를 이 판의 셸로 돌리고 출력과 docker 기록 줄을 낸다. 종료 코드는 스크립트가 `BLOCK_RC=` 로 찍는다
+// (대화형 셸은 표준 입력이 끝나면 마지막 명령의 코드로 끝나 덩이의 코드를 잃는다).
+func (r *procRig) exec(cwd, script string) (rc string, calls []string, out string) {
 	r.t.Helper()
-	sub := func(s string) string { return strings.ReplaceAll(s, "/etc/flightdeck", r.etc) }
-	body := sub(block) + "\n"
-	if !strings.Contains(body, "\n)\n") {
-		r.t.Fatalf("덩이가 `)` 줄로 닫히는 부분 셸이 아니다:\n%s", block)
-	}
-	body = strings.Replace(body, "\n)\n", "\n)\necho \"BLOCK_RC=$?\"\n", 1)
-	script := sub(r.procs.defs) + "\ncd '" + cwd + "' || exit 99\n" + prelude + "\n" + body
 	_ = os.Remove(r.log)
-	cmd := exec.Command(r.shell, "-c", script)
+	var cmd *exec.Cmd
+	if r.shell.stdin {
+		cmd = exec.Command(r.shell.path, r.shell.args...)
+		cmd.Stdin = strings.NewReader(script + "\n")
+	} else {
+		cmd = exec.Command(r.shell.path, append(append([]string{}, r.shell.args...), "-c", script)...)
+	}
 	cmd.Dir = cwd
 	env := []string{"HOME=" + r.home, "PATH=" + r.bin + ":/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C.UTF-8",
-		"FDT_LOG=" + r.log, "FDT_STATE=" + r.state}
+		"FDT_LOG=" + r.log, "FDT_STATE=" + r.state, "PS1=", "PS2=", "BASH_SILENCE_DEPRECATION_WARNING=1"}
 	for k, v := range r.env {
 		env = append(env, k+"="+v)
 	}
@@ -210,12 +254,24 @@ func (r *procRig) run(cwd, prelude, block string) (rc string, calls []string, ou
 	if m := regexp.MustCompile(`BLOCK_RC=(\d+)`).FindStringSubmatch(out); m != nil {
 		rc = m[1]
 	} else {
-		r.t.Fatalf("덩이의 종료 코드가 안 나왔다(셸이 덩이 전에 섰다):\n%s", out)
+		r.t.Fatalf("%s: 덩이의 종료 코드가 안 나왔다(셸이 덩이 전에 섰다):\n%s", r.shell.name, out)
 	}
 	if raw, err := os.ReadFile(r.log); err == nil {
 		calls = strings.Split(strings.TrimSpace(string(raw)), "\n")
 	}
 	return rc, calls, out
+}
+
+// run 은 셸 함수 정의 뒤 cwd 에서 앞줄(prelude)과 덩이(block)를 돌린다. 덩이의 부분 셸이 닫힌 바로 뒤에 그 종료 코드를 찍어
+// 낸다(덩이 뒤의 curl 같은 줄이 코드를 덮지 않게).
+func (r *procRig) run(cwd, prelude, block string) (rc string, calls []string, out string) {
+	r.t.Helper()
+	body := r.sub(block) + "\n"
+	if !strings.Contains(body, "\n)\n") {
+		r.t.Fatalf("덩이가 `)` 줄로 닫히는 부분 셸이 아니다:\n%s", block)
+	}
+	body = strings.Replace(body, "\n)\n", "\n)\necho \"BLOCK_RC=$?\"\n", 1)
+	return r.exec(cwd, r.sub(r.procs.defs)+"\ncd '"+cwd+"' || exit 99\n"+prelude+"\n"+body)
 }
 
 // composeCalls 는 기록 가운데 compose 호출만 낸다.
@@ -239,27 +295,27 @@ func called(calls []string, args string) string {
 	return ""
 }
 
-// procShells 는 절차를 돌릴 셸이다 - bash 는 꼭, zsh 는 있으면(README 의 함수를 셸 설정에 두는 사람의 셸이다).
-func procShells(t *testing.T) []string {
-	t.Helper()
-	bash, err := exec.LookPath("bash")
-	if err != nil {
-		t.Fatalf("bash 가 없다 - README 절차를 셸로 재지 못한다: %v", err)
+// calledAt 은 compose 호출 가운데 인자가 args 로 끝나는 첫 줄의 차례다(없으면 -1).
+func calledAt(calls []string, args string) int {
+	for i, c := range composeCalls(calls) {
+		if strings.HasSuffix(c, " "+args) {
+			return i
+		}
 	}
-	out := []string{bash}
-	if zsh, err := exec.LookPath("zsh"); err == nil {
-		out = append(out, zsh)
-	}
-	return out
+	return -1
 }
 
+// ran 은 기록 줄이 자리 pwd · 선택 파일 env 로 돌았는지다.
+func ran(c, pwd, env string) bool { return strings.HasPrefix(c, "PWD="+pwd+" ENV="+env+" REPOS=") }
+
 // TestREADMEProceduresStopWhole 은 README(정본 · 번역본)의 세 절차가 첫 실패에서 통째로 서고, 선 자리에 맞는 것만 남기며, 다시
-// 붙여 넣으면 된 단계를 건너뛰는지 잰다.
+// 붙여 넣으면 된 단계를 건너뛰는지 잰다 - 사람이 붙여 넣는 대화형 셸로.
 func TestREADMEProceduresStopWhole(t *testing.T) {
 	for _, readme := range []string{"README.ko.md", "README.md"} {
 		procs := loadReadmeProcs(t, readme)
-		for _, shell := range procShells(t) {
-			t.Run(readme+"/"+filepath.Base(shell), func(t *testing.T) {
+		for _, shell := range pasteShells(t) {
+			t.Run(readme+"/"+shell.name, func(t *testing.T) {
+				t.Parallel()
 				t.Run("업그레이드", func(t *testing.T) { checkUpgrade(t, shell, procs) })
 				t.Run("켜기 전에 섰을 때", func(t *testing.T) { checkBeforeSwitchOn(t, shell, procs) })
 				t.Run("72시간 되돌리기", func(t *testing.T) { checkRollback(t, shell, procs) })
@@ -269,7 +325,7 @@ func TestREADMEProceduresStopWhole(t *testing.T) {
 }
 
 // upgradeRig 는 업그레이드 전의 자리다: 꺼 둔 선택 파일, SQLite 원장, 옛 판 자리에서 도는 서버.
-func upgradeRig(t *testing.T, shell string, procs readmeProcs) *procRig {
+func upgradeRig(t *testing.T, shell procShell, procs readmeProcs) *procRig {
 	r := newProcRig(t, shell, procs)
 	r.write(r.off(), "COMPOSE_FILE=compose.yaml:compose.postgres.yaml\n")
 	r.write(r.data("fd.db"), "old")
@@ -277,7 +333,19 @@ func upgradeRig(t *testing.T, shell string, procs readmeProcs) *procRig {
 	return r
 }
 
-func checkUpgrade(t *testing.T, shell string, procs readmeProcs) {
+// switchedOnRig 는 업그레이드가 7 에서 선택 파일을 켠 뒤 8 전에 선 자리다: 켠 선택 파일, 표지, Postgres 원장의 행, 내려간 서버.
+func switchedOnRig(t *testing.T, shell procShell, procs readmeProcs) *procRig {
+	r := newProcRig(t, shell, procs)
+	r.write(r.on(), "COMPOSE_FILE=compose.yaml:compose.postgres.yaml\n")
+	r.write(r.data("fd.db"), "old")
+	r.write(r.data("fd.db.moved-to-postgres"), "")
+	r.write(filepath.Join(r.state, "pgrows"), "")
+	return r
+}
+
+const newShellRepos = "export FD_REPOS='/repos/one' FD_REPOS2='/repos/two' FD_REPOS3='' FD_REPOS4=''"
+
+func checkUpgrade(t *testing.T, shell procShell, procs readmeProcs) {
 	t.Run("끝까지 돈다", func(t *testing.T) {
 		r := upgradeRig(t, shell, procs)
 		rc, calls, out := r.run(r.work, "fdwhere", procs.upgrade)
@@ -292,13 +360,15 @@ func checkUpgrade(t *testing.T, shell string, procs readmeProcs) {
 			{"run --rm --no-deps migrate migrate --db /data/fd.db", r.work, ""},
 			{"run --rm migrate migrate --to 18", r.work, r.off()},
 			{"run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db", r.work, r.off()},
-			{"run --rm --no-deps migrate migrate verify --from /data/fd.db", r.work, r.off()},
-			{"up -d", r.work, r.on()},
+			{"run --rm migrate migrate verify --from /data/fd.db", r.work, r.off()},
+			{"up -d --build", r.work, r.on()},
 		} {
-			c := called(calls, want.args)
-			if c == "" || !strings.HasPrefix(c, "PWD="+want.pwd+" ENV="+want.env+" ARGS=") {
+			if c := called(calls, want.args); !ran(c, want.pwd, want.env) {
 				t.Errorf("`%s` 가 자리 %s · 선택 파일 %q 로 안 돌았다: %q", want.args, want.pwd, want.env, c)
 			}
+		}
+		if c := called(calls, "up -d --build"); !strings.Contains(c, " REPOS=/repos/one,/repos/two ") {
+			t.Errorf("8 의 up 이 1 이 읽은 저장소 마운트로 안 돌았다: %q", c)
 		}
 		if n := len(composeCalls(calls)); !strings.HasSuffix(composeCalls(calls)[n-1], " ARGS=compose ps -a") {
 			t.Errorf("마지막 compose 호출이 ps -a 가 아니다: %q", composeCalls(calls)[n-1])
@@ -327,12 +397,12 @@ func checkUpgrade(t *testing.T, shell string, procs readmeProcs) {
 		}
 		// 새 셸: 1 이 낸 저장소 마운트 줄만 다시 준다(서버가 내려가 fdwhere 는 못 읽는다).
 		r.env["FDT_WAIT"] = "0"
-		rc, calls, out = r.run(r.work, "export FD_REPOS='/repos/one' FD_REPOS2='/repos/two' FD_REPOS3='' FD_REPOS4=''", procs.upgrade)
+		rc, calls, out = r.run(r.work, newShellRepos, procs.upgrade)
 		if rc != "0" {
 			t.Fatalf("다시 돈 덩이가 %s 로 섰다:\n%s", rc, out)
 		}
 		joined := strings.Join(calls, "\n")
-		if strings.Contains(joined, " down") || strings.Contains(joined, "import-sqlite") || called(calls, "run --rm --no-deps migrate migrate verify --from /data/fd.db") == "" {
+		if strings.Contains(joined, " down") || strings.Contains(joined, "import-sqlite") || called(calls, "run --rm migrate migrate verify --from /data/fd.db") == "" {
 			t.Fatalf("다시 돈 덩이가 2-5 를 건너뛰고 6 부터 돌지 않았다:\n%s", joined)
 		}
 		if !r.exists(r.on()) || r.exists(r.off()) {
@@ -347,6 +417,20 @@ func checkUpgrade(t *testing.T, shell string, procs readmeProcs) {
 			t.Fatalf("옛 자리 관문이 안 섰다(rc=%s):\n%s\n%s", rc, strings.Join(calls, "\n"), out)
 		}
 	})
+	// 어느 원장(볼륨 · DB)인지는 선택 파일에만 있다 - 셸이 주면(빈 값도) 새 셸에서 빠져 다른 볼륨을 고를 수 있어 관문이 선다.
+	for _, kv := range [][2]string{{"FD_PG_INSTANCE", "other"}, {"FD_PG_DATABASE", ""}} {
+		t.Run("셸이 "+kv[0]+" 를 주면 compose 를 안 부른다", func(t *testing.T) {
+			r := upgradeRig(t, shell, procs)
+			r.env[kv[0]] = kv[1]
+			rc, calls, out := r.run(r.work, "fdwhere", procs.upgrade)
+			if rc == "0" || len(composeCalls(calls)) != 0 || !strings.Contains(out, "unset FD_PG_INSTANCE FD_PG_DATABASE") {
+				t.Fatalf("셸의 %s=%q 에 관문이 안 섰다(rc=%s):\n%s\n%s", kv[0], kv[1], rc, strings.Join(calls, "\n"), out)
+			}
+			if !r.exists(r.off()) || r.exists(r.data("fd.db.moved-to-postgres")) {
+				t.Fatal("관문이 섰는데 선택 파일 · 표지가 바뀌었다")
+			}
+		})
+	}
 	t.Run("표지 없이 선택 파일이 켜져 있으면 시작하지 않는다", func(t *testing.T) {
 		r := upgradeRig(t, shell, procs)
 		if err := os.Rename(r.off(), r.on()); err != nil {
@@ -357,9 +441,72 @@ func checkUpgrade(t *testing.T, shell string, procs readmeProcs) {
 			t.Fatalf("켜진 선택 파일 · 표지 없음에서 덩이가 compose 를 불렀다(rc=%s):\n%s", rc, strings.Join(calls, "\n"))
 		}
 	})
+	t.Run("켠 뒤 새 셸에서 이으면 띄우기 전에 선택 파일의 원장을 다시 맞댄다", func(t *testing.T) {
+		r := switchedOnRig(t, shell, procs)
+		rc, calls, out := r.run(r.work, newShellRepos, procs.upgrade)
+		if rc != "0" {
+			t.Fatalf("켠 뒤 이은 덩이가 %s 로 섰다:\n%s", rc, out)
+		}
+		v, u := calledAt(calls, "run --rm migrate migrate verify --from /data/fd.db"), calledAt(calls, "up -d --build")
+		if v < 0 || u < 0 || v > u || !ran(composeCalls(calls)[v], r.work, r.on()) {
+			t.Fatalf("켠 뒤 이은 덩이가 켠 선택 파일로 맞댄 뒤에 띄우지 않았다:\n%s", strings.Join(calls, "\n"))
+		}
+		joined := strings.Join(calls, "\n")
+		if strings.Contains(joined, " down") || strings.Contains(joined, "import-sqlite") || strings.Contains(joined, "db-roles") {
+			t.Fatalf("켠 뒤 이은 덩이가 2-6 을 다시 돌았다:\n%s", joined)
+		}
+	})
+	t.Run("켠 뒤 맞대기가 서면 띄우지 않는다", func(t *testing.T) {
+		r := switchedOnRig(t, shell, procs)
+		r.env["FDT_FAIL"] = "verify --from /data/fd.db$"
+		rc, calls, _ := r.run(r.work, newShellRepos, procs.upgrade)
+		if rc == "0" || called(calls, "up -d --build") != "" {
+			t.Fatalf("맞대기가 섰는데 덩이가 띄웠다(rc=%s):\n%s", rc, strings.Join(calls, "\n"))
+		}
+	})
+	t.Run("이 자리에서 서버가 이미 떴으면 맞대지 않고 8 만 돈다", func(t *testing.T) {
+		r := switchedOnRig(t, shell, procs)
+		r.write(filepath.Join(r.state, "created"), "")
+		rc, calls, out := r.run(r.work, newShellRepos, procs.upgrade)
+		if rc != "0" || strings.Contains(strings.Join(calls, "\n"), "verify") || called(calls, "up -d --build") == "" {
+			t.Fatalf("서버가 있는 자리에서 덩이가 맞댔거나 띄우지 않았다(rc=%s):\n%s\n%s", rc, strings.Join(calls, "\n"), out)
+		}
+	})
+	t.Run("결과를 모르는 5 를 다시 붙여 넣어도 두 번 옮기지 않고 가 를 댄다", func(t *testing.T) {
+		// 앞 실행의 5 가 커밋한 직후 끊겼다: Postgres 원장에 행이 있고 표지는 없다. 서버는 앞 실행이 내렸다 - 새 셸에서 1 의 끝 두
+		// 줄을 다시 준다.
+		r := newProcRig(t, shell, procs)
+		r.write(r.off(), "COMPOSE_FILE=compose.yaml:compose.postgres.yaml\n")
+		r.write(r.data("fd.db"), "old")
+		r.write(filepath.Join(r.state, "pgrows"), "")
+		rc, calls, out := r.run(r.work, newShellRepos+"; p=oldp w='"+r.old+"'", procs.upgrade)
+		if rc == "0" || called(calls, "run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db") != "" {
+			t.Fatalf("행이 있는 원장에 덩이가 다시 옮겼다(rc=%s):\n%s", rc, strings.Join(calls, "\n"))
+		}
+		if !strings.Contains(out, "대상이 비어 있지 않다") || !(strings.Contains(out, "「켜기 전에 섰을 때」의 가") || strings.Contains(out, `A of "Stopped before switching on"`)) {
+			t.Fatalf("예행이 선 자리에서 덩이가 「켜기 전에 섰을 때」의 가 를 대지 않았다:\n%s", out)
+		}
+		if r.exists(r.data("fd.db.moved-to-postgres")) || r.exists(r.on()) {
+			t.Fatal("예행이 섰는데 표지가 생겼거나 선택 파일이 켜졌다")
+		}
+	})
+	t.Run("fdwhere 가 못 읽으면 앞서 읽은 값을 비우고 덩이가 선다", func(t *testing.T) {
+		r := upgradeRig(t, shell, procs)
+		_ = os.Remove(filepath.Join(r.state, "created"))
+		_ = os.Remove(filepath.Join(r.state, "up"))
+		stale := "p=stale w='" + r.old + "'; export FD_REPOS=/stale FD_REPOS2=/stale2; fdwhere; " +
+			`echo "AFTER p=${p-none} w=${w-none} R=${FD_REPOS-none},${FD_REPOS2-none}"`
+		rc, calls, out := r.run(r.work, stale, procs.upgrade)
+		if !strings.Contains(out, "AFTER p=none w=none R=none,none") {
+			t.Fatalf("못 읽은 fdwhere 가 앞서 읽은 값을 남겼다:\n%s", out)
+		}
+		if rc == "0" || len(composeCalls(calls)) != 0 {
+			t.Fatalf("fdwhere 가 못 읽었는데 덩이가 compose 를 불렀다(rc=%s):\n%s", rc, strings.Join(calls, "\n"))
+		}
+	})
 }
 
-func checkBeforeSwitchOn(t *testing.T, shell string, procs readmeProcs) {
+func checkBeforeSwitchOn(t *testing.T, shell procShell, procs readmeProcs) {
 	stopped := func(t *testing.T) *procRig {
 		r := newProcRig(t, shell, procs)
 		r.write(r.off(), "COMPOSE_FILE=compose.yaml:compose.postgres.yaml\n")
@@ -417,7 +564,7 @@ func checkBeforeSwitchOn(t *testing.T, shell string, procs readmeProcs) {
 
 // rollbackRig 는 옮긴 뒤의 자리다: 켠 선택 파일, 표지, 옮긴 SQLite 원장, 이 판의 자리(work)에서 도는 Postgres 서버. 절차는 다른
 // 자리(old)에서 돌린다 - 덩이가 라벨이 가리키는 자리 · 프로젝트로 도는지 잰다.
-func rollbackRig(t *testing.T, shell string, procs readmeProcs) *procRig {
+func rollbackRig(t *testing.T, shell procShell, procs readmeProcs) *procRig {
 	r := newProcRig(t, shell, procs)
 	r.write(r.on(), "COMPOSE_FILE=compose.yaml:compose.postgres.yaml\n")
 	r.write(r.data("fd.db"), "old")
@@ -426,7 +573,19 @@ func rollbackRig(t *testing.T, shell string, procs readmeProcs) *procRig {
 	return r
 }
 
-func checkRollback(t *testing.T, shell string, procs readmeProcs) {
+// offRig 는 되돌리기가 5 에서 선택 파일을 끈 뒤 선 자리다: 꺼 둔 선택 파일, 표지, 옮긴 SQLite 원장, 남은 fd-back.db(내용 back),
+// 내려간 서버.
+func offRig(t *testing.T, shell procShell, procs readmeProcs) *procRig {
+	r := newProcRig(t, shell, procs)
+	r.write(r.off(), "COMPOSE_FILE=compose.yaml:compose.postgres.yaml\n")
+	r.write(r.data("fd.db"), "old")
+	r.write(r.data("fd-back.db"), "back")
+	r.write(r.data("fd.db.moved-to-postgres"), "")
+	return r
+}
+
+func checkRollback(t *testing.T, shell procShell, procs readmeProcs) {
+	resume := func(r *procRig) string { return "p=newp w='" + r.work + "'; export FD_REPOS='/repos/one'" }
 	t.Run("끝까지 돈다", func(t *testing.T) {
 		r := rollbackRig(t, shell, procs)
 		rc, calls, out := r.run(r.old, "fdwhere", procs.rollback)
@@ -438,11 +597,18 @@ func checkRollback(t *testing.T, shell string, procs readmeProcs) {
 				t.Errorf("compose 가 도는 서버의 자리 · 프로젝트로 안 돌았다: %q", c)
 			}
 		}
-		if c := called(calls, "run --rm --no-deps migrate migrate export-sqlite --to /data/fd-back.db"); !strings.Contains(c, " ENV="+r.on()+" ") {
-			t.Errorf("역이관이 켠 선택 파일로 안 돌았다: %q", c)
+		for _, want := range []struct{ args, env string }{
+			{"-p newp run --rm --no-deps migrate migrate export-sqlite --to /data/fd-back.db", r.on()},
+			{"-p newp run --rm migrate migrate verify --from /data/fd-back.db", r.on()},
+			{"-p newp down", r.off()},
+			{"-p newp up -d", ""},
+		} {
+			if c := called(calls, want.args); !ran(c, r.work, want.env) {
+				t.Errorf("`%s` 가 선택 파일 %q 로 안 돌았다: %q", want.args, want.env, c)
+			}
 		}
-		if c := called(calls, "-p newp up -d"); !strings.Contains(c, " ENV= ") {
-			t.Errorf("마지막 up 이 기본 경로(SQLite)로 안 돌았다: %q", c)
+		if calledAt(calls, "-p newp run --rm migrate migrate verify --from /data/fd-back.db") > calledAt(calls, "-p newp down") {
+			t.Error("맞대기 전에 겹을 내렸다")
 		}
 		if r.exists(r.on()) || !r.exists(r.off()) || r.exists(r.data("fd.db.moved-to-postgres")) || r.read(r.data("fd.db")) != "back" {
 			t.Fatal("끝난 뒤 선택 파일 · 표지 · 원장이 맞지 않다")
@@ -474,7 +640,7 @@ func checkRollback(t *testing.T, shell string, procs readmeProcs) {
 			t.Fatalf("덤프를 대지 않았거나 선택 파일 · 원장이 바뀌었다:\n%s", out)
 		}
 	})
-	t.Run("맞대기가 서면 겹을 안 내리고 아무것도 안 놓는다", func(t *testing.T) {
+	t.Run("맞대기가 서면 선택 파일을 안 끄고 아무것도 안 놓는다", func(t *testing.T) {
 		r := rollbackRig(t, shell, procs)
 		r.env["FDT_FAIL"] = "verify --from /data/fd-back.db$"
 		rc, calls, _ := r.run(r.old, "fdwhere", procs.rollback)
@@ -486,37 +652,71 @@ func checkRollback(t *testing.T, shell string, procs readmeProcs) {
 		}
 		// 다시 붙여 넣으면 이번 실행이 낸(맞지 않은) 파일을 보고 선다.
 		delete(r.env, "FDT_FAIL")
-		if rc, calls, _ := r.run(r.old, "fdwhere", procs.rollback); rc == "0" || len(composeCalls(calls)) != 0 {
+		if rc, calls, _ := r.run(r.old, resume(r), procs.rollback); rc == "0" || len(composeCalls(calls)) != 0 {
 			t.Fatalf("맞지 않은 fd-back.db 를 두고 다시 돈 덩이가 compose 를 불렀다(rc=%s)", rc)
 		}
 	})
-	t.Run("4 뒤에 섰으면 다시 붙여 넣어 5 부터 잇는다", func(t *testing.T) {
+	t.Run("5 가 끈 뒤 섰으면 다시 붙여 넣어도 놓기 전에 다시 맞댄다", func(t *testing.T) {
 		r := rollbackRig(t, shell, procs)
-		r.env["FDT_FAIL"] = "-p newp up -d$"
-		rc, _, _ := r.run(r.old, "fdwhere", procs.rollback)
-		if rc == "0" {
-			t.Fatal("up 이 섰는데 덩이가 0 으로 끝났다")
+		r.env["FDT_FAIL"] = "-p newp down$"
+		if rc, _, _ := r.run(r.old, "fdwhere", procs.rollback); rc == "0" || r.exists(r.on()) || r.read(r.data("fd.db")) != "old" {
+			t.Fatalf("5 의 내리기가 섰는데 덩이가 0 으로 끝났거나(rc=%s) 선택 파일을 안 껐거나 원장을 놓았다", rc)
 		}
-		// 5 가 놓았고 6 이 섰다: 다시 붙여 넣으면 그것을 대고 선다(6 만 다시 돈다).
 		delete(r.env, "FDT_FAIL")
-		prelude := "p=newp w='" + r.work + "'; export FD_REPOS='/repos/one'"
-		if rc, calls, _ := r.run(r.old, prelude, procs.rollback); rc == "0" || len(composeCalls(calls)) != 0 || r.read(r.data("fd.db")) != "back" {
-			t.Fatalf("놓은 뒤 다시 돈 덩이가 서지 않았거나 원장을 건드렸다(rc=%s)", rc)
+		rc, calls, out := r.run(r.old, resume(r), procs.rollback)
+		if rc != "0" {
+			t.Fatalf("다시 붙여 넣은 덩이가 %s 로 섰다:\n%s", rc, out)
 		}
-	})
-	t.Run("4 끝 뒤 5 전에 섰으면 낸 파일을 놓고 띄운다", func(t *testing.T) {
-		r := newProcRig(t, shell, procs)
-		r.write(r.off(), "COMPOSE_FILE=compose.yaml:compose.postgres.yaml\n")
-		r.write(r.data("fd.db"), "old")
-		r.write(r.data("fd-back.db"), "back")
-		r.write(r.data("fd.db.moved-to-postgres"), "")
-		prelude := "p=newp w='" + r.work + "'; export FD_REPOS='/repos/one'"
-		rc, calls, out := r.run(r.old, prelude, procs.rollback)
-		if rc != "0" || strings.Contains(strings.Join(calls, "\n"), "export-sqlite") {
-			t.Fatalf("4 뒤에서 잇지 않았다(rc=%s):\n%s\n%s", rc, strings.Join(calls, "\n"), out)
+		v, d := calledAt(calls, "-p newp run --rm migrate migrate verify --from /data/fd-back.db"), calledAt(calls, "-p newp down")
+		if v < 0 || d < 0 || v > d || !ran(composeCalls(calls)[v], r.work, r.off()) || strings.Contains(strings.Join(calls, "\n"), "export-sqlite") {
+			t.Fatalf("다시 붙여 넣은 덩이가 꺼 둔 선택 파일로 다시 맞댄 뒤에 놓지 않았다:\n%s", strings.Join(calls, "\n"))
 		}
 		if r.read(r.data("fd.db")) != "back" || r.exists(r.data("fd.db.moved-to-postgres")) || called(calls, "-p newp up -d") == "" {
-			t.Fatal("4 뒤에서 이은 덩이가 낸 파일을 놓고 띄우지 않았다")
+			t.Fatal("다시 붙여 넣은 덩이가 낸 파일을 놓고 띄우지 않았다")
+		}
+	})
+	t.Run("5 뒤에서 이을 때 맞대기가 서면 아무것도 안 놓는다", func(t *testing.T) {
+		r := offRig(t, shell, procs)
+		r.env["FDT_FAIL"] = "verify --from /data/fd-back.db$"
+		rc, calls, _ := r.run(r.old, resume(r), procs.rollback)
+		if rc == "0" || called(calls, "-p newp down") != "" || called(calls, "-p newp up -d") != "" {
+			t.Fatalf("맞대기가 섰는데 덩이가 내리기 · 띄우기로 갔다(rc=%s):\n%s", rc, strings.Join(calls, "\n"))
+		}
+		if r.read(r.data("fd.db")) != "old" || r.read(r.data("fd-back.db")) != "back" || !r.exists(r.data("fd.db.moved-to-postgres")) {
+			t.Fatal("맞대기가 섰는데 원장 · 낸 파일 · 표지가 바뀌었다 - 낡은 원장이 놓였다")
+		}
+	})
+	t.Run("5 뒤에서 이을 때 서버가 돌면 선다", func(t *testing.T) {
+		r := offRig(t, shell, procs)
+		r.serverUp("newp", r.work)
+		rc, calls, _ := r.run(r.old, resume(r), procs.rollback)
+		if rc == "0" || len(composeCalls(calls)) != 0 || r.read(r.data("fd.db")) != "old" {
+			t.Fatalf("서버가 도는데 덩이가 맞대기 · 놓기로 갔다(rc=%s):\n%s", rc, strings.Join(calls, "\n"))
+		}
+	})
+	t.Run("6 이 놓은 뒤 7 에서 섰으면 7 만 다시 돌라고 대고 선다", func(t *testing.T) {
+		r := rollbackRig(t, shell, procs)
+		r.env["FDT_FAIL"] = "-p newp up -d$"
+		if rc, _, _ := r.run(r.old, "fdwhere", procs.rollback); rc == "0" {
+			t.Fatal("up 이 섰는데 덩이가 0 으로 끝났다")
+		}
+		delete(r.env, "FDT_FAIL")
+		rc, calls, out := r.run(r.old, resume(r), procs.rollback)
+		if rc == "0" || len(composeCalls(calls)) != 0 || r.read(r.data("fd.db")) != "back" || !strings.Contains(out, `fdc -p "newp" up -d`) {
+			t.Fatalf("놓은 뒤 다시 돈 덩이가 서지 않았거나 원장을 건드렸다(rc=%s):\n%s", rc, out)
+		}
+	})
+	t.Run("꺼진 선택 파일과 낸 파일로 이으면 다시 맞대고 놓고 띄운다", func(t *testing.T) {
+		r := offRig(t, shell, procs)
+		rc, calls, out := r.run(r.old, resume(r), procs.rollback)
+		if rc != "0" || strings.Contains(strings.Join(calls, "\n"), "export-sqlite") {
+			t.Fatalf("5 뒤에서 잇지 않았다(rc=%s):\n%s\n%s", rc, strings.Join(calls, "\n"), out)
+		}
+		if c := called(calls, "-p newp run --rm migrate migrate verify --from /data/fd-back.db"); !ran(c, r.work, r.off()) {
+			t.Fatalf("5 뒤에서 이은 덩이가 꺼 둔 선택 파일로 맞대지 않았다: %q", c)
+		}
+		if r.read(r.data("fd.db")) != "back" || r.exists(r.data("fd.db.moved-to-postgres")) || !ran(called(calls, "-p newp up -d"), r.work, "") {
+			t.Fatal("5 뒤에서 이은 덩이가 낸 파일을 놓고 기본 경로로 띄우지 않았다")
 		}
 	})
 	t.Run("선택 파일이 꺼져 있고 낸 파일도 없으면 선다", func(t *testing.T) {
@@ -524,10 +724,180 @@ func checkRollback(t *testing.T, shell string, procs readmeProcs) {
 		r.write(r.off(), "COMPOSE_FILE=compose.yaml:compose.postgres.yaml\n")
 		r.write(r.data("fd.db"), "old")
 		r.write(r.data("fd.db.moved-to-postgres"), "")
-		prelude := "p=newp w='" + r.work + "'; export FD_REPOS='/repos/one'"
-		rc, calls, _ := r.run(r.old, prelude, procs.rollback)
+		rc, calls, _ := r.run(r.old, resume(r), procs.rollback)
 		if rc == "0" || len(composeCalls(calls)) != 0 || r.read(r.data("fd.db")) != "old" || !r.exists(r.data("fd.db.moved-to-postgres")) {
 			t.Fatalf("켜기 전 배포에서 72시간 되돌리기가 서지 않았다(rc=%s):\n%s", rc, strings.Join(calls, "\n"))
 		}
 	})
+}
+
+// TestREADMEPostgresBlocksHaveNoHashComments 는 README 의 「Postgres 원장」 절에 있는 bash 블록 어디에도 낱말 머리의 `#`(주석)가
+// 없는지 잰다. 설명은 `: '…'` 나 산문이다.
+//
+// ★ 대화형 zsh(macOS 의 기본 셸)는 `interactivecomments` 가 꺼져 있어 `#` 를 주석으로 읽지 않는다: `#` 줄은 「command not found: #」
+//
+//	이고 `set -e` 덩이는 그 첫 줄에서 선다. 줄 끝의 `# …` 는 앞 명령의 인자가 되고(`f='…' # 자리를 채운다` 는 f 를 셸에 안 남긴다).
+//	절차 덩이는 TestREADMEProceduresStopWhole 이 `zsh -f -i` 로 돌려 잡지만, 준비 · 덤프 · 명령 설명 블록은 돌리지 않으므로 글자로
+//	잰다.
+func TestREADMEPostgresBlocksHaveNoHashComments(t *testing.T) {
+	for _, tc := range []struct{ readme, head string }{{"README.ko.md", "\n## Postgres 원장\n"}, {"README.md", "\n## Postgres ledger\n"}} {
+		body := readmeBody(t, tc.readme)
+		_, sec, ok := strings.Cut(body, tc.head)
+		if !ok {
+			t.Fatalf("%s 에 %q 절이 없다", tc.readme, strings.TrimSpace(tc.head))
+		}
+		sec, _, _ = strings.Cut(sec, "\n## ")
+		blocks := readmeBlocks(sec)
+		if len(blocks) < 12 {
+			t.Fatalf("%s 의 Postgres 절에서 bash 블록을 %d 개만 찾았다 - 절을 잘못 잘랐다", tc.readme, len(blocks))
+		}
+		for _, b := range blocks {
+			bad, open := hashWords(b)
+			for _, ln := range bad {
+				t.Errorf("%s 의 Postgres 절 bash 블록에 `#` 주석이 있다 - 대화형 zsh 가 명령 · 인자로 돈다(`: '…'` 나 산문으로 옮긴다):\n  %s", tc.readme, ln)
+			}
+			if open {
+				t.Errorf("%s 의 bash 블록이 따옴표를 닫지 않는다(재는 쪽이 길을 잃었다):\n%s", tc.readme, b)
+			}
+		}
+	}
+}
+
+// hashWords 는 셸 글(block)에서 따옴표 밖 낱말 머리에 `#` 가 있는 줄과, 끝에서 따옴표 · 명령 치환이 열린 채인지를 낸다. 큰따옴표
+// 안의 `$(…)` 는 따옴표 밖으로 다시 센다(그 안의 작은따옴표 · 큰따옴표가 바깥을 닫지 않는다). here-doc 의 몸은 건너뛴다.
+func hashWords(block string) (bad []string, open bool) {
+	heredoc := regexp.MustCompile(`<<-?\s*'?"?([A-Za-z_]+)'?"?`)
+	type frame struct {
+		kind  byte // 'u' 따옴표 밖 · 'd' 큰따옴표 · 's' 작은따옴표
+		depth int  // 'u' 안의 맨 괄호 깊이 - 0 에서 만난 `)` 는 이 틀을 연 `$(` 를 닫는다
+	}
+	stack := []frame{{kind: 'u'}}
+	until := ""
+	for _, ln := range strings.Split(block, "\n") {
+		if until != "" {
+			if strings.TrimSpace(ln) == until {
+				until = ""
+			}
+			continue
+		}
+		rs := []rune(ln)
+		prev, esc, hit := ' ', false, false
+		for k := 0; k < len(rs); k++ {
+			c, top := rs[k], &stack[len(stack)-1]
+			subst := c == '$' && k+1 < len(rs) && rs[k+1] == '('
+			switch {
+			case top.kind == 's':
+				if c == '\'' {
+					stack = stack[:len(stack)-1]
+				}
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case subst:
+				stack = append(stack, frame{kind: 'u'})
+				k++
+			case top.kind == 'd':
+				if c == '"' {
+					stack = stack[:len(stack)-1]
+				}
+			case c == '\'':
+				stack = append(stack, frame{kind: 's'})
+			case c == '"':
+				stack = append(stack, frame{kind: 'd'})
+			case c == '(':
+				top.depth++
+			case c == ')':
+				if top.depth > 0 {
+					top.depth--
+				} else if len(stack) > 1 {
+					stack = stack[:len(stack)-1]
+				}
+			case c == '#' && strings.ContainsRune(" \t;&|()", prev):
+				hit = true
+			}
+			prev = c
+		}
+		if hit {
+			bad = append(bad, ln)
+		}
+		if m := heredoc.FindStringSubmatch(ln); m != nil && stack[len(stack)-1].kind == 'u' {
+			until = m[1]
+		}
+	}
+	return bad, len(stack) != 1 || until != ""
+}
+
+// skillShells 는 fd-update 의 갱신 사슬을 돌릴 셸이다 - 붙여 넣는 대화형 셸에 더해, 사슬을 명령으로 돌리는 비대화형 셸(bash · zsh).
+func skillShells(t *testing.T) []procShell {
+	out := pasteShells(t)
+	for _, s := range append([]procShell(nil), out...) {
+		args := []string{"--norc", "--noprofile"}
+		if strings.HasPrefix(s.name, "zsh") {
+			args = []string{"-f"}
+		}
+		out = append(out, procShell{strings.Fields(s.name)[0] + " -c", s.path, args, false})
+	}
+	return out
+}
+
+// updateChain 은 fd-update 스킬(f)에서 내리기 · 새 자리 cd · 올리기 사슬을 떼어, 자리 표시(마켓플레이스 · 새 버전)를 M · V 로 채운다.
+func updateChain(t *testing.T, f string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(pluginRoot(t), "skills", "fd-update", f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hit []string
+	for _, c := range shellChains(string(raw)) {
+		if strings.Contains(c, composeCmd+" down") && strings.Contains(c, composeCmd+" up -d") {
+			hit = append(hit, c)
+		}
+	}
+	if len(hit) != 1 {
+		t.Fatalf("fd-update/%s 에서 내리기 · 올리기 사슬이 %d 개다 - 하나여야 한다", f, len(hit))
+	}
+	return strings.NewReplacer("<마켓플레이스>", "M", "<새 버전>", "V", "<marketplace>", "M", "<new version>", "V").Replace(hit[0])
+}
+
+// TestUpdateSkillChainRunsInEveryShell 은 fd-update 의 갱신 사슬(마운트 읽기 → 관문 → 옛 자리에서 내리기 → 새 자리 cd → 올리기)을
+// 스킬의 글자 그대로 bash(macOS 면 3.2) · zsh 에서, 대화형 · 비대화형으로 돌린다. 올리기가 새 자리에서 읽은 저장소 마운트 전부로
+// 돌고, 마운트를 못 읽으면 아무 compose 도 안 부르는지 잰다.
+//
+// ★ 사슬의 첫 줄이 `readarray` 였을 때 zsh · bash 3.2 에서 그 줄이 127 로 서서 갱신이 아예 안 됐고(zsh 의 `${R[0]}` 는 비기도
+//
+//	한다), 시험은 사슬을 글자로만 봐 초록이었다. 그래서 실제로 돌린다.
+func TestUpdateSkillChainRunsInEveryShell(t *testing.T) {
+	for _, f := range []string{"SKILL.ko.md", "SKILL.md"} {
+		chain := updateChain(t, f)
+		for _, shell := range skillShells(t) {
+			t.Run(f+"/"+shell.name, func(t *testing.T) {
+				t.Parallel()
+				r := newProcRig(t, shell, readmeProcs{})
+				dst := filepath.Join(r.home, ".claude", "plugins", "cache", "M", "flightdeck", "V")
+				if err := os.MkdirAll(dst, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				script := r.sub(chain) + "\necho \"BLOCK_RC=$?\""
+				r.serverUp("oldp", r.old)
+				rc, calls, out := r.exec(r.work, script)
+				if rc != "0" {
+					t.Fatalf("갱신 사슬이 %s 로 섰다:\n%s", rc, out)
+				}
+				if c := called(calls, "down"); !ran(c, r.old, "") {
+					t.Errorf("내리기가 도는 서버의 자리에서 안 돌았다: %q", c)
+				}
+				if c := called(calls, "up -d --build"); !ran(c, dst, "") || !strings.Contains(c, " REPOS=/repos/one,/repos/two ") {
+					t.Errorf("올리기가 새 자리 · 읽은 저장소 마운트로 안 돌았다: %q\n%s", c, out)
+				}
+				// 서버가 없으면(마운트를 못 읽는다) 아무것도 내리지도 올리지도 않는다.
+				_ = os.Remove(filepath.Join(r.state, "created"))
+				_ = os.Remove(filepath.Join(r.state, "up"))
+				rc, calls, out = r.exec(r.work, script)
+				if rc == "0" || len(composeCalls(calls)) != 0 {
+					t.Errorf("마운트를 못 읽었는데 사슬이 compose 를 불렀다(rc=%s):\n%s\n%s", rc, strings.Join(calls, "\n"), out)
+				}
+			})
+		}
+	}
 }

@@ -1047,16 +1047,17 @@ func TestUpdateSkillDoesNotLoseTheRepoMount(t *testing.T) {
 		}
 		// ★ **낱말 존재로는 부족하다.** 산문에 FD_REPOS 가 여러 번 나오므로, 명령줄에서 빠져도
 		// Contains 는 참이 된다(변이로 실증: 그 구를 지워도 초록이었다). 값이 실제로 넘어가는
-		// 자리는 `up` 명령줄 하나뿐이라 거기를 본다.
+		// 자리는 `up` 으로 끝나는 사슬(마운트를 읽어 export 하고 올린다) 하나뿐이라 거기를 본다.
+		// 사슬이 실제 셸에서 그 값을 넘기는지는 TestUpdateSkillChainRunsInEveryShell 이 돌려 잰다.
 		var upLine string
-		for _, ln := range strings.Split(body, "\n") {
-			if strings.Contains(ln, "docker compose up") {
-				upLine = ln
+		for _, c := range shellChains(body) {
+			if strings.Contains(c, "docker compose up") {
+				upLine = c
 				break
 			}
 		}
 		if upLine == "" {
-			t.Fatalf("fd-update/%s 에 `docker compose up` 줄이 없다 — 갱신 절차의 본체가 사라졌다", f)
+			t.Fatalf("fd-update/%s 에 `docker compose up` 사슬이 없다 — 갱신 절차의 본체가 사라졌다", f)
 		}
 		// ★ 읽는 쪽이 **여러 개를 갈라야 한다.** 마운트가 하나였을 때는 구분자 없는 format 으로도
 		// 무해했지만, 슬롯이 넷이 된 뒤로는 갈라 읽지 않으면 경로들이 한 줄로 **붙어서** 첫 슬롯에
@@ -1077,7 +1078,7 @@ func TestUpdateSkillDoesNotLoseTheRepoMount(t *testing.T) {
 		// 그리고 접힌 자리는 화면에 안 나온다(그 침묵이 이 축이 이미 두 번 낸 결함이다).
 		for _, v := range []string{"FD_REPOS", "FD_REPOS2", "FD_REPOS3", "FD_REPOS4"} {
 			if !strings.Contains(upLine, v+"=") {
-				t.Fatalf("fd-update/%s 의 up 명령줄이 %s 를 안 넘긴다:\n  %s\n"+
+				t.Fatalf("fd-update/%s 의 up 사슬이 %s 를 안 넘긴다:\n  %s\n"+
 					"안 주면 그 마운트가 조용히 기본값으로 되돌아간다 — 실측으로 등록 7건 중 6건이\n"+
 					"파생 불능이었고 healthz 는 내내 ok 였다. 산문에 낱말만 있는 것으로는 값이 안 넘어간다",
 					f, v, strings.TrimSpace(upLine))
@@ -1088,7 +1089,8 @@ func TestUpdateSkillDoesNotLoseTheRepoMount(t *testing.T) {
 
 // 서버를 띄우고 갱신하는 안내(fd setup 의 기동 단계 · fd-update 스킬)가 compose 를 한 머리(composeCmd)로 부른다. 그 머리는 선택
 // 파일(composeEnvPath)이 있으면 덮개 파일을 얹는다. 선택 파일의 옛 자리(~/.flightdeck/compose.env)에 파일이 남았으면 기동 ·
-// 갱신이 그 앞에서 처방을 내고 멈춘다(composeEnvLegacyGuard). 감시기의 컨테이너 사유는 명령을 내지 않고 fd-update 를 가리킨다.
+// 갱신이 그 앞에서 처방을 내고 멈추고, 셸이 어느 원장인지를 정하는 값(FD_PG_INSTANCE · FD_PG_DATABASE)을 주어도 멈춘다
+// (composeEnvGuard). 감시기의 컨테이너 사유는 명령을 내지 않고 fd-update 를 가리킨다.
 //
 // ★ 이 시험이 없어서 난 일: 스킬은 compose.env 를 얹는 줄과 안 얹는 줄을 따로 썼고, setup · 감시기는 덮개 없는 `docker compose
 // up` 을 냈다. Postgres 로 옮긴 배포에서 그 안내를 따르면 기본 compose(SQLite)가 뜬다(이관 표지가 그 기동을 막지만, 막힌
@@ -1107,8 +1109,10 @@ func TestComposeGuidanceSharesOneHead(t *testing.T) {
 			start = st.Command
 		}
 	}
-	if !strings.Contains(start, composeEnvLegacyGuard+" && FD_UID=$(id -u) FD_GID=$(id -g) "+composeCmd+" up -d") {
-		t.Errorf("fd setup 의 기동 명령이 옛 자리 관문 · compose 머리를 안 쓴다: %q", start)
+	// ★ 이미지 이름이 고정(flightdeck:local · flightdeck-pg:local)이라 `--build` 없이 띄우면 같은 이름의 옛 이미지로 뜬다 -
+	//   fd-update · README 처럼 짓고 띄운다.
+	if !strings.HasSuffix(start, composeEnvGuard+" && FD_UID=$(id -u) FD_GID=$(id -g) "+composeCmd+" up -d --build") {
+		t.Errorf("fd setup 의 기동 명령이 관문 · compose 머리 · --build 로 띄우지 않는다: %q", start)
 	}
 	for _, sig := range [][2]bool{{true, false}, {false, true}} {
 		if _, why := containerVerdict(sig[0], sig[1]); strings.Contains(why, "docker compose") || !strings.Contains(why, "/fd-update") {
@@ -1116,6 +1120,10 @@ func TestComposeGuidanceSharesOneHead(t *testing.T) {
 		}
 	}
 	root := pluginRoot(t)
+	mountRead := readmeMountRead(t, "README.ko.md")
+	if en := readmeMountRead(t, "README.md"); en != mountRead {
+		t.Errorf("README 두 판의 fdrepos 마운트 읽기가 다르다:\n  %s\n  %s", mountRead, en)
+	}
 	for _, f := range []string{"SKILL.md", "SKILL.ko.md"} {
 		raw, err := os.ReadFile(filepath.Join(root, "skills", "fd-update", f))
 		if err != nil {
@@ -1131,8 +1139,8 @@ func TestComposeGuidanceSharesOneHead(t *testing.T) {
 			if c != strings.Count(chain, composeCmd) {
 				t.Errorf("fd-update/%s 의 docker compose 가 compose 머리 없이 나온다:\n  %s", f, chain)
 			}
-			if g := strings.Index(chain, composeEnvLegacyGuard+" && "); g < 0 || g > strings.Index(chain, composeCmd) {
-				t.Errorf("fd-update/%s 의 compose 사슬이 옛 자리 관문으로 시작하지 않는다:\n  %s", f, chain)
+			if g := strings.Index(chain, composeEnvGuard+" && "); g < 0 || g > strings.Index(chain, composeCmd) {
+				t.Errorf("fd-update/%s 의 compose 사슬이 선택 파일 관문(composeEnvGuard)으로 시작하지 않는다:\n  %s", f, chain)
 			}
 			if strings.Contains(chain, composeCmd+" down") {
 				down = chain
@@ -1143,17 +1151,45 @@ func TestComposeGuidanceSharesOneHead(t *testing.T) {
 		}
 		// ★ 내리기 전에 두 관문을 같은 사슬에 `&&` 로 문다 - 옛 자리의 선택 파일, 그리고 도는 서버의 FD_DB 와 선택 파일의 두 방향
 		//   맞대기(postgres:// 인데 파일이 없거나, SQLite 인데 파일이 있다). 다른 줄에 두면 앞 줄이 서도 다음 줄의 down 이 돈다.
-		if !strings.Contains(down, composeEnvLegacyGuard+" && ") || !strings.Contains(down, "FD_DB=") ||
+		if !strings.Contains(down, composeEnvGuard+" && ") || !strings.Contains(down, "FD_DB=") ||
 			strings.Count(down, composeEnvPath) <= strings.Count(composeCmd, composeEnvPath) {
-			t.Errorf("fd-update/%s 의 내리기 사슬이 옛 자리 관문 · FD_DB 맞대기를 먼저 묻지 않는다:\n  %s", f, down)
+			t.Errorf("fd-update/%s 의 내리기 사슬이 선택 파일 관문 · FD_DB 맞대기를 먼저 묻지 않는다:\n  %s", f, down)
 		}
-		// ★ 새 자리로 옮기기(cd)와 올리기(up)는 내리기와 **한 사슬**이다 - 마운트를 못 읽었거나(readarray) 관문이 서면 옮기지도
-		//   올리지도 않는다. 따로 두면 서 있는 내리기 줄 다음에 up 이 옛 판 · 빈 마운트로 돈다.
+		// ★ 새 자리로 옮기기(cd)와 올리기(up)는 내리기와 **한 사슬**이다 - 마운트를 못 읽었거나 관문이 서면 옮기지도 올리지도
+		//   않는다. 따로 두면 서 있는 내리기 줄 다음에 up 이 옛 판 · 빈 마운트로 돈다.
+		// ★ 사슬의 마운트 읽기는 README 「Postgres 로 띄우기」의 fdrepos 와 **같은 글자**다(정본은 README 한 곳). 한때 스킬만
+		//   `readarray` 로 읽어 zsh · macOS 의 bash 3.2 에서 첫 줄이 127 로 섰다.
 		d, u := strings.Index(down, composeCmd+" down"), strings.Index(down, composeCmd+" up -d")
-		if !strings.HasPrefix(down, "readarray ") || u < 0 || !strings.Contains(down[d:u], " &&\ncd ") {
-			t.Errorf("fd-update/%s 의 마운트 읽기 · 내리기 · 새 자리 cd · 올리기가 한 `&&` 사슬이 아니다:\n  %s", f, down)
+		if !strings.HasPrefix(down, mountRead) || u < 0 || !strings.Contains(down[d:u], " &&\ncd ") {
+			t.Errorf("fd-update/%s 의 마운트 읽기(README 의 fdrepos 글자) · 내리기 · 새 자리 cd · 올리기가 한 `&&` 사슬이 아니다:\n  %s\n마운트 읽기:\n  %s", f, down, mountRead)
 		}
 	}
+}
+
+// readmeMountRead 는 README 의 fdrepos 정의에서 마운트를 읽어 export 하는 두 줄(`set -- $(docker inspect …) &&` ·
+// `[ $# -ge 1 ] && export FD_REPOS=… &&`)을 줄 머리 공백을 걷어 낸다 - fd-update 의 갱신 사슬이 이 글자로 시작한다.
+func readmeMountRead(t *testing.T, readme string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(pluginRoot(t), readme))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, def, ok := strings.Cut(string(raw), "\nfdrepos() {\n")
+	def, _, closed := strings.Cut(def, "\n}\n")
+	if !ok || !closed {
+		t.Fatalf("%s 에 fdrepos 정의가 없다", readme)
+	}
+	var keep []string
+	for _, ln := range strings.Split(def, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "set -- $(docker inspect flightdeck ") || strings.HasPrefix(ln, "[ $# -ge 1 ] && export FD_REPOS=") {
+			keep = append(keep, ln)
+		}
+	}
+	if len(keep) != 2 || !strings.HasSuffix(keep[0], " &&") || !strings.HasSuffix(keep[1], " &&") {
+		t.Fatalf("%s 의 fdrepos 에서 마운트 읽기 두 줄(각각 && 로 끝난다)을 못 찾았다: %q", readme, keep)
+	}
+	return strings.Join(keep, "\n") + "\n"
 }
 
 // shellChains 는 글(body)의 셸 사슬을 낸다 - 줄 끝이 `&&` 이면 다음 줄과 이어 한 사슬이다(사이의 줄바꿈은 둔다). 코드 블록 밖의
