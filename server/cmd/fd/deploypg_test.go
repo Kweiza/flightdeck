@@ -57,7 +57,10 @@ type composeSvc struct {
 		Source string `json:"source"`
 		Target string `json:"target"`
 	} `json:"secrets"`
-	Ports []json.RawMessage `json:"ports"`
+	Ports       []json.RawMessage `json:"ports"`
+	Healthcheck struct {
+		Test []string `json:"test"`
+	} `json:"healthcheck"`
 }
 
 func (s composeSvc) env(k string) (string, bool) {
@@ -158,11 +161,12 @@ func mustRender(t *testing.T, env map[string]string, extraArgs []string, files .
 	return m
 }
 
-// pgLayerEnv 는 Postgres 겹을 렌더할 때 운영자가 주는 값이다(시크릿 두 자리는 필수).
+// pgLayerEnv 는 Postgres 겹을 렌더할 때 운영자가 주는 값이다(시크릿 두 자리와 덤프 자리는 필수).
 func pgLayerEnv() map[string]string {
 	return map[string]string{
 		"FD_PG_SERVER_PGPASS_HOST": "/etc/fdtest/server.pgpass",
 		"FD_PG_BACKUP_PGPASS_HOST": "/etc/fdtest/backup.pgpass",
+		"FD_BACKUP_HOST":           "/srv/fdtest/backups",
 		"FD_DUMP_TIMEOUT":          "45m",
 		"FD_UID":                   "1234",
 		"FD_GID":                   "5678",
@@ -221,7 +225,7 @@ func TestComposeDefaultPathStaysSQLite(t *testing.T) {
 //
 // 재는 것: 서비스 다섯과 순서(db → migrate → db-roles → 서버 · 매일 덤프), 원장 URL, 누가 무엇을 붙이나(소켓 볼륨은 관리
 // 컨테이너만, 덤프 자리는 migrate 와 db-backup 만, 시크릿은 쓰는 쪽만), 매일 덤프가 migrate 를 다시 만들 때 멈추는 것(restart),
-// 고정 이름 external 볼륨, 비밀번호가 환경 변수 · URL 에 없는 것.
+// 접속 규칙 파일, 비밀번호가 환경 변수 · URL 에 없는 것.
 func TestComposePostgresLayerWiring(t *testing.T) {
 	m := renderPG(t)
 	if got := m.serviceNames(); !slices.Equal(got, []string{"db", "db-backup", "db-roles", "flightdeck", "migrate"}) {
@@ -229,21 +233,22 @@ func TestComposePostgresLayerWiring(t *testing.T) {
 	}
 	db, mig, roles, srv, bak := m.Services["db"], m.Services["migrate"], m.Services["db-roles"], m.Services["flightdeck"], m.Services["db-backup"]
 
-	// 원장 DB.
-	if db.ContainerName != "flightdeck-db" {
-		t.Errorf("db 의 container_name 이 %q 다 - 고정해야 판이 다른 두 디렉토리가 한 데이터 볼륨에 postmaster 둘을 못 띄운다", db.ContainerName)
+	// 원장 DB. 이름(컨테이너 · 두 볼륨)은 TestComposePostgresNamesFollowOneInstance 가 잰다.
+	// 접속 규칙: 볼륨 안 pg_hba.conf 가 아니라 저장소의 파일 하나를 기동마다 읽는다(실제 거절은 TestPGHBARejectsSuperuserOverTCP).
+	if !slices.Equal(db.Command, []string{"postgres", "-c", "hba_file=" + pgHBATarget}) {
+		t.Errorf("db 의 command 가 %q 다 - hba_file 로 deploy/pg_hba.conf 만 읽어야 이미 있는 볼륨도 초사용자의 TCP 를 거절한다", db.Command)
+	}
+	if src, ro, ok := db.mount(pgHBATarget); !ok || !ro || src != filepath.Join(pluginRoot(t), "deploy", "pg_hba.conf") {
+		t.Errorf("db 의 접속 규칙 마운트가 %q(ro=%v) 다 - 저장소의 deploy/pg_hba.conf 를 읽기 전용으로 붙인다", src, ro)
+	}
+	if hc := db.Healthcheck.Test; !slices.Contains(hc, "pg_isready") || hc[slices.Index(hc, "-U")+1] == "postgres" {
+		t.Errorf("db 의 healthcheck 가 %q 다 - 초사용자로 재면 접속 규칙이 10초마다 거절 줄을 로그에 남긴다", hc)
 	}
 	if len(db.Ports) != 0 {
 		t.Errorf("db 가 포트를 낸다(%s) - compose 망 밖에 원장을 열지 않는다", db.Ports)
 	}
 	if src, _, ok := db.mount("/var/lib/postgresql/data"); !ok || src != "pgdata" {
 		t.Errorf("db 의 데이터 자리가 %q 다 - pgdata 볼륨이어야 한다", src)
-	}
-	for _, name := range []string{"pgdata", "pgrun"} {
-		v, ok := m.Volumes[name]
-		if !ok || !v.External || v.Name != "flightdeck-"+name {
-			t.Errorf("볼륨 %s 가 %+v 다 - 이름 flightdeck-%s 의 external 이어야 한다(판마다 디렉토리가 달라도 같은 원장 · `down -v` 가 못 지운다)", name, v, name)
-		}
 	}
 	if v, _ := db.env("POSTGRES_PASSWORD_FILE"); v != "/proc/sys/kernel/random/uuid" {
 		t.Errorf("db 의 POSTGRES_PASSWORD_FILE 이 %q 다 - 초사용자는 아무도 모르는 난수여야 한다(네트워크로 못 붙는다)", v)
@@ -271,8 +276,8 @@ func TestComposePostgresLayerWiring(t *testing.T) {
 		}
 	}
 	migBackups, _, ok := mig.mount("/backups")
-	if !ok || migBackups != deployHome+"/.flightdeck-backups" {
-		t.Errorf("migrate 의 /backups 가 %q 다", migBackups)
+	if !ok || migBackups != pgLayerEnv()["FD_BACKUP_HOST"] {
+		t.Errorf("migrate 의 /backups 가 %q 다 - FD_BACKUP_HOST 여야 한다", migBackups)
 	}
 
 	// 접속 계정 one-shot.
@@ -401,18 +406,105 @@ func TestComposePostgresImagesMatchTheTestServer(t *testing.T) {
 	}
 }
 
-// TestComposePostgresNeedsBothSecretFiles 는 시크릿 자리 둘이 기본값 없이 필수인지 잰다. 기본값을 두면 그 자리는 늘 홈 안(서버가
-// FD_REPOS 로 읽는 자리)이 된다 - 비면 `up` 이 그 변수 이름을 대고 서야 한다.
-func TestComposePostgresNeedsBothSecretFiles(t *testing.T) {
-	for _, drop := range []string{"FD_PG_SERVER_PGPASS_HOST", "FD_PG_BACKUP_PGPASS_HOST"} {
+// TestComposePostgresNeedsItsHostPaths 는 호스트 자리 셋(시크릿 둘 · 덤프 자리)이 기본값 없이 필수인지 잰다. 기본값을 두면 그
+// 자리는 늘 홈 안(서버가 FD_REPOS 로 읽는 자리)이 된다 - 비면 `up` 이 그 변수 이름을 대고 서야 한다.
+func TestComposePostgresNeedsItsHostPaths(t *testing.T) {
+	for _, drop := range []string{"FD_PG_SERVER_PGPASS_HOST", "FD_PG_BACKUP_PGPASS_HOST", "FD_BACKUP_HOST"} {
 		env := pgLayerEnv()
 		delete(env, drop)
 		_, stderr, err := renderCompose(t, env, nil, "compose.yaml", "compose.postgres.yaml")
 		if err == nil {
-			t.Fatalf("%s 없이도 Postgres 겹이 렌더됐다 - 시크릿 자리는 필수여야 한다", drop)
+			t.Fatalf("%s 없이도 Postgres 겹이 렌더됐다 - 기본값 없는 필수 자리여야 한다", drop)
 		}
 		if !strings.Contains(stderr, drop) {
 			t.Fatalf("%s 가 빠진 렌더의 오류가 그 이름을 안 댄다:\n%s", drop, stderr)
+		}
+	}
+}
+
+// TestDeploySettingsSitOutsideServerMounts 는 배포가 고른 것을 적는 선택 파일(composeEnvPath, README 의 꺼 둔 이름 .off 째)과
+// 그 안에 적는 호스트 자리(pgpass 둘 · 덤프 자리)가 서버의 어느 마운트에도 안 걸리는지 잰다. 마운트는 렌더한 기본 · Postgres 겹
+// 둘에서 읽는다(FD_REPOS 는 기본값 - 홈 전체).
+//
+// ★ 서버는 같은 uid 로 FD_REPOS 를 읽고 /data(~/.flightdeck)에 쓴다. 그 안의 pgpass · 덤프는 서버가 읽고, 그 안의 선택 파일은
+// 서버가 고쳐 다음 갱신이 그 덮개 · 시크릿 자리를 믿는다 - 이 저장소가 한 번 밟은 자리다(선택 파일이 ~/.flightdeck 에 있었다).
+// ★ README 의 값은 정본(README.ko.md)과 번역본을 둘 다 본다. fdc 정의가 같은 선택 파일을 보는지도 잰다 - 안내마다 자리가
+// 갈리면 한쪽이 덮개를 뺀다.
+func TestDeploySettingsSitOutsideServerMounts(t *testing.T) {
+	root := pluginRoot(t)
+	head := "cat > " + composeEnvPath + ".off <<'EOF'"
+	for _, readme := range []string{"README.ko.md", "README.md"} {
+		raw, err := os.ReadFile(filepath.Join(root, readme))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(raw)
+		if want := `COMPOSE_ENV_FILES="${FDC_ENV:-$([ ! -e ` + composeEnvPath + ` ] || echo ` + composeEnvPath + `)}" docker compose`; !strings.Contains(body, want) {
+			t.Errorf("%s 의 fdc 가 선택 파일 %s 을 fd setup · fd-update 와 같은 판정으로 안 본다(%s)", readme, composeEnvPath, want)
+		}
+		_, rest, ok := strings.Cut(body, head+"\n")
+		block, _, closed := strings.Cut(rest, "\nEOF\n")
+		if !ok || !closed {
+			t.Fatalf("%s 에 선택 파일을 쓰는 `%s` … EOF 가 없다", readme, head)
+		}
+		set := map[string]string{}
+		for _, ln := range strings.Split(block, "\n") {
+			k, v, _ := strings.Cut(ln, "=")
+			set[k] = v
+		}
+		if set["COMPOSE_FILE"] != "compose.yaml:compose.postgres.yaml" {
+			t.Errorf("%s 의 선택 파일이 COMPOSE_FILE=%q 다 - 덮개를 얹어야 한다", readme, set["COMPOSE_FILE"])
+		}
+		env := map[string]string{"FD_UID": "1234", "FD_GID": "5678"}
+		paths := []string{composeEnvPath, composeEnvPath + ".off"}
+		for _, k := range []string{"FD_PG_SERVER_PGPASS_HOST", "FD_PG_BACKUP_PGPASS_HOST", "FD_BACKUP_HOST"} {
+			v, ok := set[k]
+			if !ok || v == "" {
+				t.Fatalf("%s 의 선택 파일에 %s 가 없다 - 기본값이 없는 자리다", readme, k)
+			}
+			env[k] = v
+			paths = append(paths, v)
+		}
+		for _, files := range [][]string{{"compose.yaml"}, {"compose.yaml", "compose.postgres.yaml"}} {
+			for _, v := range mustRender(t, env, nil, files...).Services["flightdeck"].Volumes {
+				if v.Type != "bind" {
+					continue
+				}
+				for _, p := range paths {
+					hostPath := filepath.Clean(strings.NewReplacer("~/", deployHome+"/", "$HOME/", deployHome+"/").Replace(p))
+					if src := filepath.Clean(v.Source); hostPath == src || strings.HasPrefix(hostPath, src+"/") {
+						t.Errorf("%s 의 자리 %s 가 서버 마운트 %s → %s(%v) 안이다 - 서버가 읽거나 고친다", readme, p, v.Source, v.Target, files)
+					}
+				}
+			}
+		}
+	}
+}
+
+// pgHBATarget 은 db 컨테이너 안에서 접속 규칙 파일(deploy/pg_hba.conf)이 붙는 자리다(compose.postgres.yaml 의 db).
+const pgHBATarget = "/etc/postgresql/fd_hba.conf"
+
+// TestComposePostgresNamesFollowOneInstance 는 db 컨테이너와 두 external 볼륨의 이름이 배포 이름(FD_PG_INSTANCE) 하나를 따라
+// 함께 바뀌는지 잰다.
+//
+// ★ 컨테이너 이름이 고정이어야 판이 다른 두 디렉토리가 한 데이터 볼륨에 postmaster 둘을 못 띄운다(둘째가 이름 충돌로 선다).
+// ★ 볼륨이 프로젝트 밖의 고정 이름 external 이어야 판마다 디렉토리가 달라도 같은 원장이고 `down -v` 가 못 지운다.
+// ★ 셋이 한 값에서 나와야 예행(다른 배포 이름)이 운영 원장 볼륨 · 소켓에 붙지 않고, 하나만 바꿔 이름이 다른 두 db 가 한
+// 볼륨에 붙는 일이 없다.
+func TestComposePostgresNamesFollowOneInstance(t *testing.T) {
+	for _, inst := range []string{"", "fdrehearsal"} {
+		env, want := pgLayerEnv(), "flightdeck"
+		if inst != "" {
+			env["FD_PG_INSTANCE"], want = inst, inst
+		}
+		m := mustRender(t, env, nil, "compose.yaml", "compose.postgres.yaml")
+		if got := m.Services["db"].ContainerName; got != want+"-db" {
+			t.Errorf("FD_PG_INSTANCE=%q 에서 db 의 container_name 이 %q 다 - %s-db 여야 한다", inst, got, want)
+		}
+		for _, name := range []string{"pgdata", "pgrun"} {
+			if v, ok := m.Volumes[name]; !ok || !v.External || v.Name != want+"-"+name {
+				t.Errorf("FD_PG_INSTANCE=%q 에서 볼륨 %s 가 %+v 다 - 이름 %s-%s 의 external 이어야 한다", inst, name, v, want, name)
+			}
 		}
 	}
 }

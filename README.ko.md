@@ -161,7 +161,7 @@ codex                      # 한 번은 TUI 로 띄워 "Hooks need review" 를 �
 ## 설정
 
 서버는 compose 가 읽는 환경 변수로, 세션은 `fd setup` 이 쓰는 `~/.flightdeck/config.json` 이나
-환경 변수로 설정한다. Postgres 원장의 변수(`FD_PG_*` · `FD_BACKUP_HOST`)는 덮개 파일 `compose.postgres.yaml` 을 얹을 때만 읽힌다(아래 「Postgres 원장」).
+환경 변수로 설정한다. Postgres 원장의 변수(`FD_PG_*` · `FD_BACKUP_HOST`)는 덮개 파일 `compose.postgres.yaml` 을 얹을 때만 읽히고, 선택 파일 `/etc/flightdeck/compose.env` 에 적는다(아래 「Postgres 원장」).
 
 | 변수 | 쪽 | 뜻 |
 |---|---|---|
@@ -172,7 +172,8 @@ codex                      # 한 번은 TUI 로 띄워 "Hooks need review" 를 �
 | `FD_LEDGER_HOST` | 서버 | 원장 백업 자리(기본 `~/.flightdeck-ledger`) |
 | `FD_BACKUP_DIR` | 서버 | `fd migrate` 가 Postgres 원장의 판을 올리기 전에 뜨는 덤프 자리(`--backup-dir` 가 먼저고, 둘 다 비면 `/backups` 가 있을 때 그곳). Postgres 겹의 compose 는 `/backups`(호스트 쪽은 `FD_BACKUP_HOST`)로 준다. **배포마다 따로 둔다**: 물리 복제로 떠 온 시험 시스템은 원래 시스템과 원장 식별(클러스터 식별자 · DB 이름)이 같아서, 한 자리를 나눠 쓰면 되돌리기가 다른 배포의 덤프를 고를 수 있다 |
 | `FD_DUMP_TIMEOUT` | 서버 | Postgres 원장의 덤프 한 번의 기한(Go 시간 표기, 기본 `30m`, 1초 이상). `fd migrate` 가 판을 올리기 전에 뜨는 덤프와 `db-backup` 의 매일 덤프가 같은 값을 쓴다 - 둘 다 「이 원장의 정상 덤프 시간 + 여유」다. 판올림 전 덤프 동안에는 업무 쓰기가 기다리므로, 덤프가 멈추면(백업 볼륨이 응답을 멈추면) 이 기한이 쓰기가 막히는 가장 긴 시간이다. 기한이 지나면 pg_dump 를 멈추고 서버가 실행기 연결을 끊어 잠금을 풀며, 판은 올리지 않는다. 매일 덤프는 기한이 지나면 pg_dump 를 끊고 그날을 실패로 친다(멈춘 덤프가 표 잠금을 쥔 채 서 있으면 `fd migrate` 의 DDL 이 실패한다). 큰 원장에서 정상 덤프가 더 걸리면 늘린다 |
-| `FD_BACKUP_HOST` | 서버 | Postgres 겹의 덤프 자리(기본 `~/.flightdeck-backups`). `fd migrate` 의 판올림 전 덤프가 바로 아래에, `db-backup` 의 매일 덤프가 `daily/<DB>/` 에 쌓인다(새것 14개). **미리 만들고**(주인 `FD_UID`, 권한 `0700`) **배포마다 따로 둔다**: 같은 DB 이름을 쓰는 두 배포가 한 자리를 나누면 서로의 덤프로 때를 재고 서로의 덤프를 회전한다. 준비는 아래 「Postgres 로 띄우기」 |
+| `FD_BACKUP_HOST` | 서버 | Postgres 겹의 덤프 자리. **기본값이 없다** - 비면 Postgres 겹의 `up` 이 선다. `fd migrate` 의 판올림 전 덤프가 바로 아래에, `db-backup` 의 매일 덤프가 `daily/<DB>/` 에 쌓인다(새것 14개). 덤프는 원장 전체라 **서버 마운트(`FD_REPOS` - 기본 홈 전체 - 와 `~/.flightdeck`) 밖에 미리 만든다**(예 `/var/backups/flightdeck`, 주인 `FD_UID`, 권한 `0700`). **배포마다 따로 둔다**: 같은 DB 이름을 쓰는 두 배포가 한 자리를 나누면 서로의 덤프로 때를 재고 서로의 덤프를 회전한다. 준비는 아래 「Postgres 로 띄우기」 |
+| `FD_PG_INSTANCE` | 서버 | Postgres 겹의 배포 이름(기본 `flightdeck`). db 컨테이너(`<이름>-db`)와 두 볼륨(`<이름>-pgdata` · `<이름>-pgrun`)의 이름이 여기서 함께 나온다. 운영은 기본값 그대로 두고, 예행 · 시험만 다른 값을 준다(아래 「업그레이드: SQLite 원장을 Postgres 로」의 예행) |
 | `FD_PG_SERVER_PGPASS_HOST` · `FD_PG_BACKUP_PGPASS_HOST` | 서버 | Postgres 겹의 접속 계정 둘(서버 · 매일 덤프)의 pgpass 파일. **기본값이 없다** - 비면 Postgres 겹의 `up` 이 선다. 주인 `FD_UID`, 권한 `0600`, 줄 `db:5432:<DB>:<계정>:<비밀번호>`. 비밀번호가 들어가는 유일한 자리다(환경 변수 · 명령줄 · URL 에 두지 않는다). **서버 마운트 밖에 둔다** - 서버는 `FD_REPOS`(기본 홈 전체)를 읽는다(아래 「Postgres 로 띄우기」) |
 | `FD_PG_DATABASE` · `FD_PG_SERVER_USER` · `FD_PG_BACKUP_USER` | 서버 | Postgres 겹의 DB 와 접속 계정 이름(기본 `flightdeck` · `fd_server` · `fd_backup`, 소문자 · 숫자 · `_` 만). 계정은 `db-roles` 가 만들고 잰다 - 서버 계정은 `fd_app`, 덤프 계정은 `pg_read_all_data` 의 구성원이고 특권 속성이 없다. 덤프 자리는 DB 마다 따로라(`daily/<DB>/`) DB 를 바꿔도 옛 DB 의 덤프를 새 DB 가 세거나 지우지 않는다 |
 | `FD_URL` | 세션 | 서버 주소(기본 `http://127.0.0.1:7420`) |
@@ -198,8 +199,9 @@ codex                      # 한 번은 TUI 로 띄워 "Hooks need review" 를 �
 | `flightdeck` | 서버 계정(`fd_app` 의 구성원) | TCP `db:5432`, pgpass 파일 |
 | `db-backup` | 덤프 계정(`pg_read_all_data` 의 구성원) | TCP, pgpass 파일 |
 
-초사용자는 비밀번호가 없다(아무도 모르는 난수로 초기화한다). 네트워크로는 못 붙고, 소켓 볼륨을 붙인 `migrate` ·
-`db-roles` 만 붙는다. `db` 는 포트를 내지 않는다.
+초사용자는 비밀번호가 없다(아무도 모르는 난수로 초기화한다). 접속 규칙(`deploy/pg_hba.conf`)이 초사용자의 TCP 접속을 IPv4 ·
+IPv6 모두 거절하므로 소켓 볼륨을 붙인 `migrate` · `db-roles` 만 붙는다. 그 규칙은 기동마다 저장소의 파일에서 읽는다 - 이미 있는
+볼륨도 같다. `db` 는 포트를 내지 않는다.
 
 ### Postgres 로 띄우기
 
@@ -207,44 +209,63 @@ codex                      # 한 번은 TUI 로 띄워 "Hooks need review" 를 �
 
 ```bash
 # 1. 볼륨 둘. 프로젝트 밖의 고정 이름이라 판마다 디렉토리가 바뀌어도 같은 원장이고, `down -v` 가 못 지운다.
-#    compose 가 만들지 않는다 - 없으면 빈 원장을 새로 만드는 대신 `up` 이 선다.
+#    compose 가 만들지 않는다 - 없으면 빈 원장을 새로 만드는 대신 `up` 이 선다. 이름은 배포 이름(FD_PG_INSTANCE, 기본
+#    flightdeck)에서 나온다.
 docker volume create flightdeck-pgdata && docker volume create flightdeck-pgrun
 
-# 2. 덤프 자리. 없으면 Linux 의 Docker 가 root 소유 0755 로 만들어 첫 덤프부터 못 쓴다.
-install -d -m 0700 "${FD_BACKUP_HOST:-$HOME/.flightdeck-backups}"
+# 2. 서버 마운트 밖의 자리(아래 ★): 선택 파일 · pgpass 와 덤프. 덤프 자리가 없으면 Linux 의 Docker 가 root 소유 0755 로
+#    만들어 첫 덤프부터 못 쓴다.
+sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" /etc/flightdeck /var/backups/flightdeck
 
-# 3. 접속 계정 둘의 pgpass. 서버 마운트 밖(아래 ★), 주인 FD_UID, 권한 0600, 한 줄씩.
-sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" /etc/flightdeck
+# 3. 접속 계정 둘의 pgpass. 주인 FD_UID, 권한 0600, 한 줄씩.
 (umask 077
  printf 'db:5432:flightdeck:fd_server:%s\n' "$(openssl rand -hex 24)" > /etc/flightdeck/server.pgpass
  printf 'db:5432:flightdeck:fd_backup:%s\n' "$(openssl rand -hex 24)" > /etc/flightdeck/backup.pgpass)
 
-# 4. 고른 것을 한 파일에 적는다. 비밀번호는 없고 파일 자리만 있다.
-cat > ~/.flightdeck/compose.env <<'EOF'
+# 4. 고른 것을 선택 파일에 적는다. 비밀번호는 없고 자리만 있다. 꺼 둔 이름(.off)으로 쓴다 - 켜는 것은 아래 띄우기 ·
+#    업그레이드의 한 단계다.
+cat > /etc/flightdeck/compose.env.off <<'EOF'
 COMPOSE_FILE=compose.yaml:compose.postgres.yaml
 FD_PG_SERVER_PGPASS_HOST=/etc/flightdeck/server.pgpass
 FD_PG_BACKUP_PGPASS_HOST=/etc/flightdeck/backup.pgpass
+FD_BACKUP_HOST=/var/backups/flightdeck
 EOF
-fdc() { COMPOSE_ENV_FILES="$HOME/.flightdeck/compose.env" docker compose "$@"; }   # 셸 설정에 둔다
+
+# 5. 셸 설정에 둔다. fdc 는 compose 를 부르는 머리, fdrepos 는 도는 서버의 저장소 마운트를 FD_REPOS…FD_REPOS4 로 읽는다.
+fdc() {
+  FD_TOKEN="${FD_TOKEN:-$(cat ~/.flightdeck/token 2>/dev/null || sed -n 's/.*"token": *"\([^"]*\)".*/\1/p' ~/.flightdeck/config.json 2>/dev/null)}" \
+  FD_UID="${FD_UID:-$(id -u)}" FD_GID="${FD_GID:-$(id -g)}" \
+  COMPOSE_ENV_FILES="${FDC_ENV:-$([ ! -e /etc/flightdeck/compose.env ] || echo /etc/flightdeck/compose.env)}" docker compose "$@"
+}
+fdrepos() {
+  set -- $(docker inspect flightdeck --format '{{range .Mounts}}{{if eq .Source .Destination}}{{println .Source}}{{end}}{{end}}') &&
+    [ $# -ge 1 ] && export FD_REPOS="$1" FD_REPOS2="${2:-}" FD_REPOS3="${3:-}" FD_REPOS4="${4:-}" && echo "저장소 마운트: $*"
+}
 ```
 
-- `fdc` 는 그 파일을 compose 의 env 파일로 준다(`COMPOSE_ENV_FILES`, `--env-file` 과 같다). `COMPOSE_FILE` 이 덮개 파일을
-  얹는다 - 경로는 compose 를 돌리는 디렉토리 기준이라 저장소(또는 플러그인 설치본)의 루트에서 돌린다. 다른 설정(`FD_TOKEN` ·
-  `FD_REPOS` · `FD_UID` …)은 지금처럼 셸에서 준다. 셸 값이 이 파일보다 먼저고, 이 파일을 주면 그 디렉토리의 `.env` 는 안
-  읽는다. `fd-update` 스킬도 이 파일이 있으면 같은 길로 준다.
+- `fdc` 는 선택 파일이 켜져 있으면(`/etc/flightdeck/compose.env`) 그것을 compose 의 env 파일로 준다(`COMPOSE_ENV_FILES`,
+  `--env-file` 과 같다). `fd setup` 의 기동 · `fd-update` 스킬과 같은 판정이다. `FDC_ENV` 를 주면 그 파일을 대신 준다(업그레이드가
+  켜기 전에 꺼 둔 파일로 돌린다). `COMPOSE_FILE` 이 덮개 파일을 얹는다 - 경로는 compose 를 돌리는 디렉토리 기준이라
+  저장소(또는 플러그인 설치본)의 루트에서 돌린다. 토큰 · 사용자 id 는 `fd-update` 와 같게 채우고, 저장소 마운트
+  (`FD_REPOS` …)는 지금처럼 셸에서 준다(`fdrepos`). 셸 값이 선택 파일보다 먼저고, 선택 파일을 주면 그 디렉토리의 `.env` 는
+  안 읽는다.
 - 비밀번호는 공백 · 역빗금 · 콜론이 없는 인쇄 가능한 ASCII 여야 한다. 같은 파일을 서버(pgx)와 매일 덤프(libpq)가 읽는데
   두 구현이 그 밖의 글자를 다르게 푼다. `db-roles` 가 어긋난 줄을 줄 번호와 함께 거절한다(비밀번호는 안 낸다).
-- DB · 계정 이름을 바꾸면(`FD_PG_DATABASE` · `FD_PG_SERVER_USER` · `FD_PG_BACKUP_USER`, compose.env 에) pgpass 의 줄도 같이
+- DB · 계정 이름을 바꾸면(`FD_PG_DATABASE` · `FD_PG_SERVER_USER` · `FD_PG_BACKUP_USER`, 선택 파일에) pgpass 의 줄도 같이
   바꾼다.
 
-★ **pgpass 를 서버 마운트 밖에 둔다.** 서버는 같은 uid 로 `FD_REPOS`(기본 홈 전체)를 읽기 전용으로 붙인다. 홈 안에 두면
-`0600` 이어도 서버가 덤프 계정의 비밀번호까지 읽는다. 그래서 compose 는 두 자리에 기본값을 두지 않는다 - 비면 `up` 이 선다.
+★ **선택 파일 · pgpass · 덤프를 서버 마운트 밖에 둔다.** 서버는 같은 uid 로 `FD_REPOS`(기본 홈 전체)를 읽기 전용으로,
+`~/.flightdeck` 를 읽고 쓰게 붙인다. 홈 안에 두면 `0600` 이어도 서버가 덤프 계정의 비밀번호와 원장 전체의 덤프를 읽고,
+`~/.flightdeck` 안의 선택 파일은 서버가 고쳐 쓸 수 있다 - 다음 갱신(사람이, 때로 root 로 돌린다)이 그 덮개 · 시크릿 자리를
+믿는다. 그래서 compose 는 pgpass · 덤프 자리에 기본값을 두지 않는다(비면 `up` 이 그 변수 이름을 대고 선다). `FD_REPOS` 를
+`/` · `/etc` · `/var` 로 넓히지 않는다. 선택 파일의 옛 자리 `~/.flightdeck/compose.env` 에 파일이 남아 있으면 `fd setup` 의
+기동과 `fd-update` 가 옮기는 명령을 내고 멈춘다.
 
-**띄우기**
+**띄우기** - 빈 원장으로 새로 시작할 때. 선택 파일을 켜고 띄운다.
 
 ```bash
-fdc up -d --build
-fdc ps                              # db · flightdeck · db-backup 은 healthy, migrate · db-roles 는 Exited (0)
+mv -n /etc/flightdeck/compose.env.off /etc/flightdeck/compose.env && [ ! -e /etc/flightdeck/compose.env.off ] &&
+  fdc up -d --build && fdc ps -a     # db · flightdeck · db-backup 은 healthy, migrate · db-roles 는 Exited (0)
 curl -s localhost:7420/healthz      # db_ok · db_locale_ok 가 true
 ```
 
@@ -258,19 +279,23 @@ curl -s localhost:7420/healthz      # db_ok · db_locale_ok 가 true
 ```bash
 fdc run --rm --no-deps migrate selfcheck                                                # 판 · 증분 계획
 sql() { fdc run --rm --no-deps --entrypoint psql migrate -X -v ON_ERROR_STOP=1 "$@"; }    # 초사용자 psql
+srvsql() { fdc run --rm --no-deps -T --entrypoint sh flightdeck -c 'exec psql -X -v ON_ERROR_STOP=1 -d "$FD_DB" "$@"' sh "$@"; }  # 서버 계정 · 서버의 원장(표준 입력의 SQL)
+nodump() { [ -z "$(docker ps -q --filter label=com.docker.compose.service=db-backup)" ] || { echo '덤프가 아직 돈다(손으로 돌린 once 포함) - 끝나면 다시 잰다' >&2; false; }; }
 ```
 
-- **손으로 `fd migrate` 를 돌리기 전에는 `fdc stop db-backup`** 한다. pg_dump 는 끝날 때까지 모든 표의 잠금을 쥐고, 판을
-  올리는 DDL 은 그 잠금을 lock_timeout(5초) 안에 못 얻으면 실패한다. `fdc up` 이 migrate 를 다시 만들 때(새 이미지 · 설정)는
-  compose 가 매일 덤프를 먼저 멈췄다가 migrate 가 성공한 뒤 다시 띄운다(`depends_on` 의 `restart: true`). `run` 과
-  `up --no-deps migrate` 에는 그것이 없다.
+- **손으로 `fd migrate` · 역이관 · 되살리기를 돌리기 전에는 매일 덤프를 멈추고 손으로 돌린 덤프까지 끝났는지 본다**:
+  `fdc stop db-backup && nodump`. pg_dump 는 끝날 때까지 모든 표의 잠금을 쥐고, 판을 올리는 DDL 은 그 잠금을
+  lock_timeout(5초) 안에 못 얻으면 실패한다. `fdc up` 이 migrate 를 다시 만들 때(새 이미지 · 설정)는 compose 가 매일 덤프를
+  먼저 멈췄다가 migrate 가 성공한 뒤 다시 띄운다(`depends_on` 의 `restart: true`). `run` 과 `up --no-deps migrate` 에는 그것이
+  없고, `stop` 도 `restart: true` 도 서비스의 컨테이너만 멈춘다 - `fdc run --rm db-backup once` 로 손으로 돌린 덤프는 그대로
+  돈다(`down` 도 남긴다). `nodump` 가 서면 그 덤프가 끝나기를 기다렸다가 다시 잰다.
 - **비밀번호를 바꾸려면** 두 pgpass 파일을 **제자리에서** 고치고(새 파일로 바꿔 끼우면 붙어 있는 컨테이너에서 파일이
   사라진다) `fdc up -d --force-recreate --no-deps db-roles flightdeck db-backup` 한다. 서버는 기동 때 한 번 읽는다.
 
 ★ **원장 하나에 덮개 하나.** 이관은 커밋한 뒤 SQLite 원장 옆에 이관 표지(`~/.flightdeck/fd.db.moved-to-postgres`)를 남긴다.
-옮긴 뒤 `fdc` 대신 `docker compose` 만 치면 기본 경로(SQLite)의 `migrate` 가 그 표지를 보고 원장을 열지도 새로 만들지도 않아
-서버가 안 뜬다 - `docker compose down` 뒤 `fdc up -d` 로 다시 띄운다. 거꾸로 덮개를 얹은 `migrate` 는 표지 없는 `fd.db` 가
-남아 있으면 거절한다. 표지는 아래 「72시간 안에 되돌리기」만 지운다.
+옮긴 뒤 선택 파일 없이 기본 compose 로 띄우면 SQLite 쪽 `migrate` 가 그 표지를 보고 원장을 열지도 새로 만들지도 않아 서버가
+안 뜬다 - `docker compose down` 뒤 선택 파일이 켜져 있는지 보고 `fdc up -d` 로 다시 띄운다. 거꾸로 덮개를 얹은 `migrate` 는
+표지 없는 `fd.db` 가 남아 있으면 거절한다. 표지는 아래 「72시간 안에 되돌리기」만 지운다.
 
 ### 업그레이드: SQLite 원장을 Postgres 로
 
@@ -278,62 +303,103 @@ SQLite 판에서 쌓은 원장을 들고 Postgres 원장으로 넘어가는 절�
 Postgres 에 쌓인 것까지 들고 SQLite 로 되돌릴 수 있다(아래 「72시간 안에 되돌리기」).
 
 **원장이 판 18 이어야 한다.** 이관은 마지막 SQLite 판(18)만 받는다. 더 옛 판이면 이 판의 기본 경로로 먼저 판을 올린다 -
-아래 3 이 그것이고, 판이 18 인 것을 본 뒤에 4 로 간다.
+아래 3 이 그것이다.
+
+**단계마다 끝 줄이 나와야 다음으로 간다.** 단계 하나가 `&&` 한 사슬이라 어느 명령이든 실패하면 그 단계의 끝 줄(`echo`)이
+안 나온다. 다음 단계의 첫 검사도 앞 단계의 결과를 다시 잰다 - 한꺼번에 붙여 넣어도 앞이 서면 뒤가 돌지 않는다.
+**저장소(또는 이 판의 플러그인 설치본) 루트에서 돌린다.**
 
 ```bash
-# 0. 「Postgres 로 띄우기」의 준비(볼륨 · 덤프 자리 · pgpass · compose.env · fdc)를 마친다. 띄우지는 않는다.
-# 1. 지금 마운트를 읽어 둔다. FD_REPOS 등은 마운트에만 남아 내리면 못 읽는다. 그 값을 아래 명령들의 셸에 준다.
-docker inspect flightdeck --format '{{range .Mounts}}{{.Source}} -> {{.Destination}} {{if .RW}}rw{{else}}ro{{end}}{{"\n"}}{{end}}'
-# 2. 서버를 내리고 이 판의 이미지를 짓는다.
-docker compose down
-docker compose build
-# 3. SQLite 원장을 이 판으로 올린다(이미 18 이면 아무것도 안 한다). selfcheck 가 「스키마 버전 18」을 내야 한다.
-docker compose run --rm --no-deps migrate migrate --db /data/fd.db
-docker compose run --rm --no-deps migrate selfcheck --db /data/fd.db
-# 4. Postgres 원장을 띄우고 기준선만 깐다(판 18 에서 멈춘다). db 가 같이 뜬다.
-fdc run --rm migrate migrate --to 18
-# 5. 예행 → 옮기기 → 맞대기. 옮기기가 커밋한 뒤 원본 옆에 이관 표지(fd.db.moved-to-postgres)를 남긴다.
-fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db --dry-run
-fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db
-fdc run --rm --no-deps migrate migrate verify --from /data/fd.db
-# 6. 옮긴 SQLite 원장의 이름을 바꾸고 읽기 전용으로 둔다. 옆 파일(-wal · -shm)도 같이 옮긴다 - 이관이 원본을 읽기 전용으로
-#    열어도 빈 옆 파일이 생긴다.
-t=$(date -u +%Y%m%dT%H%M%SZ)
-for s in '' -wal -shm; do [ ! -e ~/.flightdeck/fd.db$s ] || mv ~/.flightdeck/fd.db$s ~/.flightdeck/fd.db.pre-pg-$t$s; done
-chmod 0444 ~/.flightdeck/fd.db.pre-pg-$t
-# 7. Postgres 원장으로 띄운다. 보드에 옮긴 항목이 보이면 된 것이다.
-fdc up -d
+# 0. 「Postgres 로 띄우기」의 준비 1-5(볼륨 · 자리 · pgpass · 꺼 둔 선택 파일 · fdc · fdrepos)를 마친다. 켜지도 띄우지도 않는다.
+# 1. 도는 서버의 compose 프로젝트 · 자리와 저장소 마운트를 읽는다. 마운트(FD_REPOS 등)는 내리면 못 읽는다.
+unset FDC_ENV; p=$(docker inspect flightdeck -f '{{index .Config.Labels "com.docker.compose.project"}}') &&
+  w=$(docker inspect flightdeck -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}') &&
+  [ -n "$p" ] && [ -d "$w" ] && fdrepos && echo "1 끝: 프로젝트 $p · 자리 $w"
+# 2. 옛 판의 자리에서 내리고, 그 프로젝트의 컨테이너가 하나도 안 남았는지 본다(손으로 돌린 run 컨테이너도).
+[ -n "$p" ] && (cd "$w" && fdc -p "$p" down) && [ -z "$(docker ps -aq --filter label=com.docker.compose.project="$p")" ] &&
+  ! docker inspect flightdeck >/dev/null 2>&1 && echo "2 끝: 내렸다"
+# 3. 이 판의 이미지를 짓고 SQLite 원장을 이 판으로 올린다(이미 18 이면 아무것도 안 한다). selfcheck 가 ok 를 내야 한다.
+! docker inspect flightdeck >/dev/null 2>&1 && fdc build &&
+  fdc run --rm --no-deps migrate migrate --db /data/fd.db && fdc run --rm --no-deps migrate selfcheck --db /data/fd.db &&
+  echo "3 끝: SQLite 원장이 이 판이다"
+# 4. 꺼 둔 선택 파일로 Postgres 원장을 띄우고 기준선만 깐다(판 18 에서 멈춘다). db 가 같이 뜬다.
+export FDC_ENV=/etc/flightdeck/compose.env.off
+[ -f "$FDC_ENV" ] && fdc run --rm migrate migrate --to 18 && echo "4 끝: 기준선을 깔았다"
+# 5. 예행 → 옮기기. 옮기기가 커밋한 뒤 원본 옆에 이관 표지(fd.db.moved-to-postgres)를 남긴다. 표지가 없으면 멈춘다.
+fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db --dry-run &&
+  fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db &&
+  [ -e ~/.flightdeck/fd.db.moved-to-postgres ] && echo "5 끝: 옮겼다"
+# 6. 접속 계정을 만들고 재고(db-roles), 서버 계정으로 서버의 원장에 붙어 본다 - 옮긴 표가 읽히고 TEMPORARY 권한이 없어야 한다.
+[ -e ~/.flightdeck/fd.db.moved-to-postgres ] && fdc up -d db-roles && [ "$(docker wait "$(fdc ps -aq db-roles)")" = 0 ] &&
+  srvsql <<'SQL' && echo "6 끝: 계정이 맞다"
+SELECT current_user AS 계정, current_database() AS 원장, (SELECT count(*) FROM item) AS 항목, (SELECT count(*) FROM judgment) AS 판단;
+SELECT 1 / (NOT has_database_privilege(current_database(), 'TEMPORARY'))::int AS temp_권한_없음;
+SQL
+# 7. 맞댄 뒤에만 선택 파일을 켠다. 켠 선택 파일은 이 뒤의 갱신 · 재기동이 Postgres 로 띄운다.
+[ -e ~/.flightdeck/fd.db.moved-to-postgres ] && fdc run --rm --no-deps migrate migrate verify --from /data/fd.db &&
+  mv -n /etc/flightdeck/compose.env.off /etc/flightdeck/compose.env && [ ! -e /etc/flightdeck/compose.env.off ] &&
+  unset FDC_ENV && echo "7 끝: 맞았고 선택 파일을 켰다"
+# 8. Postgres 원장으로 띄운다. 보드에 옮긴 항목이 보이면 된 것이다.
+[ -e /etc/flightdeck/compose.env ] && [ -z "${FDC_ENV:-}" ] && fdc up -d && fdc ps -a
 curl -s localhost:7420/healthz      # db_ok · db_locale_ok 가 true
 ```
 
-- 5 의 예행이나 옮기기가 거절 · 실패하면 아무것도 커밋되지 않는다(트랜잭션 하나). SQLite 원장은 읽기만 했다. 사유를 고치고
-  5 부터 다시 돌거나, `fdc down` 뒤 `docker compose up -d` 로 SQLite 판으로 돌아간다.
+- **5 의 표지가 남기 전에** 서면(1-5 의 거절 · 실패) 아무것도 커밋되지 않았다(이관은 트랜잭션 하나). SQLite 원장은 읽기만
+  했다. 사유를 고치고 그 단계부터 다시 돌거나, SQLite 판으로 돌아간다: `fdc down; unset FDC_ENV; fdc up -d`(선택 파일은 꺼진
+  채다).
+- **5 의 표지가 남은 뒤에** 서면(6-8) 원장은 이미 Postgres 에 있다. 사유를 고치고 그 단계부터 다시 돈다. SQLite 판으로
+  돌아가려면 아래 「72시간 안에 되돌리기」를 따른다 - 표지를 손으로 지우는 다른 길은 없다.
+- 옮긴 뒤 SQLite 원장(`fd.db` 와 옆 파일)은 그 자리에 두어도 된다 - 표지가 SQLite 쪽에서 그 원장을 막는다. 치우려면
+  (선택) 서버를 내린 채 `fd.db` · `fd.db-wal` · `fd.db-shm` 을 같은 디렉토리의 다른 이름으로 옮기고 읽기 전용으로 둔다. **표지는
+  옮기지 않는다** - 표지가 없으면 그 자리에 새 SQLite 원장이 생길 수 있다.
+- **사본을 옮겼으면**(`--from` 에 원장 자리 밖의 `VACUUM INTO` 사본) 표지는 사본 옆에 남고 원장 자리에는 없다. 덮개를 얹은
+  `migrate` 가 원장 자리의 `fd.db` 를 이관 안 된 원장으로 보고 거절한다. 원본이 옮긴 것과 같은지 맞댄 뒤 표지를 남기거나,
+  원본을 원장 자리 밖으로 옮긴다:
+  `fdc run --rm --no-deps migrate migrate verify --from /data/fd.db && touch ~/.flightdeck/fd.db.moved-to-postgres`
+- **두 원장에 이미 따로 쓰였으면**(옮긴 뒤 SQLite 판 서버가 옛 원장에 썼다 등) 두 서버를 다 내리고 **어느 원장도 지우지
+  않는다.** `verify --from` 으로 어긋난 행을 기본키로 보고 어느 쪽을 살릴지 사람이 정한다. 합치는 명령은 없다.
 - 거절 갈래와 대조의 자세한 모양은 아래 「SQLite 원장을 Postgres 로 옮기기」에 있다.
+
+**예행은 운영과 겹치지 않게 한다.** 서버 컨테이너 이름(`flightdeck`)과 포트 7420 이 고정이라 같은 Docker 에서는 운영 서버와
+같이 못 뜨고, 운영과 같은 볼륨 이름을 쓰면 예행의 `migrate` 가 운영 원장에 초사용자로 붙는다 - **다른 Docker 환경**(다른 기계 ·
+VM)에서 한다. 거기서도 운영과 다른 값을 준다: 프로젝트 이름(`fdc -p <예행>`), 홈(`HOME` - `/data` 가 `~/.flightdeck` 다),
+배포 이름 `FD_PG_INSTANCE`(db 컨테이너 · 두 볼륨의 이름), `FD_BACKUP_HOST`, 선택 파일(`FDC_ENV=<예행용 파일>`). 볼륨은
+`docker volume create <배포 이름>-pgdata && docker volume create <배포 이름>-pgrun` 으로 만들고, 끝나면 `fdc -p <예행> down` 뒤
+`docker volume rm <배포 이름>-pgdata <배포 이름>-pgrun` 으로 비운다. ★ **`flightdeck-pgdata` · `flightdeck-pgrun` 은 지우지
+않는다** - 운영 원장이다. 지우기 전에 `docker volume ls` 로 이름을 한 번 더 본다.
 
 #### 72시간 안에 되돌리기
 
 옮긴 뒤 72시간을 되돌리기 창으로 둔다. `export-sqlite` 가 Postgres 원장을 판 18 의 **새** SQLite 파일로 옮기므로, 옮긴 뒤
 Postgres 에 쌓인 항목 · 선점 · 판단도 같이 돌아온다. 이 창 동안은 Postgres 스키마를 18 위로 올리는 flightdeck 판으로
-갱신하지 않는다 - `export-sqlite` 는 판 18 의 원장만 받는다.
+갱신하지 않는다 - `export-sqlite` 는 판 18 의 원장만 받는다. 업그레이드처럼 단계마다 끝 줄이 나와야 다음으로 간다.
 
 ```bash
-# 1. 서버와 매일 덤프를 내린다(db 는 둔다). 붙은 연결이 있으면 역이관이 거절한다.
-fdc stop flightdeck db-backup
-# 2. 예행 → 옮기기 → 맞대기. 맞대기는 빼지 않는다.
-fdc run --rm --no-deps migrate migrate export-sqlite --to /data/fd-back.db --dry-run
-fdc run --rm --no-deps migrate migrate export-sqlite --to /data/fd-back.db
-fdc run --rm --no-deps migrate migrate verify --from /data/fd-back.db
-# 3. Postgres 겹을 내리고 낸 파일을 원장 자리에 둔다(옆 파일도 같이).
-fdc down
-for s in '' -wal -shm; do [ ! -e ~/.flightdeck/fd-back.db$s ] || mv ~/.flightdeck/fd-back.db$s ~/.flightdeck/fd.db$s; done
-rm ~/.flightdeck/fd.db.moved-to-postgres   # 이관 표지 - 남기면 SQLite 쪽 migrate 가 이 원장을 열지 않는다
-# 4. Postgres 를 고른 파일을 치우고 기본 경로(SQLite)로 띄운다. 남겨 두면 다음 갱신이 다시 Postgres 겹을 얹는다.
-mv ~/.flightdeck/compose.env ~/.flightdeck/compose.env.off
-docker compose up -d
+# 1. 저장소 마운트를 읽고, 서버와 매일 덤프를 내린 뒤(db 는 둔다) 손으로 돌린 덤프까지 끝났는지 본다. 붙은 연결이 있으면
+#    역이관이 거절한다.
+unset FDC_ENV; fdrepos && fdc stop flightdeck db-backup && nodump && echo "1 끝: 내렸다"
+# 2. 예행 → 옮기기. 낸 파일이 있어야 다음으로 간다.
+fdc run --rm --no-deps migrate migrate export-sqlite --to /data/fd-back.db --dry-run &&
+  fdc run --rm --no-deps migrate migrate export-sqlite --to /data/fd-back.db &&
+  [ -f ~/.flightdeck/fd-back.db ] && echo "2 끝: 냈다"
+# 3. 맞댄 뒤에만 Postgres 겹을 내리고 선택 파일을 끈다. 켜 두면 다음 갱신이 다시 Postgres 겹을 얹는다.
+[ -f ~/.flightdeck/fd-back.db ] && fdc run --rm --no-deps migrate migrate verify --from /data/fd-back.db && fdc down &&
+  mv -n /etc/flightdeck/compose.env /etc/flightdeck/compose.env.off && [ ! -e /etc/flightdeck/compose.env ] &&
+  echo "3 끝: 맞았고 선택 파일을 껐다"
+# 4. 낸 파일을 원장 자리에 둔다. 그 자리의 원장(옮긴 SQLite 원장과 옆 파일)은 지우지 않고 옆 이름으로 옮긴다. 하나라도 못
+#    옮기면 멈춘다. 그 뒤에야 이관 표지를 지운다 - 남기면 SQLite 쪽 migrate 가 이 원장을 열지 않는다.
+[ ! -e /etc/flightdeck/compose.env ] && (set -eu; cd ~/.flightdeck; [ -f fd-back.db ]; t=$(date -u +%Y%m%dT%H%M%SZ)
+  for s in '' -wal -shm -journal; do if [ -e fd.db$s ]; then mv -n fd.db$s fd.db.pre-back-$t$s; fi; done
+  for s in '' -wal -shm -journal; do [ ! -e fd.db$s ]; done
+  for s in '' -wal -shm -journal; do if [ -e fd-back.db$s ]; then mv -n fd-back.db$s fd.db$s; fi; done
+  for s in '' -wal -shm -journal; do [ ! -e fd-back.db$s ]; done
+  [ -f fd.db ]; rm -f fd.db.moved-to-postgres; echo "4 끝: 낸 원장을 놓았다")
+# 5. 기본 경로(SQLite)로 띄운다.
+[ -f ~/.flightdeck/fd.db ] && [ ! -e ~/.flightdeck/fd.db.moved-to-postgres ] && fdc up -d && fdc ps -a
 ```
 
-- 3 의 자리에 `~/.flightdeck/fd.db` 가 이미 있으면(옮긴 뒤 기본 경로로 잘못 띄워 생긴 빈 원장) 덮기 전에 열어 보고 치운다.
-- verify 가 어긋나면 `fd-back.db` 를 지우고 서버를 내린 채 1 부터 다시 돈다.
+- verify 가 어긋나면(3 이 선다) 낸 파일을 원장 자리에 두지 않는다. 붙은 연결을 찾아 내리고, `fd-back.db` 를 옆 이름으로
+  옮긴 뒤(역이관은 있는 파일을 덮지 않는다) 1 부터 다시 돈다.
 - Postgres 원장(볼륨 `flightdeck-pgdata`)은 그대로 남는다. 다시 옮길 때 이관은 빈 대상만 받는다.
 
 ### Postgres 원장의 매일 덤프
@@ -345,17 +411,21 @@ docker compose up -d
 설정은 `fdc run --rm --no-deps db-backup config` 가 한 줄로 낸다. 손으로 한 번 뜨려면 `once` 다(0 = 떴거나 아직 때가
 아니다, 1 = 실패, 3 = 다른 실행이 같은 자리에서 돌고 있어 아무것도 안 했다).
 
-**되살리기** - `migrate` 서비스로 한다(초사용자 · 소켓, 덤프가 `/backups` 에 보인다). `sql` 은 위 「Postgres 로 띄우기」의
-관리 명령이다.
+**되살리기** - `migrate` 서비스로 한다(초사용자 · 소켓, 덤프가 `/backups` 에 보인다). `sql` · `srvsql` · `nodump` 는 위
+「Postgres 로 띄우기」의 관리 명령이다. 단계마다 끝 줄이 나와야 다음으로 간다.
 
 ```bash
-fdc stop flightdeck db-backup      # 되살릴 DB 에 붙은 연결을 끊는다
+fdc stop flightdeck db-backup && nodump && echo "내렸다"      # 되살릴 DB 에 붙은 연결을 끊는다
 ```
 
-1. 덤프가 되살릴 DB 이름을 덤프에서 읽는다. `--create` 는 지금 `FD_PG_DATABASE` 가 아니라 **덤프에 적힌 이름**으로 DB 를 만든다.
+1. 되살릴 DB 이름을 덤프에서 읽어 `FD_PG_DATABASE` 와 맞댄다. `--create` 는 지금 `FD_PG_DATABASE` 가 아니라 **덤프에 적힌
+   이름**으로 DB 를 만든다 - 다르면 서버가 되살린 DB 를 안 본다. **다르면 멈춘다**: 어느 이름을 쓸지(`FD_PG_DATABASE` 와
+   pgpass 의 줄을 덤프의 이름으로 바꿀지) 사람이 정한다.
 
    ```bash
-   fdc run --rm --no-deps --entrypoint pg_restore migrate -l /backups/daily/<DB 자리>/fd-daily-<UTC>.dump | grep '^; *dbname:'
+   f='/backups/daily/<DB 자리>/fd-daily-<UTC>.dump'   # 자리를 채운다
+   fdc run --rm --no-deps --entrypoint sh migrate -c 'd=$(pg_restore -l "$1" | sed -n "s/^; *dbname: //p")
+     echo "덤프의 DB: $d · FD_PG_DATABASE: $PGDATABASE"; [ -n "$d" ] && [ "$d" = "$PGDATABASE" ]' sh "$f" && echo "1 끝: 이름이 같다"
    ```
 
    그 이름의 DB 가 이미 있으면 지우지 말고 **이름을 바꿔 남긴다**(`<DB>` 는 위에서 읽은 이름):
@@ -365,17 +435,24 @@ fdc stop flightdeck db-backup      # 되살릴 DB 에 붙은 연결을 끊는다
 3. DB 째 되살린다. `--create` 가 DB 단위 권한(PUBLIC 의 `TEMPORARY` 회수)까지 되살린다 - 미리 만든 DB 에 부으면 그것이 빠진다.
 
    ```bash
-   fdc run --rm --no-deps --entrypoint pg_restore migrate -d postgres --create --exit-on-error /backups/daily/<DB 자리>/fd-daily-<UTC>.dump
+   fdc run --rm --no-deps --entrypoint pg_restore migrate -d postgres --create --exit-on-error "$f" && echo "3 끝: 되살렸다"
    ```
 
-4. 계정을 다시 재고(`fdc up -d db-roles`) **서버 계정으로** 붙어 확인한다. 표가 읽혀야 하고(멤버십), `TEMPORARY` 권한이
-   없어야 한다. 둘 중 하나라도 어긋나면 오류로 멈추고 종료 코드가 0 이 아니다(`ON_ERROR_STOP`, 권한이 남아 있으면 0 으로
-   나누기 오류를 일부러 낸다). 이름을 바꿨으면 `fd_server` · `flightdeck` 자리에 그 이름을 쓴다.
+4. 계정을 다시 재고(`db-roles`) **서버 계정으로 서버의 원장에** 붙어(`srvsql` - 서버의 `FD_DB` 그대로) 되살린 원장인지 본다.
+   서버가 붙는 DB 가 이름을 바꿔 남긴 옛 DB 와 같은 DB(같은 oid)거나, 표가 안 읽히거나(멤버십), 항목이 0 건이거나,
+   `TEMPORARY` 권한이 남아 있으면 오류로 멈추고 종료 코드가 0 이 아니다(`ON_ERROR_STOP`, 0 으로 나누기 오류를 일부러 낸다).
+   마지막 이벤트 시각이 덤프 이름의 시각 바로 전인지는 첫 줄에서 눈으로 본다.
 
    ```bash
-   fdc run --rm --no-deps --entrypoint psql flightdeck -X -h db -U fd_server -d flightdeck -v ON_ERROR_STOP=1 \
-     -c 'SELECT count(*) FROM judgment' \
-     -c "SELECT 1 / (NOT has_database_privilege(current_database(), 'TEMPORARY'))::int"
+   fdc up -d db-roles && [ "$(docker wait "$(fdc ps -aq db-roles)")" = 0 ] && srvsql <<'SQL' && echo "4 끝: 되살린 원장이다"
+   SELECT current_database() AS 원장, d.oid, o.oid AS 옛_oid, (SELECT count(*) FROM item) AS 항목,
+          (SELECT count(*) FROM judgment) AS 판단, (SELECT max(at) FROM event) AS 마지막_이벤트
+     FROM pg_database d LEFT JOIN pg_database o ON o.datname = d.datname || '_before_restore' WHERE d.datname = current_database();
+   SELECT 1 / (d.oid IS DISTINCT FROM o.oid)::int AS 새_DB
+     FROM pg_database d LEFT JOIN pg_database o ON o.datname = d.datname || '_before_restore' WHERE d.datname = current_database();
+   SELECT 1 / (count(*) > 0)::int AS 항목_있음 FROM item;
+   SELECT 1 / (NOT has_database_privilege(current_database(), 'TEMPORARY'))::int AS temp_권한_없음;
+   SQL
    ```
 
 5. `fdc up -d` 로 다시 띄운다. 이름을 바꿔 남긴 옛 DB 는 확인이 끝나면 지운다(`sql -d postgres -c 'DROP DATABASE "<DB>_before_restore"'`).

@@ -241,7 +241,7 @@ ensure_dir() {
 		return 0
 	fi
 	log "덤프 자리 $dir 에 쓸 수 없다 - 이 컨테이너는 uid $(id -u):$(id -g) 로 돈다. 호스트의" \
-		"백업 자리(compose 의 FD_BACKUP_HOST, 기본 ~/.flightdeck-backups)를 그 uid 소유 · 권한 0700 으로 만든다:" \
+		"백업 자리(compose 의 FD_BACKUP_HOST - 서버 마운트 밖)를 그 uid 소유 · 권한 0700 으로 만든다:" \
 		"sudo install -d -m 0700 -o $(id -u) -g $(id -g) <호스트 자리>. 자리가 없으면 Docker 가 root 소유 0755 로 만든다 -" \
 		"이미 그렇게 생겼으면 sudo chown -R $(id -u):$(id -g) <호스트 자리> 와 sudo chmod 0700 <호스트 자리>"
 	return 1

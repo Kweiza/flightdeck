@@ -19,7 +19,7 @@ The repository root is the plugin root (what `${CLAUDE_PLUGIN_ROOT}` points at).
 | `board/` | Owner kanban board (`board.py` · `index.html` · `install.sh`). Its tests `test_board.py` run under `go test ./cmd/fd` |
 | `server/` | One Go module — server, CLI, MCP and hooks are **one binary** |
 | `compose.yaml` | Server container (one-shot schema apply + server). The ledger is a SQLite file |
-| `compose.postgres.yaml` · `deploy/` | The Postgres ledger override (ledger database, login accounts, daily dump) and its scripts (`db-roles.sh`, `db-backup.sh`). `deploypg_test.go` checks it against the rendered compose config |
+| `compose.postgres.yaml` · `deploy/` | The Postgres ledger override (ledger database, login accounts, daily dump) and its scripts and access rules (`db-roles.sh`, `db-backup.sh`, `pg_hba.conf`). `deploypg_test.go` checks it against the rendered compose config, `deployhba_test.go` against a real Postgres started from that config |
 | `compose.test.yaml` | Test-only Postgres (`pg-test`). The tests take it from `FD_TEST_PG` |
 | `DESIGN.md` | Document of record for the design |
 | `docs/*.md` · `docs/*.ko.md` | Topic docs (concepts · server · codex · several repositories · reference · development) |

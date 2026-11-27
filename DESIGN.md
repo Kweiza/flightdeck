@@ -167,12 +167,13 @@ REST 가 없으면 서버를 만지는 순간 전 세션의 조정이 끊기고,
       -v $FD_LEDGER_HOST:/ledger → /ledger/*.jsonl + manifest.json  (판단 원장, 매시간)
                                  /ledger/journal.git  (세대 역사, bare)
 
-  + compose.postgres.yaml — 얹을 때만. 원장은 Postgres 17, 시크릿 = 접속 계정 둘의 pgpass 파일
-    db           postgres:17. 볼륨 flightdeck-pgdata(원장) · flightdeck-pgrun(소켓), 포트를 안 낸다
+  + compose.postgres.yaml — 선택 파일(/etc/flightdeck/compose.env)이 얹을 때만. 원장은 Postgres 17, 시크릿 = 접속 계정 둘의 pgpass 파일
+    db           postgres:17. 이름은 배포 이름(FD_PG_INSTANCE, 기본 flightdeck)에서: 컨테이너 flightdeck-db,
+                 볼륨 flightdeck-pgdata(원장) · flightdeck-pgrun(소켓). 포트를 안 낸다, 접속 규칙 deploy/pg_hba.conf
     migrate      초사용자 · 소켓(trust). 손으로 하는 관리 명령(이관 · 역이관 · 되살리기 · psql)도 여기
     db-roles     one-shot. 서버 계정(fd_app 의 구성원) · 덤프 계정(pg_read_all_data 의 구성원)을 맞춘다
     flightdeck   서버 계정으로 TCP db:5432, pgpass 시크릿
-    db-backup    덤프 계정으로 매일 pg_dump -Fc → $FD_BACKUP_HOST/daily/<DB>/ (새것 14개)
+    db-backup    덤프 계정으로 매일 pg_dump -Fc → $FD_BACKUP_HOST/daily/<DB>/ (새것 14개, 자리는 기본값 없이 서버 마운트 밖)
 
 [모든 세션 머신]
   플러그인 flightdeck
@@ -186,22 +187,35 @@ REST 가 없으면 서버를 만지는 순간 전 세션의 조정이 끊기고,
 그대로다 — 갱신 한 번에 서버가 말없이 다른(빈) 원장을 보면 그것이 곧 데이터 유실로 보인다. profile 로는 이 전환을
 못 한다: profile 은 서비스를 켜고 끌 뿐 이미 있는 서비스(migrate · flightdeck)의 원장 URL · 의존 · 시크릿을 못 바꾸고,
 서버에 시크릿을 붙이면 그 파일이 없는 기본 `up` 까지 선다. 그래서 갈아 끼우는 것 전부를 `compose.postgres.yaml` 한
-파일에 두고, 고른 것은 `COMPOSE_FILE` 한 줄(README 「Postgres 로 띄우기」의 compose.env)로 남긴다. 겹의 모양:
+파일에 두고, 고른 것은 `COMPOSE_FILE` 한 줄(README 「Postgres 로 띄우기」의 선택 파일 `/etc/flightdeck/compose.env`)로
+남긴다. 겹의 모양:
 
 - **초사용자는 비밀번호가 없다.** 아무도 모르는 난수로 초기화하고 소켓만 trust 다. 소켓 볼륨은 `migrate` · `db-roles`
-  만 붙인다 — 서버와 매일 덤프는 초사용자로 못 붙는다. 빈 DB 의 준비(역할 · 스키마 권한 · pg_trgm)가 초사용자를 요구해
-  `migrate` 는 소유 역할이 아니라 초사용자로 돈다.
+  만 붙인다 — 서버와 매일 덤프는 초사용자로 못 붙는다. 비밀번호를 모르는 것에 기대지 않는다: 접속 규칙
+  (`deploy/pg_hba.conf`)이 초사용자의 TCP 를 IPv4 · IPv6(복제까지) 모두 `reject` 한다. 그 파일은 `hba_file` 로 기동마다
+  읽어, 볼륨 안 pg_hba.conf(첫 초기화의 initdb 인자가 쓴 것 - 다른 길로 만든 볼륨이면 trust 일 수 있다)를 안 탄다. 실제
+  Postgres 로 두 볼륨(새 볼륨 · trust 로 만든 볼륨)을 재는 시험이 그 거절을 잠근다(`TestPGHBARejectsSuperuserOverTCP`).
+  빈 DB 의 준비(역할 · 스키마 권한 · pg_trgm)가 초사용자를 요구해 `migrate` 는 소유 역할이 아니라 초사용자로 돈다.
 - **볼륨은 프로젝트 밖의 고정 이름이고 external 이다.** compose 프로젝트 이름은 디렉토리 이름인데 플러그인 설치본은
   판마다 디렉토리가 다르다 — 프로젝트 볼륨이면 갱신 한 번에 빈 원장이 뜬다. external 이라 `down -v` 가 못 지우고, 없으면
   빈 원장을 새로 만드는 대신 `up` 이 선다. 같은 까닭으로 `db` 의 container_name 을 고정한다: 두 디렉토리가 한 데이터
-  볼륨에 postmaster 둘을 띄우면 PID 이름공간이 달라 postmaster.pid 가 못 막는다.
-- **시크릿은 pgpass 파일 둘뿐이고 서버 마운트 밖에 둔다.** 서버는 같은 uid 로 `FD_REPOS`(기본 홈 전체)를 읽는다.
-  같은 파일을 pgx(서버)와 libpq(덤프)가 다르게 푸므로 `db-roles` 가 두 구현이 같게 읽는 꼴만 받는다.
+  볼륨에 postmaster 둘을 띄우면 PID 이름공간이 달라 postmaster.pid 가 못 막는다. 컨테이너 이름과 두 볼륨 이름은 배포 이름
+  `FD_PG_INSTANCE` 하나에서 나온다 — 하나만 바꿔 이름이 다른 둘이 한 볼륨에 붙는 일이 없고, 예행(다른 배포 이름)이 운영
+  원장의 소켓에 초사용자로 붙지 않는다.
+- **시크릿은 pgpass 파일 둘뿐이고, 시크릿 · 덤프 · 선택 파일을 모두 서버 마운트 밖에 둔다.** 서버는 같은 uid 로
+  `FD_REPOS`(기본 홈 전체)를 읽고 `~/.flightdeck` 에 쓴다 — 홈 안이면 서버가 덤프 계정의 비밀번호와 원장 전체의 덤프를 읽고,
+  `~/.flightdeck` 안의 선택 파일은 서버가 고쳐 다음 갱신(사람이, 때로 root 로)이 그 덮개 · 시크릿 자리를 믿는다. 그래서 pgpass
+  자리와 덤프 자리(`FD_BACKUP_HOST`)는 기본값이 없고(root 없이 만들 수 있는 홈 밖 자리가 없어 기본값은 늘 홈 안이 된다),
+  선택 파일은 `/etc/flightdeck/compose.env` 다. 옛 자리(`~/.flightdeck/compose.env`)에 파일이 남으면 `fd setup` 의 기동과
+  `fd-update` 가 처방을 내고 선다. 같은 pgpass 파일을 pgx(서버)와 libpq(덤프)가 다르게 푸므로 `db-roles` 가 두 구현이 같게
+  읽는 꼴만 받는다.
 - **매일 덤프는 `fd migrate` 가 돌기 전에 멈춘다.** pg_dump 는 끝날 때까지 모든 표의 ACCESS SHARE 잠금을 쥐고, 판을
   올리는 DDL 은 lock_timeout(5초) 안에 그 잠금을 못 얻으면 실패한다. `db-backup` 의 `depends_on.migrate` 에
   `restart: true` 를 걸어 compose 가 migrate 를 다시 만들 때 덤프를 먼저 멈추고 migrate 가 성공한 뒤 다시 띄운다.
   재시도는 판올림을 덤프 길이만큼 미루며 실패를 덮고, 공유 권고 잠금은 pg_dump 가 낄 자리가 없어 안 골랐다. 손으로 도는
-  migrate(`run`, `up --no-deps`)에는 compose 가 이것을 안 하므로 그 절차가 덤프를 먼저 멈춘다.
+  migrate(`run`, `up --no-deps`)에는 compose 가 이것을 안 하므로 그 절차가 덤프를 먼저 멈춘다. `restart: true` · `stop` ·
+  `down` 은 서비스의 컨테이너만 멈추고 손으로 돌린 덤프(`run … db-backup once`)는 남기므로, 그 절차와 `fd-update` 는
+  `db-backup` 컨테이너가 하나도 안 도는지까지 잰다.
 
 **MCP 를 로컬 stdio 로 두는 것이 첫 결정이다.** 원격 http MCP 는 끊기면 재연결 실패 후 전 세션이 수동
 재시도를 요구한다 — 서버 장애를 도구 계층까지 끌어올린다. 로컬 프로세스는 끊기지 않고, 원격 장애는
@@ -1785,7 +1799,8 @@ fail-open 기록은 없다. 압력이 실물로 관측된 적이 없고, 근거 
   예산이 유계로 말할 것이 없는 유일한 갈래이고, 그래서 그 거절이 `/healthz` 에 남는다.
 
 다른 스큐 원천에는 서버 몫의 상한조차 없다: MCP 는 Claude Code 재기동을, 컨테이너는 사람이
-`docker compose up -d --build` 를 칠 때까지 기다린다. 그래서 위 행의 배너는 **안 없어진다.**
+갱신 명령(`fd-update` 의 compose 머리 — 선택 파일이 있으면 Postgres 덮개를 얹는 `COMPOSE_ENV_FILES=… docker compose up -d --build`)
+을 칠 때까지 기다린다. 그래서 위 행의 배너는 **안 없어진다.**
 
 **마이그레이션 행은 2026-08-23 에 구현과 맞춰졌다.** 그 전까지 이 자리에는 "이 문서를 근거로
 '설계대로 돼 있다'고 믿는 것이 지금의 진짜 위험"이라는 경고가 2026-08-03 부터 서 있었다.
@@ -1995,7 +2010,9 @@ compose 두 번째 서비스) 중 **티커**를 골랐다. `selfwatch` 가 정�
   사본을 만들지 마라. 판정은 한 자리에만 산다.**
 - **컨테이너는 자기 갱신을 안 한다.** 이미지는 불변이라 실행 파일이 영영 안 바뀌고, 그 상태로
   "보는 중"이라고 말하면 읽는 쪽은 따라오고 있다고 믿는다 — 침묵보다 나쁜 **틀린 안심**이다.
-  갱신 경로는 `docker compose up -d --build` 이고, **그 사실을 화면이 말한다**(`self_update.reason`).
+  갱신 경로는 `fd-update` 의 compose 머리로 치는 `up -d --build`(선택 파일이 있으면 Postgres 덮개를 얹는
+  `COMPOSE_ENV_FILES=… docker compose` - `fd setup` 의 기동 · 이 사유와 한 상수 `composeCmd`)이고, **그 사실을 화면이
+  말한다**(`self_update.reason`). 덮개를 뺀 `up` 은 Postgres 로 옮긴 배포를 SQLite 로 띄우려 든다.
 - **`syscall.Exec` 이 없는 플랫폼도 같다** — 안 켜고 사유를 낸다. no-op 으로 접지 않는다:
   빈 성공을 내면 호출부가 **드레인까지 마친 뒤** "재기동했다"로 읽고 서버는 내려간 채 남는다.
 - **롤백 자리를 안 만든다.** 죽은 프로세스는 자기를 못 되돌린다 — supervisor 를 새로 만드는 일이 된다.

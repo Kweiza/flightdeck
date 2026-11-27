@@ -168,7 +168,7 @@ Why it is built this way, and the full table of what works, is in [Using it from
 ## Configuration
 
 The server reads environment variables through compose; sessions read `~/.flightdeck/config.json`
-(written by `fd setup`) or environment variables. The Postgres ledger's variables (`FD_PG_*`, `FD_BACKUP_HOST`) are read only when the override `compose.postgres.yaml` is layered on (see "Postgres ledger" below).
+(written by `fd setup`) or environment variables. The Postgres ledger's variables (`FD_PG_*`, `FD_BACKUP_HOST`) are read only when the override `compose.postgres.yaml` is layered on, and go into the selection file `/etc/flightdeck/compose.env` (see "Postgres ledger" below).
 
 | Variable | Side | Meaning |
 |---|---|---|
@@ -179,7 +179,8 @@ The server reads environment variables through compose; sessions read `~/.flight
 | `FD_LEDGER_HOST` | server | Where the ledger backup goes (default `~/.flightdeck-ledger`) |
 | `FD_BACKUP_DIR` | server | Where `fd migrate` writes the dump it takes before upgrading a Postgres ledger (`--backup-dir` wins; when both are empty, `/backups` if it exists). The Postgres layer of compose sets it to `/backups` (on the host, `FD_BACKUP_HOST`). **Give each deployment its own directory**: a test system cloned by physical replication shares the ledger identity (cluster identifier and database name) with its source, so in a shared directory a rollback could pick the other deployment's dump |
 | `FD_DUMP_TIMEOUT` | server | Deadline for one dump of a Postgres ledger (Go duration, default `30m`, at least 1s). The dump `fd migrate` takes before upgrading and the daily dump of `db-backup` use the same value: for both it is "this ledger's normal dump time plus headroom". Business writes wait while the pre-upgrade dump runs, so if the dump stalls (say the backup volume stops responding) this is the longest they stay blocked. Past the deadline pg_dump is stopped, the server drops the migrator's connection and its locks, and the version is not raised. The daily dump stops pg_dump past the deadline and counts the day as failed (a stalled dump holding table locks makes the DDL of `fd migrate` fail). Raise it if a large ledger's normal dump takes longer |
-| `FD_BACKUP_HOST` | server | The dump directory of the Postgres layer (default `~/.flightdeck-backups`). The dump `fd migrate` takes before upgrading goes right in it, the daily dumps of `db-backup` into its `daily/<db>/` (newest 14 kept). **Create it beforehand** (owner `FD_UID`, mode `0700`) and **give each deployment its own**: two deployments with the same database name sharing one directory would judge freshness by each other's dumps and rotate each other's dumps away. Setup is in "Running on Postgres" below |
+| `FD_BACKUP_HOST` | server | The dump directory of the Postgres layer. **No default**: if it is empty, `up` with the Postgres layer stops. The dump `fd migrate` takes before upgrading goes right in it, the daily dumps of `db-backup` into its `daily/<db>/` (newest 14 kept). Dumps hold the whole ledger, so **create it beforehand outside the server's mounts (`FD_REPOS`, the whole home by default, and `~/.flightdeck`)** (for example `/var/backups/flightdeck`, owner `FD_UID`, mode `0700`). **Give each deployment its own**: two deployments with the same database name sharing one directory would judge freshness by each other's dumps and rotate each other's dumps away. Setup is in "Running on Postgres" below |
+| `FD_PG_INSTANCE` | server | The deployment name of the Postgres layer (default `flightdeck`). The db container's name (`<name>-db`) and both volumes' names (`<name>-pgdata`, `<name>-pgrun`) all come from it. Production keeps the default; only rehearsals and tests give another value (the rehearsal in "Upgrade: SQLite ledger to Postgres" below) |
 | `FD_PG_SERVER_PGPASS_HOST` · `FD_PG_BACKUP_PGPASS_HOST` | server | The pgpass files of the Postgres layer's two login accounts (server and daily dump). **No default**: if one is empty, `up` with the Postgres layer stops. Owner `FD_UID`, mode `0600`, line `db:5432:<db>:<account>:<password>`. They are the only place the passwords live (never in environment variables, command lines or URLs). **Keep them outside the server's mounts**: the server reads `FD_REPOS` (the whole home by default) (see "Running on Postgres" below) |
 | `FD_PG_DATABASE` · `FD_PG_SERVER_USER` · `FD_PG_BACKUP_USER` | server | Database and login account names of the Postgres layer (default `flightdeck`, `fd_server` and `fd_backup`; lowercase letters, digits and `_` only). `db-roles` creates and checks the accounts: the server account is a member of `fd_app`, the dump account of `pg_read_all_data`, and neither has privileged attributes. Each database gets its own dump directory (`daily/<db>/`), so after switching databases the new one neither counts nor deletes the old one's dumps |
 | `FD_URL` | session | Server address (default `http://127.0.0.1:7420`) |
@@ -207,8 +208,10 @@ server at that database. A plain `docker compose up` without the override is sti
 | `flightdeck` | the server account (member of `fd_app`) | TCP `db:5432`, a pgpass file |
 | `db-backup` | the dump account (member of `pg_read_all_data`) | TCP, a pgpass file |
 
-The superuser has no password (it is initialised with a random value nobody knows). It cannot connect over the network;
-only `migrate` and `db-roles`, which mount the socket volume, can. `db` publishes no port.
+The superuser has no password (it is initialised with a random value nobody knows). The access rules
+(`deploy/pg_hba.conf`) reject the superuser over TCP, IPv4 and IPv6 alike, so only `migrate` and `db-roles`, which mount the
+socket volume, can connect as it. Those rules are read from the repository's file at every start, so an existing volume
+gets them too. `db` publishes no port.
 
 ### Running on Postgres
 
@@ -217,47 +220,67 @@ only `migrate` and `db-roles`, which mount the socket volume, can. `db` publishe
 ```bash
 # 1. Two volumes. Fixed names outside any project, so the ledger stays the same when each version lives in another
 #    directory, and `down -v` cannot remove them. Compose does not create them: if one is missing, `up` stops instead of
-#    creating an empty ledger.
+#    creating an empty ledger. The names come from the deployment name (FD_PG_INSTANCE, default flightdeck).
 docker volume create flightdeck-pgdata && docker volume create flightdeck-pgrun
 
-# 2. The dump directory. If it is missing, Docker on Linux creates it root-owned 0755 and the first dump cannot write.
-install -d -m 0700 "${FD_BACKUP_HOST:-$HOME/.flightdeck-backups}"
+# 2. Places outside the server's mounts (see the star note): the selection file and pgpass, and the dumps. If the dump
+#    directory is missing, Docker on Linux creates it root-owned 0755 and the first dump cannot write.
+sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" /etc/flightdeck /var/backups/flightdeck
 
-# 3. A pgpass for each login account. Outside the server's mounts (see the star note), owner FD_UID, mode 0600, one line each.
-sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" /etc/flightdeck
+# 3. A pgpass for each login account. Owner FD_UID, mode 0600, one line each.
 (umask 077
  printf 'db:5432:flightdeck:fd_server:%s\n' "$(openssl rand -hex 24)" > /etc/flightdeck/server.pgpass
  printf 'db:5432:flightdeck:fd_backup:%s\n' "$(openssl rand -hex 24)" > /etc/flightdeck/backup.pgpass)
 
-# 4. Write the choice down in one file. No passwords in it, only file locations.
-cat > ~/.flightdeck/compose.env <<'EOF'
+# 4. Write the choice down in the selection file. No passwords in it, only locations. Write it under its switched-off name
+#    (.off): switching it on is one step of starting or upgrading below.
+cat > /etc/flightdeck/compose.env.off <<'EOF'
 COMPOSE_FILE=compose.yaml:compose.postgres.yaml
 FD_PG_SERVER_PGPASS_HOST=/etc/flightdeck/server.pgpass
 FD_PG_BACKUP_PGPASS_HOST=/etc/flightdeck/backup.pgpass
+FD_BACKUP_HOST=/var/backups/flightdeck
 EOF
-fdc() { COMPOSE_ENV_FILES="$HOME/.flightdeck/compose.env" docker compose "$@"; }   # keep it in your shell config
+
+# 5. Keep these in your shell config. fdc is the head that calls compose; fdrepos reads the running server's repository
+#    mounts into FD_REPOS…FD_REPOS4.
+fdc() {
+  FD_TOKEN="${FD_TOKEN:-$(cat ~/.flightdeck/token 2>/dev/null || sed -n 's/.*"token": *"\([^"]*\)".*/\1/p' ~/.flightdeck/config.json 2>/dev/null)}" \
+  FD_UID="${FD_UID:-$(id -u)}" FD_GID="${FD_GID:-$(id -g)}" \
+  COMPOSE_ENV_FILES="${FDC_ENV:-$([ ! -e /etc/flightdeck/compose.env ] || echo /etc/flightdeck/compose.env)}" docker compose "$@"
+}
+fdrepos() {
+  set -- $(docker inspect flightdeck --format '{{range .Mounts}}{{if eq .Source .Destination}}{{println .Source}}{{end}}{{end}}') &&
+    [ $# -ge 1 ] && export FD_REPOS="$1" FD_REPOS2="${2:-}" FD_REPOS3="${3:-}" FD_REPOS4="${4:-}" && echo "repository mounts: $*"
+}
 ```
 
-- `fdc` hands that file to compose as its env file (`COMPOSE_ENV_FILES`, the same as `--env-file`), and `COMPOSE_FILE`
-  layers the override. The paths are relative to the directory compose runs in, so run it from the root of the repository
-  (or of the installed plugin). Give the other settings (`FD_TOKEN`, `FD_REPOS`, `FD_UID`, …) in the shell as before: shell
-  values win over the file, and with this file the directory's `.env` is not read. The `fd-update` skill passes the file
-  the same way when it exists.
+- When the selection file is switched on (`/etc/flightdeck/compose.env`), `fdc` hands it to compose as its env file
+  (`COMPOSE_ENV_FILES`, the same as `--env-file`). That is the same test the start step of `fd setup` and the `fd-update`
+  skill make. With `FDC_ENV` set it hands that file instead (the upgrade runs on the switched-off file before switching it
+  on). `COMPOSE_FILE` layers the override; the paths are relative to the directory compose runs in, so run it from the root
+  of the repository (or of the installed plugin). The token and user ids are filled in the way `fd-update` does; the
+  repository mounts (`FD_REPOS` …) come from the shell as before (`fdrepos`). Shell values win over the selection file, and
+  with it the directory's `.env` is not read.
 - Passwords must be printable ASCII without spaces, backslashes or colons. The server (pgx) and the daily dump (libpq) read
   the same file and the two parse anything else differently. `db-roles` refuses a line that does not fit and names its line
   number (never the password).
-- If you change the database or account names (`FD_PG_DATABASE`, `FD_PG_SERVER_USER`, `FD_PG_BACKUP_USER`, in compose.env),
-  change the pgpass lines too.
+- If you change the database or account names (`FD_PG_DATABASE`, `FD_PG_SERVER_USER`, `FD_PG_BACKUP_USER`, in the selection
+  file), change the pgpass lines too.
 
-★ **Keep the pgpass files outside the server's mounts.** The server runs as the same uid and mounts `FD_REPOS` (the whole home
-by default) read-only. Inside the home, even at `0600`, the server could read the dump account's password too. That is why
-compose has no default for either location: if one is empty, `up` stops.
+★ **Keep the selection file, the pgpass files and the dumps outside the server's mounts.** The server runs as the same uid,
+mounts `FD_REPOS` (the whole home by default) read-only and `~/.flightdeck` read-write. Inside the home, even at `0600`, the
+server could read the dump account's password and the dumps of the whole ledger, and a selection file inside
+`~/.flightdeck` is one the server could rewrite: the next update (run by a person, sometimes as root) would trust that
+override and those secret locations. That is why compose has no default for the pgpass or dump locations: if one is empty,
+`up` stops and names the variable. Do not widen `FD_REPOS` to `/`, `/etc` or `/var`. If a file is left at the selection
+file's old place `~/.flightdeck/compose.env`, the start step of `fd setup` and `fd-update` print the command that moves it
+and stop.
 
-**Start**
+**Start** - for a new, empty ledger. Switch the selection file on, then start.
 
 ```bash
-fdc up -d --build
-fdc ps                              # db, flightdeck and db-backup healthy; migrate and db-roles Exited (0)
+mv -n /etc/flightdeck/compose.env.off /etc/flightdeck/compose.env && [ ! -e /etc/flightdeck/compose.env.off ] &&
+  fdc up -d --build && fdc ps -a     # db, flightdeck and db-backup healthy; migrate and db-roles Exited (0)
 curl -s localhost:7420/healthz      # db_ok and db_locale_ok are true
 ```
 
@@ -271,21 +294,27 @@ pg_restore are all there, and it connects as the superuser over the socket. Use 
 ```bash
 fdc run --rm --no-deps migrate selfcheck                                                # version and planned steps
 sql() { fdc run --rm --no-deps --entrypoint psql migrate -X -v ON_ERROR_STOP=1 "$@"; }    # superuser psql
+srvsql() { fdc run --rm --no-deps -T --entrypoint sh flightdeck -c 'exec psql -X -v ON_ERROR_STOP=1 -d "$FD_DB" "$@"' sh "$@"; }  # the server account on the server's ledger (SQL on stdin)
+nodump() { [ -z "$(docker ps -q --filter label=com.docker.compose.service=db-backup)" ] || { echo 'a dump is still running (a hand-run once too) - check again when it ends' >&2; false; }; }
 ```
 
-- **Run `fdc stop db-backup` before running `fd migrate` by hand.** pg_dump holds a lock on every table until it ends, and the
-  DDL that raises the version fails when it cannot take that lock within lock_timeout (5s). When `fdc up` recreates migrate
-  (new image or settings), compose stops the daily dump first and starts it again after migrate succeeds (`restart: true`
-  in `depends_on`). `run` and `up --no-deps migrate` do not do that.
+- **Before running `fd migrate`, the export or a restore by hand, stop the daily dump and check that hand-run dumps have
+  ended too**: `fdc stop db-backup && nodump`. pg_dump holds a lock on every table until it ends, and the DDL that raises
+  the version fails when it cannot take that lock within lock_timeout (5s). When `fdc up` recreates migrate (new image or
+  settings), compose stops the daily dump first and starts it again after migrate succeeds (`restart: true` in
+  `depends_on`). `run` and `up --no-deps migrate` do not, and neither `stop` nor `restart: true` touches more than the
+  service's own container: a dump started by hand with `fdc run --rm db-backup once` keeps running (`down` leaves it too).
+  If `nodump` stops, wait for that dump to end and check again.
 - **To change the passwords**, edit both pgpass files **in place** (replacing a file with a new one makes it disappear inside
   the containers that mount it), then `fdc up -d --force-recreate --no-deps db-roles flightdeck db-backup`. The server reads
   its file once at startup.
 
 ★ **One ledger, one override.** After committing, the import leaves a move marker next to the SQLite ledger
-(`~/.flightdeck/fd.db.moved-to-postgres`). Typing `docker compose` instead of `fdc` after the move runs the default path's
-(SQLite) `migrate`, which sees the marker and neither opens nor creates the ledger, so the server stays down: run
-`docker compose down`, then start again with `fdc up -d`. The other way round, `migrate` with the override refuses while an
-unmarked `fd.db` remains. Only "Going back within 72 hours" below removes the marker.
+(`~/.flightdeck/fd.db.moved-to-postgres`). Starting the default compose without the selection file after the move runs the
+default path's (SQLite) `migrate`, which sees the marker and neither opens nor creates the ledger, so the server stays down:
+run `docker compose down`, check that the selection file is switched on, and start again with `fdc up -d`. The other way
+round, `migrate` with the override refuses while an unmarked `fd.db` remains. Only "Going back within 72 hours" below
+removes the marker.
 
 ### Upgrade: SQLite ledger to Postgres
 
@@ -293,65 +322,117 @@ This takes the ledger you built on SQLite into a Postgres ledger. The server is 
 you can go back to SQLite, carrying along what was written in Postgres ("Going back within 72 hours" below).
 
 **The ledger must be at version 18.** The import only takes the last SQLite version (18). An older ledger is raised first on
-this version's default path: that is step 3, and go on to step 4 only once it shows version 18.
+this version's default path: that is step 3.
+
+**Go on to the next step only after a step prints its last line.** Each step is one `&&` chain, so if any command fails the
+step's closing `echo` does not print. The next step's first check also re-tests what the previous step left; pasted all at
+once, nothing after a failed step runs. **Run it from the root of the repository (or of this version's installed plugin).**
 
 ```bash
-# 0. Finish the setup of "Running on Postgres" (volumes, dump directory, pgpass, compose.env, fdc). Do not start it.
-# 1. Read the current mounts. FD_REPOS and friends only survive in the mounts and cannot be read once the container is
-#    down. Give those values to the shell of the commands below.
-docker inspect flightdeck --format '{{range .Mounts}}{{.Source}} -> {{.Destination}} {{if .RW}}rw{{else}}ro{{end}}{{"\n"}}{{end}}'
-# 2. Take the server down and build this version's image.
-docker compose down
-docker compose build
-# 3. Raise the SQLite ledger to this version (nothing happens if it is at 18). selfcheck must report schema version 18.
-docker compose run --rm --no-deps migrate migrate --db /data/fd.db
-docker compose run --rm --no-deps migrate selfcheck --db /data/fd.db
-# 4. Start the Postgres ledger and lay only the baseline (stops at version 18). db starts with it.
-fdc run --rm migrate migrate --to 18
-# 5. Dry run, move, compare. After committing, the move leaves a move marker (fd.db.moved-to-postgres) next to the source.
-fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db --dry-run
-fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db
-fdc run --rm --no-deps migrate migrate verify --from /data/fd.db
-# 6. Rename the moved SQLite ledger and make it read-only. Move its side files (-wal, -shm) with it: the import opens the
-#    source read-only and still leaves empty side files.
-t=$(date -u +%Y%m%dT%H%M%SZ)
-for s in '' -wal -shm; do [ ! -e ~/.flightdeck/fd.db$s ] || mv ~/.flightdeck/fd.db$s ~/.flightdeck/fd.db.pre-pg-$t$s; done
-chmod 0444 ~/.flightdeck/fd.db.pre-pg-$t
-# 7. Start on the Postgres ledger. It worked if the board shows the moved items.
-fdc up -d
+# 0. Finish setup steps 1-5 of "Running on Postgres" (volumes, places, pgpass, switched-off selection file, fdc, fdrepos).
+#    Do not switch it on or start it.
+# 1. Read the running server's compose project and directory and its repository mounts. The mounts (FD_REPOS and friends)
+#    cannot be read once the container is down.
+unset FDC_ENV; p=$(docker inspect flightdeck -f '{{index .Config.Labels "com.docker.compose.project"}}') &&
+  w=$(docker inspect flightdeck -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}') &&
+  [ -n "$p" ] && [ -d "$w" ] && fdrepos && echo "1 done: project $p in $w"
+# 2. Take it down from the old version's directory and check that no container of that project is left (hand-run ones too).
+[ -n "$p" ] && (cd "$w" && fdc -p "$p" down) && [ -z "$(docker ps -aq --filter label=com.docker.compose.project="$p")" ] &&
+  ! docker inspect flightdeck >/dev/null 2>&1 && echo "2 done: it is down"
+# 3. Build this version's image and raise the SQLite ledger to this version (nothing happens at 18). selfcheck must say ok.
+! docker inspect flightdeck >/dev/null 2>&1 && fdc build &&
+  fdc run --rm --no-deps migrate migrate --db /data/fd.db && fdc run --rm --no-deps migrate selfcheck --db /data/fd.db &&
+  echo "3 done: the SQLite ledger is at this version"
+# 4. Start the Postgres ledger from the switched-off selection file and lay only the baseline (stops at version 18). db
+#    starts with it.
+export FDC_ENV=/etc/flightdeck/compose.env.off
+[ -f "$FDC_ENV" ] && fdc run --rm migrate migrate --to 18 && echo "4 done: baseline laid"
+# 5. Dry run, then move. After committing, the move leaves a move marker (fd.db.moved-to-postgres) next to the source. No
+#    marker, no further.
+fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db --dry-run &&
+  fdc run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db &&
+  [ -e ~/.flightdeck/fd.db.moved-to-postgres ] && echo "5 done: moved"
+# 6. Create and check the login accounts (db-roles), then connect as the server account to the server's ledger: the moved
+#    tables must be readable and TEMPORARY must be gone.
+[ -e ~/.flightdeck/fd.db.moved-to-postgres ] && fdc up -d db-roles && [ "$(docker wait "$(fdc ps -aq db-roles)")" = 0 ] &&
+  srvsql <<'SQL' && echo "6 done: the accounts are right"
+SELECT current_user AS account, current_database() AS ledger, (SELECT count(*) FROM item) AS items, (SELECT count(*) FROM judgment) AS judgments;
+SELECT 1 / (NOT has_database_privilege(current_database(), 'TEMPORARY'))::int AS no_temp_privilege;
+SQL
+# 7. Switch the selection file on only after the compare matches. Once on, later updates and restarts start on Postgres.
+[ -e ~/.flightdeck/fd.db.moved-to-postgres ] && fdc run --rm --no-deps migrate migrate verify --from /data/fd.db &&
+  mv -n /etc/flightdeck/compose.env.off /etc/flightdeck/compose.env && [ ! -e /etc/flightdeck/compose.env.off ] &&
+  unset FDC_ENV && echo "7 done: it matches, selection file on"
+# 8. Start on the Postgres ledger. It worked if the board shows the moved items.
+[ -e /etc/flightdeck/compose.env ] && [ -z "${FDC_ENV:-}" ] && fdc up -d && fdc ps -a
 curl -s localhost:7420/healthz      # db_ok and db_locale_ok are true
 ```
 
-- If the dry run or the move in step 5 refuses or fails, nothing is committed (one transaction), and the SQLite ledger was
-  only read. Fix the cause and run again from step 5, or go back to SQLite with `fdc down` and `docker compose up -d`.
+- If it stops **before step 5 leaves the marker** (a refusal or failure in 1-5), nothing is committed (the import is one
+  transaction) and the SQLite ledger was only read. Fix the cause and run again from that step, or go back to SQLite:
+  `fdc down; unset FDC_ENV; fdc up -d` (the selection file stays off).
+- If it stops **after step 5 left the marker** (6-8), the ledger is already in Postgres. Fix the cause and run again from
+  that step. To go back to SQLite, follow "Going back within 72 hours" below: there is no other way to remove the marker by
+  hand.
+- After the move the SQLite ledger (`fd.db` and its side files) may stay where it is: the marker blocks it on the SQLite
+  side. To tidy up (optional), with the server down, move `fd.db`, `fd.db-wal` and `fd.db-shm` to other names in the same
+  directory and make them read-only. **Do not move the marker**: without it a new SQLite ledger could appear in that place.
+- **If you moved a copy** (a `VACUUM INTO` copy outside the ledger's place given to `--from`), the marker sits next to the
+  copy, not in the ledger's place, and `migrate` with the override sees the `fd.db` in the ledger's place as a ledger that
+  was never moved and refuses. Check that the original matches what was moved and leave the marker, or move the original
+  out of the ledger's place:
+  `fdc run --rm --no-deps migrate migrate verify --from /data/fd.db && touch ~/.flightdeck/fd.db.moved-to-postgres`
+- **If both ledgers have already been written to separately** (a SQLite server wrote to the old ledger after the move, for
+  example), take both servers down and **delete neither ledger**. `verify --from` lists the rows that differ by primary
+  key; a person decides which side to keep. There is no merge command.
 - The refusals and the comparison in detail are in "Moving a SQLite ledger to Postgres" below.
+
+**Keep the rehearsal apart from production.** The server container name (`flightdeck`) and port 7420 are fixed, so it
+cannot run next to the production server on the same Docker, and with the production volume names a rehearsal's `migrate`
+connects to the production ledger as the superuser: rehearse on **another Docker environment** (another machine or a VM).
+Even there, give values that differ from production: the project name (`fdc -p <rehearsal>`), the home (`HOME`: `/data` is
+`~/.flightdeck`), the deployment name `FD_PG_INSTANCE` (the db container's and both volumes' names), `FD_BACKUP_HOST`, and the
+selection file (`FDC_ENV=<rehearsal file>`). Create the volumes with
+`docker volume create <deployment>-pgdata && docker volume create <deployment>-pgrun`, and empty them afterwards with
+`fdc -p <rehearsal> down` and `docker volume rm <deployment>-pgdata <deployment>-pgrun`. ★ **Never remove
+`flightdeck-pgdata` or `flightdeck-pgrun`**: that is the production ledger. Check the names once more with `docker volume ls`
+before removing anything.
 
 #### Going back within 72 hours
 
 The 72 hours after the move are the rollback window. `export-sqlite` moves the Postgres ledger into a **new** SQLite file at
 version 18, so the items, claims and judgments written in Postgres after the move come back too. During the window, do not
-update to a flightdeck version that raises the Postgres schema past 18: `export-sqlite` only takes a version-18 ledger.
+update to a flightdeck version that raises the Postgres schema past 18: `export-sqlite` only takes a version-18 ledger. As in
+the upgrade, go on only after a step prints its last line.
 
 ```bash
-# 1. Stop the server and the daily dump (leave db up). The export refuses while other connections are attached.
-fdc stop flightdeck db-backup
-# 2. Dry run, move, compare. Do not skip the compare.
-fdc run --rm --no-deps migrate migrate export-sqlite --to /data/fd-back.db --dry-run
-fdc run --rm --no-deps migrate migrate export-sqlite --to /data/fd-back.db
-fdc run --rm --no-deps migrate migrate verify --from /data/fd-back.db
-# 3. Take the Postgres layer down and put the new file in the ledger's place (side files too).
-fdc down
-for s in '' -wal -shm; do [ ! -e ~/.flightdeck/fd-back.db$s ] || mv ~/.flightdeck/fd-back.db$s ~/.flightdeck/fd.db$s; done
-rm ~/.flightdeck/fd.db.moved-to-postgres   # the move marker: left in place, the SQLite migrate will not open this ledger
-# 4. Put away the file that chose Postgres and start on the default path (SQLite). Left in place, the next update would
-#    layer Postgres again.
-mv ~/.flightdeck/compose.env ~/.flightdeck/compose.env.off
-docker compose up -d
+# 1. Read the repository mounts, stop the server and the daily dump (leave db up), and check that hand-run dumps have ended
+#    too. The export refuses while other connections are attached.
+unset FDC_ENV; fdrepos && fdc stop flightdeck db-backup && nodump && echo "1 done: stopped"
+# 2. Dry run, then move. No file, no further.
+fdc run --rm --no-deps migrate migrate export-sqlite --to /data/fd-back.db --dry-run &&
+  fdc run --rm --no-deps migrate migrate export-sqlite --to /data/fd-back.db &&
+  [ -f ~/.flightdeck/fd-back.db ] && echo "2 done: written"
+# 3. Take the Postgres layer down and switch the selection file off only after the compare matches. Left on, the next update
+#    would layer Postgres again.
+[ -f ~/.flightdeck/fd-back.db ] && fdc run --rm --no-deps migrate migrate verify --from /data/fd-back.db && fdc down &&
+  mv -n /etc/flightdeck/compose.env /etc/flightdeck/compose.env.off && [ ! -e /etc/flightdeck/compose.env ] &&
+  echo "3 done: it matches, selection file off"
+# 4. Put the new file in the ledger's place. The ledger already there (the moved SQLite ledger and its side files) is not
+#    deleted but moved to a side name; if any of them cannot be moved, it stops. Only then is the move marker removed: left
+#    in place, the SQLite migrate will not open this ledger.
+[ ! -e /etc/flightdeck/compose.env ] && (set -eu; cd ~/.flightdeck; [ -f fd-back.db ]; t=$(date -u +%Y%m%dT%H%M%SZ)
+  for s in '' -wal -shm -journal; do if [ -e fd.db$s ]; then mv -n fd.db$s fd.db.pre-back-$t$s; fi; done
+  for s in '' -wal -shm -journal; do [ ! -e fd.db$s ]; done
+  for s in '' -wal -shm -journal; do if [ -e fd-back.db$s ]; then mv -n fd-back.db$s fd.db$s; fi; done
+  for s in '' -wal -shm -journal; do [ ! -e fd-back.db$s ]; done
+  [ -f fd.db ]; rm -f fd.db.moved-to-postgres; echo "4 done: the exported ledger is in place")
+# 5. Start on the default path (SQLite).
+[ -f ~/.flightdeck/fd.db ] && [ ! -e ~/.flightdeck/fd.db.moved-to-postgres ] && fdc up -d && fdc ps -a
 ```
 
-- If `~/.flightdeck/fd.db` already exists at step 3 (an empty ledger from starting the default path by mistake after the
-  move), look at it and remove it before overwriting.
-- If verify does not match, delete `fd-back.db`, keep the server down, and start again from step 1.
+- If verify does not match (step 3 stops), do not put the file in the ledger's place. Find and stop whatever is attached,
+  move `fd-back.db` to a side name (the export does not overwrite an existing file), and start again from step 1.
 - The Postgres ledger (volume `flightdeck-pgdata`) stays. A later move needs an empty target: the import refuses otherwise.
 
 ### Daily dumps of a Postgres ledger
@@ -364,18 +445,22 @@ than the interval plus two checks plus the deadline (26h30m by default).
 `fdc run --rm --no-deps db-backup config` prints the settings on one line. `once` takes one dump by hand (0 = dumped, or not
 due yet; 1 = failed; 3 = another run is working in the same directory, nothing done).
 
-**Restore** - in the `migrate` service (superuser over the socket; the dumps are visible under `/backups`). `sql` is the
-admin command from "Running on Postgres".
+**Restore** - in the `migrate` service (superuser over the socket; the dumps are visible under `/backups`). `sql`, `srvsql`
+and `nodump` are the admin commands from "Running on Postgres". Go on only after a step prints its last line.
 
 ```bash
-fdc stop flightdeck db-backup      # drop the connections to the database you are restoring
+fdc stop flightdeck db-backup && nodump && echo "stopped"     # drop the connections to the database you are restoring
 ```
 
-1. Read from the dump which database it restores. `--create` makes the database under **the name written in the dump**, not
-   the current `FD_PG_DATABASE`.
+1. Read from the dump which database it restores and compare it with `FD_PG_DATABASE`. `--create` makes the database under
+   **the name written in the dump**, not the current `FD_PG_DATABASE`; if they differ, the server does not see the restored
+   database. **If they differ, stop**: a person decides which name to use (whether to change `FD_PG_DATABASE` and the pgpass
+   lines to the dump's name).
 
    ```bash
-   fdc run --rm --no-deps --entrypoint pg_restore migrate -l /backups/daily/<db dir>/fd-daily-<UTC>.dump | grep '^; *dbname:'
+   f='/backups/daily/<db dir>/fd-daily-<UTC>.dump'   # fill in the placeholders
+   fdc run --rm --no-deps --entrypoint sh migrate -c 'd=$(pg_restore -l "$1" | sed -n "s/^; *dbname: //p")
+     echo "dump database: $d, FD_PG_DATABASE: $PGDATABASE"; [ -n "$d" ] && [ "$d" = "$PGDATABASE" ]' sh "$f" && echo "1 done: same name"
    ```
 
    If a database by that name exists, do not drop it; **rename it and keep it** (`<db>` is the name read above):
@@ -387,18 +472,25 @@ fdc stop flightdeck db-backup      # drop the connections to the database you ar
    restoring into a database created beforehand loses that.
 
    ```bash
-   fdc run --rm --no-deps --entrypoint pg_restore migrate -d postgres --create --exit-on-error /backups/daily/<db dir>/fd-daily-<UTC>.dump
+   fdc run --rm --no-deps --entrypoint pg_restore migrate -d postgres --create --exit-on-error "$f" && echo "3 done: restored"
    ```
 
-4. Check the accounts again (`fdc up -d db-roles`) and connect **as the server account** to check. The tables must be
-   readable (the membership) and `TEMPORARY` must be gone. If either is off it stops with an error and a nonzero exit
-   (`ON_ERROR_STOP`; a remaining privilege triggers a deliberate division by zero). If you renamed them, use your names in
-   place of `fd_server` and `flightdeck`.
+4. Check the accounts again (`db-roles`), then connect **as the server account to the server's ledger** (`srvsql`: the
+   server's own `FD_DB`) and check that it is the restored ledger. If the database the server connects to is the renamed old
+   one (the same oid), the tables are not readable (the membership), there are no items, or `TEMPORARY` remains, it stops
+   with an error and a nonzero exit (`ON_ERROR_STOP`; a deliberate division by zero). Check by eye on the first line that
+   the last event is just before the time in the dump's name.
 
    ```bash
-   fdc run --rm --no-deps --entrypoint psql flightdeck -X -h db -U fd_server -d flightdeck -v ON_ERROR_STOP=1 \
-     -c 'SELECT count(*) FROM judgment' \
-     -c "SELECT 1 / (NOT has_database_privilege(current_database(), 'TEMPORARY'))::int"
+   fdc up -d db-roles && [ "$(docker wait "$(fdc ps -aq db-roles)")" = 0 ] && srvsql <<'SQL' && echo "4 done: it is the restored ledger"
+   SELECT current_database() AS ledger, d.oid, o.oid AS old_oid, (SELECT count(*) FROM item) AS items,
+          (SELECT count(*) FROM judgment) AS judgments, (SELECT max(at) FROM event) AS last_event
+     FROM pg_database d LEFT JOIN pg_database o ON o.datname = d.datname || '_before_restore' WHERE d.datname = current_database();
+   SELECT 1 / (d.oid IS DISTINCT FROM o.oid)::int AS new_database
+     FROM pg_database d LEFT JOIN pg_database o ON o.datname = d.datname || '_before_restore' WHERE d.datname = current_database();
+   SELECT 1 / (count(*) > 0)::int AS has_items FROM item;
+   SELECT 1 / (NOT has_database_privilege(current_database(), 'TEMPORARY'))::int AS no_temp_privilege;
+   SQL
    ```
 
 5. Start again with `fdc up -d`. Drop the renamed old database once the check is done
