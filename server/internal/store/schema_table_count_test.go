@@ -112,7 +112,7 @@ var sqliteOnlyTables = map[string]string{
 // 수는 그대로인데 데이터 모델은 달라지고, 그 변경이 리뷰에서 안 보이면 안 된다.
 //
 // 두 엔진을 함께 본다: PG 기준선의 선언 = wantTables(26), SQLite 의 선언 = wantTables + sqliteOnlyTables(28).
-// DESIGN §3 의 「테이블 N개」는 지금 도는 엔진(SQLite)의 28 이고, PG 로 넘어가는 작업이 26 으로 고친다.
+// DESIGN 「데이터 모델」 절의 「테이블 N개」는 PG 기준선의 26 이다(SQLite 의 28 은 옮기는 동안만 사는 사본의 수다).
 //
 // SQLite 의 살아 있는 DB `sqlite_master` 는 28 보다 **4 큰** 수를 낸다(2026-09-16 운영 원장
 // mode=ro 사본 실측: 판 16 에서 31). 축이 **둘** 어긋나기 때문이다:
@@ -140,7 +140,7 @@ func TestDeclaredTablesMatchDesign(t *testing.T) {
 	} {
 		if !slices.Equal(c.got, c.want) {
 			t.Errorf("%s: 선언한 표가 %d개다 — 이 시험은 %d개를 안다.\n"+
-				"표를 더했거나 지웠으면 **wantTables 와 DESIGN §3 의 '테이블 N개' 도 같이 고쳐라**"+
+				"표를 더했거나 지웠으면 **wantTables 와 DESIGN 「데이터 모델」 절의 '테이블 N개' 도 같이 고쳐라**"+
 				"(그 숫자가 곧 이 레포의 계약이고, 틀리면 아무도 계약을 검산할 수 없다).\n"+
 				"실측: %v\n기대: %v", c.engine, len(c.got), len(c.want), c.got, c.want)
 		}
@@ -214,7 +214,7 @@ func TestLiveSchemaAfterAllMigrationsMatchesTheDeclaredList(t *testing.T) {
 
 	if len(live) != len(want) {
 		t.Fatalf("올린 DB 의 표가 %d개인데 선언−걷어낸 것은 %d개다.\n"+
-			"표를 걷는 증분을 실었으면 migrationsDropTables 에 그 이름을 더하고 **DESIGN §3 도 같이 고쳐라**.\n"+
+			"표를 걷는 증분을 실었으면 migrationsDropTables 에 그 이름을 더하고 **DESIGN 「데이터 모델」 절도 같이 고쳐라**.\n"+
 			"실측(DB): %v\n기대(선언−DROP): %v", len(live), len(want), live, want)
 	}
 	for i := range want {

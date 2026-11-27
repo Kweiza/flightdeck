@@ -9,7 +9,8 @@
 #   전부 그 축 위에 서 있어서, git 없는 이미지에서는 보드가 `브랜치 ?(못 읽음)` 과
 #   `파생 결손` 만 낸다 — 서버는 멀쩡히 200 을 내므로 **고장이 안 보인 채로 반쪽이 된다.**
 #   설계 §2 의 "공급망 표면을 바이너리 하나로"를 여기서 한 번 접는다. 접지 않으면
-#   조정 계층의 절반이 없다.
+#   조정 계층의 절반이 없다. Postgres 원장의 도구(아래 postgresql17-client)가 같은 까닭으로
+#   두 번째로 접는다 - 판올림 전 덤프가 pg_dump 를 exec 로 부른다.
 
 FROM golang:1.25-alpine AS build
 WORKDIR /src
@@ -46,8 +47,14 @@ RUN set -eu; \
 # `fd doctor` 는 서버를 치고, 미도달이면 0 이 아닌 값을 낸다.
 
 FROM alpine:3.21
-# git 하나만 넣는다. 이것이 파생의 유일한 외부 의존이다.
-RUN apk add --no-cache git
+# git 은 파생의 유일한 외부 의존이다.
+#
+# ★ postgresql17-client(psql · pg_dump · pg_restore)는 Postgres 원장의 도구다. `fd migrate` 는 판을 올리기 전에 pg_dump 로
+#   덤프를 뜨고(없으면 판올림이 그 자리에서 선다), 되돌리기 · 되살리기 · 역이관 절차는 이 이미지(compose.postgres.yaml 의
+#   migrate 관리 컨테이너)의 psql · pg_restore 로 돈다. **큰 판은 원장 서버(compose.postgres.yaml 의 db 이미지)와 같거나
+#   높아야 한다** - pg_dump 는 자기보다 높은 서버를 거절한다. db 의 큰 판을 올리는 사람은 이 줄도 올린다
+#   (TestPostgresClientMatchesTheLedgerServer 가 둘을 맞댄다). SQLite 원장으로 도는 기본 배치는 이 도구를 안 쓴다.
+RUN apk add --no-cache git postgresql17-client
 WORKDIR /data
 COPY --from=build /out/fd /usr/local/bin/fd
 

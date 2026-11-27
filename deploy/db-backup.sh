@@ -1,7 +1,7 @@
 #!/bin/sh
 # flightdeck db-backup - Postgres 원장의 매일 덤프(pg_dump -Fc)와 보존 회전.
 #
-# compose 의 db-backup 서비스가 postgres 이미지 안에서 돌린다(서버와 같은 주판이라 pg_dump 가 서버보다 낮지 않다).
+# compose.postgres.yaml 의 db-backup 서비스가 postgres 이미지 안에서 돌린다(서버와 같은 주판이라 pg_dump 가 서버보다 낮지 않다).
 # 매시간 판단 원장(JSONL · journal.git, fd serve 안의 잡)과는 다른 겹이다: 그것은 여섯 표의 결정적 산출물이고, 이것은
 # 원장 전체를 새 DB 로 되살리는 복원 수단이다.
 #

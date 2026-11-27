@@ -40,6 +40,7 @@ fd selfcheck --db ~/.flightdeck/fd.db
 **재기동해도 되는가**에만 답한다 — 그 바이너리가 실행되는가, DB 증분 계획이 거절이 아닌가.
 **되돌릴 때도 이걸 먼저 물어라.** DB 버전이 그 판이 아는 것보다 높으면 거절이 나온다.
 (`모르는 명령: selfcheck` 가 나올 만큼 옛 판이면, 그 판의 `serve` 가 기동에서 같은 이유로 멈춘다.)
+**Postgres 원장이면**(`~/.flightdeck/compose.env` 가 있다 — README 「Postgres 로 띄우기」) 4 의 플러그인 갱신 뒤 새 자리에서 `COMPOSE_ENV_FILES=~/.flightdeck/compose.env docker compose run --rm --build --no-deps migrate selfcheck` 로 묻는다. 도는 서버의 `FD_DB`(`docker inspect`)가 `postgres://` 인데 그 파일이 없으면 **멈추고 묻는다** — 없이 올리면 서버가 빈 SQLite 원장으로 뜬다.
 
 ## 4. 갱신한다
 
@@ -50,9 +51,9 @@ claude plugin update flightdeck@<마켓플레이스>
 # 내리기 전에 저장소 마운트를 **전부** 읽는다 — 이 값들은 어디에도 안 남는다
 readarray -t R < <(docker inspect flightdeck --format '{{range .Mounts}}{{if eq .Source .Destination}}{{println .Source}}{{end}}{{end}}')
 
-cd ~/.claude/plugins/cache/<마켓플레이스>/flightdeck/<옛 버전> && docker compose down
+C=; [ -e ~/.flightdeck/compose.env ] && C=~/.flightdeck/compose.env; cd ~/.claude/plugins/cache/<마켓플레이스>/flightdeck/<옛 버전> && COMPOSE_ENV_FILES=$C docker compose down
 cd ../<새 버전>
-FD_TOKEN="$(cat ~/.flightdeck/token 2>/dev/null || sed -n 's/.*"token": *"\([^"]*\)".*/\1/p' ~/.flightdeck/config.json)" FD_REPOS="${R[0]}" FD_REPOS2="${R[1]:-}" FD_REPOS3="${R[2]:-}" FD_REPOS4="${R[3]:-}" FD_UID=$(id -u) FD_GID=$(id -g) docker compose up -d --build
+FD_TOKEN="$(cat ~/.flightdeck/token 2>/dev/null || sed -n 's/.*"token": *"\([^"]*\)".*/\1/p' ~/.flightdeck/config.json)" FD_REPOS="${R[0]}" FD_REPOS2="${R[1]:-}" FD_REPOS3="${R[2]:-}" FD_REPOS4="${R[3]:-}" FD_UID=$(id -u) FD_GID=$(id -g) COMPOSE_ENV_FILES=$C docker compose up -d --build
 ```
 
 **옛 자리에서 먼저 내린다.** compose 프로젝트 이름이 **버전 디렉토리**라, 새 자리에서 바로 올리면
@@ -64,7 +65,7 @@ FD_TOKEN="$(cat ~/.flightdeck/token 2>/dev/null || sed -n 's/.*"token": *"\([^"]
 빠뜨리면 갱신마다 풀린다 — 실측(NAS): 등록 7건 중 **6건이 파생 불능**이었고 `healthz` 는 ok 였다.
 
 **설치된 캐시 자리에서 띄운다.** 개발 저장소에서 띄우면 설치된 판과 도는 판이 갈라진다.
-DB 증분은 서버가 열 때 스스로 얹고, 얹기 전에 백업을 뜬다 — 따로 할 일이 없다.
+DB 증분은 compose 의 `migrate` 단계가 서버보다 먼저 얹고 얹기 전에 백업을 뜬다(서버는 그것이 성공한 뒤에만 뜨고, 안 뜨면 사유는 `logs migrate`). Postgres 원장은 고정 이름 볼륨이라 자리가 바뀌어도 그대로다.
 
 ## 5. 갱신됐다는 증거를 본다
 

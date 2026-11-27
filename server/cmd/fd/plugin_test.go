@@ -1273,7 +1273,7 @@ func TestComposeAppliesMigrationsInASeparateStepBeforeServing(t *testing.T) {
 // dockerfileEntrypointRe 는 Dockerfile 의 ENTRYPOINT exec 형식에서 **실행 파일 경로**를 뽑는다.
 var dockerfileEntrypointRe = regexp.MustCompile(`(?m)^ENTRYPOINT\s+\[\s*"([^"]+)"`)
 
-// composeCommandRe 는 compose.yaml 의 `command: [...]` 한 줄에서 **첫 원소**를 뽑는다.
+// composeCommandRe 는 compose 파일의 `command: [...]` 한 줄에서 **첫 원소**를 뽑는다.
 var composeCommandRe = regexp.MustCompile(`(?m)^\s*command:\s*\[\s*"([^"]+)"`)
 
 // TestComposeCommandsDoNotRepeatTheEntrypoint 는 compose 의 `command` 가 이미지의
@@ -1314,26 +1314,29 @@ func TestComposeCommandsDoNotRepeatTheEntrypoint(t *testing.T) {
 	}
 	entry := m[1]
 
-	cf, err := os.ReadFile(filepath.Join(root, "compose.yaml"))
-	if err != nil {
-		t.Fatalf("compose.yaml 이 없다: %v", err)
-	}
-	cmds := composeCommandRe.FindAllStringSubmatch(string(cf), -1)
-	// ★ 하나도 못 찾으면 **통과가 아니라 실패**다. `command:` 의 표기가 밀리면(블록 형식 등)
-	// 이 시험은 아무것도 안 보면서 초록이 된다 — 이 레포가 두 번 밟은 그 자리다.
-	if len(cmds) == 0 {
-		t.Fatalf("compose.yaml 에 `command: [\"…\"]` 가 하나도 없다 —\n" +
-			"표기가 밀렸으면 이 시험은 **아무것도 안 보면서 초록**이 된다. 여기를 고쳐라")
-	}
-	for _, c := range cmds {
-		if c[1] == entry {
-			t.Fatalf("compose 의 command 첫 낱말이 이미지의 ENTRYPOINT 와 같다: %q\n"+
-				"도커는 command 를 ENTRYPOINT **뒤에 붙인다** — 실제로 도는 것은\n"+
-				"  %s %s …\n"+
-				"이고, 인자 파서에게 첫 낱말은 서브커맨드다. `모르는 명령: %s` 로 exit 2 가 되고,\n"+
-				"`service_completed_successfully` 때문에 **서버가 아예 안 뜬다**.\n"+
-				"command 에서 실행 파일 경로를 빼라 — 서브커맨드부터 적는다",
-				c[1], entry, c[1], c[1])
+	// 기본 파일과 Postgres 겹(덮개 파일이 migrate 의 command 를 갈아 끼운다) 둘 다 잰다.
+	for _, name := range []string{"compose.yaml", "compose.postgres.yaml"} {
+		cf, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatalf("%s 이 없다: %v", name, err)
+		}
+		cmds := composeCommandRe.FindAllStringSubmatch(string(cf), -1)
+		// ★ 하나도 못 찾으면 **통과가 아니라 실패**다. `command:` 의 표기가 밀리면(블록 형식 등)
+		// 이 시험은 아무것도 안 보면서 초록이 된다 — 이 레포가 두 번 밟은 그 자리다.
+		if len(cmds) == 0 {
+			t.Fatalf("%s 에 `command: [\"…\"]` 가 하나도 없다 —\n"+
+				"표기가 밀렸으면 이 시험은 **아무것도 안 보면서 초록**이 된다. 여기를 고쳐라", name)
+		}
+		for _, c := range cmds {
+			if c[1] == entry {
+				t.Fatalf("%s 의 command 첫 낱말이 이미지의 ENTRYPOINT 와 같다: %q\n"+
+					"도커는 command 를 ENTRYPOINT **뒤에 붙인다** — 실제로 도는 것은\n"+
+					"  %s %s …\n"+
+					"이고, 인자 파서에게 첫 낱말은 서브커맨드다. `모르는 명령: %s` 로 exit 2 가 되고,\n"+
+					"`service_completed_successfully` 때문에 **서버가 아예 안 뜬다**.\n"+
+					"command 에서 실행 파일 경로를 빼라 — 서브커맨드부터 적는다",
+					name, c[1], entry, c[1], c[1])
+			}
 		}
 	}
 }

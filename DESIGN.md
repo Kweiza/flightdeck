@@ -150,20 +150,29 @@ REST 가 없으면 서버를 만지는 순간 전 세션의 조정이 끊기고,
 
 ## 2. 배치
 
-### Tier A (이 문서의 범위) — 컨테이너 1개, 러너 0, 시크릿 0
+### Tier A (이 문서의 범위) — 서버 1개, 러너 0, 원장은 SQLite 파일(기본) 또는 Postgres(고를 때)
 
 ```
 [서버 머신]
-  컨테이너 flightdeck   (Go 정적 바이너리 + SQLite, 볼륨 2개)
-    :7420  GET  /                서버 렌더 HTML 한 장 (읽기 전용 대시보드)
-           GET  /events          SSE
-           POST /api/v1/...      REST (정본)
-           GET  /healthz         {ok, api_version, db_ok, disk_free_pct, self_update}
-           GET  /metrics         Prometheus
-    -v ~/.flightdeck:/data  →  /data/fd.db   (SQLite, WAL, busy_timeout=5000)
-                               /data/logs/
-    -v $FD_LEDGER_HOST:/ledger → /ledger/*.jsonl + manifest.json  (판단 원장, 매시간)
-                               /ledger/journal.git  (세대 역사, bare)
+  compose.yaml — 기본. 원장은 SQLite 파일 하나, 시크릿 0
+    migrate      one-shot. 스키마만 올리고 끝난다 — 서버는 그것이 성공한 뒤에만 뜬다(「열화」 절)
+    flightdeck   Go 정적 바이너리, 볼륨 2개
+      :7420  GET  /                서버 렌더 HTML 한 장 (읽기 전용 대시보드)
+             GET  /events          SSE
+             POST /api/v1/...      REST (정본)
+             GET  /healthz         {ok, api_version, db_ok, db_locale_ok, disk_free_pct, self_update}
+             GET  /metrics         Prometheus
+      -v ~/.flightdeck:/data  →  /data/fd.db   (SQLite, WAL, busy_timeout=5000)
+                                 /data/logs/
+      -v $FD_LEDGER_HOST:/ledger → /ledger/*.jsonl + manifest.json  (판단 원장, 매시간)
+                                 /ledger/journal.git  (세대 역사, bare)
+
+  + compose.postgres.yaml — 얹을 때만. 원장은 Postgres 17, 시크릿 = 접속 계정 둘의 pgpass 파일
+    db           postgres:17. 볼륨 flightdeck-pgdata(원장) · flightdeck-pgrun(소켓), 포트를 안 낸다
+    migrate      초사용자 · 소켓(trust). 손으로 하는 관리 명령(이관 · 역이관 · 되살리기 · psql)도 여기
+    db-roles     one-shot. 서버 계정(fd_app 의 구성원) · 덤프 계정(pg_read_all_data 의 구성원)을 맞춘다
+    flightdeck   서버 계정으로 TCP db:5432, pgpass 시크릿
+    db-backup    덤프 계정으로 매일 pg_dump -Fc → $FD_BACKUP_HOST/daily/<DB>/ (새것 14개)
 
 [모든 세션 머신]
   플러그인 flightdeck
@@ -172,6 +181,27 @@ REST 가 없으면 서버를 만지는 순간 전 세션의 조정이 끊기고,
     hooks/          5종
     skills/         3개
 ```
+
+**Postgres 원장은 덮개 파일로 고른다(2026-11-27).** 기본 `docker compose up` 은 판이 올라도 SQLite 파일 원장
+그대로다 — 갱신 한 번에 서버가 말없이 다른(빈) 원장을 보면 그것이 곧 데이터 유실로 보인다. profile 로는 이 전환을
+못 한다: profile 은 서비스를 켜고 끌 뿐 이미 있는 서비스(migrate · flightdeck)의 원장 URL · 의존 · 시크릿을 못 바꾸고,
+서버에 시크릿을 붙이면 그 파일이 없는 기본 `up` 까지 선다. 그래서 갈아 끼우는 것 전부를 `compose.postgres.yaml` 한
+파일에 두고, 고른 것은 `COMPOSE_FILE` 한 줄(README 「Postgres 로 띄우기」의 compose.env)로 남긴다. 겹의 모양:
+
+- **초사용자는 비밀번호가 없다.** 아무도 모르는 난수로 초기화하고 소켓만 trust 다. 소켓 볼륨은 `migrate` · `db-roles`
+  만 붙인다 — 서버와 매일 덤프는 초사용자로 못 붙는다. 빈 DB 의 준비(역할 · 스키마 권한 · pg_trgm)가 초사용자를 요구해
+  `migrate` 는 소유 역할이 아니라 초사용자로 돈다.
+- **볼륨은 프로젝트 밖의 고정 이름이고 external 이다.** compose 프로젝트 이름은 디렉토리 이름인데 플러그인 설치본은
+  판마다 디렉토리가 다르다 — 프로젝트 볼륨이면 갱신 한 번에 빈 원장이 뜬다. external 이라 `down -v` 가 못 지우고, 없으면
+  빈 원장을 새로 만드는 대신 `up` 이 선다. 같은 까닭으로 `db` 의 container_name 을 고정한다: 두 디렉토리가 한 데이터
+  볼륨에 postmaster 둘을 띄우면 PID 이름공간이 달라 postmaster.pid 가 못 막는다.
+- **시크릿은 pgpass 파일 둘뿐이고 서버 마운트 밖에 둔다.** 서버는 같은 uid 로 `FD_REPOS`(기본 홈 전체)를 읽는다.
+  같은 파일을 pgx(서버)와 libpq(덤프)가 다르게 푸므로 `db-roles` 가 두 구현이 같게 읽는 꼴만 받는다.
+- **매일 덤프는 `fd migrate` 가 돌기 전에 멈춘다.** pg_dump 는 끝날 때까지 모든 표의 ACCESS SHARE 잠금을 쥐고, 판을
+  올리는 DDL 은 lock_timeout(5초) 안에 그 잠금을 못 얻으면 실패한다. `db-backup` 의 `depends_on.migrate` 에
+  `restart: true` 를 걸어 compose 가 migrate 를 다시 만들 때 덤프를 먼저 멈추고 migrate 가 성공한 뒤 다시 띄운다.
+  재시도는 판올림을 덤프 길이만큼 미루며 실패를 덮고, 공유 권고 잠금은 pg_dump 가 낄 자리가 없어 안 골랐다. 손으로 도는
+  migrate(`run`, `up --no-deps`)에는 compose 가 이것을 안 하므로 그 절차가 덤프를 먼저 멈춘다.
 
 **MCP 를 로컬 stdio 로 두는 것이 첫 결정이다.** 원격 http MCP 는 끊기면 재연결 실패 후 전 세션이 수동
 재시도를 요구한다 — 서버 장애를 도구 계층까지 끌어올린다. 로컬 프로세스는 끊기지 않고, 원격 장애는
@@ -231,7 +261,7 @@ GHE push 도 이 구현 어디에도 없고, 그 셋을 어떻게 쪼갤지는 �
 
 ---
 
-## 3. 데이터 모델 — SQLite 파일 하나, 테이블 28개, 계층 셋
+## 3. 데이터 모델 — 원장 하나, 테이블 26개, 계층 셋
 
 계층이 곧 쓰기 권한이다.
 
@@ -241,25 +271,27 @@ GHE push 도 이 구현 어디에도 없고, 그 셋을 어떻게 쪼갤지는 �
 | **Q — 큐** | 항목·의존·선점·판정이력 | 사람은 `title`·`body`·`reason` 만. 나머지는 서버가 채운다 |
 | **J — 판단** | 핸드오프·결정·기각·스냅숏 | 사람만. **추가 전용**(UPDATE·DELETE 트리거로 차단) |
 
-정본은 `server/internal/store/schema.sql`. 아래는 그 요지와 **각 제약이 막는 사고**다.
+정본은 Postgres 기준선 `server/internal/store/pg/001_baseline.sql`(빈 DB 의 준비는 `pg/bootstrap.sql`)이다.
+SQLite 판(`server/internal/store/schema.sql` + 증분)은 기준선이 접어 넣은 판 18 과 같은 뜻이고 — 두 판이 어긋나면
+`TestPGBaselineFoldsTheLastSQLiteVersion` 이 빨갛다 — 옮기는 동안만 산다. 원장은 배포마다 둘 중 하나다(「배치」 절의
+Tier A). 아래는 그 요지와 **각 제약이 막는 사고**다.
 
-**★ 28 은 세는 축을 밝혀 둔다 — 안 밝히면 다음 사람이 다른 축을 세고 어긋났다고 판단한다.**
-사람이 선언한 것 = `schema.sql` 의 `CREATE TABLE` 21 + `CREATE VIRTUAL TABLE` 1(`judgment_fts`) +
-증분 6(`idempotency` 002 · `landing_queue` 003 · `landing_queue_resource` 008 ·
-`project_member` 014 · `item_revision` 016 · `session_inbox` 018) = 28
-반면 살아 있는 DB 에서 `sqlite_master` 를 그대로 세면 **32** 가 나온다. 축이 **둘** 어긋난다:
+**★ 26 은 세는 축을 밝혀 둔다 — 안 밝히면 다음 사람이 다른 축을 세고 어긋났다고 판단한다.**
+PG 기준선이 선언한 것 = `pg/001_baseline.sql` 의 `CREATE TABLE` 26. SQLite 판은 둘을 더 선언해 28 이다
+(`schema.sql` 의 `CREATE TABLE` 21 + `CREATE VIRTUAL TABLE` 1 + 증분 6 — `idempotency` 002 · `landing_queue` 003 ·
+`landing_queue_resource` 008 · `project_member` 014 · `item_revision` 016 · `session_inbox` 018):
 
-- **⊖ 증분 011 이 `item_dependents` 를 DROP 한다.** 선언은 `schema.sql` 에 그대로 남아 있지만
+- **`judgment_fts`** — FTS5 가상 표. PG 에서는 `judgment` 의 pg_trgm GIN 식 인덱스가 그 자리라 표가 아니다.
+- **`item_dependents`** — 증분 011 이 DROP 한 죽은 표. 선언은 `schema.sql` 에 그대로 남아 있지만
   (정의를 두 자리에 두지 않는다는 규율 — `BaseSchemaVersion` 주석) **어떤 DB 에도 그 표는
-  없다.** 빈 DB 도 "schema.sql → 증분 전부"를 거치므로 만들었다가 지운다.
-- **⊕ SQLite 가 다섯을 더 만든다.** FTS5 가 `judgment_fts` 하나마다 그림자 표 넷
-  (`judgment_fts_config`·`_data`·`_docsize`·`_idx`), 거기에 `AUTOINCREMENT` 가 있는 표마다
-  공유하는 `sqlite_sequence` 하나.
+  없다.** 빈 DB 도 "schema.sql → 증분 전부"를 거치므로 만들었다가 지운다. 기준선은 옮기지 않았다.
 
-합치면 28 − 1 + 4 + 1 = 32. 다섯은 SQLite 엔진이 만드는 부산물이고 `item_dependents` 는
-은퇴한 선언이라 **둘 다 이 절이 말하는 데이터 모델이 아니다** — 그래서 이 절은 28 을 쓴다.
-산식의 검산은 `store/schema_table_count_test.go` 가 **이름 목록 28개로** 잠근다(수만 맞추는
-시험이 아니다 — 하나를 지우고 하나를 더하면 거기서 빨개진다).
+살아 있는 SQLite DB 에서 `sqlite_master` 를 그대로 세면 **32** 가 나온다: 28 − 1(`item_dependents`) + 4(FTS5 가
+`judgment_fts` 뒤에 만드는 그림자 표 `judgment_fts_config`·`_data`·`_docsize`·`_idx`) + 1(`AUTOINCREMENT` 표가 공유하는
+`sqlite_sequence`). 다섯은 SQLite 엔진의 부산물이고 `item_dependents` 는 은퇴한 선언이라 **둘 다 이 절이 말하는 데이터
+모델이 아니다** — 그래서 이 절은 26 을 쓴다. 산식의 검산은 `store/schema_table_count_test.go` 가 두 엔진을 함께
+**이름 목록으로** 잠근다: PG 기준선 = `wantTables`(26), SQLite = 그것 + `sqliteOnlyTables`(28). 수만 맞추는 시험이
+아니다 — 하나를 지우고 하나를 더하면 거기서 빨개진다.
 
 **실측(2026-09-16, 운영 원장 `mode=ro` 사본):** 판 15 에서 `sqlite_master` 30개
 (선언 25 + 그림자 4 + `sqlite_sequence` 1), 증분 016 을 얹어 **31개**. 실제로 다른 세션이 `sqlite_master` 값(28, 그때 `landing_queue` 전)을 "테이블 수"로
@@ -1844,7 +1876,7 @@ N-1 까지만 올려 두고 옛 바이너리로 계속 도는 선택지를 준�
 | DB 와 다른 볼륨 | 있음 | `compose.yaml` 이 `$FD_LEDGER:/ledger` 를 따로 붙인다. **기본값은 여전히 같은 디스크다**(`~/.flightdeck-ledger` 는 `~/.flightdeck` 의 형제다) — 이 줄이 사는 것은 *가를 수 있는 자리*이지 분리 그 자체가 아니다. 진짜 분리는 `FD_LEDGER_HOST` 를 다른 매체로 겨눠야 성립한다 |
 | bare 레포 커밋(`journal.git`) | 있음 | `$FD_LEDGER/journal.git` 에 회차마다 한 커밋. **가드를 안 건드렸다** — `JudgeOutTarget` 이 막는 것은 판단 본문이 남의 레포 **작업본**에 쌓이는 사고인데, bare 레포에는 작업 트리가 없어 그 관심사가 성립하지 않는다. 작업 트리 없이 `hash-object`→`mktree`→`commit-tree`→`update-ref` 로만 쌓는다. **디스크에 실린 바이트를 쌓지 갓 인코딩한 것을 쌓지 않는다** — 매니페스트의 `exported_at` 이 회차마다 달라 후자면 안 바뀐 회차도 커밋이 생긴다 |
 | 6시간 `VACUUM INTO` | **없음** | `VACUUM INTO` 는 있지만 마이그레이션 직전 1회다(`Store.backup`). 정기 작업이 아니다 |
-| 매일 덤프(Postgres 원장) | **자리만** | `compose.yaml` 의 `db-backup` 서비스(`deploy/db-backup.sh`)가 `pg_dump -Fc` 를 `$FD_BACKUP_HOST/daily` 에 하루 한 번 뜨고 새것 14개만 남긴다. `.part.<무작위>` 로 떠서 `pg_restore --list` 가 읽은 뒤에만 이름을 주고, 회전은 그 뒤에만 한다 - 접속이 끊긴 날이 이어져도 앞 덤프가 안 지워진다. 덤프 자리는 DB 마다 따로다(`daily/<DB>/`, 소문자 · 숫자 · `_` · `-` 밖의 바이트는 `%XX` - 단사라 두 DB 가 한 자리로 안 모인다). 한 자리에서는 그 자리의 `fd-daily.lock` 을 `flock -n` 으로 쥔 실행 하나만 정리 · 때 재기 · 덤프 · 회전을 하고, 못 쥔 실행은 종료 코드 3 으로 아무것도 안 한다 - 잠금은 pg_dump 에 물려 덤프가 끝날 때까지 간다. 때 재기와 회전은 같은 이름 규칙(`fd-daily-<8자리>T<6자리>Z.dump`) 하나로 센다. pg_dump 는 `timeout` 기한(`FD_DUMP_TIMEOUT`, `fd migrate` 의 판올림 전 덤프와 같은 이름 · 같은 문법 · 같은 범위 - 시험이 둘을 맞댄다)와 `--lock-wait-timeout`(서버의 `lockTimeout` 과 같은 값) 안에서만 돈다. pg_dump 는 서버 쪽 제한을 0 으로 두므로 기한은 바깥에서만 걸 수 있다. 기한을 넘으면 그날은 실패라 부분 파일도 회전도 없다. healthcheck 의 낡음 기준은 간격 + 확인 두 번 + 기한(기본 26시간 30분)이다. 비밀번호는 pgpass 시크릿 파일로만 받는다(서버의 `FD_REPOS` 마운트 밖에 둔다). profile `postgres` 뒤에 있어 지금은 안 뜨고, Postgres 로 옮기는 단계가 `db` 서비스와 함께 켠다. 매시간 판단 원장은 두 엔진에서 같은 바이트다(Postgres 는 `ReadTx` 의 REPEATABLE READ READ ONLY 스냅숏 하나로 읽는다) |
+| 매일 덤프(Postgres 원장) | 있음(Postgres 겹) | `compose.postgres.yaml` 의 `db-backup` 서비스(`deploy/db-backup.sh`)가 `pg_dump -Fc` 를 `$FD_BACKUP_HOST/daily` 에 하루 한 번 뜨고 새것 14개만 남긴다. `.part.<무작위>` 로 떠서 `pg_restore --list` 가 읽은 뒤에만 이름을 주고, 회전은 그 뒤에만 한다 - 접속이 끊긴 날이 이어져도 앞 덤프가 안 지워진다. 덤프 자리는 DB 마다 따로다(`daily/<DB>/`, 소문자 · 숫자 · `_` · `-` 밖의 바이트는 `%XX` - 단사라 두 DB 가 한 자리로 안 모인다). 한 자리에서는 그 자리의 `fd-daily.lock` 을 `flock -n` 으로 쥔 실행 하나만 정리 · 때 재기 · 덤프 · 회전을 하고, 못 쥔 실행은 종료 코드 3 으로 아무것도 안 한다 - 잠금은 pg_dump 에 물려 덤프가 끝날 때까지 간다. 때 재기와 회전은 같은 이름 규칙(`fd-daily-<8자리>T<6자리>Z.dump`) 하나로 센다. pg_dump 는 `timeout` 기한(`FD_DUMP_TIMEOUT`, `fd migrate` 의 판올림 전 덤프와 같은 이름 · 같은 문법 · 같은 범위 - 시험이 둘을 맞댄다)와 `--lock-wait-timeout`(서버의 `lockTimeout` 과 같은 값) 안에서만 돈다. pg_dump 는 서버 쪽 제한을 0 으로 두므로 기한은 바깥에서만 걸 수 있다. 기한을 넘으면 그날은 실패라 부분 파일도 회전도 없다. healthcheck 의 낡음 기준은 간격 + 확인 두 번 + 기한(기본 26시간 30분)이다. 비밀번호는 덤프 계정(`pg_read_all_data` 의 구성원)의 pgpass 시크릿 파일로만 받는다(서버의 `FD_REPOS` 마운트 밖에 둔다). Postgres 겹(덮개 파일)을 얹을 때만 뜨고, `fd migrate` 가 돌기 전에 멈춘다(`depends_on` 의 `restart: true` — 판올림의 DDL 이 덤프의 표 잠금에 걸려 서지 않게, 「배치」 절). 매시간 판단 원장은 두 엔진에서 같은 바이트다(Postgres 는 `ReadTx` 의 REPEATABLE READ READ ONLY 스냅숏 하나로 읽는다) |
 
 **실측 (2026-08-06 19:43 KST).** `judgment` 1,157행 · `judgment_link` 1,734행 · `snapshot` 12행 ·
 `session` 302행 · `project` 8행 · `machine` 8행이
@@ -2218,6 +2250,25 @@ YAML 전체를 들이면 그 파서가 읽는 모든 것(앵커·별칭·태그�
 
 매일 자동 대조(추천 일치율 · 생존 집합 · 대시보드 생성물 vs 손 편집)를 돌리고,
 **3일 연속 일치하면** 그 자리의 손 편집을 막는다.
+
+### SQLite 원장에서 Postgres 원장으로 (2026-11-27)
+
+같은 규율을 원장 엔진의 전환에도 쓴다: **되돌릴 수 있어야 착수한다.**
+
+- **기본은 그대로다.** 이 판까지 기본 배포는 SQLite 파일 원장이고, Postgres 는 소유자가 덮개 파일을 얹어 고를 때만
+  켜진다(「배치」 절의 Tier A). 갱신이 원장을 바꾸지 않는다.
+- **옮기기는 한 트랜잭션이고 맞댄 뒤에만 커밋한다.** `fd migrate import-sqlite` 가 판 18 의 SQLite 원장을 **빈**
+  Postgres 원장으로 옮기고, 같은 트랜잭션 안에서 표마다 행 수 · 전 칸 지문 · identity 순번을 맞대 어긋나면 되감는다.
+  `--dry-run` 이 같은 길을 끝까지 돌고 되감는다. `fd migrate verify` 가 그 대조만 다시 한다. 판 18 보다 옛 원장은 먼저
+  SQLite 판에서 올린다 — 옛 판을 건너 옮기는 길은 만들지 않는다(옮기는 코드가 판 하나만 안다).
+- **옮긴 SQLite 파일은 지우지 않는다.** 이름을 바꾸고(`fd.db.pre-pg-<UTC>`, 옆 파일 `-wal` · `-shm` 째) 읽기 전용으로
+  둔다. 이름을 바꾸는 까닭은 덮개 파일을 빼고 띄운 서버가 옛 원장을 말없이 다시 열지 않게 하는 것이다 — 그때 서버는 빈
+  SQLite 원장으로 떠서 잘못이 보인다.
+- **72시간 되돌리기 창.** `fd migrate export-sqlite` 가 Postgres 원장을 판 18 의 **새** SQLite 파일로 옮기고 같은 대조로
+  맞춘 뒤에만 이름을 붙인다 — 옮긴 뒤 Postgres 에 쌓인 쓰기도 같이 돌아온다. 그 창 동안은 Postgres 스키마를 18 위로
+  올리지 않는다(역이관은 판 18 만 받는다). 절차는 README 「업그레이드: SQLite 원장을 Postgres 로」.
+- **배포 정의와 운영 전환은 다른 일이다.** 덮개 파일 · 계정 스크립트 · 절차는 코드와 함께 나가고, 살아 있는 원장을
+  옮기는 것은 소유자가 확인하고 하는 한 번의 작업이다.
 
 ---
 

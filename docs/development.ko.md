@@ -18,7 +18,8 @@
 | `skills/` | 스킬 4개 |
 | `board/` | 소유자 칸반 보드(`board.py` · `index.html` · `install.sh`). 시험 `test_board.py` 는 `go test ./cmd/fd` 가 돌린다 |
 | `server/` | Go 모듈 하나 — 서버 · CLI · MCP · 훅이 **한 바이너리**다 |
-| `compose.yaml` | 서버 컨테이너(스키마 적용 one-shot + 서버) |
+| `compose.yaml` | 서버 컨테이너(스키마 적용 one-shot + 서버). 원장은 SQLite 파일 |
+| `compose.postgres.yaml` · `deploy/` | Postgres 원장 덮개 파일(원장 DB · 접속 계정 · 매일 덤프)과 그 스크립트(`db-roles.sh` · `db-backup.sh`). 시험 `deploypg_test.go` 가 렌더한 compose 설정으로 잰다 |
 | `compose.test.yaml` | 시험 전용 Postgres(`pg-test`). 시험이 `FD_TEST_PG` 로 받는다 |
 | `DESIGN.md` | 설계 정본 |
 | `docs/*.md` · `docs/*.ko.md` | 주제별 문서(개념 · 서버 운영 · codex · 여러 저장소 · 레퍼런스 · 개발) |
