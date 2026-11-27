@@ -215,7 +215,9 @@ func (s *Store) importInto(ctx context.Context, src *Store, dryRun bool, rep *Im
 			return nil
 		})
 		switch {
-		case dryRun && errors.Is(err, errDryRun):
+		// 되감기까지 성공해야 예행이 끝난 것이다. 되감기가 실패하면 sessionTx 가 errDryRun 과 함께 errRollbackFailed 를
+		// 싸서 내므로, 그때는 예행 성공으로 보지 않는다.
+		case dryRun && errors.Is(err, errDryRun) && !errors.Is(err, errRollbackFailed):
 			return nil
 		case err != nil:
 			return err
@@ -403,8 +405,10 @@ func targetReady(ctx context.Context, q dbtx) error {
 		if err != nil {
 			return err
 		}
-		if seq.called {
-			busy = append(busy, fmt.Sprintf("%s.%s 순번(%d 까지 냈다)", t.Name, c.Name, seq.last))
+		// 새 기준선의 순번은 (시작값, 아직 안 냄)이다. 번호를 냈거나(called), 앞선 이관이 RESTART 로 옮겨 둔 순번(called 가
+		// 거짓이어도 last ≠ 시작값)은 그 번호까지 이미 쓰인 원장의 흔적이다 - 다시 옮기면 순번을 되감아 낸 번호를 다시 낸다.
+		if seq.called || seq.last != seq.start {
+			busy = append(busy, fmt.Sprintf("%s.%s 순번(다음 번호 %d)", t.Name, c.Name, pg.NextValue(seq.last, seq.called)))
 		}
 	}
 	if len(busy) > 0 {
@@ -791,6 +795,8 @@ type identitySeq struct {
 	// last · called 는 시퀀스의 last_value · is_called 다. called 가 거짓이면 아직 번호를 낸 적이 없다(다음이 last 다).
 	last   int64
 	called bool
+	// start 는 시퀀스의 시작값(pg_sequence.seqstart)이다. RESTART 는 이것을 안 바꾼다 - 새 기준선은 last = start 다.
+	start int64
 }
 
 // readIdentity 는 대상 표 table 의 identity 칸 col 의 시퀀스를 읽는다. 시퀀스를 읽는 권한(SELECT)이 있어야 한다 - 소유
@@ -806,6 +812,9 @@ func readIdentity(ctx context.Context, r Reader, table, col string) (identitySeq
 	seq := identitySeq{name: name.String}
 	if err := r.QueryRowContext(ctx, `SELECT last_value, is_called FROM `+seq.name).Scan(&seq.last, &seq.called); err != nil {
 		return identitySeq{}, fmt.Errorf("%s.%s 의 순번을 읽지 못했다(시퀀스를 읽는 권한은 소유 역할에 있다): %w", table, col, err)
+	}
+	if err := r.QueryRowContext(ctx, `SELECT seqstart FROM pg_sequence WHERE seqrelid = ?::regclass`, seq.name).Scan(&seq.start); err != nil {
+		return identitySeq{}, fmt.Errorf("%s.%s 의 순번 시작값을 읽지 못했다: %w", table, col, err)
 	}
 	return seq, nil
 }

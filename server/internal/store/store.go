@@ -1314,6 +1314,9 @@ func (s *Store) stepTx(ctx context.Context, sess *migrateSession, m Migration, b
 // (migrateSession.release)까지 올라가고 *sql.Conn 의 Close 가 열린 트랜잭션이 끝나기를 영영 기다린다 - 패닉이 밖으로
 // 나가지도 못하고 실행기가 선다. defer 는 세션 해제보다 먼저 돈다(안쪽 함수의 defer 가 먼저다). 커밋한 뒤의 되감기는
 // sql.ErrTxDone 으로 아무것도 안 한다.
+// errRollbackFailed 는 sessionTx 의 되감기가 실패했다는 표지다. body 오류(예: 예행의 errDryRun)와 함께 싸여 나간다.
+var errRollbackFailed = errors.New("롤백도 실패")
+
 func (s *Store) sessionTx(ctx context.Context, sess *migrateSession, what string, body func(context.Context, *txConn) error) (err error) {
 	defer func() { err = asFault(err) }()
 	tx, err := s.begin(ctx, txSpec{kind: txWrite, on: sess})
@@ -1323,7 +1326,7 @@ func (s *Store) sessionTx(ctx context.Context, sess *migrateSession, what string
 	defer func() { _ = tx.Rollback() }()
 	if err := body(ctx, tx); err != nil {
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			return fmt.Errorf("%s 실패(path=%q): %w (롤백도 실패: %v)", what, s.path, err, rbErr)
+			return fmt.Errorf("%s 실패(path=%q): %w (%w: %v)", what, s.path, err, errRollbackFailed, rbErr)
 		}
 		return fmt.Errorf("%s 실패(path=%q): %w", what, s.path, err)
 	}

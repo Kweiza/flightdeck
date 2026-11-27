@@ -363,6 +363,20 @@ func TestImportSQLiteRefusesATargetThatIsNotEmpty(t *testing.T) {
 		t.Fatalf("거절했는데 대상에 %d 행", n)
 	}
 
+	// 번호를 내지 않았어도(is_called 거짓) 순번이 시작값에서 옮겨져 있으면 빈 원장이 아니다. 앞선 이관이 지워진 최고 번호를
+	// 지키려고 RESTART 로 옮겨 두고 행만 사라진 꼴이다 - 다시 옮기면 순번을 1 로 되감는다.
+	dsn3, dst3 := importTarget(t)
+	pgExec(t, dst3, `SELECT setval(pg_get_serial_sequence('event', 'id'), 101, false)`)
+	for _, dry := range []bool{true, false} {
+		_, err := ImportSQLite(ctx, src, dsn3, ImportOptions{DryRun: dry}, quietLog())
+		if err == nil || !strings.Contains(err.Error(), "비어 있지 않다") || !strings.Contains(err.Error(), "event.id 순번(다음 번호 101)") {
+			t.Fatalf("예행 %v: 시작값에서 옮겨진 순번이 있는 대상에 옮겼다: %v", dry, err)
+		}
+	}
+	if n := targetRows(t, dst3); n != 0 {
+		t.Fatalf("거절했는데 대상에 %d 행", n)
+	}
+
 	bare := storetest.NewBare(t, "")
 	if _, err := ImportSQLite(ctx, src, bare, ImportOptions{}, quietLog()); err == nil || !strings.Contains(err.Error(), "--to 18") {
 		t.Fatalf("빈 DB 에 옮겼거나 처방이 없다: %v", err)
