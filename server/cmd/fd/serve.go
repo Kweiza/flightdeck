@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/kweiza/flightdeck/internal/api"
+	"github.com/kweiza/flightdeck/internal/auth"
 	"github.com/kweiza/flightdeck/internal/lang"
 	"github.com/kweiza/flightdeck/internal/service"
 	"github.com/kweiza/flightdeck/internal/store"
@@ -114,16 +116,14 @@ func portOf(addr string) string {
 // 않는다(runServe 자신은 시험이 없다 — FD_TOKEN 도 같은 처지다). 여기서 멈추는 근거는
 // **실패 모양**이다: 토큰이 끊기면 인증이 통째로 열려 시끄럽게 드러나고, self_update 가
 // 끊기면 화면이 아무 말도 안 하는 **침묵**이라 이 축만 한 칸 더 뺐다.
-func serveAPIOptions(token string, ratePerMinute int, log *slog.Logger, inContainer bool,
-	watcher *selfWatcher, ledgerJob *ledgerBackupJob, requireTokenOnLoopback bool, screenOpts []web.Option) api.Options {
+func serveAPIOptions(token string, ratePerMinute int, log *slog.Logger, ac authConfig,
+	watcher *selfWatcher, ledgerJob *ledgerBackupJob, screenOpts []web.Option) api.Options {
 	opt := api.Options{
 		Token:         token,
 		RatePerMinute: ratePerMinute,
 		Log:           log,
-		InContainer:   inContainer,
-		// ★ 기본값(false)이 설계의 기본 동작이다 — 그것을 여기서 바꾸지 않는다.
-		// 이 필드가 배선을 타야 하는 이유는 아래 플래그 주석에 있다.
-		RequireTokenOnLoopback: requireTokenOnLoopback,
+		AuthMode:      ac.Mode,
+		TLS:           ac.TLS,
 	}
 	// ★ nil 감시기면 콜백을 안 단다. api 쪽은 SelfUpdate 가 nil 이면 그 절을 통째로
 	// 빼므로(handlers_meta.go), "감시기가 없다"와 "감시기가 빈 값을 답한다"가 안 섞인다.
@@ -205,29 +205,56 @@ func buildIdentity(stat func(string) (ExeID, error)) string {
 	return id.String()
 }
 
+// authConfig 는 fd serve 의 인증 단계와 전송 정책이다.
+type authConfig struct {
+	Mode auth.Mode
+	TLS  auth.TLSPolicy
+}
+
+// readAuthConfig 는 FD_AUTH · FD_TLS · FD_TLS_CERT · FD_TLS_KEY · FD_TRUSTED_PROXY 를 읽는다. 순수 함수다(env 를 받는다).
+//
+// ★ FD_AUTH 의 기본값은 transition 이다. 지금 배포는 FD_TOKEN 하나로 모든 기기 · 훅 · MCP · 보드가 붙는다 - 기본값을 accounts
+// 로 두면 이 판으로 갈아 끼우는 순간 그 전부가 401 이다. 각 기기가 fd login 으로 옮긴 뒤 사람이 FD_AUTH=accounts 로 좁힌다.
+func readAuthConfig(env func(string) (string, bool)) (authConfig, error) {
+	mode, err := auth.ParseMode(envOr(env, "FD_AUTH", ""))
+	if err != nil {
+		return authConfig{}, err
+	}
+	tp, err := auth.ParseTLS(envOr(env, "FD_TLS", ""), envOr(env, "FD_TLS_CERT", ""),
+		envOr(env, "FD_TLS_KEY", ""), envOr(env, "FD_TRUSTED_PROXY", ""))
+	if err != nil {
+		return authConfig{}, err
+	}
+	return authConfig{Mode: mode, TLS: tp}, nil
+}
+
 // runServe 는 `fd serve` 다.
 func runServe(args []string, env func(string) (string, bool), log *slog.Logger) int {
 	fs := newFlagSet("serve")
 	addr := fs.String("addr", envOr(env, "FD_ADDR", ":7420"), "수신 주소")
 	dbPath := fs.String("db", "", "SQLite 파일 경로 또는 postgres:// 접속 URL(비면 자동)")
 	rate := fs.Int("rate-per-minute", 0, "원격 주소당 분당 요청 상한(0 이면 무제한)")
-	// ★ 루프백 면제를 끄는 스위치다. **기본값은 면제 열림이고 그것을 안 바꾼다** —
-	// 로컬 루프백으로 토큰 없이 붙는 세션이 이 제품의 정상 사용이라, 기본값을 뒤집으면
-	// 그것들이 한꺼번에 전부 깨진다.
-	//
-	// ★ 이 플래그가 필요한 자리는 **리버스 프록시가 같은 호스트에 있는 배포**다.
-	// 면제 판정은 RemoteAddr 이므로(auth.go 의 IsLoopback) 그 프록시를 거친 요청이
-	// 전부 127.0.0.1 로 도착한다 — 토큰을 켜 뒀는데 바깥에서 오는 요청 전부가
-	// 무인증으로 통과한다. 컨테이너 배포는 해당 없다: 브리지 게이트웨이가 172.x 라
-	// 루프백으로 안 보인다(login.go 가 그 사실을 이미 적어 뒀다).
-	//
-	// ★ 환경변수를 안 만든다. 이 저장소의 불리언 설정은 전부 플래그이고
-	// (migrate.go·project.go), 불리언 환경변수는 선례가 없다. 한 축을 위해 새 관례를
-	// 만들면 다음 사람이 어느 쪽이 규칙인지 모른다.
-	requireTokenOnLoopback := fs.Bool("require-token-on-loopback", false,
-		"루프백 요청에도 토큰을 요구한다(리버스 프록시가 같은 호스트에 있으면 켜라)")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	// ★ 인증 단계 · 전송 정책을 DB 를 열기 **전에** 읽는다. 잘못 적은 값으로 원장을 열고 판올림까지 건 뒤 거절하면 남는 것이
+	// 없다. 루프백 밖 평문 bind 의 거절도 여기서 정한다(auth.JudgeBind).
+	ac, err := readAuthConfig(env)
+	if err != nil {
+		log.Error("인증 설정을 읽지 못해 기동을 중단한다", "error", err.Error())
+		return 2
+	}
+	tlsConf, err := auth.ServerTLSConfig(ac.TLS)
+	if err != nil {
+		log.Error("TLS 인증서를 읽지 못해 기동을 중단한다", "error", err.Error())
+		return 1
+	}
+	switch v := auth.JudgeBind(*addr, ac.TLS, ac.Mode); {
+	case v.Refuse:
+		log.Error("이 주소로는 띄우지 않는다", "route", clip(*addr, 120), "reason", v.Reason)
+		return 1
+	case v.Warn != "":
+		log.Warn("평문 HTTP 로 루프백 밖에서 듣는다", "route", clip(*addr, 120), "reason", v.Warn)
 	}
 
 	home, _ := os.UserHomeDir()
@@ -269,7 +296,7 @@ func runServe(args []string, env func(string) (string, bool), log *slog.Logger) 
 	// ★ 잡을 핸들러보다 먼저 만든다 — api.Options.LedgerBackup 콜백이 이 잡의 State() 를
 	//   물으므로 조립 시점에 이미 있어야 한다(감시기와 같은 이유).
 	ledgerJob := newLedgerBackupJob(log, st, LedgerOutDir(env, home, inContainer), ledgerBackupInterval)
-	handler := buildHandler(svc, webH, serveAPIOptions(token, *rate, log, inContainer, watcher, ledgerJob, *requireTokenOnLoopback, screenOpts))
+	handler := buildHandler(svc, webH, serveAPIOptions(token, *rate, log, ac, watcher, ledgerJob, screenOpts))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -282,6 +309,9 @@ func runServe(args []string, env func(string) (string, bool), log *slog.Logger) 
 		log.Error("서버를 띄우지 못했다", "route", clip(*addr, 120),
 			"error", lerr.Error(), "reason", PortAdvice(*addr, lerr))
 		return 1
+	}
+	if tlsConf != nil {
+		ln = tls.NewListener(ln, tlsConf)
 	}
 
 	// ★ **바인드 성공 뒤다.** 리스너가 열리기 전에 적으면 포트를 이미 물린 기동도
@@ -298,7 +328,7 @@ func runServe(args []string, env func(string) (string, bool), log *slog.Logger) 
 	go ledgerJob.Run(ctx)
 
 	log.Info("기동", "route", clip(ln.Addr().String(), 120), "db_path", shown,
-		"api_version", service.APIVersion, "auth_required", token != "",
+		"api_version", service.APIVersion, "auth_mode", string(ac.Mode), "tls", string(ac.TLS.Mode), "token_set", token != "",
 		"ledger_out", clip(ledgerJob.route, 200))
 
 	return serveWithWatcher(ctx, ln, handler, log, watcher)

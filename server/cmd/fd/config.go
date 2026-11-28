@@ -144,7 +144,7 @@ func ResolveEndpoint(get func(string) (string, bool), home string) Endpoint {
 		ep.URL, ep.URLSource = strings.TrimRight(strings.TrimSpace(v), "/"), "FD_URL 환경변수"
 	}
 
-	ep.TokenSource = "없음 — 인증이 꺼져 있거나 루프백 면제로 도는 중이다"
+	ep.TokenSource = "없음 - 서버가 토큰 없이 도는 전환 단계일 때만 통한다(루프백도 같다)"
 	if found && cfg.Token != "" {
 		ep.Token, ep.TokenSource = cfg.Token, "config.json ("+clip(path, 200)+")"
 	}

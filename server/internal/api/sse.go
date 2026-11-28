@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/kweiza/flightdeck/internal/auth"
 )
 
 // SSE — 서버가 미는 변화 알림.
@@ -68,6 +70,35 @@ func oneLine(s string) string {
 type Sub struct {
 	ch      chan []byte
 	project string // 빈 문자열이면 전 프로젝트
+	owner   StreamOwner
+	// cut 은 서버가 이 스트림을 끊었다는 신호다(Hub.Cut 이 닫는다). ch 를 닫지 않고 따로 두는 이유: 핸들러가 「종료 · 철회」를
+	// 가려 작별 줄을 고르고, ch 의 닫힘은 Unsubscribe 한 곳의 몫으로 남는다.
+	cut chan struct{}
+}
+
+// StreamOwner 는 스트림을 연 주체다 - 열린 스트림을 (계정, 기기 | 화면 세션)으로 묶은 목록의 열쇠다(설계: 철회는 다음
+// 요청부터 듣는데 열린 스트림에는 다음 요청이 없다). 빈 칸은 어떤 끊기와도 안 맞는다 - FD_TOKEN · 무인증 스트림은 계정 쓰기로
+// 끊을 것이 없다(FD_TOKEN 을 바꾸고 서버를 다시 띄우면 끊긴다).
+type StreamOwner struct {
+	Account, Machine, WebSession string
+}
+
+// OwnerOf 는 주체의 스트림 열쇠다.
+func OwnerOf(p auth.Principal) StreamOwner {
+	return StreamOwner{Account: p.AccountID, Machine: p.MachineID, WebSession: p.WebSession}
+}
+
+// CutAccount · CutMachine · CutWebSession 은 Hub.Cut 의 고르기다. 빈 id 는 아무것도 안 고른다.
+func CutAccount(id string) func(StreamOwner) bool {
+	return func(o StreamOwner) bool { return id != "" && o.Account == id }
+}
+
+func CutMachine(id string) func(StreamOwner) bool {
+	return func(o StreamOwner) bool { return id != "" && o.Machine == id }
+}
+
+func CutWebSession(idHash string) func(StreamOwner) bool {
+	return func(o StreamOwner) bool { return idHash != "" && o.WebSession == idHash }
 }
 
 // Hub 는 구독자 집합이다.
@@ -86,14 +117,37 @@ func NewHub(buf int) *Hub {
 	return &Hub{subs: map[*Sub]struct{}{}, buf: buf}
 }
 
-// Subscribe 는 구독자를 등록한다. project 가 비면 전부 받는다.
-func (h *Hub) Subscribe(project string) *Sub {
-	s := &Sub{ch: make(chan []byte, h.buf), project: strings.TrimSpace(project)}
+// Subscribe 는 구독자를 등록한다. project 가 비면 전부 받는다. owner 는 철회 · 끄기가 이 스트림을 고르는 열쇠다.
+func (h *Hub) Subscribe(project string, owner StreamOwner) *Sub {
+	s := &Sub{ch: make(chan []byte, h.buf), project: strings.TrimSpace(project), owner: owner, cut: make(chan struct{})}
 	h.mu.Lock()
 	h.subs[s] = struct{}{}
 	h.mu.Unlock()
 	return s
 }
+
+// Cut 은 고른 주체의 열린 스트림을 끊고 그 수를 돌려준다. 철회 · 끄기 · 로그아웃 트랜잭션이 **커밋된 뒤** 부른다 - 앞에서
+// 끊으면 롤백된 철회에도 스트림이 끊기고, 다시 붙은 스트림은 아직 철회 전 원장을 보고 통과한다.
+//
+// ★ 구독 집합에서 지우고 cut 만 닫는다(잠금 안). 지운 구독은 발행을 더 안 받고, 뒤의 Unsubscribe 는 할 일이 없다 - ch 를
+// 함께 닫으면 핸들러의 select 가 「ch 닫힘」과 「끊김」 중 아무것이나 골라 작별 줄이 갈린다.
+func (h *Hub) Cut(match func(StreamOwner) bool) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for s := range h.subs {
+		if !match(s.owner) {
+			continue
+		}
+		delete(h.subs, s)
+		close(s.cut)
+		n++
+	}
+	return n
+}
+
+// Cut 은 이 구독이 서버에게 끊겼다는 신호다.
+func (s *Sub) Cut() <-chan struct{} { return s.cut }
 
 // Unsubscribe 는 구독을 끊고 채널을 닫는다.
 //

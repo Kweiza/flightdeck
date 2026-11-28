@@ -23,6 +23,7 @@ type NotFoundKind string
 const (
 	NFProject      NotFoundKind = "프로젝트"
 	NFMachine      NotFoundKind = "머신"
+	NFAccount      NotFoundKind = "계정"
 	NFItem         NotFoundKind = "항목"
 	NFClaim        NotFoundKind = "선점"
 	NFLiveClaim    NotFoundKind = "살아 있는 선점"
@@ -53,7 +54,7 @@ func NotFoundKinds() []NotFoundKind {
 	return []NotFoundKind{
 		NFProject, NFMachine, NFItem, NFClaim, NFLiveClaim, NFSession,
 		NFJudgment, NFSnapshot, NFResourceHold, NFIdempotency, NFRefState, NFChangeSet,
-		NFLiveLandingRow, NFItemAfter,
+		NFLiveLandingRow, NFItemAfter, NFAccount,
 	}
 }
 

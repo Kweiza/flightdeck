@@ -56,7 +56,7 @@ func TestPublishEnvelopeCarriesKindProjectAndSession(t *testing.T) {
 			c.prepare(t, e, envProjectA, sessA)
 			c.prepare(t, e, envProjectB, sessB)
 
-			sub := e.srv.hub.Subscribe("")
+			sub := e.srv.hub.Subscribe("", StreamOwner{})
 			defer e.srv.hub.Unsubscribe(sub)
 
 			wantSessA := c.fire(t, e, envProjectA, sessA)

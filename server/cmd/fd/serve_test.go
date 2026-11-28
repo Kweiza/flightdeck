@@ -362,7 +362,7 @@ func TestSelfUpdateStatusOfLosesNoFieldAcrossTheLine(t *testing.T) {
 // 접히므로 서버는 멀쩡히 뜨고 REST 도 다 돌고, 오직 브라우저에서만 폼 대신 JSON 이 뜬다.
 // serve.go 가 조립을 순수 함수로 뽑아둔 근거가 정확히 이것이다.
 func TestServeAPIOptionsWiresLoginScreen(t *testing.T) {
-	opt := serveAPIOptions("tok", 60, slog.Default(), false, nil, nil, false, nil)
+	opt := serveAPIOptions("tok", 60, slog.Default(), authConfig{}, nil, nil, nil)
 	if opt.LoginScreen == nil {
 		t.Fatal("LoginScreen 이 nil 이다 — 브라우저가 폼 대신 JSON 401 을 본다")
 	}
@@ -413,7 +413,7 @@ func TestServeAPIOptionsLoginScreenFollowsLang(t *testing.T) {
 		{[]web.Option{web.WithLang(lang.English)}, `<html lang="en">`},
 		{nil, `<html lang="ko">`},
 	} {
-		opt := serveAPIOptions("tok", 60, slog.Default(), false, nil, nil, false, tc.opts)
+		opt := serveAPIOptions("tok", 60, slog.Default(), authConfig{}, nil, nil, tc.opts)
 		rec := httptest.NewRecorder()
 		opt.LoginScreen(rec, httptest.NewRequest("GET", "/", nil), api.LoginView{Next: "/", Action: "./login"})
 		if body := rec.Body.String(); !strings.Contains(body, tc.want) {

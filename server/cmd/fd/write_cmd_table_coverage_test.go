@@ -518,6 +518,10 @@ var knownCliDoWrites = map[string]cliDoException{
 		"tellInbox 주석). 소켓은 세션이 끝나면 죽고 다른 세션에 다시 쓰이므로, 오프라인 큐에 쌓아 " +
 		"뒀다가 재생하면 끝난 세션의 소켓을 되살린다. 다음 프롬프트가 지금 값을 다시 적는다. " +
 		"그리고 정책표(JudgeOffline)는 이 명령을 몰라 거절한다."},
+	"runAdminBootstrap": {"응답이 비밀(일회용 로그인 코드)이라 서버가 이 경로를 멱등 표에 안 넣는다(api.JudgeSecretResponse) - " +
+		"Client.Write 의 멱등 키는 아무 뜻이 없고, 오프라인 큐에 쌓으면 재생 때 코드가 아무도 안 보는 응답으로 사라진다. " +
+		"부트스트랩은 사람이 한 번 손으로 부르는 일이라 미도달이면 그 자리에서 실패를 보이는 것이 맞다. " +
+		"그리고 정책표(JudgeOffline)는 이 명령을 몰라 거절한다."},
 }
 
 // TestCliDoWriteCallsAreKnownAndJustified 는 I-4 를 잰다: a.cli.do 로 직접 나가는 서버

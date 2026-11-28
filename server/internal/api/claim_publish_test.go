@@ -91,7 +91,7 @@ func TestClaimEventNamesTheModeTheItemAndTheOverlapCount(t *testing.T) {
 	claim("theirs-item", theirs)
 
 	// 준비가 끝난 뒤에 구독한다 — 그래야 아래 세 이벤트만 큐에 있다.
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	// ① 새 선점 — 겹치는 판이다.

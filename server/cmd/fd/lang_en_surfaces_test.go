@@ -113,18 +113,40 @@ func TestEnglishSurfacesHaveNoHangul(t *testing.T) {
 }
 
 // loginReasonsForLangTest 는 로그인 화면에 사유로 실릴 수 있는 문장이다 — 거절하는 갈래만
-// (api/login.go 의 loginRefused 호출 셋, api/auth.go 에서 OK=false 인 사유). 통과 사유는
-// 폼에 안 뜬다.
+// (api/login.go 의 loginRefused 호출, internal/auth 에서 OK=false 인 사유, store.ErrLoginCodeRefused). 통과 사유는
+// 폼에 안 뜬다. 사유를 더하거나 고치면 여기와 표(internal/lang/catalog.go)를 함께 고친다.
 var loginReasonsForLangTest = []string{
+	// api/login.go
 	"폼을 읽을 수 없다",
-	"토큰을 적어라",
+	"로그인 코드를 적어라",
+	"로그인 코드가 아니다 - 관리자에게 로그인 코드를 받아라. FD_TOKEN 은 화면 로그인에 못 쓴다(부트스트랩 전용)",
+	"토큰이나 로그인 코드를 적어라",
 	"토큰이 일치하지 않는다",
+	"이 서버는 계정 원장이 없어 로그인 코드를 못 바꾼다",
+	"로그인 코드가 맞지 않거나 만료됐다(한 번만 쓴다) - 관리자에게 새 코드를 받아라",
+	// internal/auth
 	"Authorization 헤더가 'Bearer <token>' 형식이 아니다",
 	"Authorization 인증 방식이 Bearer 가 아니다",
-	"화면 쿠키의 토큰이 일치하지 않는다 — 토큰이 바뀌었으면 다시 로그인해라",
-	"루프백이지만 이 서버는 루프백에도 토큰을 요구한다",
-	"쿠키가 있지만 이 경로는 화면이 아니다 — /api/v1 은 Authorization 헤더만 받는다",
-	"Authorization 헤더가 없다",
+	"이 값은 기기 토큰이 아니다 - 화면 쿠키 · 로그인 코드는 헤더로 못 쓴다",
+	"기기 토큰의 모양이 아니다 - 잘렸거나 다른 값이 섞였다",
+	"화면 세션 쿠키의 모양이 아니다 - 다시 로그인해라",
+	"쿠키가 있지만 이 경로는 화면이 아니다 - /api/v1 은 Authorization 헤더만 받는다",
+	"자격증명이 없다 - Authorization: Bearer <기기 토큰> 을 실어라(루프백도 같다)",
+	"이 값은 기기 토큰이 아니고 이 서버에는 FD_TOKEN 이 없다 - fd login 으로 기기 토큰을 받아라",
+	"FD_TOKEN 은 부트스트랩 전용이다(FD_AUTH=accounts) - 기기 토큰(fd login)이나 화면 로그인을 써라",
+	"계정 원장이 없어 부트스트랩 여부를 못 쟀다",
+	"관리자 수를 못 읽었다 - 원장에 붙지 못했다",
+	"관리자가 이미 있다 - FD_TOKEN 은 첫 관리자를 만들 때만 통한다. 관리자 로그인 코드는 서버 컨테이너 안의 fd admin recover <login> 이 낸다(옛 원장을 이어받았으면 login 은 owner 다)",
+	"이 서버는 계정 원장이 없어 기기 토큰을 대조할 수 없다",
+	"이 기기 토큰을 서버가 모른다 - 다른 서버의 토큰이거나 지워진 기기다. fd login 으로 다시 받아라",
+	"기기 토큰을 못 대조했다 - 원장에 붙지 못했다",
+	"철회된 기기 토큰이다 - fd login 으로 새로 받아라",
+	"이 기기의 계정이 꺼져 있다 - 관리자에게 물어라",
+	"이 서버는 계정 원장이 없어 로그인 쿠키를 대조할 수 없다 - 다시 로그인해라",
+	"로그인이 끝났다(로그아웃했거나 지워졌다) - 다시 로그인해라",
+	"로그인 쿠키를 못 대조했다 - 원장에 붙지 못했다",
+	"로그인이 만료됐다 - 다시 로그인해라",
+	"이 계정이 꺼져 있다 - 관리자에게 물어라",
 }
 
 var (

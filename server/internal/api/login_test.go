@@ -8,31 +8,8 @@ import (
 	"testing"
 )
 
-func TestJudgeCookieSecure(t *testing.T) {
-	cases := []struct {
-		name  string
-		tls   bool
-		proto string
-		want  bool
-	}{
-		{"평문", false, "", false},
-		{"직접 TLS", true, "", true},
-		{"프록시가 https 라 함", false, "https", true},
-		{"프록시가 http 라 함", false, "http", false},
-		{"프록시 목록의 첫째를 본다", false, "https, http", true},
-		{"대문자", false, "HTTPS", true},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := JudgeCookieSecure(c.tls, c.proto); got != c.want {
-				t.Fatalf("JudgeCookieSecure(%v, %q) = %v, 기대 %v", c.tls, c.proto, got, c.want)
-			}
-		})
-	}
-}
-
 func TestLoginCookieAttributes(t *testing.T) {
-	c := LoginCookie("s3cret", loginCookieMaxAge, false)
+	c := LoginCookie(LoginCookieName, "s3cret", loginCookieMaxAge, false)
 	if c.Name != LoginCookieName || c.Value != "s3cret" {
 		t.Fatalf("이름/값이 다르다: %q=%q", c.Name, c.Value)
 	}
@@ -157,12 +134,17 @@ func TestLogoutClearsCookie(t *testing.T) {
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("상태가 %d 다", rec.Code)
 	}
+	// 두 쿠키(세션 · 옛 FD_TOKEN)를 다 지운다 - 어느 쪽으로 로그인했는지 서버는 폼 제출에서 모른다.
 	cookies := rec.Result().Cookies()
-	if len(cookies) != 1 || cookies[0].Name != LoginCookieName {
-		t.Fatalf("쿠키를 안 지웠다: %+v", cookies)
+	cleared := map[string]bool{}
+	for _, c := range cookies {
+		if c.MaxAge >= 0 || c.Value != "" {
+			t.Fatalf("쿠키 %s 가 안 지워졌다: MaxAge=%d Value=%q", c.Name, c.MaxAge, c.Value)
+		}
+		cleared[c.Name] = true
 	}
-	if cookies[0].MaxAge >= 0 || cookies[0].Value != "" {
-		t.Fatalf("쿠키가 안 지워졌다: MaxAge=%d Value=%q", cookies[0].MaxAge, cookies[0].Value)
+	if len(cookies) != 2 || !cleared[LoginCookieName] || !cleared[SessionCookieName] {
+		t.Fatalf("두 쿠키를 다 지워야 한다: %+v", cookies)
 	}
 }
 

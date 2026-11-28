@@ -8,6 +8,7 @@ import (
 
 	"context"
 	"errors"
+	"github.com/kweiza/flightdeck/internal/auth"
 	"github.com/kweiza/flightdeck/internal/buildinfo"
 	"github.com/kweiza/flightdeck/internal/service"
 	"github.com/kweiza/flightdeck/internal/store"
@@ -15,50 +16,14 @@ import (
 
 // 화면·알림·진단 표면.
 
-// LoopbackReach 는 루프백 면제가 **실제로 닿는가**에 대한 관측이다.
-//
-// ★ 설정과 관측을 가르는 이유가 실물 사고다(2026-08-05). 서버를 컨테이너로 띄우면
-// 호스트에서 온 요청의 원격 주소가 브리지 게이트웨이(172.x)이고 IsLoopback 이 false 다 —
-// **면제를 받는 클라이언트가 하나도 없다.** 그런데 설정값만 옮기는 표면은 그 상황에서도
-// "루프백 요청만 토큰 없이 통과한다"를 낸다. 운영자는 그것을 믿고 클라이언트에 토큰을
-// 안 준 채 전환하고, 첫 쓰기에서 전면 차단을 만난다. 실제로 그렇게 됐고 대응은
-// 인증을 통째로 끄는 것이었다.
-//
-// 참인 설정을 말하면서 거짓인 결론을 읽게 하는 문장은 침묵보다 나쁘다 —
-// buildinfo.Coord 의 Known 과 SelfUpdateStatus 의 Watching 이 같은 규율이다.
-type LoopbackReach struct {
-	// Configured 는 설정상 면제가 열려 있는가다(= !RequireTokenOnLoopback).
-	Configured bool
-	// Observed 는 이 서버에 루프백으로 **실제로 도달한 요청**이 있었는가다.
-	//
-	// ★ 면제가 발동했는가가 아니라 도달했는가다. 다들 토큰을 실어서 면제가 한 번도
-	// 안 걸리는 것은 정상이고, 도달 자체가 0인 것만이 배선 결함이다.
-	Observed bool
-	// InContainer 는 안 닿는 **사유를 아는 경우** 그 사실이다. 배선이 판정해 준다.
-	//
-	// 문구가 아니라 불리언인 이유: 사람이 읽을 문장은 표면의 몫이고, 배선이 문자열을
-	// 넘기면 self_update 축의 문구("자기 갱신을 안 한다")가 인증 문맥으로 새어 든다.
-	InContainer bool
-}
-
-// open 은 면제가 **실제로 열려 있는가**다. 설정과 관측이 둘 다 참일 때만 참이다.
-func (r LoopbackReach) open() bool { return r.Configured && r.Observed }
-
 // AuthStatus 는 /healthz 가 알리는 인증 상태다.
 //
-// ★ **조용한 무인증은 안 된다.** 토큰이 설정되지 않았다는 사실과 루프백 면제가
-// 켜져 있다는 사실이 여기 없으면, 운영자는 서버가 열려 있다는 것을 알 방법이 없다.
-//
-// ★ LoopbackOpen 과 LoopbackConfigured 를 **한 필드로 접지 마라.** 접으면
-// "면제를 껐다"와 "면제는 켰는데 아무도 못 받는다"가 같은 false 로 보이고,
-// 그 둘은 처방이 정반대다(전자는 의도한 상태, 후자는 배선 결함이다).
+// ★ **조용한 무인증은 안 된다.** 토큰이 설정되지 않은 전환 단계 서버는 자격증명 없는 요청을 통과시킨다 - 그 사실이 여기
+// 없으면 운영자는 서버가 열려 있다는 것을 알 방법이 없다. 루프백 면제는 없어졌다(두 단계 모두) - 그래서 루프백 설정 · 도달
+// 관측 칸도 없다.
 type AuthStatus struct {
-	TokenSet bool `json:"token_set"`
-	// LoopbackOpen 은 **관측**이다 — 설정이 열려 있고 실제로 루프백 도달이 있었을 때만 참.
-	LoopbackOpen bool `json:"loopback_open"`
-	// LoopbackConfigured 는 설정값 그대로다.
-	LoopbackConfigured bool   `json:"loopback_configured"`
-	Notice             string `json:"notice"`
+	TokenSet bool   `json:"token_set"`
+	Notice   string `json:"notice"`
 }
 
 // HealthzBody 는 /healthz 응답이다.
@@ -73,13 +38,17 @@ type HealthzBody struct {
 	DBOK       bool   `json:"db_ok"`
 	DBError    string `json:"db_error,omitempty"`
 	// DBLocaleOK 는 원장 DB 의 로케일이 기동 검사와 같은 관문을 지나는가다(service.Health 의 같은 칸).
-	DBLocaleOK    bool       `json:"db_locale_ok"`
-	DBLocaleError string     `json:"db_locale_error,omitempty"`
-	DiskFreePct   float64    `json:"disk_free_pct"`
-	DiskKnown     bool       `json:"disk_known"`
-	DiskError     string     `json:"disk_error,omitempty"`
-	At            time.Time  `json:"at"`
-	Auth          AuthStatus `json:"auth"`
+	DBLocaleOK    bool      `json:"db_locale_ok"`
+	DBLocaleError string    `json:"db_locale_error,omitempty"`
+	DiskFreePct   float64   `json:"disk_free_pct"`
+	DiskKnown     bool      `json:"disk_known"`
+	DiskError     string    `json:"disk_error,omitempty"`
+	At            time.Time `json:"at"`
+	// AuthMode 는 인증 단계다(FD_AUTH: transition | accounts).
+	AuthMode string `json:"auth_mode"`
+	// TLS 는 전송 정책이다(FD_TLS: off | files | proxy).
+	TLS  string     `json:"tls"`
+	Auth AuthStatus `json:"auth"`
 	// Build 는 **응답하는 이 프로세스**의 빌드 좌표다. 파일의 것이 아니다.
 	//
 	// ★ api_version 으로는 판 나이를 못 나른다 — 그 값은 계약이 깨질 때만 오르므로
@@ -162,69 +131,33 @@ type SelfUpdateStatus struct {
 
 // AuthNotice 는 지금 인증 상태를 사람이 읽을 한 줄로 만든다. 순수 함수다.
 //
-// ★ 갈래 순서가 계약이다. **면제가 꺼진 경우를 관측보다 먼저 본다** — 끈 서버는
-// 도달이 0이어도 정상이고, 그것을 "안 닿는다"로 말하면 의도한 설정이 결함으로 읽힌다.
-func AuthNotice(tokenSet bool, reach LoopbackReach) string {
+// ★ 전환 단계는 다음 걸음을 같이 준다(FD_AUTH=accounts 로 좁히기). 그 걸음을 안 적으면 「FD_TOKEN 이 어디서나 통한다」가 정상
+// 상태로 읽혀 좁히는 날이 안 온다.
+func AuthNotice(tokenSet bool, mode auth.Mode, tls auth.TLSMode) string {
+	var n string
 	switch {
+	case mode == auth.ModeAccounts:
+		n = "계정 단계다(FD_AUTH=accounts) - 기기 토큰 · 화면 로그인만 받는다. FD_TOKEN 은 관리자가 0명일 때의 /admin/bootstrap 에만 통한다"
 	case !tokenSet:
-		return "토큰이 설정되지 않았다 — 이 서버는 전 요청을 무인증으로 통과시킨다"
-	case !reach.Configured:
-		return "토큰이 설정돼 있다. 루프백에도 토큰이 필요하다"
-	case reach.Observed:
-		// ★ **리버스 프록시를 함께 경고한다.** 면제 판정은 RemoteAddr 이라, 프록시가 같은
-		// 호스트에 있으면 그것을 거친 요청 전부가 127.0.0.1 로 도착해 이 면제를 받는다 —
-		// 토큰을 켜 뒀는데 바깥에서 오는 요청이 전부 무인증으로 통과하는 상태다.
-		// 관측은 원래 있었고(loopback_open) 없던 것은 이 연결이다: 그 값을 프록시와 못 이으면
-		// "루프백으로 아무도 안 치는데 왜 열렸다지"로 읽고 넘긴다.
-		return "토큰이 설정돼 있다. 루프백 요청만 토큰 없이 통과한다 — " +
-			"리버스 프록시가 같은 호스트에 있으면 그것을 거친 요청 전부가 여기에 해당한다. " +
-			"그 배포라면 -require-token-on-loopback 으로 면제를 꺼라"
-	case reach.InContainer:
-		return "토큰이 설정돼 있다. 루프백 면제는 설정상 열려 있으나 이 서버에 루프백으로 도달한 요청이 없다 — " +
-			"컨테이너라서다(/.dockerenv). 호스트에서 오는 요청은 브리지 게이트웨이로 보이므로 루프백이 아니다. " +
-			"클라이언트도 토큰이 필요하다"
+		n = "토큰이 설정되지 않았다 - 전환 단계라 자격증명이 없는 요청을 무인증으로 통과시킨다"
 	default:
-		// ★ **재는 법을 같이 준다.** 이 갈래를 본 사람이 할 가장 자연스러운 확인이
-		// 루프백에서 /healthz 를 쳐 보는 것인데, 그 요청은 인증 게이트 앞에서 되돌아
-		// 나가 관측을 안 남긴다(middleware.go 의 /healthz 조기 반환). 그래서 확인하려는
-		// 시도가 언제나 "아직 없다"를 확증한다 — 절차를 안 주면 이 문장이 함정이 된다.
-		return "토큰이 설정돼 있다. 루프백 면제는 설정상 열려 있으나 이 서버에 루프백으로 도달한 요청이 아직 없다 — " +
-			"면제를 받는 클라이언트가 하나도 없을 수 있다. 클라이언트에 토큰을 실어라. " +
-			"이 값은 /healthz 로는 안 움직인다 — 재려면 루프백에서 API 요청을 한 번 보내라"
+		n = "전환 단계다(FD_AUTH=transition) - FD_TOKEN 과 기기 토큰 · 화면 로그인을 함께 받는다. " +
+			"기기마다 fd login 을 마치면 FD_AUTH=accounts 로 좁혀라"
 	}
+	if tls == auth.TLSOff {
+		n += ". 전송은 평문이다(FD_TLS 꺼짐) - 루프백 밖에 묶었다면 토큰이 망에 평문으로 실린다"
+	}
+	return n
 }
 
-// UnauthorizedGuidance 는 401 을 받은 사람에게 **무엇을 하면 되는지**를 낸다. 순수 함수다.
-//
-// ★ 이 문구가 관측을 따라야 하는 이유가 실물 사고다. 앞선 판은 조건 없이
-// "루프백은 토큰 없이 통과한다(/healthz 가 그 설정을 알린다)" 를 붙였고, 그래서
-// **루프백에서 401 을 맞은 응답이 자기 자신을 반박했다** — 401 을 낸 그 응답이
-// 401 이 나면 안 된다고 안내한 셈이다. 원인을 찾던 세션이 그 문장 때문에
-// 배선(도커 브리지)이 아니라 자기 토큰 설정을 의심했다.
-//
-// 거짓을 지우면서 **처방까지 지우지 않는다** — 어느 갈래든 Bearer 지시는 남는다.
-func UnauthorizedGuidance(reach LoopbackReach) string {
-	const base = "Authorization: Bearer <token> 을 실어라."
-	switch {
-	case !reach.Configured:
-		return base + " 이 서버는 루프백에도 토큰을 요구한다."
-	case reach.Observed:
-		// ★ 이 갈래만 "그 **설정**을 알린다"로 남아 있었다 — 아래 둘은 관측 어법인데.
-		// 두 가지가 틀렸다. (가) /healthz 가 내는 loopback_open 은 설정이 아니라
-		// Configured && Observed 다. (나) 더 나쁜 것: 이 갈래를 보는 사람은 **방금 401 을
-		// 맞았는데** "루프백은 토큰 없이 통과한다"를 읽는다. 그 사람이 루프백에서 왔다면
-		// 원인은 면제가 아니라 **토큰 값**이다(JudgeAuth 는 헤더가 있으면 먼저 대조하고
-		// 불일치는 루프백이어도 거절한다 — auth.go 의 순서 계약). 면제의 범위를 적어
-		// 그 사람이 자기 401 을 설명할 수 있게 한다.
-		return base + " 루프백 면제는 이 서버에 닿는다(/healthz 의 auth 절이 그 관측을 낸다)." +
-			" 다만 면제는 토큰이 없을 때뿐이다 — 틀린 토큰은 루프백이어도 거절한다."
-	case reach.InContainer:
-		return base + " 루프백 면제는 설정상 열려 있으나 이 서버는 컨테이너라 호스트에서 오는 요청이" +
-			" 루프백으로 안 보인다 — 면제를 기대하지 마라(/healthz 의 auth 절이 그 관측을 낸다)."
-	default:
-		return base + " 루프백 면제는 설정상 열려 있으나 이 서버에 루프백으로 도달한 요청이 아직 없다" +
-			" — 면제를 기대하지 마라(/healthz 의 auth 절이 그 관측을 낸다)."
+// UnauthorizedGuidance 는 401 을 받은 사람에게 **무엇을 하면 되는지**를 낸다. 순수 함수다. 루프백 면제는 없다 - 어느
+// 단계든 루프백도 자격증명이 필요하다는 것을 함께 적는다(옛 판의 면제를 믿고 토큰 없이 치는 도구가 원인을 찾게).
+func UnauthorizedGuidance(mode auth.Mode) string {
+	if mode == auth.ModeAccounts {
+		return "Authorization: Bearer <기기 토큰> 을 실어라(fd login 이 받는다). 화면은 로그인 코드로 로그인한다. " +
+			"FD_TOKEN 은 부트스트랩 전용이다. 루프백도 같다."
 	}
+	return "Authorization: Bearer <기기 토큰>(fd login) 이나 FD_TOKEN 을 실어라 - 전환 단계라 둘 다 통한다. 루프백도 같다."
 }
 
 // dbErrorRemote 는 Postgres 원장에 붙지 못했을 때 /healthz 가 내는 안내다. 서버 로그에 실제로 남는 것(종류 · SQLSTATE)을
@@ -238,20 +171,17 @@ const dbErrorRemote = "DB 에 접속할 수 없다 - 서버 로그에 종류 · 
 // 다른 필드로 되살아난다 — 실제로 그 모양의 누출이 흔하다.
 // ★ build 를 **인자로 받는다.** service.Health 에 필드를 더하지 않는 이유가 둘이다 —
 // 빌드 좌표는 DB·디스크 상태가 아니라 프로세스의 성질이고, 인자로 받으면 이 함수가
-// tokenSet·loopbackOpen 과 같은 모양으로 순수하게 남아 시험이 값을 직접 준다.
+// tokenSet·mode 와 같은 모양으로 순수하게 남아 시험이 값을 직접 준다.
 // su 도 같은 이유로 인자다 — 핸들러가 body 에 따로 얹으면 순수 함수가 불완전한 body 를
 // 만들고 그 시험은 통과한다. 실제 응답과 갈리는 그 모양을 이 저장소가 반복해서 문제 삼았다.
-func HealthzOf(h service.Health, tokenSet bool, reach LoopbackReach, build buildinfo.Coord,
+func HealthzOf(h service.Health, tokenSet bool, mode auth.Mode, tls auth.TLSMode, build buildinfo.Coord,
 	su SelfUpdateStatus, lb LedgerBackupStatus) HealthzBody {
 	b := HealthzBody{
 		OK: h.OK, APIVersion: h.APIVersion, DBOK: h.DBOK, DBLocaleOK: h.DBLocaleOK, Build: build,
 		SelfUpdate: su, LedgerBackup: lb,
 		DiskFreePct: h.DiskFreePct, DiskKnown: h.DiskKnown, At: h.At,
-		Auth: AuthStatus{
-			TokenSet: tokenSet, LoopbackOpen: reach.open(),
-			LoopbackConfigured: reach.Configured,
-			Notice:             AuthNotice(tokenSet, reach),
-		},
+		AuthMode: string(mode), TLS: string(tls),
+		Auth: AuthStatus{TokenSet: tokenSet, Notice: AuthNotice(tokenSet, mode, tls)},
 	}
 	// ★ Postgres 면 서버 로그에도 원인 전문이 없다 - store 가 드라이버 문구(접속 문자열의 조각 · 원격 주소를 품는다)를
 	//   걷고 종류 · SQLSTATE 만 남긴다. 「전문은 로그에」라고 하면 없는 것을 찾으러 간다.
@@ -303,7 +233,7 @@ func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if s.opt.LedgerBackup != nil {
 		lb = s.opt.LedgerBackup()
 	}
-	body := HealthzOf(h, s.opt.Token != "", s.loopbackReach(), buildinfo.Self(), su, lb)
+	body := HealthzOf(h, s.opt.Token != "", s.opt.AuthMode, s.opt.TLS.Mode, buildinfo.Self(), su, lb)
 	status := http.StatusOK
 	if !body.OK {
 		status = http.StatusServiceUnavailable
@@ -435,7 +365,9 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	rc := http.NewResponseController(w)
-	subscriber := s.hub.Subscribe(project)
+	// 주체는 게이트가 실었다. 철회 · 끄기 · 로그아웃이 이 열쇠로 이 스트림을 고른다(Hub.Cut).
+	who, _ := auth.FromContext(r.Context())
+	subscriber := s.hub.Subscribe(project, OwnerOf(who))
 	defer s.hub.Unsubscribe(subscriber)
 
 	// 첫 줄을 즉시 보낸다 — 구독이 성립했다는 사실 자체가 소비자에게 필요한 신호다.
@@ -475,6 +407,12 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-r.Context().Done():
 			return // 클라이언트가 끊었다
+		case <-subscriber.Cut():
+			// 이 주체의 자격증명이 철회됐다(기기 철회 · 계정 끄기 · 로그아웃). 다시 붙으면 게이트가 401 을 낸다.
+			if _, err := io.WriteString(w, ": bye 자격증명이 철회됐다 - 다시 로그인해라\n\n"); err == nil {
+				_ = rc.Flush()
+			}
+			return
 		case <-beat.C:
 			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil {
 				return

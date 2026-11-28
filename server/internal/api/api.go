@@ -23,19 +23,26 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"github.com/kweiza/flightdeck/internal/auth"
 	"github.com/kweiza/flightdeck/internal/service"
 	"github.com/kweiza/flightdeck/internal/store"
 )
 
 // Options 는 서버 표면의 설정이다.
 type Options struct {
-	// Token 은 Bearer 토큰이다. **비면 인증이 꺼진다** — 그 사실을 /healthz 가 알린다.
+	// Token 은 FD_TOKEN(공유 토큰)이다. 전환 단계에서 비면 자격증명 없는 요청이 무인증으로 통과한다 — 그 사실을 /healthz 가
+	// 알린다. 계정 단계에서는 부트스트랩 전용이다(auth.Gate).
 	Token string
-	// RequireTokenOnLoopback 은 루프백 면제를 끈다. 기본값(false)이 설계의 기본 동작이다.
-	RequireTokenOnLoopback bool
+	// AuthMode 는 인증 단계다(FD_AUTH). 영값은 전환 단계다(withDefaults).
+	AuthMode auth.Mode
+	// TLS 는 전송 정책이다(FD_TLS). 영값은 평문이다. proxy 면 게이트가 신뢰 프록시 밖의 연결을 거절하고, 세션 쿠키의 Secure 도
+	// 이것이 정한다.
+	TLS auth.TLSPolicy
+	// Authenticator 는 요청 → 주체 판정이다. nil 이면 원장(service 의 store)으로 auth.Gate 를 만든다 — 바꿔 끼우는 자리는 조립
+	// (fd serve)과 시험이다.
+	Authenticator auth.Authenticator
 	// Heartbeat 는 SSE 주석 줄 간격이다. 0 이면 20초.
 	Heartbeat time.Duration
 	// SSEBuffer 는 구독자당 버퍼 이벤트 수다. 0 이면 32.
@@ -64,18 +71,6 @@ type Options struct {
 	//
 	// ★ SelfUpdate 와 같은 이유로 콜백이다 — 이 값은 회차마다 바뀐다.
 	LedgerBackup func() LedgerBackupStatus
-
-	// InContainer 는 이 서버가 컨테이너 안인가다. **배선이 판정해 준다.**
-	//
-	// ★ 이 표면이 쓰는 곳은 하나뿐이다 — 루프백 면제가 안 닿을 때 **그 사유를 말하는 것**.
-	// 컨테이너에서는 호스트의 127.0.0.1 요청이 도커 브리지를 거쳐 172.x 로 보이고,
-	// 그래서 면제가 구조적으로 안 걸린다. 그 사실을 모르면 운영자는 자기 토큰 설정을
-	// 의심하며 시간을 쓴다(실제로 그렇게 됐다).
-	//
-	// 불리언인 이유: 사람이 읽을 문장은 표면의 몫이다. 배선이 문자열을 넘기면
-	// self_update 축의 문구("자기 갱신을 안 한다")가 인증 문맥으로 새어 든다 —
-	// 그 둘은 같은 신호(/.dockerenv)를 보지만 하려는 말이 다르다.
-	InContainer bool
 
 	// Fallback 은 REST 라우트에 안 걸린 요청을 받을 핸들러다(보통 대시보드).
 	// nil 이면 JSON 404 를 낸다.
@@ -144,6 +139,12 @@ func (o Options) withDefaults() Options {
 	if o.Clock == nil {
 		o.Clock = func() time.Time { return time.Now().UTC() }
 	}
+	if o.AuthMode == "" {
+		o.AuthMode = auth.ModeTransition
+	}
+	if o.TLS.Mode == "" {
+		o.TLS.Mode = auth.TLSOff
+	}
 	return o
 }
 
@@ -184,26 +185,8 @@ type server struct {
 	draining  chan struct{}
 	drainOnce sync.Once
 
-	// loopbackSeen 은 **루프백으로 도달한 요청이 실제로 있었는가**다.
-	//
-	// ★ 설정만으로는 면제가 닿는지 알 수 없다. 컨테이너 배포에서는 호스트의
-	// 127.0.0.1 요청이 브리지 게이트웨이(172.x)로 보여 IsLoopback 이 false 이고,
-	// 그래서 면제를 받는 클라이언트가 **하나도 없는데** 설정은 열려 있다.
-	// 그 어긋남을 /healthz 와 401 처방이 말하려면 이 관측이 있어야 한다.
-	//
-	// 단조 증가다(한 번 참이면 안 내려간다). 나중에 도달이 끊긴 것을 잡으려면
-	// 마지막 시각을 재야 하는데, 이 축이 답하려는 질문은 "닿기는 하는가"이고
-	// 거기에는 한 번의 관측이면 충분하다 — 켜졌다 꺼지는 값은 배너를 깜빡이게 한다.
-	loopbackSeen atomic.Bool
-}
-
-// loopbackReach 는 설정과 관측을 합쳐 면제의 실제 도달 여부를 낸다.
-func (s *server) loopbackReach() LoopbackReach {
-	return LoopbackReach{
-		Configured:  !s.opt.RequireTokenOnLoopback,
-		Observed:    s.loopbackSeen.Load(),
-		InContainer: s.opt.InContainer,
-	}
+	// gate 는 요청 → 주체 판정이다(Options.Authenticator 또는 기본 auth.Gate).
+	gate auth.Authenticator
 }
 
 // resolveRoute 는 이 요청의 라우트 라벨을 낸다.
@@ -300,7 +283,21 @@ func newServer(svc *service.Service, opt Options) *server {
 			s.idem.db = s.st
 		}
 	}
+	s.gate = s.authenticator()
 	return s
+}
+
+// authenticator 는 주입된 판정기, 없으면 원장으로 만든 기본 판정기다. 원장이 없는 조립(시험의 대조 조립)은 계정 자격증명을
+// 모두 거절한다 - nil 포인터를 인터페이스에 담으면 「원장이 있다」로 읽혀 조회에서 터진다.
+func (s *server) authenticator() auth.Authenticator {
+	if s.opt.Authenticator != nil {
+		return s.opt.Authenticator
+	}
+	var dir auth.Directory
+	if s.st != nil {
+		dir = s.st
+	}
+	return auth.NewGate(s.opt.AuthMode, s.opt.Token, dir, s.opt.Clock)
 }
 
 // routes 는 표면 목록이다. 설계 §6 의 REST 표와 1:1 이다.
@@ -375,6 +372,10 @@ func (s *server) routes() *http.ServeMux {
 
 	// 화면 로그인. **게이트 앞에서 갈라진다**(withAuth·withIdempotency 가 함께 보는
 	// JudgePreSessionPath) — 로그인이 게이트 뒤에 있으면 로그인하려면 이미 로그인돼 있어야 한다.
+	mux.HandleFunc("POST /admin/bootstrap", s.handleBootstrap)
+	mux.HandleFunc("POST /api/v1/devices/{id}/revoke", s.handleRevokeDevice)
+	mux.HandleFunc("PATCH /api/v1/admin/accounts/{id}", s.handleSetAccountDisabled)
+
 	mux.HandleFunc("GET /login", s.handleLogin)
 	mux.HandleFunc("POST /login", s.handleLogin)
 	mux.HandleFunc("POST /logout", s.handleLogout)
@@ -396,8 +397,9 @@ func (s *server) routes() *http.ServeMux {
 // chain 은 게이트를 순서대로 감싼다. **순서가 계약이다.**
 //
 //	requestID  — 상관키를 만든다. 401·429 응답에도 실린다
+//	 transport — 403. FD_TLS=proxy 에서 신뢰 프록시 밖의 연결(auth.JudgeTransport). 자격증명을 보기 전이다
 //	  rateLimit — 429. 로그 줄 없음(초과 트래픽이 그대로 로그 증폭이 된다)
-//	    auth    — 401. 로그 줄 없음
+//	    auth    — 401(원장 장애는 503). 로그 줄 없음. 통과한 주체를 ctx 에 싣는다
 //	      accessLog — 여기서부터 "게이트를 통과한 요청"이다. 1건당 1줄
 //	        screenWrite — 화면 폼의 출처를 대조하고 쿼리 키를 헤더로 올린다
 //	          nulGate   — URL(경로 · 질의)의 NUL 을 400 으로(nul.go)
@@ -410,7 +412,7 @@ func (s *server) routes() *http.ServeMux {
 // screenWrite 가 idempotency **바깥**인 이유: 안쪽에 두면 키가 헤더로 올라가기 전에
 // 이미 400 이 나간 뒤다. accessLog 안쪽인 이유: 여기서 내는 403 도 로그에 남아야 한다.
 func (s *server) chain(h http.Handler) http.Handler {
-	return s.withRequestID(s.withRateLimit(s.withAuth(s.withAccessLog(s.withScreenWrite(s.withURLGate(s.withIdempotency(s.withRecover(s.withRelativeLocation(h)))))))))
+	return s.withRequestID(s.withTransport(s.withRateLimit(s.withAuth(s.withAccessLog(s.withScreenWrite(s.withURLGate(s.withIdempotency(s.withRecover(s.withRelativeLocation(h))))))))))
 }
 
 // ShutdownGrace 는 드레인이 인플라이트에 주는 시간이다.

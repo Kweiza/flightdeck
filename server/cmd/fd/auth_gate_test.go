@@ -32,11 +32,8 @@ func TestWebWritesAreBehindTheSameGateAsREST(t *testing.T) {
 		t.Fatal("전제가 깨졌다 — 올바른 토큰도 401 이다")
 	}
 
-	// httptest 는 127.0.0.1 이라 루프백 면제가 걸린다. 면제를 끄고 재조립해야
-	// "원격에서 들어온 요청"과 같은 좌표계가 된다 — 그러지 않으면 이 시험이
-	// 루프백이라 통과한 것인지 게이트가 막은 것인지 구분되지 않는다.
-	h2 := newHarnessAuth(t, "supersecret")
-	h2.requireTokenEverywhere()
+	// httptest 는 127.0.0.1 이다. 루프백 면제가 없어졌으므로 이 하네스 그대로가 "원격에서 들어온 요청"과 같은 좌표계다.
+	h2 := h
 
 	for _, c := range []struct {
 		name, method, path string

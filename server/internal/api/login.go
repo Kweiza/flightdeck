@@ -1,49 +1,32 @@
 package api
 
 import (
-	"crypto/subtle"
+	"errors"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/kweiza/flightdeck/internal/auth"
 	"github.com/kweiza/flightdeck/internal/judge"
+	"github.com/kweiza/flightdeck/internal/store"
 )
 
-// 화면 로그인 — 브라우저가 자격증명을 내놓는 유일한 길이다(설계 §6).
+// 화면 로그인 — 브라우저가 자격증명을 내놓는 유일한 길이다(설계 「REST `/api/v1/` — 정본」).
 //
-// ★ 이 파일이 존재하는 이유. JudgeAuth 는 Authorization 헤더를 읽는데 브라우저는 최초
+// ★ 이 파일이 존재하는 이유. 게이트는 Authorization 헤더를 읽는데 브라우저는 최초
 // 요청에 임의 헤더를 못 싣는다. 응답이 WWW-Authenticate: Bearer 라 로그인 팝업도 안 뜬다
-// (브라우저는 Basic 에만 띄운다). 컨테이너 배포에서는 루프백 면제도 구조적으로 안 걸린다 —
-// 브리지 게이트웨이가 172.x 라 호스트 요청이 루프백으로 안 보인다. 즉 토큰을 켠 컨테이너
-// 서버의 화면은 **브라우저로 도달 불가**였다.
+// (브라우저는 Basic 에만 띄운다). 그래서 폼으로 받은 값을 쿠키로 바꾼다.
+//
+// 폼이 받는 값은 둘이다.
+//   - 로그인 코드(`fdl_`, 부트스트랩 · fd admin recover 가 낸다): 한 번 바꿔 화면 세션 쿠키(fd_session, 14일)를 굽는다.
+//   - FD_TOKEN: **전환 단계에서만.** 옛 쿠키(fd_token)를 굽는다. 계정 단계에서는 거절한다 - FD_TOKEN 은 부트스트랩 전용이다.
 //
 // ★ 화면을 게이트 사슬 밖으로 빼는 처방은 기각이다. 그 사슬은 무인증 POST 로 항목이
 // 실제 폐기된 사고의 처방이고 여전히 옳다(api.go 의 Fallback 주석).
 
-// loginCookieMaxAge 는 로그인 쿠키의 수명(초)이다 — 10년.
-//
-// ★ 사실상 무기한인 이유: 사용자 1명·토큰 1개·역할 없음인 개인 조정 화면이다. 짧게 잡으면
-// 보드를 볼 때마다 40자 토큰을 붙여 넣게 되고, 그러면 사람이 토큰을 어딘가 평문으로
-// 적어 두게 된다 — 수명을 줄여 얻으려던 것을 그 습관이 되돌린다.
-// 대신 로그아웃을 둔다. 내 머신이 아닌 곳에서 지우는 유일한 길이다.
+// loginCookieMaxAge 는 옛 로그인 쿠키(FD_TOKEN)의 수명(초)이다 — 10년. 전환 단계의 옛 동작 그대로다 - 그 쿠키는 FD_TOKEN 을
+// 바꾸면 죽고, 계정 단계에서는 인정되지 않는다.
 const loginCookieMaxAge = 10 * 365 * 24 * 60 * 60
-
-// JudgeCookieSecure 는 이 요청이 TLS 뒤인가다. 순수 함수다.
-//
-// ★ **무조건 켜면 안 된다.** Secure 쿠키는 http:// 에서 저장조차 안 되므로, 이 서버의
-// 기본 배포(평문 루프백·컨테이너)에서 로그인이 원리적으로 불가능해진다 — 폼은 뜨는데
-// 제출하면 다시 폼이 뜨고, 원인이 쿠키 속성이라는 것이 그 증상에서 안 보인다.
-//
-// ★ X-Forwarded-Proto 를 **여기서만** 신뢰한다. JudgeScreenOrigin 은 스킴을 일부러 안 보는데
-// (없는 신뢰를 만들면 그것이 다음 우회로가 된다), 이 축의 실패 방향은 반대다: 헤더를 속여
-// 얻는 것이 Secure 플래그 하나뿐이고 그것은 공격자에게 이득이 아니라 손해다.
-func JudgeCookieSecure(tls bool, forwardedProto string) bool {
-	if tls {
-		return true
-	}
-	// 프록시 사슬은 "https, http" 처럼 쉼표로 온다. 첫째가 클라이언트에 가장 가깝다.
-	first, _, _ := strings.Cut(forwardedProto, ",")
-	return strings.EqualFold(strings.TrimSpace(first), "https")
-}
 
 // LoginCookie 는 쿠키 한 벌을 만든다. 순수 함수다.
 //
@@ -51,9 +34,9 @@ func JudgeCookieSecure(tls bool, forwardedProto string) bool {
 // HttpOnly 가 없으면 XSS 하나로 토큰이 새고, SameSite=Strict 가 없으면 크로스사이트
 // 요청에 쿠키가 실린다. 시험이 넷을 개별로 단정하는 이유가 이것이다 — 하나가 빠져도
 // 로그인은 멀쩡히 되므로 왕복 시험만으로는 안 잡힌다.
-func LoginCookie(value string, maxAge int, secure bool) *http.Cookie {
+func LoginCookie(name, value string, maxAge int, secure bool) *http.Cookie {
 	return &http.Cookie{
-		Name:     LoginCookieName,
+		Name:     name,
 		Value:    value,
 		Path:     "/",
 		HttpOnly: true,
@@ -81,7 +64,7 @@ func (s *server) seeOther(w http.ResponseWriter, r *http.Request, to string) {
 	w.WriteHeader(http.StatusSeeOther)
 }
 
-// handleLogin 은 토큰 폼을 받아 쿠키를 굽는다.
+// handleLogin 은 폼 값을 받아 쿠키를 굽는다(이 파일 머리말의 두 갈래).
 //
 // GET 은 "/" 로 보낸다 — 사용자가 주소창에 칠 수 있는 URL 이라, 없으면 화면의
 // 404("대시보드는 / 한 장이다")가 나와 혼란스럽다. 인증이 안 됐으면 거기서 폼을 만난다.
@@ -105,23 +88,55 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	next := JudgeNext(r.PostFormValue("next"))
-
-	// ★ 인증이 꺼진 서버는 쿠키를 굽지 않는다. 구우면 나중에 토큰을 켰을 때 그 쿠키가
+	got := strings.TrimSpace(r.PostFormValue("token"))
+	if k, ok := auth.KindOf(got); ok && k == auth.LoginCode {
+		s.exchangeLoginCode(w, r, got, next)
+		return
+	}
+	if s.opt.AuthMode == auth.ModeAccounts {
+		if got == "" {
+			s.loginRefused(w, r, "로그인 코드를 적어라", next)
+			return
+		}
+		s.loginRefused(w, r, "로그인 코드가 아니다 - 관리자에게 로그인 코드를 받아라. FD_TOKEN 은 화면 로그인에 못 쓴다(부트스트랩 전용)", next)
+		return
+	}
+	// ★ 토큰이 없는 전환 단계 서버는 쿠키를 굽지 않는다. 구우면 나중에 토큰을 켰을 때 그 쿠키가
 	// **틀린 자격증명**이 되어, 브라우저가 폼이 아니라 거절을 만난다.
 	if s.opt.Token == "" {
 		s.seeOther(w, r, next)
 		return
 	}
-	got := strings.TrimSpace(r.PostFormValue("token"))
 	if got == "" {
-		s.loginRefused(w, r, "토큰을 적어라", next)
+		s.loginRefused(w, r, "토큰이나 로그인 코드를 적어라", next)
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(got), []byte(s.opt.Token)) != 1 {
+	if !auth.SharedTokenMatches(s.opt.Token, got) {
 		s.loginRefused(w, r, "토큰이 일치하지 않는다", next)
 		return
 	}
-	s.putLoginCookie(w, r, s.opt.Token, loginCookieMaxAge)
+	s.putCookie(w, r, LoginCookieName, s.opt.Token, loginCookieMaxAge)
+	s.seeOther(w, r, next)
+}
+
+// exchangeLoginCode 는 로그인 코드를 화면 세션으로 바꾼다. 옛 쿠키는 지운다 - 둘 다 있으면 세션이 이기지만(auth.pick), 남은 옛
+// 쿠키는 FD_TOKEN 원값을 브라우저에 둔 채다.
+func (s *server) exchangeLoginCode(w http.ResponseWriter, r *http.Request, code, next string) {
+	if s.st == nil {
+		s.loginRefused(w, r, "이 서버는 계정 원장이 없어 로그인 코드를 못 바꾼다", next)
+		return
+	}
+	got, err := s.st.ExchangeLoginCode(r.Context(), code, r.UserAgent(), s.now())
+	if errors.Is(err, store.ErrLoginCodeRefused) {
+		s.loginRefused(w, r, store.ErrLoginCodeRefused.Error(), next)
+		return
+	}
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.putCookie(w, r, SessionCookieName, got.Cookie, int(auth.SessionTTL/time.Second))
+	s.putCookie(w, r, LoginCookieName, "", -1)
 	s.seeOther(w, r, next)
 }
 
@@ -146,25 +161,36 @@ func (s *server) refusedCrossSite(w http.ResponseWriter, r *http.Request, what, 
 	return true
 }
 
-// putLoginCookie 는 이 요청의 스킴에 맞는 쿠키를 굽는다. 지우는 것도 같은 자리다
+// putCookie 는 이 요청의 전송에 맞는 쿠키를 굽는다. 지우는 것도 같은 자리다
 // (값 없음 · MaxAge<0). Secure 판정이 두 자리에 살면 한쪽만 고쳐지고, 그러면
 // 로그아웃이 로그인과 **다른 속성**의 쿠키를 내 브라우저가 원본을 안 지운다.
-func (s *server) putLoginCookie(w http.ResponseWriter, r *http.Request, value string, maxAge int) {
-	http.SetCookie(w, LoginCookie(value, maxAge,
-		JudgeCookieSecure(r.TLS != nil, r.Header.Get("X-Forwarded-Proto"))))
+func (s *server) putCookie(w http.ResponseWriter, r *http.Request, name, value string, maxAge int) {
+	http.SetCookie(w, LoginCookie(name, value, maxAge,
+		auth.CookieSecure(s.opt.TLS, r.TLS != nil, r.Header.Get("X-Forwarded-Proto"))))
 }
 
-// handleLogout 은 쿠키를 지운다.
+// handleLogout 은 화면 세션을 끝내고 쿠키를 지운다.
 //
-// ★ 토큰 자체는 유효한 채로 남는다. 이것이 지우는 것은 **이 브라우저의 쿠키 하나**다.
-// 토큰을 무효화하는 길은 FD_TOKEN 을 바꾸고 서버를 다시 띄우는 것뿐이고, 이 제품에
-// 그것 말고 다른 길을 만들지 않는다(사용자 1명, 토큰 1개, 역할 없음 — 설계 §6).
+// ★ 세션 쿠키면 원장의 행을 지우고(다음 요청부터 401), 커밋 뒤 그 세션의 열린 스트림(/events)을 끊는다. 옛 쿠키(FD_TOKEN)는
+// 이 브라우저의 쿠키만 지운다 - FD_TOKEN 자체는 유효한 채로 남는다(바꾸는 길은 FD_TOKEN 을 바꾸고 서버를 다시 띄우는 것).
 func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if s.refusedCrossSite(w, r, "로그아웃", "대시보드 화면의 버튼을 눌러라.") {
 		return
 	}
+	if v := cookieValue(r, SessionCookieName); v != "" && s.st != nil {
+		if k, ok := auth.KindOf(v); ok && k == auth.SessionToken {
+			h := auth.Hash(v)
+			if _, _, err := s.st.EndWebSession(r.Context(), h); err != nil {
+				// 원장이 세션을 못 지웠는데 쿠키만 지우면 「로그아웃했다」고 믿게 된다 - 그 세션 값은 아직 통한다.
+				s.fail(w, r, err)
+				return
+			}
+			s.hub.Cut(CutWebSession(h))
+		}
+	}
 	// MaxAge<0 이 삭제다. 값도 비운다 — 둘 중 하나만 하면 브라우저에 따라 남는다.
-	s.putLoginCookie(w, r, "", -1)
+	s.putCookie(w, r, SessionCookieName, "", -1)
+	s.putCookie(w, r, LoginCookieName, "", -1)
 	s.seeOther(w, r, "/")
 }
 
@@ -190,6 +216,6 @@ func (s *server) loginRefused(w http.ResponseWriter, r *http.Request, why, next 
 	s.writeError(w, r, Classified{
 		Status: http.StatusUnauthorized, Code: "unauthorized",
 		Message:  why,
-		Guidance: UnauthorizedGuidance(s.loopbackReach()),
+		Guidance: UnauthorizedGuidance(s.opt.AuthMode),
 	})
 }

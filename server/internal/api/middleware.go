@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kweiza/flightdeck/internal/auth"
 	"github.com/kweiza/flightdeck/internal/judge"
 	"github.com/kweiza/flightdeck/internal/store"
 )
@@ -118,62 +119,50 @@ func (s *server) withRateLimit(next http.Handler) http.Handler {
 	})
 }
 
-// withAuth 는 인증 게이트다. 판정은 순수 함수 JudgeAuth 가 한다.
+// withTransport 는 전송 정책(FD_TLS=proxy)을 건다: 신뢰 프록시 밖에서 곧장 온 연결은 TLS 를 건너뛴 평문이라 자격증명을 보기
+// 전에 거절한다. 판정은 auth.JudgeTransport 다. /healthz 도 예외가 아니다 - 컨테이너 헬스체크는 안에서 루프백으로 친다.
+func (s *server) withTransport(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if v := auth.JudgeTransport(r.RemoteAddr, s.opt.TLS); !v.OK {
+			s.writeError(w, r, Classified{
+				Status: http.StatusForbidden, Code: "transport_refused",
+				Message:  v.Reason,
+				Guidance: "이 서버는 TLS 프록시 뒤에서만 받는다(FD_TLS=proxy) - 프록시의 https 주소로 붙어라.",
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withAuth 는 인증 게이트다. 판정은 Authenticator(auth.Gate)가 하고, 통과한 주체를 ctx 에 싣는다(auth.FromContext).
 func (s *server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// /healthz 는 게이트 앞에 둔다. 배너 훅이 "서버가 살아 있나 · 인증이 켜져 있나"를
+		// /healthz 는 게이트 앞에 둔다. 배너 훅이 "서버가 살아 있나 · 인증이 어떤 단계인가"를
 		// 묻는 유일한 창인데, 그것을 인증 뒤에 두면 토큰 오설정 시 아무것도 알 수 없다.
-		//
-		// ★ 이 줄은 **두 번째 하중을 진다.** 아래 도달 관측보다 위에 있어서 /healthz 요청은
-		// loopbackSeen 에 안 들어간다 — 그리고 그 순서를 뒤집으면 **모든 컨테이너 배포가
-		// 기동 30초 안에 loopback_open:true 가 된다.** 이미지의 HEALTHCHECK 가 컨테이너
-		// **안에서** `fd doctor` 를 30초마다 돌리고(server/Dockerfile · compose.yaml),
-		// `fd doctor` 가 치는 것은 /healthz 하나뿐이며(cmd/fd/cmds.go 의 a.cli.Healthz —
-		// REST 에 진단 엔드포인트가 없어서다), 컨테이너 안에서 서버를 치면 그것이 루프백이다.
-		// 그러면 면제를 받는 클라이언트가 0인데 "닿는다"를 내게 된다 — 이 축이 존재하는
-		// 이유인 바로 그 거짓 광고이고, notice·guidance 의 컨테이너 갈래는 도달 불가가 된다.
-		//
-		// 대가는 **/healthz 로는 도달을 못 잰다**는 것이다. 그 함정은 없애는 대신 알린다 —
-		// 도달-0 갈래의 notice 가 재는 법을 같이 준다(handlers_meta.go 의 AuthNotice).
-		// 잠그는 시험: TestHealthzItselfDoesNotCountAsLoopbackReach.
 		if r.URL.Path == "/healthz" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// ★ 도달 관측은 **판정보다 먼저**, 그리고 판정 결과와 무관하게 남긴다.
-		//
-		// 통과한 요청만 세면 "루프백에서 왔는데 토큰이 틀려 거절된" 요청이 관측에서
-		// 빠지고, 그러면 면제가 멀쩡히 닿는 서버가 계속 "아무도 못 받는다"고 말한다.
-		// 이 축이 답하는 질문은 "인증을 통과했는가"가 아니라 **"루프백이 여기까지 오는가"**다.
-		if IsLoopback(r.RemoteAddr) {
-			s.loopbackSeen.Store(true)
-		}
-
 		// 로그인·로그아웃은 게이트 앞이다. 판정은 핸들러가 스스로 한다(login.go).
-		//
-		// ★ loopbackSeen 관측 **뒤**다. 앞에 두면 루프백에서 온 로그인 요청이 도달
-		// 관측에서 빠진다 — /healthz 를 앞에 둔 것은 그 요청이 컨테이너 안에서 30초마다
-		// 자동으로 나기 때문이고, 로그인은 사람이 치는 것이라 사정이 다르다.
 		if JudgePreSessionPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
-
-		// 쿠키는 화면 경로에서만 인정한다 — 그 판정은 JudgeAuth 안에 있다.
-		// 여기서는 값만 읽는다. 쿠키가 없으면 ErrNoCookie 라 빈 문자열로 남는다.
-		var cookieTok string
-		if c, err := r.Cookie(LoginCookieName); err == nil {
-			cookieTok = c.Value
+		d := s.gate.Authenticate(r.Context(), authRequest(r))
+		if d.Unavailable {
+			// ★ 401 로 접지 않는다. 원장 장애가 "토큰이 틀렸다"로 읽히면 사람은 멀쩡한 토큰을 갈아 치운다.
+			s.log.WarnContext(r.Context(), "인증 판정 실패 - 원장에 붙지 못했다", "reason", d.Reason)
+			s.writeError(w, r, Classified{
+				Status: http.StatusServiceUnavailable, Code: "auth_unavailable",
+				Message:  d.Reason,
+				Guidance: "잠시 뒤에 다시 불러라 - 원장 상태는 /healthz 의 db_ok 가 낸다.",
+			})
+			return
 		}
-		d := JudgeAuth(AuthRequest{
-			RemoteAddr:  r.RemoteAddr,
-			AuthHeader:  r.Header.Get("Authorization"),
-			CookieToken: cookieTok,
-			ScreenPath:  JudgeScreenPath(r.URL.Path),
-		}, s.opt.Token, s.opt.RequireTokenOnLoopback)
 		if !d.OK {
 			s.met.incUnauthorized()
-			// 로그 줄 없음(위 규율). 사유는 응답에만 싣는다.
+			// 로그 줄 없음(위 규율). 사유는 응답에만 싣는다. 사유에는 자격증명 값이 없다(auth.Decision).
 			//
 			// ★ HTML 을 읽는 소비자에게는 폼을 낸다. **상태코드는 401 그대로다** —
 			// 리다이렉트로 덮으면 인증 실패가 지표에서 사라지고, /metrics 의
@@ -197,11 +186,11 @@ func (s *server) withAuth(next http.Handler) http.Handler {
 			s.writeError(w, r, Classified{
 				Status: http.StatusUnauthorized, Code: "unauthorized",
 				Message:  d.Reason,
-				Guidance: UnauthorizedGuidance(s.loopbackReach()),
+				Guidance: UnauthorizedGuidance(s.opt.AuthMode),
 			})
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), d.Principal)))
 	})
 }
 
@@ -300,7 +289,10 @@ func (s *server) withIdempotency(next http.Handler) http.Handler {
 		// 인 채로 begin() 에 들어가고, 그러면 서로 무관한 로그인 시도들이 s.entries[""]
 		// 한 슬롯을 공유한다 — 틀린 토큰의 401 이 캐시된 뒤 맞는 토큰의 재시도가
 		// fingerprint 불일치로 409 가 된다. 폼에 키를 심는 우회를 기각한 것과 같은 실패다.
-		if JudgePreSessionPath(r.URL.Path) {
+		//
+		// ★ 비밀을 내는 경로(부트스트랩)도 안 들어간다. 멱등 기록은 응답 본문을 원장에 남긴다 - 한 번만 보인다던 로그인 코드가
+		// 거기 평문으로 산다(JudgeSecretResponse). 그 경로는 본문 상한을 손으로 건다.
+		if JudgePreSessionPath(r.URL.Path) || JudgeSecretResponse(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}

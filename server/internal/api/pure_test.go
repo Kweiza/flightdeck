@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kweiza/flightdeck/internal/auth"
 	"github.com/kweiza/flightdeck/internal/buildinfo"
 	"github.com/kweiza/flightdeck/internal/nulesc"
 	"github.com/kweiza/flightdeck/internal/service"
@@ -19,96 +20,6 @@ import (
 // 순수 함수 시험 — 표와 **표 밖 케이스**를 함께 둔다.
 // 표만 두면 시험이 구현자가 상상한 입력만 보게 되고, 그 밖의 입력이 정확히
 // 결함이 사는 자리다.
-
-func TestJudgeAuth(t *testing.T) {
-	const tok = "s3cret"
-	cases := []struct {
-		name       string
-		req        AuthRequest
-		token      string
-		strictLoop bool
-		wantOK     bool
-		wantAnon   bool
-		reasonHas  string
-	}{
-		{"토큰 일치", AuthRequest{RemoteAddr: "203.0.113.9:1", AuthHeader: "Bearer " + tok}, tok, false, true, false, "일치한다"},
-		{"토큰 불일치", AuthRequest{RemoteAddr: "203.0.113.9:1", AuthHeader: "Bearer nope"}, tok, false, false, false, "일치하지 않는다"},
-		{"헤더 없음 원격", AuthRequest{RemoteAddr: "203.0.113.9:1"}, tok, false, false, false, "헤더가 없다"},
-		{"헤더 없음 루프백", AuthRequest{RemoteAddr: "127.0.0.1:1"}, tok, false, true, true, "루프백"},
-		{"헤더 없음 IPv6 루프백", AuthRequest{RemoteAddr: "[::1]:1"}, tok, false, true, true, "루프백"},
-		{"루프백 면제 끔", AuthRequest{RemoteAddr: "127.0.0.1:1"}, tok, true, false, false, "루프백에도 토큰을 요구한다"},
-		{"서버 토큰 미설정", AuthRequest{RemoteAddr: "203.0.113.9:1"}, "", false, true, true, "설정되지 않았다"},
-		{"형식 위반", AuthRequest{RemoteAddr: "127.0.0.1:1", AuthHeader: "Bearer a b"}, tok, false, false, false, "형식이 아니다"},
-		{"방식이 Basic", AuthRequest{RemoteAddr: "127.0.0.1:1", AuthHeader: "Basic abcd"}, tok, false, false, false, "Bearer 가 아니다"},
-		{"루프백인데 토큰이 틀림", AuthRequest{RemoteAddr: "127.0.0.1:1", AuthHeader: "Bearer wrong"}, tok, false, false, false, "일치하지 않는다"},
-		{"토큰 미설정 + 헤더 있음", AuthRequest{RemoteAddr: "203.0.113.9:1", AuthHeader: "Bearer whatever"}, "", false, true, true, "대조할 기준이 없다"},
-		{"RemoteAddr 이 이상함", AuthRequest{RemoteAddr: "@unix-socket"}, tok, false, false, false, "헤더가 없다"},
-		{"소문자 bearer", AuthRequest{RemoteAddr: "203.0.113.9:1", AuthHeader: "bearer " + tok}, tok, false, true, false, "일치한다"},
-		{"토큰 대소문자 다름", AuthRequest{RemoteAddr: "203.0.113.9:1", AuthHeader: "Bearer S3CRET"}, tok, false, false, false, "일치하지 않는다"},
-
-		// ── 쿠키 축 ──────────────────────────────────────────────────────────
-		// ① 화면 경로의 맞는 쿠키는 통과한다. 브라우저가 들어오는 유일한 길이다.
-		{"쿠키 일치 + 화면", AuthRequest{RemoteAddr: "203.0.113.9:1", CookieToken: tok, ScreenPath: true},
-			tok, false, true, false, "쿠키"},
-		// ② ★ 같은 쿠키가 REST 에서는 통과하지 못한다. 이 줄이 설계 전체를 붙든다 —
-		//    빠지면 REST 쓰기의 CSRF 방어가 SameSite 하나로 줄어든다.
-		{"쿠키 일치 + REST", AuthRequest{RemoteAddr: "203.0.113.9:1", CookieToken: tok, ScreenPath: false},
-			tok, false, false, false, "화면이 아니다"},
-		// ③ 틀린 쿠키는 거절한다. 사유가 "헤더가 없다"로 접히면 옛 쿠키를 든 브라우저의
-		//    처방("다시 로그인해라")이 안 나온다.
-		{"쿠키 불일치 + 화면", AuthRequest{RemoteAddr: "203.0.113.9:1", CookieToken: "nope", ScreenPath: true},
-			tok, false, false, false, "쿠키의 토큰이 일치하지 않는다"},
-		// ④ 틀린 쿠키는 **루프백이어도** 거절한다. 틀린 헤더와 같은 규율이다.
-		{"쿠키 불일치 + 루프백", AuthRequest{RemoteAddr: "127.0.0.1:1", CookieToken: "nope", ScreenPath: true},
-			tok, false, false, false, "일치하지 않는다"},
-		// ⑤ ★ 헤더가 이긴다. 헤더를 실을 수 있는 클라이언트가 쿠키로 조용히 뒤집히면
-		//    무엇이 인증했는지가 요청마다 달라진다.
-		{"헤더 틀림 + 쿠키 맞음", AuthRequest{RemoteAddr: "203.0.113.9:1", AuthHeader: "Bearer wrong", CookieToken: tok, ScreenPath: true},
-			tok, false, false, false, "일치하지 않는다"},
-		// ⑥ ★ 쿠키가 있어도 루프백 면제는 살아 있어야 한다. 쿠키 갈래를 면제보다 위에서
-		//    거절로 끝내면 이 줄이 깨진다 — 즉 기존 배포의 루프백 클라이언트가 죽는다.
-		{"비화면 쿠키 + 루프백 면제", AuthRequest{RemoteAddr: "127.0.0.1:1", CookieToken: tok, ScreenPath: false},
-			tok, false, true, true, "루프백"},
-		// ⑦ 서버에 토큰이 없으면 쿠키도 대조할 기준이 없다.
-		{"토큰 미설정 + 쿠키", AuthRequest{RemoteAddr: "203.0.113.9:1", CookieToken: "whatever", ScreenPath: true},
-			"", false, true, true, "설정되지 않았다"},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got := JudgeAuth(c.req, c.token, c.strictLoop)
-			if got.OK != c.wantOK || got.Anonymous != c.wantAnon {
-				t.Fatalf("판정이 다르다: OK=%v Anonymous=%v (기대 OK=%v Anonymous=%v) 사유=%q",
-					got.OK, got.Anonymous, c.wantOK, c.wantAnon, got.Reason)
-			}
-			if got.Reason == "" {
-				t.Fatal("사유가 비었다 — 사유 없는 판정은 '왜'에 답하지 못한다")
-			}
-			if !strings.Contains(got.Reason, c.reasonHas) {
-				t.Fatalf("사유에 %q 가 없다: %q", c.reasonHas, got.Reason)
-			}
-		})
-	}
-}
-
-func TestIsLoopback(t *testing.T) {
-	cases := map[string]bool{
-		"127.0.0.1:8080": true,
-		"127.5.5.5:1":    true,
-		"[::1]:7420":     true,
-		"::1":            true,
-		"127.0.0.1":      true,
-		"192.0.2.1:1234": false,
-		"":               false,
-		"localhost:7420": false, // 이름 해석을 하지 않는다 — 해석하면 DNS 가 인증의 일부가 된다
-		"  ":             false,
-		"999.1.1.1:1":    false,
-	}
-	for addr, want := range cases {
-		if got := IsLoopback(addr); got != want {
-			t.Errorf("IsLoopback(%q)=%v, 기대 %v", addr, got, want)
-		}
-	}
-}
 
 func TestRoutePattern(t *testing.T) {
 	cases := []struct{ pattern, method, want string }{
@@ -388,14 +299,30 @@ func TestValidateWorkspacePath(t *testing.T) {
 }
 
 func TestAuthNoticeAndHealthzScrub(t *testing.T) {
-	if !strings.Contains(AuthNotice(false, LoopbackReach{Configured: true, Observed: true}), "무인증") {
+	if !strings.Contains(AuthNotice(false, auth.ModeTransition, auth.TLSFiles), "무인증") {
 		t.Fatal("토큰 미설정을 알리지 않는다 — 조용한 무인증은 안 된다")
 	}
-	if !strings.Contains(AuthNotice(true, LoopbackReach{Configured: true, Observed: true}), "루프백") {
-		t.Fatal("루프백 면제 사실이 없다")
+	if n := AuthNotice(true, auth.ModeTransition, auth.TLSFiles); !strings.Contains(n, "FD_AUTH=accounts") {
+		t.Fatalf("전환 단계가 다음 걸음(좁히기)을 안 준다: %s", n)
 	}
-	if strings.Contains(AuthNotice(true, LoopbackReach{Configured: false}), "루프백만") {
-		t.Fatal("면제가 꺼졌는데 켜진 것처럼 말한다")
+	// 계정 단계는 토큰이 있든 없든 무인증 문구가 없다 - 그 단계에는 무인증 갈래가 없다.
+	if n := AuthNotice(false, auth.ModeAccounts, auth.TLSFiles); strings.Contains(n, "무인증") || !strings.Contains(n, "/admin/bootstrap") {
+		t.Fatalf("계정 단계 문구가 틀렸다: %s", n)
+	}
+	if n := AuthNotice(true, auth.ModeAccounts, auth.TLSOff); !strings.Contains(n, "평문") {
+		t.Fatalf("평문 전송을 안 알린다: %s", n)
+	}
+	if n := AuthNotice(true, auth.ModeAccounts, auth.TLSProxy); strings.Contains(n, "평문") {
+		t.Fatalf("TLS 를 켰는데 평문이라 한다: %s", n)
+	}
+	// 401 처방은 어느 단계든 루프백도 자격증명이 필요하다고 말한다(면제가 없어졌다).
+	for _, m := range []auth.Mode{auth.ModeTransition, auth.ModeAccounts} {
+		if g := UnauthorizedGuidance(m); !strings.Contains(g, "루프백도 같다") || !strings.Contains(g, "Bearer") {
+			t.Fatalf("%s 의 401 처방이 틀렸다: %s", m, g)
+		}
+	}
+	if strings.Contains(UnauthorizedGuidance(auth.ModeAccounts), "둘 다 통한다") {
+		t.Fatal("계정 단계 처방이 FD_TOKEN 도 통한다고 말한다")
 	}
 
 	body := HealthzOf(service.Health{
@@ -403,7 +330,7 @@ func TestAuthNoticeAndHealthzScrub(t *testing.T) {
 		DBPath:    "/home/user/.flightdeck/fd.db",
 		DBError:   "unable to open database file /home/user/.flightdeck/fd.db",
 		DiskError: "statfs /home/user/.flightdeck: no such file",
-	}, true, LoopbackReach{Configured: true, Observed: true}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
+	}, true, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
 	raw, err := json.Marshal(body)
 	if err != nil {
 		t.Fatalf("직렬화 실패: %v", err)
@@ -423,7 +350,7 @@ func TestAuthNoticeAndHealthzScrub(t *testing.T) {
 // 「측정 실패 · 로그를 보라」로 바꾸지 않고 그대로 내는지 잰다. 그 갈래는 정상이라 서버 로그에 남는 것이 없다.
 func TestHealthzKeepsRemoteDiskReason(t *testing.T) {
 	body := HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true, DiskFreePct: -1, DiskError: service.DiskRemote},
-		true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
+		true, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
 	if body.DiskKnown || body.DiskError != service.DiskRemote {
 		t.Fatalf("원격 DB 의 디스크 항목이 (%v, %q)다 - 기대 (false, %q)", body.DiskKnown, body.DiskError, service.DiskRemote)
 	}
@@ -433,13 +360,13 @@ func TestHealthzKeepsRemoteDiskReason(t *testing.T) {
 // 바꾸며, 못 잰 사유는 그대로 내는지 잰다. 거짓일 때도 키가 있어야 한다 - 빠지면 감시가 「모름」과 「틀렸다」를 못 가른다.
 func TestHealthzCarriesTheLocaleAxis(t *testing.T) {
 	ok := HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true, DBLocaleOK: true},
-		true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
+		true, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
 	if !ok.DBLocaleOK || ok.DBLocaleError != "" {
 		t.Fatalf("관문을 지난 원장: (%v, %q)", ok.DBLocaleOK, ok.DBLocaleError)
 	}
 	refused := HealthzOf(service.Health{APIVersion: "1", DBOK: true,
 		DBLocaleError: "DB 로케일이 이 서버가 기대는 값이 아니다 - 정렬 제공자가 builtin 이 아니다(datlocprovider=c)"},
-		true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
+		true, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
 	if refused.DBLocaleOK || !strings.Contains(refused.DBLocaleError, "서버 로그") || strings.Contains(refused.DBLocaleError, "datlocprovider") {
 		t.Fatalf("거절한 원장: (%v, %q)", refused.DBLocaleOK, refused.DBLocaleError)
 	}
@@ -451,7 +378,7 @@ func TestHealthzCarriesTheLocaleAxis(t *testing.T) {
 		t.Fatalf("거짓인 db_locale_ok 가 본문에서 빠졌다: %s", raw)
 	}
 	down := HealthzOf(service.Health{APIVersion: "1", DBLocaleError: service.DBLocaleUnmeasured},
-		true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
+		true, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
 	if down.DBLocaleOK || down.DBLocaleError != service.DBLocaleUnmeasured {
 		t.Fatalf("못 잰 원장: (%v, %q)", down.DBLocaleOK, down.DBLocaleError)
 	}
@@ -463,118 +390,13 @@ func TestHealthzCarriesTheLocaleAxis(t *testing.T) {
 func TestHealthzDBErrorPointsAtWhatTheLogHas(t *testing.T) {
 	h := service.Health{APIVersion: "1", DBRemote: true,
 		DBError: "Postgres 와 주고받지 못했다(postgres): 서버가 거절했다(SQLSTATE 55000)"}
-	pg := HealthzOf(h, true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{}).DBError
+	pg := HealthzOf(h, true, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{}).DBError
 	if pg != dbErrorRemote || strings.Contains(pg, "전문") || !strings.Contains(pg, "SQLSTATE") {
 		t.Fatalf("Postgres 접속 실패 안내가 로그에 남는 것(종류 · SQLSTATE)과 다르다: %q", pg)
 	}
 	h.DBRemote = false
-	if lite := HealthzOf(h, true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{}).DBError; !strings.Contains(lite, "원인 전문은 서버 로그에") {
+	if lite := HealthzOf(h, true, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{}).DBError; !strings.Contains(lite, "원인 전문은 서버 로그에") {
 		t.Fatalf("SQLite 접속 실패 안내가 바뀌었다: %q", lite)
-	}
-}
-
-// 루프백 문장은 **설정이 아니라 도달 가능성**을 말해야 한다.
-//
-// ★ 실물 사고가 이 시험의 근거다(2026-08-05). 서버를 컨테이너로 띄우면 호스트에서 온
-// 요청의 원격 주소가 브리지 게이트웨이(172.x)라 IsLoopback 이 false 다 — **면제를 실제로
-// 받는 클라이언트가 0인데** /healthz 는 "루프백 요청만 토큰 없이 통과한다"를 그대로 냈다.
-// 운영자는 그것을 믿고 클라이언트에 토큰을 안 준 채 전환했고 첫 쓰기에서 401 을 만났다.
-// 그 대응이 **인증을 통째로 끄는 것**이었다(token → token.off-2026-08-05). 그것이 이 문장의 비용이다.
-func TestAuthNoticeSaysLoopbackIsConfiguredButUnreached(t *testing.T) {
-	n := AuthNotice(true, LoopbackReach{Configured: true, Observed: false})
-	if !strings.Contains(n, "도달") {
-		t.Fatalf("면제가 설정만 열려 있고 아무도 그것을 못 받는다는 사실이 없다: %q", n)
-	}
-	if strings.Contains(n, "루프백 요청만 토큰 없이 통과한다") {
-		t.Fatalf("면제를 받는 클라이언트가 0인데 통과한다고 단정한다: %q", n)
-	}
-}
-
-// 안 닿는 **사유를 아는데 말하지 않는 것**은 절반만 고친 것이다.
-//
-// 설정과 관측이 어긋난다는 사실만 내면 운영자는 "왜?"를 스스로 파야 하고, 그 답
-// (도커 브리지가 소스 주소를 갈아 끼운다)은 서버가 이미 알고 있다 — self_update 축이
-// 같은 신호(/.dockerenv)를 이미 본다.
-func TestAuthNoticeNamesContainerWhenLoopbackUnreached(t *testing.T) {
-	n := AuthNotice(true, LoopbackReach{Configured: true, Observed: false, InContainer: true})
-	if !strings.Contains(n, "컨테이너") {
-		t.Fatalf("안 닿는 사유를 아는데 안 말한다: %q", n)
-	}
-	if !strings.Contains(n, "토큰") {
-		t.Fatalf("그래서 무엇을 해야 하는지가 없다 — 클라이언트도 토큰이 필요하다: %q", n)
-	}
-}
-
-// 면제가 **꺼져 있을 때**는 관측을 물을 이유가 없다. 그 갈래를 관측으로 오염시키면
-// "면제를 껐다"와 "면제는 켰는데 아무도 못 받는다"가 화면에서 같아진다 — 처방이 정반대다.
-func TestAuthNoticeKeepsTheDisabledCaseDistinct(t *testing.T) {
-	off := AuthNotice(true, LoopbackReach{Configured: false, Observed: false, InContainer: true})
-	if strings.Contains(off, "도달") || strings.Contains(off, "컨테이너") {
-		t.Fatalf("면제를 끈 서버가 '안 닿는다'고 말한다 — 끈 것은 결함이 아니다: %q", off)
-	}
-	if !strings.Contains(off, "루프백에도 토큰이 필요하다") {
-		t.Fatalf("면제가 꺼졌다는 사실이 사라졌다: %q", off)
-	}
-}
-
-// 도달-0 갈래는 **재는 법까지** 줘야 한다.
-//
-// ★ 이 문장을 읽은 사람이 할 가장 자연스러운 확인이 루프백에서 /healthz 를 쳐 보는
-// 것인데, 그 요청은 인증 게이트 앞에서 되돌아 나가 관측을 안 남긴다. 절차를 안 주면
-// **확인하려는 시도가 언제나 "아직 없다"를 확증한다** — 멀쩡한 서버를 결함으로 읽는다.
-func TestAuthNoticeTellsHowToMeasureReach(t *testing.T) {
-	n := AuthNotice(true, LoopbackReach{Configured: true, Observed: false})
-	if !strings.Contains(n, "/healthz") {
-		t.Fatalf("재는 법이 없다 — 이 값이 /healthz 로는 안 움직인다는 사실이 어디에도 안 나온다: %q", n)
-	}
-	if !strings.Contains(n, "API 요청") {
-		t.Fatalf("무엇을 하면 재지는지가 없다: %q", n)
-	}
-	// 사유를 아는 갈래(컨테이너)는 제 사유를 말한다 — 절차로 덮으면 진단이 흐려진다.
-	c := AuthNotice(true, LoopbackReach{Configured: true, Observed: false, InContainer: true})
-	if !strings.Contains(c, "컨테이너") {
-		t.Fatalf("사유를 아는 갈래가 사유를 잃었다: %q", c)
-	}
-}
-
-// 면제가 **닿는** 서버가 내는 401 처방도 거짓을 말하면 안 된다.
-//
-// ★ 이 갈래만 오래 "그 **설정**을 알린다"로 남아 있었다 — 인접 갈래 둘은 관측 어법인데.
-// 그리고 이 문구를 읽는 사람은 **방금 401 을 맞았다.** 루프백에서 왔다면 원인은 면제가
-// 아니라 토큰 값이다(JudgeAuth 는 헤더가 있으면 먼저 대조하고 불일치는 루프백이어도
-// 거절한다 — auth.go 의 순서 계약). 면제의 범위를 안 적으면 그 사람이 자기가 방금 받은
-// 401 을 설명하지 못하고, 그것이 2026-08-05 사고에서 세션이 배선을 안 의심한 이유다.
-func TestUnauthorizedGuidanceScopesTheExemptionWhenLoopbackReaches(t *testing.T) {
-	g := UnauthorizedGuidance(LoopbackReach{Configured: true, Observed: true})
-	if strings.Contains(g, "설정을 알린다") {
-		t.Fatalf("관측 축인데 설정을 알린다고 말한다 — 인접 갈래 둘과 어법이 갈린다: %q", g)
-	}
-	if !strings.Contains(g, "틀린 토큰은 루프백이어도 거절한다") {
-		t.Fatalf("면제의 범위가 없다 — 401 을 맞은 루프백 클라이언트가 자기 401 을 설명할 수 없다: %q", g)
-	}
-	if !strings.Contains(g, "Bearer") {
-		t.Fatalf("거짓을 지우면서 처방까지 지웠다: %q", g)
-	}
-}
-
-// loopback_open 은 **관측**이고, 설정값은 따로 남는다.
-//
-// 둘을 한 필드에 접으면 "왜 안 닿는가"를 물을 수 없다 — 설정이 꺼진 것인지
-// 켰는데 도달이 없는 것인지가 같은 false 로 보인다.
-func TestHealthzLoopbackOpenIsObservedNotConfigured(t *testing.T) {
-	body := HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true},
-		true, LoopbackReach{Configured: true, Observed: false}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
-	if body.Auth.LoopbackOpen {
-		t.Fatal("도달한 루프백 요청이 없는데 loopback_open 이 참이다 — 설정을 옮기기만 하면 그것이 거짓 광고다")
-	}
-	if !body.Auth.LoopbackConfigured {
-		t.Fatal("설정값이 사라졌다 — 관측과 설정이 둘 다 있어야 '왜 안 닿는가'를 물을 수 있다")
-	}
-
-	seen := HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true},
-		true, LoopbackReach{Configured: true, Observed: true}, buildinfo.Coord{}, SelfUpdateStatus{}, LedgerBackupStatus{})
-	if !seen.Auth.LoopbackOpen {
-		t.Fatal("루프백으로 도달한 요청이 있는데 loopback_open 이 거짓이다 — 관측을 안 읽는다")
 	}
 }
 
@@ -584,7 +406,7 @@ func TestHealthzLoopbackOpenIsObservedNotConfigured(t *testing.T) {
 func TestHealthzCarriesSelfUpdateRefusal(t *testing.T) {
 	at := time.Date(2026, 8, 5, 0, 31, 2, 0, time.UTC)
 	body := HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true},
-		false, LoopbackReach{Configured: true, Observed: true}, buildinfo.Coord{}, SelfUpdateStatus{
+		false, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{
 			Watching: true, LastAt: &at,
 			From: "07e5df4", To: "1d044b2",
 			Outcome: "refused", Detail: "selfcheck exit 1 — 증분 계획이 거절된다",
@@ -613,7 +435,7 @@ func TestHealthzCarriesSelfUpdateRefusal(t *testing.T) {
 // 화면에서는 정상으로 보인다. 여기서도 키:값 쌍으로 단언한다(태그 오타를 잡으려면 그래야 한다).
 func TestHealthzCarriesTheStalledWatcher(t *testing.T) {
 	body := HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true},
-		false, LoopbackReach{Configured: true, Observed: true}, buildinfo.Coord{}, SelfUpdateStatus{
+		false, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{
 			Watching: true,
 			Stalled:  "실행 파일을 못 쟀다: no such file or directory",
 		}, LedgerBackupStatus{})
@@ -626,7 +448,7 @@ func TestHealthzCarriesTheStalledWatcher(t *testing.T) {
 	}
 	// 아무 일도 없을 때는 안 나가야 한다 — 빈 축이 매번 실리면 읽는 쪽이 그 키를 무시하게 된다.
 	quiet, err := json.Marshal(HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true},
-		false, LoopbackReach{Configured: true, Observed: true}, buildinfo.Coord{}, SelfUpdateStatus{Watching: true}, LedgerBackupStatus{}))
+		false, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{Watching: true}, LedgerBackupStatus{}))
 	if err != nil {
 		t.Fatalf("직렬화 실패: %v", err)
 	}
@@ -641,7 +463,7 @@ func TestHealthzCarriesTheStalledWatcher(t *testing.T) {
 // "지금 못 잰다"(회복된다)와 "영영 안 바뀔 자리를 잰다"(회복이 없다)가 같은 값이 된다.
 func TestHealthzCarriesTheUncoveredBranch(t *testing.T) {
 	body := HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true},
-		false, LoopbackReach{Configured: true, Observed: true}, buildinfo.Coord{}, SelfUpdateStatus{
+		false, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{
 			Watching:  true,
 			Uncovered: "이 실행 파일 이름에는 소스 트리가 박혀 있다(런처 bin/fd)",
 		}, LedgerBackupStatus{})
@@ -658,7 +480,7 @@ func TestHealthzCarriesTheUncoveredBranch(t *testing.T) {
 	}
 	// 덮는 배치에서는 안 나가야 한다. 빈 축이 매번 실리면 읽는 쪽이 그 키를 무시하게 된다.
 	quiet, err := json.Marshal(HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true},
-		false, LoopbackReach{Configured: true, Observed: true}, buildinfo.Coord{}, SelfUpdateStatus{Watching: true}, LedgerBackupStatus{}))
+		false, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{Watching: true}, LedgerBackupStatus{}))
 	if err != nil {
 		t.Fatalf("직렬화 실패: %v", err)
 	}
@@ -672,7 +494,7 @@ func TestHealthzCarriesTheUncoveredBranch(t *testing.T) {
 // 원리적으로 못 잡는다(Go 필드 값은 태그와 무관하게 그대로 있으므로).
 func TestHealthzSaysWhenItIsNotWatching(t *testing.T) {
 	body := HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true},
-		false, LoopbackReach{Configured: true, Observed: true}, buildinfo.Coord{}, SelfUpdateStatus{
+		false, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{
 			Watching: false, Reason: "이 플랫폼은 자기 재기동을 지원하지 않는다",
 		}, LedgerBackupStatus{})
 	if body.SelfUpdate.Watching {
@@ -702,7 +524,7 @@ func TestHealthzSaysWhenItIsNotWatching(t *testing.T) {
 // 조각은 **각자 자기 것만** 잰다.
 func TestHealthzOmitsLastAtWhenNoAttemptEver(t *testing.T) {
 	body := HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true},
-		false, LoopbackReach{Configured: true, Observed: true}, buildinfo.Coord{}, SelfUpdateStatus{
+		false, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{
 			Watching: true, // 감시 중이지만 아직 교체를 한 번도 안 봤다 — LastAt 이 nil
 		}, LedgerBackupStatus{})
 	if body.SelfUpdate.LastAt != nil {
@@ -747,7 +569,7 @@ func TestClip(t *testing.T) {
 func TestHealthzCarriesLedgerBackup(t *testing.T) {
 	at := time.Date(2026, 8, 10, 4, 0, 0, 0, time.UTC)
 	body := HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true},
-		true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{},
+		true, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{},
 		LedgerBackupStatus{Running: true, LastAt: &at, Outcome: "failed",
 			Detail: "디스크가 찼다", Route: "/ledger"})
 	if !body.LedgerBackup.Running || body.LedgerBackup.Outcome != "failed" {
@@ -764,7 +586,7 @@ func TestHealthzCarriesLedgerBackup(t *testing.T) {
 	}
 	// 회차가 없으면 시각 키가 통째로 빠진다 — 제로값이 1970년으로 나가면 안 된다.
 	quiet, err := json.Marshal(HealthzOf(service.Health{OK: true, APIVersion: "1", DBOK: true},
-		true, LoopbackReach{}, buildinfo.Coord{}, SelfUpdateStatus{},
+		true, auth.ModeTransition, auth.TLSOff, buildinfo.Coord{}, SelfUpdateStatus{},
 		LedgerBackupStatus{Running: true}))
 	if err != nil {
 		t.Fatalf("직렬화 실패: %v", err)
@@ -899,28 +721,11 @@ func TestJudgeNextFrom(t *testing.T) {
 	}
 }
 
-// TestAuthNoticeWarnsAboutSameHostProxy 는 면제가 **실제로 열린** 갈래가 리버스 프록시를
-// 함께 경고하는지 본다.
-//
-// ★ 관측은 이미 있었다 — loopback_open 이 그 상태를 정확히 낸다. 없던 것은 **연결**이다.
-// 같은 호스트 프록시 뒤에서 그 값이 참이 되는데, 운영자가 그 사실을 프록시와 잇지
-// 못하면 "내 서버는 루프백으로 아무도 안 치는데 왜 열렸다고 하지"로 읽고 넘긴다.
-func TestAuthNoticeWarnsAboutSameHostProxy(t *testing.T) {
-	n := AuthNotice(true, LoopbackReach{Configured: true, Observed: true})
-	for _, want := range []string{"리버스 프록시", "require-token-on-loopback"} {
-		if !strings.Contains(n, want) {
-			t.Errorf("문구에 %q 가 없다 — 운영자가 loopback_open 을 프록시와 못 잇는다: %s", want, n)
-		}
-	}
-}
-
 func TestJudgePreSessionPath(t *testing.T) {
 	cases := map[string]bool{
 		"/login":  true,
 		"/logout": true,
-		// /healthz 는 여기 없다 — loopbackSeen 관측보다도 앞이라 미들웨어가 따로 본다.
-		// 여기 넣으면 그 순서가 흐려지고, 컨테이너 헬스체크가 loopback_open 을 거짓으로
-		// 참으로 만드는 회귀가 돌아온다(middleware.go 의 그 근거).
+		// /healthz 는 여기 없다 — 읽기 하나라 멱등과 무관하고, 인증 게이트만 따로 앞에서 보낸다.
 		"/healthz":           false,
 		"/":                  false,
 		"/api/v1/items/next": false,

@@ -181,9 +181,9 @@ func readEventFrame(t *testing.T, br *bufio.Reader) string {
 
 func TestSSEProjectFilterDoesNotHideGlobalEvents(t *testing.T) {
 	e := newEnv(t, nil)
-	other := e.srv.hub.Subscribe("다른프로젝트")
-	mine := e.srv.hub.Subscribe(testProject)
-	all := e.srv.hub.Subscribe("")
+	other := e.srv.hub.Subscribe("다른프로젝트", StreamOwner{})
+	mine := e.srv.hub.Subscribe(testProject, StreamOwner{})
+	all := e.srv.hub.Subscribe("", StreamOwner{})
 	defer func() {
 		e.srv.hub.Unsubscribe(other)
 		e.srv.hub.Unsubscribe(mine)
@@ -211,7 +211,7 @@ func TestSSEProjectFilterDoesNotHideGlobalEvents(t *testing.T) {
 
 func TestSlowSubscriberDoesNotBlockPublishingAndIsCounted(t *testing.T) {
 	e := newEnv(t, func(o *Options) { o.SSEBuffer = 1 })
-	slow := e.srv.hub.Subscribe("")
+	slow := e.srv.hub.Subscribe("", StreamOwner{})
 	defer e.srv.hub.Unsubscribe(slow)
 
 	for i := 0; i < 3; i++ {

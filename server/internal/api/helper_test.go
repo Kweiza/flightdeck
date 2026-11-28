@@ -129,10 +129,10 @@ type reqOpt func(*http.Request)
 func withHeader(k, v string) reqOpt { return func(r *http.Request) { r.Header.Set(k, v) } }
 func withRemote(addr string) reqOpt { return func(r *http.Request) { r.RemoteAddr = addr } }
 func withKey(k string) reqOpt       { return withHeader("Idempotency-Key", k) }
+func bearer(tok string) reqOpt      { return withHeader("Authorization", "Bearer "+tok) }
 
-// loopback 은 요청을 루프백에서 온 것으로 만든다.
-// httptest.NewRequest 의 기본 RemoteAddr 은 192.0.2.1 이라 **루프백이 아니다** —
-// 그 기본값이 이 시험의 "원격" 축을 공짜로 준다.
+// loopback 은 요청을 루프백에서 온 것으로 만든다. 인증에는 이제 아무 뜻이 없다(면제가 없어졌다) - 원격 주소 축(지표 ·
+// 액세스 로그 · 신뢰 프록시)을 재는 시험이 쓴다. httptest.NewRequest 의 기본 RemoteAddr 은 192.0.2.1 이라 루프백이 아니다.
 func loopback() reqOpt { return withRemote("127.0.0.1:54321") }
 
 func (e *env) do(method, path string, body any, opts ...reqOpt) *httptest.ResponseRecorder {

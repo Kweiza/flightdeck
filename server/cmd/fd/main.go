@@ -69,6 +69,8 @@ const usage = `fd — flightdeck 클라이언트/서버
   fd project rm --project <id> --reason … 잔해 프로젝트를 원장에서 지운다(--yes 없이는 세기만 한다)
   fd alloc <counter>                      원자 발번
   fd doctor                               이 머신과 서버의 축을 실제로 잰다
+  fd admin bootstrap --login <이름>        관리자 0명인 서버에 FD_TOKEN 으로 첫 관리자를 만든다(로그인 코드를 한 번 보인다)
+  fd admin recover <login> [--db <원장>]  서버 컨테이너 안에서 원장을 직접 열어 그 관리자의 새 로그인 코드를 낸다
 
   --project <이름>                        워크스페이스 멤버 레포에 건다(status·next·pick·add·
                                           finish·land·label·lane wait). 루트 레포의
@@ -82,6 +84,7 @@ const usage = `fd — flightdeck 클라이언트/서버
   fd export --judgments --out <디렉토리>   판단 원장을 JSONL 로 낸다. **DB 전량**이라 --project 를 안 받는다
 
 환경: FD_URL(기본 http://127.0.0.1:7420) · FD_TOKEN · FD_PROJECT · FD_STATE_DIR · FD_LOG
+서버: FD_AUTH(transition 기본 · accounts) · FD_TLS(files · proxy · 빈 값) · FD_TLS_CERT · FD_TLS_KEY · FD_TRUSTED_PROXY
 `
 
 func main() { os.Exit(run(os.Args[1:], os.LookupEnv, os.Stdin, os.Stdout, os.Stderr)) }
@@ -188,6 +191,8 @@ func run(args []string, env func(string) (string, bool), stdin io.Reader, stdout
 		return app.runSetup(ctx, args[1:], stdout)
 	case "doctor":
 		return app.runDoctor(ctx, args[1:], stdout)
+	case "admin":
+		return app.runAdmin(ctx, args[1:], stdout)
 	case "migrate":
 		return app.runMigrate(ctx, args[1:], stdout)
 	case "import":

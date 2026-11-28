@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kweiza/flightdeck/internal/auth"
 	"github.com/kweiza/flightdeck/internal/model"
 	"github.com/kweiza/flightdeck/internal/store"
 )
@@ -21,10 +22,10 @@ import (
 func TestUnauthenticatedRequestIs401AndLeavesNoAccessLog(t *testing.T) {
 	e := newEnv(t, func(o *Options) { o.Token = "s3cret" })
 
-	// ① 대조: 루프백은 토큰 없이 통과하고, 그 요청은 액세스 로그에 **남는다**.
-	pass := e.do(http.MethodGet, "/metrics", nil, loopback(), withHeader("X-Request-Id", "probe-pass"))
+	// ① 대조: 토큰을 실은 요청은 통과하고, 그 요청은 액세스 로그에 **남는다**.
+	pass := e.do(http.MethodGet, "/metrics", nil, bearer("s3cret"), withHeader("X-Request-Id", "probe-pass"))
 	if pass.Code != http.StatusOK {
-		t.Fatalf("루프백이 막혔다: %d %s", pass.Code, pass.Body.String())
+		t.Fatalf("토큰을 실은 요청이 막혔다: %d %s", pass.Code, pass.Body.String())
 	}
 	if n := len(e.logs.served(t, "probe-pass")); n != 1 {
 		t.Fatalf("게이트를 통과한 요청의 액세스 로그가 %d줄이다 — 대조가 성립하지 않아 아래 단정은 무의미하다", n)
@@ -50,7 +51,7 @@ func TestUnauthenticatedRequestIs401AndLeavesNoAccessLog(t *testing.T) {
 	}
 
 	// ③ 그 축의 정본은 카운터다.
-	m := e.do(http.MethodGet, "/metrics", nil, loopback())
+	m := e.do(http.MethodGet, "/metrics", nil, bearer("s3cret"))
 	if !strings.Contains(m.Body.String(), "flightdeck_unauthorized_total 1") {
 		t.Fatalf("401 이 카운터에도 안 잡혔다 — 그러면 이 축의 원천이 하나도 없다:\n%s", m.Body.String())
 	}
@@ -298,19 +299,16 @@ func TestHealthzIsReachableWithoutTokenAndAnnouncesAuth(t *testing.T) {
 	if !ok {
 		t.Fatalf("auth 절이 없다: %s", w.Body.String())
 	}
-	// ★ 이 단정은 loopback_open 에서 loopback_configured 로 **옮겼다**(계약을 지운 게 아니다).
-	//
-	// 원래 의도는 "인증 설정이 응답에 실린다"이고 그것은 그대로다. 다만 이 요청은
-	// 원격에서 오므로 루프백 도달이 0이고, loopback_open 은 이제 **관측**이라 거짓이
-	// 맞다 — 앞선 판은 그 상황에서도 참을 내서 "면제가 열려 있다"를 믿게 했다.
-	// 그 거짓이 실물 사고를 냈다(2026-08-05, 컨테이너 배포 · 토큰 전면 해제로 귀결).
-	if auth["token_set"] != true || auth["loopback_configured"] != true {
-		t.Fatalf("인증 설정이 안 실렸다: %v", auth)
+	// 인증 단계 · 전송 정책이 실린다. 루프백 칸(설정 · 관측)은 면제와 함께 없어졌다.
+	if auth["token_set"] != true || body["auth_mode"] != "transition" || body["tls"] != "off" {
+		t.Fatalf("인증 설정이 안 실렸다: auth=%v auth_mode=%v tls=%v", auth, body["auth_mode"], body["tls"])
 	}
-	if auth["loopback_open"] != false {
-		t.Fatalf("원격에서 물었는데 면제가 열려 있다고 답한다 — 이 값은 설정이 아니라 관측이어야 한다: %v", auth)
+	for _, gone := range []string{"loopback_open", "loopback_configured"} {
+		if _, ok := auth[gone]; ok {
+			t.Fatalf("면제가 없어졌는데 %s 칸이 남았다: %v", gone, auth)
+		}
 	}
-	if s, _ := auth["notice"].(string); !strings.Contains(s, "루프백") {
+	if s, _ := auth["notice"].(string); !strings.Contains(s, "전환 단계") {
 		t.Fatalf("사람이 읽을 한 줄이 없다: %v", auth)
 	}
 	if strings.Contains(w.Body.String(), e.dbPath) || strings.Contains(w.Body.String(), "db_path") {
@@ -325,97 +323,22 @@ func TestHealthzIsReachableWithoutTokenAndAnnouncesAuth(t *testing.T) {
 	}
 }
 
-// 관측은 **실제로 재야** 한다 — 안 재고 false 를 내면 방향만 다른 같은 거짓말이다.
-//
-// ★ 이 시험이 없으면 "설정을 안 옮긴다"는 것만 확인되고, 면제가 멀쩡히 닿는 서버가
-// 영원히 "아무도 못 받는다"고 말하는 상태가 초록으로 통과한다.
-func TestHealthzObservesLoopbackOnceALoopbackRequestArrives(t *testing.T) {
-	e := newEnv(t, func(o *Options) { o.Token = "s3cret" })
-
-	reach := func() map[string]any {
-		return decodeBody(t, e.do(http.MethodGet, "/healthz", nil))["auth"].(map[string]any)
-	}
-
-	if a := reach(); a["loopback_open"] != false {
-		t.Fatalf("아직 루프백 요청이 하나도 없는데 면제가 열려 있다고 답한다: %v", a)
-	}
-
-	// 루프백에서 게이트를 지난다. 토큰이 없어도 면제로 통과하는 그 요청이 바로 관측 대상이다.
-	w := e.do(http.MethodGet, "/api/v1/dashboard.json?project=p", nil, loopback())
-	if w.Code == http.StatusUnauthorized {
-		t.Fatalf("루프백 면제가 안 걸렸다 — 이 시험의 전제가 깨졌다: %s", w.Body.String())
-	}
-
-	a := reach()
-	if a["loopback_open"] != true {
-		t.Fatalf("루프백으로 도달한 요청이 있었는데 관측이 안 남았다: %v", a)
-	}
-	if s, _ := a["notice"].(string); !strings.Contains(s, "루프백 요청만 토큰 없이 통과한다") {
-		t.Fatalf("면제가 실제로 닿는데 안 닿는 것처럼 말한다: %q", s)
-	}
-}
-
-// `/healthz` 요청 자신은 도달 관측을 **안 남긴다** — 그리고 그것은 사고가 아니라 하중이다.
-//
-// ★ `withAuth` 의 `/healthz` 조기 반환은 라우팅 목적으로 놓였지만(배너 훅이 인증 없이
-// 물을 창), 그 줄이 관측 저장보다 **위에** 있는 덕에 컨테이너 헬스체크가 관측에서 빠진다.
-// 순서를 뒤집으면 **모든 컨테이너 배포가 기동 30초 안에 `loopback_open:true` 가 된다**:
-// 이미지의 HEALTHCHECK 가 컨테이너 **안에서** `fd doctor` 를 30초마다 돌리고
-// (`server/Dockerfile` 의 HEALTHCHECK · `compose.yaml` 의 healthcheck), `fd doctor` 가
-// 치는 것은 `/healthz` 하나뿐이다(`cmd/fd/cmds.go` 의 `a.cli.Healthz` — REST 에 진단
-// 엔드포인트가 없어서다). 컨테이너 안에서 서버를 치면 그것은 루프백이다.
-//
-// 그러면 면제를 받는 클라이언트가 하나도 없는데 "면제가 닿는다"를 내게 된다 — 이 축이
-// 존재하는 이유인 바로 그 거짓 광고다(2026-08-05 사고). `notice`·`guidance` 의 컨테이너
-// 갈래(`Configured && !Observed && InContainer`)는 도달 불가가 된다.
-//
-// 위 시험이 관측을 만들려고 `/api/v1` 을 치는 것은 이 사실의 **우회**일 뿐 단정이 아니다.
-// 이 시험이 그 단정이다 — 없으면 `:121-125` 의 ★("관측은 판정보다 먼저")를 읽고 그 줄을
-// 조기 반환 위로 올리는 가장 자연스러운 리팩터링이 **전 시험 초록인 채** 이것을 깬다.
-func TestHealthzItselfDoesNotCountAsLoopbackReach(t *testing.T) {
-	e := newEnv(t, func(o *Options) { o.Token = "s3cret" })
-
-	reach := func() map[string]any {
-		return decodeBody(t, e.do(http.MethodGet, "/healthz", nil, loopback()))["auth"].(map[string]any)
-	}
-
-	// 컨테이너 헬스체크가 30초마다 하는 일이다. 몇 번을 쳐도 관측이 안 쌓여야 한다.
-	for i := 0; i < 5; i++ {
-		if a := reach(); a["loopback_open"] != false {
-			t.Fatalf("루프백에서 온 %d번째 /healthz 가 도달 관측을 남겼다 — 컨테이너 헬스체크가"+
-				" 30초마다 이것을 치므로 모든 컨테이너가 곧 '면제가 닿는다'를 내게 된다: %v", i+1, a)
+// TestLoopbackWithoutTokenIs401 은 루프백 면제가 없어졌는지 본다(성공 기준 「루프백 무토큰 401」). 두 단계 모두 그렇다 - 전환
+// 단계도 토큰을 켠 서버는 루프백에서 온 무자격 요청을 거절한다. 처방은 루프백도 같다고 말한다.
+func TestLoopbackWithoutTokenIs401(t *testing.T) {
+	for _, m := range []auth.Mode{auth.ModeTransition, auth.ModeAccounts} {
+		e := newEnv(t, func(o *Options) { o.Token = "s3cret"; o.AuthMode = m })
+		w := e.do(http.MethodGet, "/api/v1/dashboard.json?project=p", nil, loopback())
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: 루프백 + 토큰 없음이 %d 다 — 면제가 살아 있다: %s", m, w.Code, w.Body.String())
 		}
-	}
-
-	// 문구까지 잠근다. loopback_open 만 보면 notice 가 갈래를 잘못 골라도 안 걸린다.
-	if s, _ := reach()["notice"].(string); strings.Contains(s, "루프백 요청만 토큰 없이 통과한다") {
-		t.Fatalf("도달한 요청이 없는데 면제가 닿는다고 말한다: %q", s)
-	}
-}
-
-// 401 의 처방도 **관측을 따라야** 한다.
-//
-// ★ 실물 사고의 가장 나쁜 조각이 여기였다. 루프백에서 401 을 맞은 사람이 받은 안내가
-// "루프백은 토큰 없이 통과한다(/healthz 가 그 설정을 알린다)" 였다 — 401 을 낸 그 응답이
-// 401 이 나면 안 된다고 말한 셈이다. 원인을 찾던 세션이 그 문장 때문에 배선이 아니라
-// 자기 토큰 설정을 의심했다.
-func TestUnauthorizedGuidanceDoesNotPromiseUnreachableLoopback(t *testing.T) {
-	e := newEnv(t, func(o *Options) { o.Token = "s3cret" })
-
-	w := e.do(http.MethodGet, "/api/v1/dashboard.json?project=p", nil)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("원격 + 토큰 없음이 %d 다: %s", w.Code, w.Body.String())
-	}
-	errObj, ok := decodeBody(t, w)["error"].(map[string]any)
-	if !ok {
-		t.Fatalf("error 절이 없다: %s", w.Body.String())
-	}
-	g, _ := errObj["guidance"].(string)
-	if strings.Contains(g, "루프백은 토큰 없이 통과한다") {
-		t.Fatalf("면제가 이 서버에 닿지 않는데 닿는다고 안내한다 — 401 을 받은 사람이 정확히 이 문장 때문에 배선을 안 의심한다: %q", g)
-	}
-	if !strings.Contains(g, "Bearer") {
-		t.Fatalf("무엇을 하면 되는지가 사라졌다 — 거짓을 지우면서 처방까지 지우면 안 된다: %q", g)
+		errObj, ok := decodeBody(t, w)["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("error 절이 없다: %s", w.Body.String())
+		}
+		if g, _ := errObj["guidance"].(string); !strings.Contains(g, "Bearer") || !strings.Contains(g, "루프백도 같다") {
+			t.Fatalf("%s: 처방이 무엇을 하면 되는지 · 루프백도 같다는 것을 안 말한다: %q", m, g)
+		}
 	}
 }
 

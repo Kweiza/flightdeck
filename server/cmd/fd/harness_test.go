@@ -281,20 +281,6 @@ const harnessClientTimeout = 30 * time.Second
 // timeUnit 은 SSE 처럼 끝나지 않는 응답을 끊는 짧은 구간이다.
 const timeUnit = time.Second
 
-// requireTokenEverywhere 는 루프백 면제를 끄고 하네스를 재조립한다.
-//
-// httptest 는 127.0.0.1 이라 기본 설정에서는 토큰 없이도 통과한다. 그 상태로
-// "인증이 걸린다"를 단정하면 **루프백이라 통과한 것인지 게이트가 막은 것인지 구분되지 않는다.**
-func (h *harness) requireTokenEverywhere() {
-	h.t.Helper()
-	quiet := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	handler := buildHandler(h.svc, web.New(h.svc, web.WithLogger(quiet)),
-		api.Options{Log: quiet, Token: h.token, RequireTokenOnLoopback: true})
-	h.srv.Close()
-	h.srv = httptest.NewServer(handler)
-	h.t.Cleanup(h.srv.Close)
-}
-
 // runWithStdin 은 임의의 io.Reader 를 stdin 으로 준다.
 //
 // run/runEnv 는 문자열을 받아 strings.NewReader 로 감싸므로 **항상 즉시 EOF** 다.

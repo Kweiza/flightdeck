@@ -1115,13 +1115,16 @@ GET    /projects                    POST   /projects/{id}/remove  (잔해 지우
 GET    /dashboard.json              GET    /notices      (꼬리 전용)  POST /sessions/{id}/prescriptions (세션 카드 파생 안 돎)
 GET    /events        (SSE)         GET    /healthz
 GET    /metrics
-GET|POST /login                     POST   /logout       (화면 토큰 로그인 — 아래 ★)
+GET|POST /login                     POST   /logout       (화면 로그인: 로그인 코드, 전환 단계면 FD_TOKEN 도 - 아래 ★)
+POST   /admin/bootstrap             (접두 밖: 관리자 0명일 때 FD_TOKEN 으로 첫 관리자와 그 로그인 코드를 낸다. 응답이 비밀이라 멱등 표 밖)
+POST   /devices/{id}/revoke         (기기 토큰 철회: 관리자는 누구의 기기든, 계정은 자기 기기만. 그 기기의 열린 스트림을 끊는다)
+PATCH  /admin/accounts/{id}         (관리자 전용 계정 끄기 · 켜기 {"disabled": bool}. 끄면 그 계정의 열린 스트림을 끊는다)
 ```
 
 **이 표는 `/api/v1` 밖의 표면도 적는다.** 헤더의 접두는 *대부분이 그것*이라는 뜻이지
 경계가 아니다 — `/healthz`·`/metrics`·`/events`(짧은 별칭, 화면이 이걸 문다)·`/login`·
-`/logout` 은 접두 밖이고, 그래도 이 서버가 내는 HTTP 표면이라 여기 있다. **접두를 경계로
-읽으면 그 다섯이 표에서 빠지고, 실제로 로그인 표면 셋이 그렇게 빠져 있었다**(2026-08-11
+`/logout`·`/admin/bootstrap` 은 접두 밖이고, 그래도 이 서버가 내는 HTTP 표면이라 여기 있다. **접두를 경계로
+읽으면 그 여섯이 표에서 빠지고, 실제로 로그인 표면 셋이 그렇게 빠져 있었다**(2026-08-11
 기계 대조에서 드러났다 — `internal/web` 의 화면 라우트는 별개 mux 라 여전히 이 표 밖이다).
 
 **`GET /sessions` 는 카드를 두 축으로 지목한다 — 3중키와 카드 id.**
@@ -1158,24 +1161,45 @@ worktree 축을 빼면 그 축은 아무 데서도 복구되지 않는다** — 
 **모든 도구 응답 지연에 저장소 전수 훑기가 얹힌다.** 표면을 가르면 그 비용이
 `/metrics` 의 라우트 라벨에서도 화면 트래픽과 갈려 보인다.
 
-인증은 `Authorization: Bearer <token>`. 사용자 1명이므로 토큰 1개, 역할 없음.
-**루프백은 토큰 없이 허용하되, `/healthz` 는 그 면제가 실제로 닿는지를 알린다.**
-`loopback_configured` 가 설정값이고, `loopback_open` 은 설정이 열린 채 루프백 요청이
-이 프로세스에 한 번이라도 닿았을 때만 참이다 — 안 닿는 사유는 `notice` 가 말한다.
-컨테이너로 띄우면 호스트 요청이 브리지 게이트웨이로 보여 면제가 구조적으로 안 걸린다.
-도달은 API 요청만 남긴다 — `/healthz` 는 게이트 앞이라 안 센다(컨테이너 헬스체크가 그 창을 30초마다 친다).
+**인증은 단계(`FD_AUTH`)로 갈린다: `transition`(기본값)과 `accounts`.** 정본은 `internal/auth` 의 `Gate` 다.
+게이트는 캐시 없이 요청마다 원장을 읽는다. 그래서 기기 철회 · 계정 끄기는 다음 요청부터 듣는다.
 
-**브라우저는 헤더를 못 싣는다 — 그래서 화면 경로에만 쿠키 갈래가 있다.**
-`POST /login` 이 토큰을 대조해 `fd_token` 쿠키(`HttpOnly`·`SameSite=Strict`·`Path=/`·10년,
-TLS 뒤에서만 `Secure`)를 굽고, `JudgeAuth` 는 **`/` · `/actions/*` · `/events` 에서만** 그
-쿠키를 인정한다. `/api/v1/*` 는 헤더 전용 그대로다 — REST 쓰기는 `withScreenWrite` 의 출처
+- 헤더 `Authorization: Bearer fdd_…` 는 **기기 토큰**이다. 원장의 `machine.token_hash`(sha256)와 대조하고,
+  철회된 기기 · 꺼진 계정은 401 이다. 헤더에 화면 쿠키 값(`fds_…`)이나 로그인 코드(`fdl_…`)를 실으면 거절한다.
+- 화면 쿠키 `fd_session`(`fds_…`, 14일)은 **화면 세션**이다. 일회용 로그인 코드(`fdl_…`, 1시간)를 `/login` 폼에
+  넣으면 그 코드 행을 지우고 화면 세션 행 하나로 바꾼다.
+- `transition` 은 위 둘에 더해 `FD_TOKEN`(헤더 · 옛 `fd_token` 쿠키)도 받는다. 그 주체는 관리자 역할의 공용 주체다.
+  `FD_TOKEN` 이 비어 있으면 옛날처럼 무인증으로 통한다. **새 판으로 갈아도 지금 붙은 기기 · 훅 · MCP · 화면이 하나도
+  401 로 떨어지지 않는 것이 이 단계의 몫이다.** 각 기기가 `fd login` 으로 기기 토큰을 받은 뒤 `FD_AUTH=accounts` 로 좁힌다.
+- `accounts` 에서 `FD_TOKEN` 은 관리자가 0명인 동안 `POST /admin/bootstrap` 한 곳에서만 듣는다. 관리자가 한 명이라도
+  있으면(꺼진 관리자도 센다) 어디서든 401 이다. 관리자 계정을 못 쓰게 됐으면 컨테이너 안에서
+  `fd admin recover <login>` 이 원장을 직접 열어 새 로그인 코드를 낸다(꺼진 관리자면 다시 켠다).
+- **루프백 면제는 없다.** 두 단계 모두 루프백 요청도 같은 게이트를 지난다. `/healthz` 는 `auth_mode`(단계) · `tls`(전송) ·
+  `auth.token_set` 을 낸다.
+- 토큰 · 쿠키 · 코드는 원장에 sha256 만 남고 대조는 상수 시간이다. 로그 · 오류 · 응답에 원값을 싣지 않는다.
+  예외는 부트스트랩 · recover 가 로그인 코드를 **한 번** 보이는 자리뿐이다.
+
+**전송 정책은 `FD_TLS` 다.** `files` 는 서버가 `FD_TLS_CERT` · `FD_TLS_KEY` 로 직접 TLS 로 듣는다. `proxy` 는 앞의
+리버스 프록시가 TLS 를 끝내고, 서버는 `FD_TRUSTED_PROXY`(CIDR 목록)와 루프백에서 온 연결만 받는다. 거기서 벗어나
+곧장 온 연결은 403 `transport_refused` 다. 빈 값은 평문이다. 루프백 밖 평문 bind 는 `accounts` 에서 기동을 거절하고
+`transition` 에서는 경고만 한다. 지금 배포(컨테이너 안 평문, 앞에서 TLS)가 갱신하는 순간 못 뜨면 전환 길이 끊기기 때문이다.
+모드와 안 맞는 값(`FD_TLS` 없이 `FD_TLS_CERT` 만 있는 것 따위)은 기동 오류다. "TLS 를 켰다"고 믿는 평문 서버를 안 만든다.
+
+**철회 · 끄기 · 로그아웃은 그 주체의 열린 스트림을 같은 자리에서 끊는다.** 열린 `/events` 에는 다음 요청이 없어 게이트가
+다시 볼 기회가 없다. 허브는 구독마다 주체(계정 · 기기 · 화면 세션)를 들고, 원장 쓰기가 커밋된 **뒤** `Hub.Cut` 이 맞는
+구독을 닫는다. 끊긴 스트림은 `: bye` 한 줄을 받고 끝난다.
+
+**브라우저는 헤더를 못 싣는다. 그래서 화면 경로에만 쿠키 갈래가 있다.**
+쿠키(`HttpOnly`·`SameSite=Strict`·`Path=/`, `FD_TLS` 가 켜졌거나 TLS 뒤일 때 `Secure`)는
+**`/` · `/actions/*` · `/events` 에서만** 인정한다. 화면 경로에서는 `fd_session` 이 옛 `fd_token` 보다 먼저다.
+`/api/v1/*` 는 헤더 전용 그대로다. REST 쓰기는 `withScreenWrite` 의 출처
 대조를 안 타므로(`JudgeScreenWrite` 가 화면 경로만 `Screen=true`), 거기에 쿠키를 열면 REST
 쓰기 전체의 CSRF 방어가 `SameSite` 하나로 줄어든다. **헤더가 있으면 쿠키는 안 본다**
-(멱등 키와 같은 규율 — 무엇이 인증했는지가 요청마다 달라지면 안 된다).
+(멱등 키와 같은 규율: 무엇이 인증했는지가 요청마다 달라지면 안 된다).
 인증 안 된 요청 중 `Accept: text/html` 인 것만 **401 본문에 폼**을 받는다. 상태코드는
-401 그대로다 — 리다이렉트로 덮으면 인증 실패가 `/metrics` 의 unauthorized 축에서 사라진다.
-`/login`·`/logout` 은 게이트 앞이다(`JudgePreSessionPath`). 로그아웃은 그 브라우저의 쿠키만
-지운다 — 토큰 무효화는 `FD_TOKEN` 교체뿐이고 이 제품에 다른 길을 만들지 않는다.
+401 그대로다. 리다이렉트로 덮으면 인증 실패가 `/metrics` 의 unauthorized 축에서 사라진다.
+`/login`·`/logout` 은 게이트 앞이다(`JudgePreSessionPath`). 로그아웃은 그 화면 세션 행을 지우고, 그 세션의 열린 스트림을
+끊고, 두 쿠키를 지운다. 기기 토큰 무효화는 `POST /devices/{id}/revoke` 다. 전환 단계의 `FD_TOKEN` 무효화는 여전히 교체뿐이다.
 
 모든 쓰기에 `Idempotency-Key: <session>:<seq>` — 단 `/login`·`/logout` 은 통째로 빠진다.
 세션이 생기기 전의 요청이라 `<session>:<seq>` 를 만들 값 자체가 없다. **면제는 키 요구가
@@ -1183,6 +1207,8 @@ TLS 뒤에서만 `Secure`)를 굽고, `JudgeAuth` 는 **`/` · `/actions/*` · `
 들어가 서로 무관한 로그인 시도가 한 슬롯을 공유했고, 틀린 토큰의 401 이 캐시된 뒤 맞는
 토큰의 재시도가 fingerprint 불일치로 409 가 됐다(TTL 24시간). `JudgePreSessionPath` 가
 인증 게이트와 멱등 게이트 양쪽에서 이 둘을 함께 면제하는 이유다.
+`POST /admin/bootstrap` 도 멱등 표에 안 들어간다(`JudgeSecretResponse`). 응답이 로그인 코드라 표에 담으면 원값이 원장에
+남는다. 재시도는 409 「관리자가 이미 있다」를 받고, 코드를 잃었으면 `fd admin recover` 가 새로 낸다.
 
 **`/healthz` 의 `self_update` 는 서버가 자기 교체를 따라가고 있는가다**(축 자체는 §7).
 모양은 `internal/api/handlers_meta.go` 의 `SelfUpdateStatus` 가 정본이다. 읽는 순서에 규율이 있다 —

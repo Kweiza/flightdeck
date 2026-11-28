@@ -91,19 +91,9 @@ func TestLoginRoundTripBehindPathPrefix(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 	svc := service.New(st, quiet)
 
-	opt := serveAPIOptions(token, 0, quiet, false, nil, nil, false, nil)
-	// ★ **루프백 면제를 끈다.** httptest 서버는 언제나 127.0.0.1 이고 프록시도 같은
-	// 머신이라, 끄지 않으면 업스트림이 보는 RemoteAddr 이 루프백이라 인증 게이트가
-	// 통째로 건너뛰어진다 — 첫 방문이 401 이 아니라 **200** 이 되고, 그러면 이 시험은
-	// 로그인을 한 번도 안 거치고 초록이 된다(실측). 재려는 것이 로그인 왕복인데
-	// 로그인이 아예 안 일어나는 것이 가장 나쁜 초록이다.
-	//
-	// ★ 이 한 줄이 가리키는 더 큰 축이 있다. `serveAPIOptions` 는 이 필드를 한 번도
-	// 세팅하지 않아서 **운영 배포의 면제는 항상 켜져 있고 끌 길이 없다.** 판정은
-	// RemoteAddr 이므로 같은 호스트의 리버스 프록시 뒤에서는 실제 배포도 루프백으로
-	// 보인다. 그 축은 이 항목의 범위가 아니라 별도로 다룬다 — 여기서는 이 시험이
-	// **인증이 실제로 켜진 서버**를 재게 만드는 것이 전부다.
-	opt.RequireTokenOnLoopback = true
+	opt := serveAPIOptions(token, 0, quiet, authConfig{}, nil, nil, nil)
+	// ★ httptest 서버는 언제나 127.0.0.1 이고 프록시도 같은 머신이다. 루프백 면제가 없어졌으므로 그대로 첫 방문이 401 이다 -
+	// 앞선 판은 여기서 면제를 손으로 꺼야 했다(안 끄면 로그인을 한 번도 안 거치고 초록이 됐다).
 	upstream := httptest.NewServer(buildHandler(svc, web.New(svc, web.WithLogger(quiet)), opt))
 	t.Cleanup(upstream.Close)
 

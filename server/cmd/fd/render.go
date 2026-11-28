@@ -136,12 +136,10 @@ func RenderHealth(h healthzResponse, reachable bool, url string) string {
 	for _, line := range ledgerBackupLines(h) {
 		fmt.Fprintf(&b, "\n    %s", line)
 	}
-	// ★ 설정과 관측을 **따로** 찍는다. 한 값으로 접으면 "면제를 껐다"(의도한 상태)와
-	// "면제는 켰는데 아무도 못 받는다"(배선 결함)가 화면에서 같아지는데, 처방이 정반대다.
-	// 앞선 판은 `루프백 개방` 한 값만 냈고 그 값이 설정이었다 — 컨테이너 배포에서
-	// 그 줄이 참인 설정을 말하며 거짓인 결론을 읽게 했다.
-	fmt.Fprintf(&b, "\n    인증: 토큰 설정 %v · 루프백 면제 설정 %v · 루프백 도달 %v",
-		h.Auth.TokenSet, h.Auth.LoopbackConfigured, h.Auth.LoopbackOpen)
+	// ★ 단계 · 전송을 함께 찍는다. 「토큰이 설정돼 있다」만으로는 그 토큰이 어디서나 통하는지(전환 단계) 부트스트랩에만
+	// 통하는지(계정 단계) 모른다. 옛 서버는 두 칸을 안 내므로 「?」다.
+	fmt.Fprintf(&b, "\n    인증: 단계 %s · 전송 %s · 토큰 설정 %v",
+		orUnknown(h.AuthMode), orUnknown(h.TLS), h.Auth.TokenSet)
 	if h.Auth.Notice != "" {
 		fmt.Fprintf(&b, "\n    %s", clip(h.Auth.Notice, 300))
 	}
@@ -328,4 +326,12 @@ func ledgerBackupLines(h healthzResponse) []string {
 		line += "\n           저널: " + label
 	}
 	return []string{line}
+}
+
+// orUnknown 은 옛 서버가 안 낸 칸을 「?」로 보인다.
+func orUnknown(v string) string {
+	if v == "" {
+		return "?"
+	}
+	return v
 }

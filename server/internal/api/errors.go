@@ -165,6 +165,13 @@ func ClassifyError(err error) Classified {
 		return ConflictAdvice(conflict)
 	}
 
+	// 계정 쓰기의 원장 거절(부트스트랩이 닫혔다 · 마지막 관리자 · 토큰 없는 기기 …). 사유는 store 가 사람이 읽을 문장으로
+	// 지었고 비밀을 안 싣는다.
+	var accountRefused *store.AccountRefusedError
+	if errors.As(err, &accountRefused) {
+		return Classified{Status: http.StatusConflict, Code: accountRefused.Code, Message: accountRefused.Reason}
+	}
+
 	var missing *store.NotFoundError
 	if errors.As(err, &missing) {
 		return NotFoundAdvice(missing)
@@ -207,6 +214,7 @@ var notFoundGuidance = map[store.NotFoundKind]string{
 	store.NFProject: "프로젝트가 아직 등록되지 않았다 — 세션을 한 번 열면 등록된다(fd open). " +
 		"훅이 도는지, project 인자의 철자가 맞는지 확인해라.",
 	store.NFMachine: "머신이 등록돼 있지 않다 — 세션을 열면 함께 등록된다(fd open).",
+	store.NFAccount: "그 계정이 없다 — 로그인 이름 · 계정 id 철자를 확인해라.",
 	store.NFItem: "항목 id 오타이거나 아직 큐에 없는 항목이다 — fd next 로 목록을 보고, " +
 		"없으면 fd add 로 넣어라. 이미 끝난 항목이면 409(claim_refused)로 온다.",
 	store.NFClaim: "그 항목에 선점 행이 아예 없다 — 아직 아무도 집지 않았다는 뜻이다(fd pick <id>).",

@@ -88,7 +88,7 @@ services:
     user: "${FD_UID:-1000}:${FD_GID:-1000}"
     ports:
       # 127.0.0.1 로 묶지 않는다: 다른 머신의 세션이 붙는 것이 이 제품의 전부다.
-      # 대신 FD_TOKEN 을 주면 루프백 밖에서는 토큰이 필요해진다.
+      # 대신 FD_TOKEN 을 주면 모든 요청에 자격증명이 필요해진다(루프백도 같다).
       - "7420:7420"
     volumes:
       # DB · 로그.
@@ -148,6 +148,15 @@ services:
       # 토큰을 비우면 인증이 꺼진다. **그 사실을 /healthz 가 알린다** —
       # 조용히 열어 두면 잠겨 있다고 믿는 상태로 노출된다.
       FD_TOKEN: "${FD_TOKEN:-}"
+      # 인증 단계. 비면 transition(FD_TOKEN 과 기기 토큰을 함께 받는다) - 각 기기가 fd login 을 마친 뒤
+      # accounts 로 좁힌다(DESIGN 「REST `/api/v1/` — 정본」). 오타는 기동 오류다.
+      FD_AUTH: "${FD_AUTH:-}"
+      # 전송 정책. 비면 평문(앞에서 TLS 를 끝내는 지금 배포). proxy 면 FD_TRUSTED_PROXY 의 CIDR 에서 온 연결만 받는다.
+      # files 는 인증서 파일을 컨테이너에 마운트해야 한다(FD_TLS_CERT · FD_TLS_KEY 는 컨테이너 안 경로다).
+      FD_TLS: "${FD_TLS:-}"
+      FD_TLS_CERT: "${FD_TLS_CERT:-}"
+      FD_TLS_KEY: "${FD_TLS_KEY:-}"
+      FD_TRUSTED_PROXY: "${FD_TRUSTED_PROXY:-}"
       FD_LOG: "${FD_LOG:-info}"
       # 대시보드 언어. en 이면 영어로 낸다(기본 한국어 — README 「설정」).
       FD_LANG: "${FD_LANG:-}"

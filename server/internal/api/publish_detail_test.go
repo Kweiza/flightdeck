@@ -146,7 +146,7 @@ func (e *env) openIn(t *testing.T, project, cc string) string {
 //	label   — 카드에 뜨는 이름.
 func TestSessionOpenEventCarriesCreatedAndLabel(t *testing.T) {
 	e := newEnv(t, nil)
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	// ① 신규 · 라벨 가
@@ -175,7 +175,7 @@ func TestSessionStateEventCarriesTheRequestedState(t *testing.T) {
 	e := newEnv(t, nil)
 	sess := e.openSession("cc-state")
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	e.okBody(t, e.write(http.MethodPatch, "/api/v1/sessions/"+sess,
@@ -198,7 +198,7 @@ func TestSessionRekeyEventCarriesTheNewCCSessionID(t *testing.T) {
 	e := newEnv(t, nil)
 	sess := e.openSession("cc-rekey-0")
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	e.okBody(t, e.write(http.MethodPost, "/api/v1/sessions/"+sess+"/rekey",
@@ -220,7 +220,7 @@ func TestSessionSignalEventCarriesKindAndPathCount(t *testing.T) {
 	e := newEnv(t, nil)
 	sess := e.openSession("cc-signal")
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	e.okBody(t, e.write(http.MethodPost, "/api/v1/sessions/"+sess+"/signals",
@@ -241,7 +241,7 @@ func TestSessionWorkspaceEventCarriesIsPrimary(t *testing.T) {
 	e := newEnv(t, nil)
 	sess := e.openSession("cc-ws")
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	e.okBody(t, e.write(http.MethodPost, "/api/v1/sessions/"+sess+"/workspaces", map[string]any{
@@ -270,7 +270,7 @@ func TestJudgmentNoteEventCarriesKindRecipientsAndBytes(t *testing.T) {
 	e := newEnv(t, nil)
 	sess := e.openSession("cc-note-a")
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	body1 := "짧은 근거"
@@ -305,7 +305,7 @@ func TestCounterAllocEventCarriesNameAndValue(t *testing.T) {
 	e := newEnv(t, nil)
 	e.openSession("cc-counter") // 프로젝트 등록
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	alloc := func(name string) map[string]any {
@@ -334,7 +334,7 @@ func TestSnapshotPutEventCarriesMethodAndKey(t *testing.T) {
 	e := newEnv(t, nil)
 	e.openSession("cc-snapshot") // 프로젝트 등록
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	e.okBody(t, e.write(http.MethodPut, "/api/v1/snapshots/queue.open", map[string]any{
@@ -377,7 +377,7 @@ func TestItemAddEventNamesTheItem(t *testing.T) {
 	e := newEnv(t, nil)
 	sess := e.openSession("cc-add")
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	e.addItem(t, "add-first", sess, nil)
@@ -402,7 +402,7 @@ func TestClaimReclaimEventCarriesItemAndActor(t *testing.T) {
 			map[string]any{"project": testProject, "session_id": holder}), "선점("+id+")")
 	}
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	e.okBody(t, e.write(http.MethodPost, "/api/v1/items/rc-one/claim/release", map[string]any{
@@ -439,7 +439,7 @@ func TestItemFinishEventCarriesItemModeFollowupsAndReleased(t *testing.T) {
 		"project": testProject, "session_id": sess, "mode": LandModeAcquire,
 	}), "레인 취득")
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	got1 := e.okBody(t, e.write(http.MethodPost, "/api/v1/items/fin-one/finish", map[string]any{
@@ -485,7 +485,7 @@ func TestItemMoveEventCarriesItemFromToAndCrossRefs(t *testing.T) {
 
 	// ★ 전 프로젝트를 구독한다. 셋째 이동은 **출발 프로젝트가 py** 라, cp 만 구독하면
 	// 허브가 그 이벤트를 걸러 낸다 — publish 의 project 인자는 라우팅에 쓰이는 값이다.
-	sub := e.srv.hub.Subscribe("")
+	sub := e.srv.hub.Subscribe("", StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	got1 := e.okBody(t, e.write(http.MethodPost, "/api/v1/items/mv-one/move", map[string]any{
@@ -534,7 +534,7 @@ func TestAfterCutEventCarriesItemAndRemainingCount(t *testing.T) {
 		"after": []map[string]any{{"item": "dep-c"}},
 	})
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	e.okBody(t, e.write(http.MethodPost, "/api/v1/items/cut-two-deps/after/cut", map[string]any{
@@ -567,7 +567,7 @@ func TestLaneEventCarriesModeRowStateAndPosition(t *testing.T) {
 	first := e.openSession("cc-lane-a")
 	second := e.openSession("cc-lane-b")
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	land := func(sess, mode string, extra map[string]any) map[string]any {
@@ -613,7 +613,7 @@ func TestLaneReleaseEventCarriesRowHeldAndActor(t *testing.T) {
 	held := land(holder) // 맨 앞 — 레인을 쥔다
 	wait := land(waiter) // 뒤 — 대기만 한다
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	release := func(body map[string]any, rowID int, actor string) {
@@ -647,7 +647,7 @@ func TestLandCarriesResources(t *testing.T) {
 	e := newEnv(t, nil)
 	sess := e.openSession("cc-res")
 
-	sub := e.srv.hub.Subscribe(testProject)
+	sub := e.srv.hub.Subscribe(testProject, StreamOwner{})
 	defer e.srv.hub.Unsubscribe(sub)
 
 	got := e.okBody(t, e.write(http.MethodPost, "/api/v1/landing", map[string]any{
