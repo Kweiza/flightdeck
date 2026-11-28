@@ -25,8 +25,8 @@ func TestWriteLeavesNoTempFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Write 실패: %v", err)
 	}
-	if len(written) != 7 {
-		t.Errorf("파일이 %d개 — 7개를 기대한다: %v", len(written), written)
+	if len(written) != 8 {
+		t.Errorf("파일이 %d개 — 8개를 기대한다(줄 파일 일곱 + manifest): %v", len(written), written)
 	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
@@ -37,8 +37,8 @@ func TestWriteLeavesNoTempFiles(t *testing.T) {
 			t.Errorf("임시 파일이 남았다: %s", e.Name())
 		}
 	}
-	if len(ents) != 7 {
-		t.Errorf("디렉토리에 %d개가 있다 — 7개를 기대한다", len(ents))
+	if len(ents) != 8 {
+		t.Errorf("디렉토리에 %d개가 있다 — 8개를 기대한다", len(ents))
 	}
 }
 
@@ -517,7 +517,7 @@ func TestJudgeCountsNamesEveryMismatchedTable(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Write 의 cleanup 은 **자기 실행이 만든** tmp 만 안다. 프로세스가 준비 단에서 급사하면
-// (SIGKILL·전원 차단) 최대 일곱 개가 남고, 뒤이은 성공적 실행도 그것을 안 치운다.
+// (SIGKILL·전원 차단) 최대 여덟 개가 남고, 뒤이은 성공적 실행도 그것을 안 치운다.
 // 판단 본문이 든 몇 MB 짜리가 급사마다 쌓이고 not-empty 가드가 세는 항목 수를 부풀린다.
 //
 // ★ 나이로 가른다. "저 tmp 를 만든 프로세스가 살아 있나"는 이 자리에서 알 수 없고,

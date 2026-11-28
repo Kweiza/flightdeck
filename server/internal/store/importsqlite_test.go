@@ -35,25 +35,42 @@ const importAt = "'2026-01-02T03:04:05.000006Z'"
 //   - 지워진 최고 번호: pick_eval 은 3번을, resource_hold 는 2번을 지워 sqlite_sequence 가 max(id) 보다 크다
 //   - item_after 의 rowid 틈(3 · 5 · 7)과 넣은 순서와 다른 rowid 순서
 //   - 자기 참조(judgment.supersedes)
+//   - 증분 020 의 표 넷과 칸: 값이 든 행과 NULL 인 행이 함께(machine.token_hash · judgment.author · item_revision.author)
 const importSeed = `
 INSERT INTO project(id, path, remote_url, default_branch, config, config_from_sha, created_at, pinned_at, archived_at) VALUES
   ('p', '/r/p', 'git@example.invalid:p.git', 'main', NULL, NULL, ` + importAt + `, NULL, NULL),
   ('p2', '/r/p2', NULL, 'trunk', '{"k":1}', 'abc', ` + importAt + `, ` + importAt + `, '');
-INSERT INTO machine(id, hostname, first_seen, last_seen) VALUES ('m', 'h', ` + importAt + `, ` + importAt + `);
-INSERT INTO session(id, project, machine_id, worktree, cc_session_id, label, state, blocked_why, opened_at, harness) VALUES
-  ('s1', 'p', 'm', '/w1', 'c1', NULL, 'active', NULL, ` + importAt + `, NULL),
-  ('s2', 'p', 'm', '/w2', 'c2', '', 'blocked', '기다린다', ` + importAt + `, 'codex');
+INSERT INTO account(id, login, display_name, email, role, password_hash, created_at, disabled_at) VALUES
+  ('a1', 'alice', '앨리스', NULL, 'admin', '$argon2id$v=19$x', ` + importAt + `, NULL),
+  ('a2', 'bob', 'b', 'b@example.invalid', 'member', NULL, ` + importAt + `, ` + importAt + `);
+INSERT INTO invite(id, token_hash, created_by, role, email, created_at, expires_at, used_at, used_by, revoked_at) VALUES
+  ('v1', 'th1', 'a1', 'member', NULL, ` + importAt + `, ` + importAt + `, ` + importAt + `, 'a2', NULL),
+  ('v2', 'th2', 'a1', 'admin', 'c@example.invalid', ` + importAt + `, ` + importAt + `, NULL, NULL, ` + importAt + `);
+INSERT INTO web_session(id_hash, account_id, created_at, expires_at, last_seen_at, user_agent) VALUES
+  ('wh1', 'a1', ` + importAt + `, ` + importAt + `, ` + importAt + `, NULL), ('wh2', 'a2', ` + importAt + `, ` + importAt + `, ` + importAt + `, '');
+INSERT INTO machine(id, hostname, first_seen, last_seen, account_id, name, token_hash, token_prefix, token_origin, issued_at,
+    revoked_at, revoked_by) VALUES
+  ('m', 'h', ` + importAt + `, ` + importAt + `, 'a1', 'h', 'tk1', 'fd_m_abc', 'https://fd.example.invalid', ` + importAt + `, NULL, NULL),
+  ('m2', 'h2', ` + importAt + `, ` + importAt + `, NULL, NULL, NULL, NULL, NULL, NULL, ` + importAt + `, 'a1');
+INSERT INTO device_code(code_hash, user_code, machine_hint, requested_name, requested_ip, requested_at, invite_id, expires_at,
+    approved_by, approved_at, issued_machine) VALUES
+  ('dc1', 'ABCD-EFGH', 'm', 'h', '192.0.2.1', ` + importAt + `, 'v1', ` + importAt + `, 'a1', ` + importAt + `, 'm'),
+  ('dc2', 'IJKL-MNOP', NULL, '새 기기', '192.0.2.2', ` + importAt + `, NULL, ` + importAt + `, NULL, NULL, NULL);
+INSERT INTO session(id, project, machine_id, worktree, cc_session_id, label, state, blocked_why, opened_at, harness, account_id) VALUES
+  ('s1', 'p', 'm', '/w1', 'c1', NULL, 'active', NULL, ` + importAt + `, NULL, 'a1'),
+  ('s2', 'p', 'm', '/w2', 'c2', '', 'blocked', '기다린다', ` + importAt + `, 'codex', NULL);
 INSERT INTO session_workspace(session_id, project, path, is_primary) VALUES ('s1', 'p', '/w1', 1), ('s1', 'p2', '/w1/sub', 0);
 INSERT INTO signal(session_id, kind, at) VALUES ('s1', 'prompt', ` + importAt + `), ('s2', 'tool', ` + importAt + `);
 INSERT INTO footprint(session_id, path, origin, first_at, last_at) VALUES
   ('s1', 'a.go', 'observed', ` + importAt + `, ` + importAt + `), ('s1', 'a.go', 'declared', ` + importAt + `, ` + importAt + `);
 INSERT INTO ref_state(project, ref, sha, subject, at) VALUES ('p', 'main', 'sha1', NULL, ` + importAt + `), ('p', 'dev', 'sha2', '', ` + importAt + `);
 INSERT INTO change_set(project, base_sha, head_sha, paths, computed_at) VALUES ('p', 'b', 'h', '["a.go"]', ` + importAt + `);
-INSERT INTO item(project, id, title, body, paths, labels, state, close_reason, landed_ref, created_at, closed_at) VALUES
+INSERT INTO item(project, id, title, body, paths, labels, state, close_reason, landed_ref, created_at, closed_at, created_by,
+    created_session) VALUES
   ('p', 'i1', '제목', '본문 "따옴표"
-둘째 줄', '["a.go"]', '[]', 'open', NULL, NULL, ` + importAt + `, NULL),
-  ('p', 'i2', 't2', '', '[]', '["x"]', 'dropped', '사유', NULL, ` + importAt + `, ` + importAt + `),
-  ('p', 'i3', 't3', 'b', '[]', '[]', 'claimed', NULL, NULL, ` + importAt + `, NULL);
+둘째 줄', '["a.go"]', '[]', 'open', NULL, NULL, ` + importAt + `, NULL, 'a1', 's1'),
+  ('p', 'i2', 't2', '', '[]', '["x"]', 'dropped', '사유', NULL, ` + importAt + `, ` + importAt + `, 'a2', NULL),
+  ('p', 'i3', 't3', 'b', '[]', '[]', 'claimed', NULL, NULL, ` + importAt + `, NULL, NULL, NULL);
 INSERT INTO item_after(rowid, project, item_id, dep_item, dep_job, dep_sha, dep_project) VALUES
   (7, 'p', 'i1', NULL, NULL, 'sha9', 'p2'), (3, 'p', 'i1', 'i2', NULL, NULL, NULL), (5, 'p', 'i3', NULL, 'j1', NULL, NULL);
 INSERT INTO claim(project, item_id, session_id, at, released_at, force_reason) VALUES ('p', 'i3', 's1', ` + importAt + `, NULL, NULL);
@@ -62,9 +79,9 @@ INSERT INTO pick_eval(project, session_id, at, picked, rejected, picked_with) VA
   ('p', 's1', ` + importAt + `, NULL, '[{"item":"i2","reason_code":"x"}]', '["i3"]'),
   ('p', 's2', ` + importAt + `, NULL, '[]', NULL);
 DELETE FROM pick_eval WHERE id = 3;
-INSERT INTO judgment(id, project, session_id, at, kind, title, body, supersedes) VALUES
-  ('j1', 'p', 's1', ` + importAt + `, 'decision', 't', '판단을 남긴다', NULL),
-  ('j2', NULL, NULL, ` + importAt + `, 'now', NULL, '정정한다', 'j1');
+INSERT INTO judgment(id, project, session_id, at, kind, title, body, supersedes, author, via) VALUES
+  ('j1', 'p', 's1', ` + importAt + `, 'decision', 't', '판단을 남긴다', NULL, 'a1', 'session'),
+  ('j2', NULL, NULL, ` + importAt + `, 'now', NULL, '정정한다', 'j1', NULL, NULL);
 INSERT INTO judgment_link(judgment_id, target_kind, target_id, target_project) VALUES ('j1', 'item', 'i1', NULL), ('j2', 'commit', 'sha1', 'p');
 INSERT INTO snapshot(project, key, value, method, evidence, input_digest, computed_at) VALUES
   ('p', 'k1', 'v', 'command', NULL, NULL, ` + importAt + `), ('p', 'k2', 'v', 'manual', '근거', 'd', ` + importAt + `);
@@ -84,8 +101,8 @@ INSERT INTO landing_queue(project, session_id, enqueued_at, left_at, left_kind, 
   ('p', 's1', ` + importAt + `, NULL, NULL, NULL), ('p', 's2', ` + importAt + `, ` + importAt + `, 'fail', '까닭');
 INSERT INTO landing_queue_resource(row_id, resource) VALUES (1, 'env:db');
 INSERT INTO project_member(root_project, member_project, path, declared_at) VALUES ('p', 'p2', 'sub', ` + importAt + `);
-INSERT INTO item_revision(project, item_id, rev, at, session_id, title, body, paths, reason) VALUES
-  ('p', 'i1', 1, ` + importAt + `, 's1', 't', 'b', '[]', 'r'), ('p', 'i1', 2, ` + importAt + `, NULL, 't', 'b2', '["a"]', 'r2');
+INSERT INTO item_revision(project, item_id, rev, at, session_id, title, body, paths, reason, author) VALUES
+  ('p', 'i1', 1, ` + importAt + `, 's1', 't', 'b', '[]', 'r', 'a1'), ('p', 'i1', 2, ` + importAt + `, NULL, 't', 'b2', '["a"]', 'r2', NULL);
 INSERT INTO session_inbox(session_id, machine_id, socket, mode, seen_at) VALUES ('s1', 'm', '/run/s.sock', '', ` + importAt + `);
 `
 
@@ -215,6 +232,17 @@ func TestImportSQLiteRoundTrip(t *testing.T) {
 	}
 	if strings.Contains(rep.To, "@") || rep.To != "postgres" {
 		t.Fatalf("보고의 대상 표시값이 %q 다", rep.To)
+	}
+	// 소유자 귀속 축은 원본을 잰다: 시드에 소유자 계정이 없고, 행위자 칸마다 한 행씩 비었다(판정에는 안 든다 - 위 Matched).
+	wantAttr := Attribution{
+		Columns: []ActorColumn{
+			{"machine", "account_id", 2, 1}, {"session", "account_id", 2, 1}, {"item", "created_by", 3, 1},
+			{"judgment", "author", 2, 1}, {"judgment", "via", 2, 1}, {"item_revision", "author", 2, 1},
+		},
+		Via: []ViaCount{{"", 1}, {"session", 1}},
+	}
+	if !reflect.DeepEqual(rep.Attribution, wantAttr) || rep.Attribution.Unattributed() != 6 {
+		t.Errorf("귀속 축이 %+v 다, 기대 %+v", rep.Attribution, wantAttr)
 	}
 
 	again, err := VerifySQLite(ctx, src, dsn, VerifyOptions{}, quietLog())
@@ -819,8 +847,12 @@ func TestTransferPlanFollowsTheRange(t *testing.T) {
 			t.Errorf("판 %d: %s(기대 %s)", v, got, want)
 		}
 	}
-	if got := transferRange(); got != fmt.Sprintf("%d-%d", pg.ImportFloor(), pg.ImportVersion) {
-		t.Errorf("범위 표기가 %q 다", got)
+	// 증분 020 이 인덱스만 더한 것이 아니어서 범위가 한 판(20)이 됐다 - 한 판이면 그 판만 적는다("20-20" 이 아니라).
+	if pg.ImportFloor() != pg.ImportVersion {
+		t.Fatalf("범위가 %d-%d 다 - 한 판이라는 아래 기대를 다시 써라", pg.ImportFloor(), pg.ImportVersion)
+	}
+	if got := transferRange(); got != fmt.Sprint(pg.ImportVersion) {
+		t.Errorf("범위 표기가 %q 다(기대 %q)", got, fmt.Sprint(pg.ImportVersion))
 	}
 }
 

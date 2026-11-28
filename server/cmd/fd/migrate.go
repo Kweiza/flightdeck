@@ -388,11 +388,11 @@ func (a *App) exportJudgments(ctx context.Context, dbFlag, outDir string, out io
 
 	losses := ledger.Losses()
 	fmt.Fprintf(out, "fd export --judgments · DB 전량 → %s\n\n", outDir)
-	// ★ 여섯 표 전부를 낸다. Task 10 이 FK 폐포를 닫으면서 machine·project·session 이 늘었다 —
-	//   그 셋이 없으면 세션 걸린 판단(실측 85%)이 복원에서 전부 롤백된다.
-	fmt.Fprintf(out, "  판단 %d · 링크 %d · 스냅숏 %d · 세션 %d · 프로젝트 %d · 머신 %d (파일 %d)\n",
+	// ★ 일곱 표 전부를 낸다. Task 10 이 FK 폐포를 닫으면서 machine·project·session 이 늘었다 —
+	//   그 셋이 없으면 세션 걸린 판단(실측 85%)이 복원에서 전부 롤백된다. 증분 020 이 account 를 더했다(판단의 작성자).
+	fmt.Fprintf(out, "  판단 %d · 링크 %d · 스냅숏 %d · 세션 %d · 프로젝트 %d · 머신 %d · 계정 %d (파일 %d)\n",
 		m.Counts.Judgments, m.Counts.Links, m.Counts.Snapshots,
-		m.Counts.Sessions, m.Counts.Projects, m.Counts.Machines, len(names))
+		m.Counts.Sessions, m.Counts.Projects, m.Counts.Machines, m.Counts.Accounts, len(names))
 	fmt.Fprintf(out, "\n── 이 백업이 안 덮는 것 (%d건)\n", len(losses))
 	for _, l := range losses {
 		fmt.Fprintf(out, "  - %s\n", l)
@@ -415,7 +415,7 @@ func nowStampString() string {
 
 // importJudgments 는 `fd import --judgments --from <디렉토리>` 다.
 //
-// ★ **빈 표 전제**다. 폐포 여섯 표가 하나라도 비어 있지 않으면 거절한다.
+// ★ **빈 표 전제**다. 폐포 일곱 표가 하나라도 비어 있지 않으면 거절한다.
 // 이미 있는 DB 에 부어넣는 것(병합 복원)은 다른 연산이고, 그것을 이 명령이 조용히
 // 하면 어느 행이 어디서 왔는지 아무도 못 가른다. judgment 는 no_update·no_delete
 // 트리거로 UPDATE·DELETE 가 물리적으로 금지돼 있어 **잘못 들어간 행을 못 고친다** —
@@ -441,8 +441,8 @@ func (a *App) importJudgments(ctx context.Context, dbFlag, fromDir string, apply
 
 	c := ledger.CountsOf(d)
 	fmt.Fprintf(out, "fd import --judgments · %s → DB\n\n", fromDir)
-	fmt.Fprintf(out, "  판단 %d · 링크 %d · 스냅숏 %d · 세션 %d · 프로젝트 %d · 머신 %d (스키마 %d판)\n",
-		c.Judgments, c.Links, c.Snapshots, c.Sessions, c.Projects, c.Machines, m.SchemaVersion)
+	fmt.Fprintf(out, "  판단 %d · 링크 %d · 스냅숏 %d · 세션 %d · 프로젝트 %d · 머신 %d · 계정 %d (스키마 %d판)\n",
+		c.Judgments, c.Links, c.Snapshots, c.Sessions, c.Projects, c.Machines, c.Accounts, m.SchemaVersion)
 
 	// 원장 칸 관문(이관 · 서버 쓰기와 같은 칸 규칙)이 적용에서 낼 판정을 예행도 낸다 - DB 없이 같은 문장 · 같은 관문으로 잰다.
 	rewrites, err := store.ScreenLedger(d)
@@ -484,11 +484,11 @@ func (a *App) importJudgments(ctx context.Context, dbFlag, fromDir string, apply
 	}
 	if n := ledger.CountsOf(cur); n != (ledger.Counts{}) {
 		fmt.Fprintf(out, "\n되쓰기 거절: 대상 DB 의 폐포가 비어 있지 않다"+
-			"(판단 %d · 링크 %d · 스냅숏 %d · 세션 %d · 프로젝트 %d · 머신 %d).\n"+
+			"(판단 %d · 링크 %d · 스냅숏 %d · 세션 %d · 프로젝트 %d · 머신 %d · 계정 %d).\n"+
 			"  이 명령은 **빈 DB 복원**이다. 이미 있는 DB 에 부어넣는 것(병합)은 다른 연산이고,\n"+
 			"  judgment 는 UPDATE·DELETE 가 트리거로 금지돼 잘못 들어간 행을 못 고친다 —\n"+
 			"  그래서 들어가기 전에 막는 것이 유일한 방벽이다. 빈 파일을 --db 로 지목해라.\n",
-			n.Judgments, n.Links, n.Snapshots, n.Sessions, n.Projects, n.Machines)
+			n.Judgments, n.Links, n.Snapshots, n.Sessions, n.Projects, n.Machines, n.Accounts)
 		a.log.Warn("대상 DB 가 비어 있지 않아 되쓰기를 거절한다", "db_path", path)
 		return 2
 	}

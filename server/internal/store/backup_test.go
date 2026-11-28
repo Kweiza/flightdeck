@@ -86,7 +86,7 @@ func TestReadLedgerIsDeterministicallyOrdered(t *testing.T) {
 	})
 }
 
-// TestPGReadLedgerReadsOneSnapshot 은 원장 여섯 표가 한 스냅숏에서 읽히는지 Postgres 에서 잰다(재설계 스펙 4.9.5: 매시간
+// TestPGReadLedgerReadsOneSnapshot 은 원장 일곱 표가 한 스냅숏에서 읽히는지 Postgres 에서 잰다(재설계 스펙 4.9.5: 매시간
 // 원장의 읽기 스냅숏은 ReadTx). 판단을 다 읽은 뒤 링크를 읽기 전에 다른 연결이 판단 X 와 그 링크를 커밋한다. 한 스냅숏이면
 // X 도 X 의 링크도 안 보이고, 표마다 따로 읽으면 판단 목록에 없는 판단을 가리키는 링크가 원장에 실린다 - 그 원장은
 // 되쓰기(WriteLedger)가 FK 로 거절하므로 백업이 복원 못 할 파일이 된다.
@@ -920,9 +920,9 @@ func TestWriteLedgerRestoresProjectViewAxisInOrder(t *testing.T) {
 // 원장이 담는 컬럼은 **스키마가 정본이다**
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestLedgerColumnListsMatchTheSchema 는 폐포 여섯 표의 컬럼 목록이 스키마와 같은지 잰다.
+// TestLedgerColumnListsMatchTheSchema 는 폐포 일곱 표의 컬럼 목록이 스키마와 같은지 잰다.
 //
-// ★ 이 관문이 없으면 무엇이 조용해지나. 여섯 표 중 하나에 nullable 컬럼이 들어오면
+// ★ 이 관문이 없으면 무엇이 조용해지나. 일곱 표 중 하나에 nullable 컬럼이 들어오면
 // 백업이 그것을 버리고(읽기 목록에 없다) 복원도 버리는데(쓰기 목록에 없다), 왕복 시험은
 // want·final 이 **둘 다 ReadLedger 산출물**이라 새 컬럼이 양쪽에 똑같이 없어
 // reflect.DeepEqual 이 원리적으로 못 본다 — 전 시험이 초록인 채로 "무손실"이 무손실이
@@ -937,14 +937,14 @@ func TestWriteLedgerRestoresProjectViewAxisInOrder(t *testing.T) {
 // 두 엔진의 스키마와 맞댄다. 목록 하나를 두 엔진이 같이 쓰므로, Postgres 기준선에만 칸이 하나 더 생겨도 여기서 빨갛다
 // (계산 칼럼은 원장이 실을 것이 아니라 도우미가 뺀다 - catalog_test.go 의 columnsQuery).
 func TestLedgerColumnListsMatchTheSchema(t *testing.T) {
-	// 전제 — 폐포가 여섯 표라는 것 자체를 못박는다. 늘거나 줄면 사람이 판단해야 한다:
+	// 전제 — 폐포가 일곱 표라는 것 자체를 못박는다. 늘거나 줄면 사람이 판단해야 한다:
 	// 표가 늘면 ReadLedger·WriteLedger 가 그것을 실제로 담는지, 줄면 그 표의 행이
 	// 복원 후 어디서 오는지가 먼저 답해져야 한다.
 	var names []string
 	for _, e := range ledgerTables {
 		names = append(names, e.name)
 	}
-	want := []string{"machine", "project", "session", "judgment", "judgment_link", "snapshot"}
+	want := []string{"account", "machine", "project", "session", "judgment", "judgment_link", "snapshot"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("원장 폐포의 표 집합이 달라졌다.\n  발견: %v\n  기대: %v", names, want)
 	}
@@ -956,7 +956,16 @@ func TestLedgerColumnListsMatchTheSchema(t *testing.T) {
 			// 순서가 아니라 **집합**으로 댄다. 목록 안의 순서는 질의 자신의 문제이고
 			// (SELECT 순서 = Scan 순서 · INSERT 순서 = 인자 순서), 스키마 순서와 같을
 			// 의무가 없다. 이 관문이 재는 것은 "빠뜨린 것이 있나"다.
-			missing := ledgerColsMinus(schema, listed)
+			// 일부러 안 담는 비밀 칸(ledgerSecretCols)은 빼고 잰다. 그 칸이 스키마에 정말 있는지도 잰다 - 이름이 낡으면
+			// 그 칸은 빼 준 것이 아니라 새로 생긴 칸을 못 본 것이다.
+			secret := ledgerSecretCols[e.name]
+			if stale := ledgerColsMinus(secret, schema); len(stale) > 0 {
+				t.Errorf("원장이 안 담는다고 적은 %s 의 비밀 칸 %v 가 스키마에 없다", e.name, stale)
+			}
+			if carried := ledgerColsMinus(secret, ledgerColsMinus(secret, listed)); len(carried) > 0 {
+				t.Errorf("원장이 %s 의 비밀 칸 %v 를 담는다 - 매시간 쌓는 기록에 비밀이 영구히 남는다", e.name, carried)
+			}
+			missing := ledgerColsMinus(ledgerColsMinus(schema, listed), secret)
 			extra := ledgerColsMinus(listed, schema)
 			if len(missing) > 0 {
 				t.Errorf("원장이 %s 의 컬럼 %v 를 안 담는다.\n"+
@@ -994,7 +1003,7 @@ func ledgerColsMinus(a, b []string) []string {
 // 상수는 스키마와 여전히 맞으니 초록인데 그 질의만 컬럼을 빠뜨린 채로. 그것이 정확히
 // 이 항목이 닫으러 온 결함의 모양이다(예전 WriteLedger 의 여섯 INSERT 가 그랬다).
 //
-// 그래서 폐포 여섯 표에 대해서는 backup.go 안에 **손으로 적은 컬럼 목록이 0개**여야 한다.
+// 그래서 폐포 일곱 표에 대해서는 backup.go 안에 **손으로 적은 컬럼 목록이 0개**여야 한다.
 // 질의는 전부 `+<표>Cols+` 형태로 상수를 끼워 넣는다.
 func TestLedgerSQLHasNoInlineColumnLists(t *testing.T) {
 	b, err := os.ReadFile("backup.go")

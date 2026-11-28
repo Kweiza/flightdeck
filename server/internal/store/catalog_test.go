@@ -70,7 +70,8 @@ func catalogNames(t *testing.T, s *Store, what, q string, args ...any) []string 
 // 선언과 맞대어 잰다.
 func TestLiveColumnsReadDeclarationOrderOnBothEngines(t *testing.T) {
 	bothEngines(t, func(t *testing.T, s *Store) {
-		want := []string{"id", "hostname", "first_seen", "last_seen"}
+		want := []string{"id", "hostname", "first_seen", "last_seen",
+			"account_id", "name", "token_hash", "token_prefix", "token_origin", "issued_at", "revoked_at", "revoked_by"}
 		if got := liveColumns(t, s, "machine"); !slices.Equal(got, want) {
 			t.Fatalf("machine 의 칸이 %v - 선언 순서 %v 여야 한다", got, want)
 		}

@@ -6,7 +6,8 @@
 //   - Baseline(001_baseline.sql): 소유 역할로 — 표 · 인덱스 · 추가 전용 트리거 · 앱 역할의 권한.
 //     SQLite 판 18 과 같은 뜻이고 판 번호도 18 이다(BaselineVersion).
 //   - Steps(019_*.sql …): 기준선 위 증분. 소유 역할로 하나씩 돈다. SQLite 원장이 운영 원장인 동안은 SQLite 에 오르는
-//     증분을 같은 판 번호 · 같은 뜻으로 여기에도 싣는다(019 가 그 첫째다) - 두 판이 갈리면 store 의 시험이 빨갛다.
+//     증분을 같은 판 번호 · 같은 뜻으로 여기에도 싣는다(019 가 그 첫째, 020 이 계정 · 행위자 칸이다) - 두 판이 갈리면 store 의
+//     시험이 빨갛다.
 //     인덱스만 더한 증분(IndexOnly)은 이관 판 범위(ImportFloor)와 기록을 잃지 않는 내림의 바탕이다.
 //
 // ★ 판(schema_version 행)을 적는 것은 이 SQL 이 아니라 이전 실행기다 — SQLite 의 schema.sql 이 판 행을 안
@@ -53,6 +54,9 @@ const BaselineVersion = 18
 //go:embed 019_event_by_project_kind.sql
 var stepEventByProjectKind string
 
+//go:embed 020_accounts.sql
+var stepAccounts string
+
 // Step 은 기준선 위 증분 하나다. 이전 실행기(store 의 pgMigrations)와 시험 원판(Latest)이 같은 목록을 싣는다.
 type Step struct {
 	To   int    // 적용 뒤의 판
@@ -63,6 +67,7 @@ type Step struct {
 // Steps 는 기준선 위에 순서대로 얹는 증분 전부다. 판 번호는 BaselineVersion 바로 위부터 빈칸 없이 오른다.
 var Steps = []Step{
 	{To: 19, Name: "event 를 (project, kind, id) 로 찾는다", SQL: stepEventByProjectKind},
+	{To: 20, Name: "계정 · 기기 토큰 · 행위자 칸, 옛 행을 소유자 계정에 귀속", SQL: stepAccounts},
 }
 
 // IndexOnly 는 증분 SQL 이 인덱스를 더하기만 하는가와, 그렇다면 더한 인덱스의 이름(적힌 순서)이다. 순수 함수다. 두 엔진의 증분에

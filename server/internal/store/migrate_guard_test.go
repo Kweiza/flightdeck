@@ -228,6 +228,18 @@ var destructiveExempt = map[int]exemption{
 			"FK 위반을 내 적용 자체가 실패하므로, 그 조건부가 opInsertSelect 를 부른 이유다. " +
 			"판올림 전 VACUUM INTO 백업도 자동으로 뜬다. 근거 전문과 21쌍은 012 머리말에 있다.",
 	},
+	// 020 · 계정 표 · 행위자 칸을 더하고 옛 행을 소유자 계정에 귀속한다.
+	20: {
+		ops: []op{opUpdateSet, opInsertSelect, opDropTable},
+		why: "UPDATE 는 이 증분이 **방금 더한 칸**(machine.account_id · name, session.account_id, item.created_by, " +
+			"judgment.author · via, item_revision.author)에만 쓴다 - 기존 칸은 읽기만 하므로 그 칸을 비우면 이 증분 이전 " +
+			"값과 같다. INSERT … SELECT 는 둘이다: 원장에 행이 있을 때만 소유자 계정 한 행을 넣는 조건부(빈 원장에는 " +
+			"안 넣어 이관 · 역이관 대상이 원본의 계정 행을 그대로 받는다)와, 표마다 바꾼 행 수(changes())를 그 표의 행 " +
+			"수와 함께 적는 대조 행이다. DROP TABLE 은 그 대조를 담은 TEMP 표(temp.attribution_count)를 같은 트랜잭션 " +
+			"끝에서 지우는 것뿐이고 영구 표는 하나도 안 지운다. 추가 전용 트리거 둘(judgment_no_update · " +
+			"item_revision_no_update)은 같은 트랜잭션에서 지웠다 다시 만든다(이 판정 밖의 DROP TRIGGER) - 되감기면 함께 " +
+			"되돌아온다. 판올림 전 VACUUM INTO 백업도 뜬다. 근거 전문은 020 머리말에 있다.",
+	},
 }
 
 // neverExempt 는 예외로도 못 여는 조작이다. 데이터가 아니라 **구조**가 사라지는 것들이다.

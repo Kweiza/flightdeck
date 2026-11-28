@@ -11,12 +11,18 @@ func ptr(s string) *string { return &s }
 
 func sampleDump() store.LedgerDump {
 	return store.LedgerDump{
-		// machine 은 NULL 가능 컬럼이 없다 — 섞을 축이 없으므로 한 행이면 충분하다.
+		// account 는 email · disabled_at 이 NULL 가능하다. 한 행은 둘 다 NULL, 한 행은 둘 다 값이 있다.
+		Accounts: []store.LedgerAccount{
+			{ID: "a1", Login: "alice", DisplayName: "앨리스", Role: "admin", CreatedAt: "2026-08-01T00:00:00.000000Z"},
+			{ID: "a2", Login: "bob", DisplayName: "밥", Email: ptr("b@example.invalid"), Role: "member",
+				CreatedAt: "2026-08-01T00:00:00.000000Z", DisabledAt: ptr("2026-08-02T00:00:00.000000Z")},
+		},
+		// machine 의 NULL 가능 칸(계정 · 토큰 · 철회)은 왕복 시험의 픽스처(seedIncrementColumns)가 채운다. 여기선 한 행이면 충분하다.
 		Machines: []store.LedgerMachine{
 			{ID: "m1", Hostname: "host-1",
 				FirstSeen: "2026-08-01T00:00:00.000000Z", LastSeen: "2026-08-06T00:00:00.000000Z"},
 		},
-		// project 는 remote_url·config·config_from_sha 셋이 NULL 가능하다 — 한 행은 전부 NULL,
+		// project 는 remote_url·config·config_from_sha 셋이 NULL 가능하다. 한 행은 전부 NULL,
 		// 한 행은 전부 값이 있게 섞는다.
 		Projects: []store.LedgerProject{
 			{ID: "p", Path: "/repo/p", RemoteURL: nil, DefaultBranch: "main",
@@ -24,7 +30,7 @@ func sampleDump() store.LedgerDump {
 			{ID: "p2", Path: "/repo/p2", RemoteURL: ptr("git@example.com:p2.git"), DefaultBranch: "trunk",
 				Config: ptr(`{"lane":1}`), ConfigFromSHA: ptr("deadbeef"), CreatedAt: "2026-08-02T00:00:00.000000Z"},
 		},
-		// session 은 label·blocked_why 둘이 NULL 가능하다 — 한 행은 둘 다 NULL(active),
+		// session 은 label·blocked_why 둘이 NULL 가능하다. 한 행은 둘 다 NULL(active),
 		// 한 행은 둘 다 값이 있다(blocked).
 		Sessions: []store.LedgerSession{
 			{ID: "s1", Project: "p", MachineID: "m1", Worktree: "/w/s1", CCSessionID: "cc1",
@@ -97,14 +103,14 @@ func TestEncodeKeepsRawTimestamp(t *testing.T) {
 	}
 }
 
-// 한 줄이 한 행이다. 그리고 파일 일곱(JSONL 여섯 + manifest)이 나온다.
-func TestEncodeProducesSevenFilesAndLinePerRow(t *testing.T) {
+// 한 줄이 한 행이다. 그리고 파일 여덟(JSONL 일곱 + manifest)이 나온다.
+func TestEncodeProducesEightFilesAndLinePerRow(t *testing.T) {
 	files, m, err := Encode(sampleDump(), 4, "2026-08-06T00:00:00.000000Z")
 	if err != nil {
 		t.Fatalf("Encode 실패: %v", err)
 	}
 	for _, name := range []string{
-		"machines.jsonl", "projects.jsonl", "sessions.jsonl",
+		"accounts.jsonl", "machines.jsonl", "projects.jsonl", "sessions.jsonl",
 		"judgments.jsonl", "judgment_links.jsonl", "snapshots.jsonl", ManifestName,
 	} {
 		if _, ok := files[name]; !ok {
@@ -118,7 +124,7 @@ func TestEncodeProducesSevenFilesAndLinePerRow(t *testing.T) {
 	if m.SchemaVersion != 4 || m.FormatVersion != FormatVersion || m.Format != FormatName {
 		t.Errorf("manifest 가 이상하다: %+v", m)
 	}
-	if m.Counts.Machines != 1 || m.Counts.Projects != 2 || m.Counts.Sessions != 2 ||
+	if m.Counts.Accounts != 2 || m.Counts.Machines != 1 || m.Counts.Projects != 2 || m.Counts.Sessions != 2 ||
 		m.Counts.Judgments != 2 || m.Counts.Links != 1 || m.Counts.Snapshots != 1 {
 		t.Errorf("건수가 틀리다: %+v", m.Counts)
 	}

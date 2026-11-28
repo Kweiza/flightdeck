@@ -16,10 +16,11 @@ import (
 // 그쪽에만 있는 규칙은 export.go 다.
 //
 // ★ 표 목록(tables)은 이관 판(ImportVersion)의 표 · 칸을 손으로 적은 것이다. 이관은 그 목록이 그대로 맞는 판 범위
-// (ImportFloor..ImportVersion)만 받는다 - 범위 안 판끼리는 인덱스만 다르다. 판 18 위의 증분(019 인덱스)은 표 · 칸을 안 바꿨으므로
-// 목록은 기준선 18 의 것 그대로다. 표나 칸을 바꾸는 증분이 두 엔진에 함께 오르면 이 목록도 같이 고치고, 그 증분은 인덱스만
-// 더한 것이 아니므로 범위의 아래 끝이 그 판으로 오른다. 손으로 적은 목록이 두 엔진의 살아 있는 카탈로그와 같은지는
-// import_test.go 가 잰다(칼럼 이름 · 순서 · 타입 · NOT NULL · 기본키 · identity).
+// (ImportFloor..ImportVersion)만 받는다 - 범위 안 판끼리는 인덱스만 다르다. 표나 칸을 바꾸는 증분이 두 엔진에 함께 오르면 이
+// 목록도 같이 고치고, 그 증분은 인덱스만 더한 것이 아니므로 범위의 아래 끝이 그 판으로 오른다. 증분 020(계정 표 넷 · 행위자
+// 칸)이 그것이라 범위는 판 20 하나다 - 판 19 이하의 원본은 먼저 이 판의 fd 로 판을 올린다(sourceRefusal 이 그 명령을 준다).
+// 손으로 적은 목록이 두 엔진의 살아 있는 카탈로그와 같은지는 import_test.go 가 잰다(칼럼 이름 · 순서 · 타입 · NOT NULL ·
+// 기본키 · identity).
 //
 // ★ 옮기지 않는 것은 LeftBehind 다. 그 밖의 표는 전부 옮긴다 - idempotency 도다(재기동 너머로 판단 · 발번 · 항목
 // 만들기 · 종료를 한 번만 처리하려는 기록이라, 버리면 전환 직전 응답을 잃은 기기의 아웃박스 재전송이 판단을 두 건
@@ -30,16 +31,17 @@ import (
 // 그 위 Steps 가 같은 뜻으로 닿는 판). 역이관이 내는 SQLite 파일이 이 판이고, 빈 Postgres 원장은 `fd migrate --to ImportVersion`
 // 이 이 판까지만 깐다. 이 수가 store.SchemaVersion 과 같은지는 import_test.go 가 잰다. 받는 판은 이 하나가 아니라 범위다
 // (Transferable).
-const ImportVersion = 19
+const ImportVersion = 20
 
 // ImportFloor 는 이관 · 역이관 · 대조가 받는 가장 낮은 판이다. ImportVersion 에서 아래로 인덱스만 더한 증분(IndexOnly)을 거슬러
 // 닿는 판이고, 기준선(BaselineVersion) 아래로는 내려가지 않는다 - Postgres 원장에는 그 아래 판이 없다.
 //
 // ★ 판 범위 규칙은 이것 하나다. 인덱스만 더한 증분은 표 · 칸 · 행을 안 바꾸므로 그 아래 판의 원장도 옮길 것(Tables)이 같고, 같은
-// 까닭으로 기록을 잃지 않고 내릴 수 있다(store 의 DownSteps). 그래서 원본과 대상의 판이 범위 안에서 서로 달라도 받는다: 판 18 에서
-// 옮긴 SQLite 원장(표지가 있어 판을 못 올린다)을 판 19 로 오른 Postgres 원장과 맞대는 것이 그 갈래다(README 「켜기 전에 섰을
-// 때」). 인덱스가 받는 값의 상한(MaxBytes)은 이관의 사전 검사(ImportCell)가 범위 전체에 똑같이 잰다 - 범위의 꼭대기가 그 인덱스를
-// 갖기 때문이다.
+// 까닭으로 기록을 잃지 않고 내릴 수 있다(store 의 DownSteps). 그래서 원본과 대상의 판이 범위 안에서 서로 달라도 받는다: 범위가
+// 18-19 이던 동안은 판 18 에서 옮긴 SQLite 원장(표지가 있어 판을 못 올린다)을 판 19 로 오른 Postgres 원장과 맞대는 것이 그
+// 갈래였다. 증분 020 은 인덱스만 더한 것이 아니라 지금 범위는 판 20 하나다 - 옛 판에서 옮기다 선 배포는 그 판으로 마저 가거나
+// 되돌아간다(README 「켜기 전에 섰을 때」). 인덱스가 받는 값의 상한(MaxBytes)은 이관의 사전 검사(ImportCell)가 범위 전체에 똑같이
+// 잰다 - 범위의 꼭대기가 그 인덱스를 갖기 때문이다.
 func ImportFloor() int { return floorOf(Steps, ImportVersion, BaselineVersion) }
 
 // floorOf 는 증분 목록 steps 위에서 판 top 부터 아래로 인덱스만 더한 증분을 거슬러 닿는 판이다(base 아래로는 안 간다). 순수
@@ -217,18 +219,30 @@ func TableOf(name string) (Table, bool) {
 	return Table{}, false
 }
 
-// Tables 는 옮기는 표 전부다. FK 순서(부모가 먼저)이고 기준선의 선언 순서와 같다. 읽기만 한다.
+// Tables 는 옮기는 표 전부다. FK 순서(부모가 먼저)다 - 기준선 18 의 표는 그 선언 순서 그대로이고, 증분 020 의 계정 표는
+// 그것을 가리키는 표보다 앞에(account · invite · web_session), 기기를 가리키는 device_code 는 끝에 둔다. 읽기만 한다.
 //
 // ★ 자기 참조(judgment.supersedes)는 순서로 못 푼다. 옮기기는 FK 검사를 커밋으로 미룬다(기준선의 FK 는 전부 DEFERRABLE 이다).
 func Tables() []Table { return tables }
 
 var tables = []Table{
+	{Name: "account", Cols: []Column{key(txt("id")), ref(nn(txt("login"))), nn(txt("display_name")), txt("email"),
+		nn(txt("role")), txt("password_hash"), nn(txt("created_at")), txt("disabled_at")},
+		unique: []Unique{{Name: "account_login_key", Cols: []string{"login"}}}},
+	{Name: "invite", Cols: []Column{key(txt("id")), ref(nn(txt("token_hash"))), ref(nn(txt("created_by"))), nn(txt("role")),
+		txt("email"), nn(txt("created_at")), nn(txt("expires_at")), txt("used_at"), ref(txt("used_by")), txt("revoked_at")},
+		unique: []Unique{{Name: "invite_token_hash_key", Cols: []string{"token_hash"}}}},
+	{Name: "web_session", Cols: []Column{key(txt("id_hash")), ref(nn(txt("account_id"))), nn(txt("created_at")),
+		nn(txt("expires_at")), nn(txt("last_seen_at")), txt("user_agent")}},
 	{Name: "project", Cols: []Column{key(txt("id")), nn(txt("path")), txt("remote_url"), nn(txt("default_branch")),
 		txt("config"), txt("config_from_sha"), nn(txt("created_at")), txt("pinned_at"), txt("archived_at")}},
-	{Name: "machine", Cols: []Column{key(txt("id")), nn(txt("hostname")), nn(txt("first_seen")), nn(txt("last_seen"))}},
+	{Name: "machine", Cols: []Column{key(txt("id")), nn(txt("hostname")), nn(txt("first_seen")), nn(txt("last_seen")),
+		ref(txt("account_id")), txt("name"), ref(txt("token_hash")), txt("token_prefix"), txt("token_origin"), txt("issued_at"),
+		txt("revoked_at"), ref(txt("revoked_by"))},
+		unique: []Unique{{Name: "machine_token_hash", Cols: []string{"token_hash"}}}},
 	{Name: "session", Cols: []Column{key(txt("id")), ref(nn(txt("project"))), ref(nn(txt("machine_id"))),
 		ref(nn(txt("worktree"))), ref(nn(txt("cc_session_id"))), txt("label"), nn(txt("state")), txt("blocked_why"),
-		nn(txt("opened_at")), txt("harness")},
+		nn(txt("opened_at")), txt("harness"), ref(txt("account_id"))},
 		unique: []Unique{{Name: "session_machine_id_worktree_cc_session_id_key", Cols: []string{"machine_id", "worktree", "cc_session_id"}}}},
 	{Name: "session_workspace", Cols: []Column{key(txt("session_id")), ref(nn(txt("project"))), key(txt("path")), nn(num("is_primary"))}},
 	{Name: "signal", Cols: []Column{key(txt("session_id")), key(txt("kind")), nn(txt("at"))}},
@@ -239,7 +253,7 @@ var tables = []Table{
 		doc(nn(txt("paths"))), nn(txt("computed_at"))}},
 	{Name: "item", Cols: []Column{key(txt("project")), key(txt("id")), nn(txt("title")), nn(txt("body")),
 		doc(nn(txt("paths"))), doc(nn(txt("labels"))), nn(txt("state")), txt("close_reason"), txt("landed_ref"),
-		nn(txt("created_at")), txt("closed_at")}},
+		nn(txt("created_at")), txt("closed_at"), ref(txt("created_by")), ref(txt("created_session"))}},
 	{Name: "item_after", Cols: []Column{ref(nn(txt("project"))), ref(nn(txt("item_id"))), ref(txt("dep_item")),
 		ref(txt("dep_job")), ref(txt("dep_sha")), ref(txt("dep_project")), rowid(ident(num("seq")))}},
 	{Name: "claim", Cols: []Column{key(txt("project")), key(txt("item_id")), ref(nn(txt("session_id"))), nn(txt("at")),
@@ -247,7 +261,7 @@ var tables = []Table{
 	{Name: "pick_eval", AutoIncrement: true, Cols: []Column{ident(num("id")), ref(nn(txt("project"))),
 		ref(nn(txt("session_id"))), nn(txt("at")), ref(txt("picked")), doc(nn(txt("rejected"))), doc(txt("picked_with"))}},
 	{Name: "judgment", Cols: []Column{key(txt("id")), ref(txt("project")), ref(txt("session_id")), nn(txt("at")),
-		nn(txt("kind")), txt("title"), nn(txt("body")), ref(txt("supersedes"))}},
+		nn(txt("kind")), txt("title"), nn(txt("body")), ref(txt("supersedes")), ref(txt("author")), txt("via")}},
 	{Name: "judgment_link", Cols: []Column{key(txt("judgment_id")), key(txt("target_kind")), key(txt("target_id")),
 		ref(txt("target_project"))}},
 	{Name: "snapshot", DigestKey: "key", Cols: []Column{key(txt("project")), key(txt("key")), nn(txt("value")),
@@ -273,10 +287,14 @@ var tables = []Table{
 	{Name: "project_member", Cols: []Column{key(txt("root_project")), key(txt("member_project")), nn(txt("path")),
 		nn(txt("declared_at"))}},
 	{Name: "item_revision", Cols: []Column{key(txt("project")), key(txt("item_id")), key(num("rev")), nn(txt("at")),
-		ref(txt("session_id")), nn(txt("title")), nn(txt("body")), doc(nn(txt("paths"))), nn(txt("reason"))}},
+		ref(txt("session_id")), nn(txt("title")), nn(txt("body")), doc(nn(txt("paths"))), nn(txt("reason")), ref(txt("author"))}},
 	{Name: "session_inbox", Cols: []Column{key(txt("session_id")), ref(nn(txt("machine_id"))), ref(nn(txt("socket"))),
 		nn(txt("mode")), nn(txt("seen_at"))},
 		unique: []Unique{{Name: "session_inbox_socket", Cols: []string{"machine_id", "socket"}}}},
+	{Name: "device_code", Cols: []Column{key(txt("code_hash")), ref(nn(txt("user_code"))), ref(txt("machine_hint")),
+		nn(txt("requested_name")), nn(txt("requested_ip")), nn(txt("requested_at")), ref(txt("invite_id")), nn(txt("expires_at")),
+		ref(txt("approved_by")), txt("approved_at"), ref(txt("issued_machine"))},
+		unique: []Unique{{Name: "device_code_user_code_key", Cols: []string{"user_code"}}}},
 }
 
 func txt(name string) Column  { return Column{Name: name, Kind: Text} }

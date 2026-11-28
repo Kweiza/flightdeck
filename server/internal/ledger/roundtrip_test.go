@@ -2,13 +2,12 @@ package ledger_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -35,7 +34,7 @@ func TestLedgerSurvivesFullRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("원본 DB 열기 실패: %v", err)
 	}
-	seedLedgerFixture(t, src)
+	seedLedgerFixture(t, src, srcPath)
 
 	want, err := src.ReadLedger(ctx)
 	if err != nil {
@@ -67,6 +66,14 @@ func TestLedgerSurvivesFullRoundTrip(t *testing.T) {
 	files, m, err := ledger.Encode(want, store.SchemaVersion, "2026-08-06T00:00:00.000000Z")
 	if err != nil {
 		t.Fatalf("Encode 실패: %v", err)
+	}
+	// 비밀 칸(store.LedgerSecretColumns)의 값은 어느 파일에도 없다 - 원장은 지워지지 않는 기록 저장소에 매시간 쌓인다.
+	for name, b := range files {
+		for _, secret := range []string{fixturePasswordHash, fixtureTokenHash} {
+			if strings.Contains(string(b), secret) {
+				t.Errorf("%s 에 비밀 칸 값 %q 가 실렸다", name, secret)
+			}
+		}
 	}
 	dir := filepath.Join(t.TempDir(), "out")
 	if _, err := ledger.Write(files, dir); err != nil {
@@ -125,7 +132,7 @@ func TestRestoredDBHasWorkingFullTextSearch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("원본 열기 실패: %v", err)
 	}
-	seedLedgerFixture(t, src)
+	seedLedgerFixture(t, src, dbp1)
 	dump, err := src.ReadLedger(ctx)
 	if err != nil {
 		t.Fatalf("원장 읽기 실패: %v", err)
@@ -252,11 +259,12 @@ func seedLedgerRefs(t *testing.T, s *store.Store) {
 }
 
 // seedLedgerFixture 는 왕복이 실제로 무언가를 보게 하는 데이터를 넣는다 —
-// NULL 과 값, supersedes, 여러 target_kind, 전문검색용 고유 낱말.
-func seedLedgerFixture(t *testing.T, s *store.Store) {
+// NULL 과 값, supersedes, 여러 target_kind, 전문검색용 고유 낱말. path 는 s 가 연 원장 파일이다(seedIncrementColumns).
+func seedLedgerFixture(t *testing.T, s *store.Store, path string) {
 	t.Helper()
 	ctx := context.Background()
 	seedLedgerRefs(t, s)
+	defer seedIncrementColumns(t, path)
 
 	sess, _, err := s.OpenSession(ctx, "p", "m1", "/w/cc1", "cc1", "", time.Time{})
 	if err != nil {
@@ -323,6 +331,44 @@ func seedLedgerFixture(t *testing.T, s *store.Store) {
 	}
 }
 
+// 비밀 칸에 심는 값. 원장 파일 어디에도 나오면 안 된다(TestLedgerSurvivesFullRoundTrip).
+const (
+	fixturePasswordHash = "$argon2id$v=19$fixture-secret"
+	fixtureTokenHash    = "fixture-token-digest"
+)
+
+// seedIncrementColumns 는 증분이 폐포 표에 더한 nullable 칸을 채운다: 계정 표와 증분 020 의 칸(기기 · 세션의 계정, 판단의
+// 작성자 · 갈래), 그리고 그 전 증분의 칸(project.pinned_at · archived_at, session.harness, judgment_link.target_project). 020 의
+// 칸을 쓰는 저장 계층이 아직 없어(store/account.go 머리말) 원장 파일에 SQL 로 바로 쓴다 - 옛 칸도 같은 자리에서 채워 이 관문의
+// 입력을 한 곳에 둔다. 판단은 추가 전용이라 칸을 채운 새 행을 넣는다.
+func seedIncrementColumns(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("원장 파일 열기 실패: %v", err)
+	}
+	defer db.Close()
+	const at = "2026-08-06T00:00:05.000000Z"
+	for _, q := range []string{
+		`INSERT INTO account(id, login, display_name, email, role, password_hash, created_at, disabled_at) VALUES
+		   ('a1', 'alice', '앨리스', 'a@example.invalid', 'admin', '` + fixturePasswordHash + `', '` + at + `', NULL),
+		   ('a2', 'bob', '밥', NULL, 'member', NULL, '` + at + `', '` + at + `')`,
+		`UPDATE machine SET account_id = 'a1', name = '개발 기기', token_hash = '` + fixtureTokenHash + `', token_prefix = 'fd_abcde',
+		   token_origin = 'https://fd.example.invalid', issued_at = '` + at + `', revoked_at = '` + at + `', revoked_by = 'a2'
+		 WHERE id = 'm1'`,
+		`UPDATE session SET account_id = 'a1' WHERE cc_session_id = 'cc1'`,
+		`INSERT INTO judgment(id, project, session_id, at, kind, title, body, supersedes, author, via) VALUES
+		   ('01ZACCOUNT', 'p', NULL, '` + at + `', 'decision', '[fdboard] 노트', '보드가 남긴 노트', NULL, 'a1', 'web')`,
+		`INSERT INTO judgment_link(judgment_id, target_kind, target_id, target_project) VALUES ('01ZACCOUNT', 'item', 'i1', 'p')`,
+		`UPDATE project SET pinned_at = '` + at + `', archived_at = '` + at + `' WHERE id = 'p'`,
+		`UPDATE session SET harness = 'codex' WHERE cc_session_id = 'cc1'`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("계정 칸 심기 실패(%s): %v", q, err)
+		}
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 왕복 시험의 **입력**을 지킨다 — 읽기가 버린 값은 왕복이 원리적으로 못 본다
 // ─────────────────────────────────────────────────────────────────────────────
@@ -339,6 +385,10 @@ func seedLedgerFixture(t *testing.T, s *store.Store) {
 // ★ 컬럼 목록을 손으로 안 적는다. 스키마에서 nullable 을 뽑고 DTO 의 json 태그로 잇는다.
 // 손으로 적으면 새 nullable 컬럼이 조용해지고, 실제로 이 축을 처방한 항목 본문이 "여섯"을
 // 적었는데 실측하면 **열하나**였다.
+//
+// ★ 스키마는 증분까지 올린 원장의 카탈로그다(PRAGMA table_info). schema.sql 은 판 1 의 글이라 증분이 더한 표 · 칸
+// (account, judgment.author 같은 것)이 거기 없다 - 글을 읽으면 증분이 더한 nullable 칸이 이 관문을 말없이 지나간다.
+// 원장이 일부러 안 싣는 비밀 칸(store.LedgerSecretColumns)은 뺀다.
 func TestRoundTripFixtureExercisesEveryNullableColumn(t *testing.T) {
 	ctx := context.Background()
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -353,15 +403,15 @@ func TestRoundTripFixtureExercisesEveryNullableColumn(t *testing.T) {
 		t.Fatalf("원본 DB 열기 실패: %v", err)
 	}
 	defer src.Close()
-	seedLedgerFixture(t, src)
+	seedLedgerFixture(t, src, srcPath)
 
 	want, err := src.ReadLedger(ctx)
 	if err != nil {
 		t.Fatalf("원장 읽기 실패: %v", err)
 	}
 
-	schema := readClosureSchema(t)
 	rows := map[string]any{
+		"account":       want.Accounts,
 		"project":       want.Projects,
 		"machine":       want.Machines,
 		"session":       want.Sessions,
@@ -375,7 +425,7 @@ func TestRoundTripFixtureExercisesEveryNullableColumn(t *testing.T) {
 		if !ok {
 			t.Fatalf("폐포 표 %q 의 DTO 를 이 시험이 모른다 — 표가 늘었으면 여기도 이어라", table)
 		}
-		for _, col := range schemaNullableColumns(t, schema, table) {
+		for _, col := range liveNullableColumns(t, srcPath, table) {
 			checked++
 			assertSomeRowCarries(t, table, col, slice)
 		}
@@ -421,47 +471,42 @@ func assertSomeRowCarries(t *testing.T, table, col string, slice any) {
 		"넣거나, 읽기가 정말 이 컬럼을 버리고 있는지 확인해라.", table, col)
 }
 
-func readClosureSchema(t *testing.T) string {
+// liveNullableColumns 는 path 원장의 표 하나에서 NULL 이 될 수 있는 칸을 선언 순서로 낸다(기본키 · NOT NULL 은 빠진다).
+// 원장이 일부러 안 싣는 비밀 칸도 뺀다.
+func liveNullableColumns(t *testing.T, path, table string) []string {
 	t.Helper()
-	p := filepath.Join("..", "store", "schema.sql")
-	b, err := os.ReadFile(p)
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		t.Fatalf("schema.sql 을 못 읽었다(%s): %v", p, err)
+		t.Fatalf("원장 파일 열기 실패: %v", err)
 	}
-	return string(b)
-}
-
-// ledgerColumnLineRe 는 컬럼 선언 줄의 이름이다. CHECK 목록의 따옴표 값·제약 줄은 안 걸린다.
-var ledgerColumnLineRe = regexp.MustCompile(`^([a-z_][a-z0-9_]*)\s+\S`)
-
-// schemaNullableColumns 는 표 하나에서 NULL 이 될 수 있는 컬럼을 뽑는다.
-func schemaNullableColumns(t *testing.T, schema, table string) []string {
-	t.Helper()
-	head := "\nCREATE TABLE " + table + " (\n"
-	i := strings.Index(schema, head)
-	if i < 0 {
-		t.Fatalf("%s 표 선언을 못 찾았다 — 이 관문의 좌표가 틀렸다", table)
+	defer db.Close()
+	rows, err := db.Query(`SELECT name, "notnull", pk FROM pragma_table_info(?) ORDER BY cid`, table)
+	if err != nil {
+		t.Fatalf("%s 칸 목록 조회 실패: %v", table, err)
 	}
-	rest := schema[i+len(head):]
-	j := strings.Index(rest, "\n);\n")
-	if j < 0 {
-		t.Fatalf("%s 표 선언의 끝을 못 찾았다", table)
+	defer rows.Close()
+	secret := map[string]bool{}
+	for _, c := range store.LedgerSecretColumns() {
+		secret[c] = true
 	}
 	var out []string
-	for _, raw := range strings.Split(rest[:j], "\n") {
-		ln := strings.TrimSpace(raw)
-		if k := strings.Index(ln, "--"); k >= 0 {
-			ln = strings.TrimSpace(ln[:k])
+	n := 0
+	for rows.Next() {
+		var name string
+		var notNull, pk int
+		if err := rows.Scan(&name, &notNull, &pk); err != nil {
+			t.Fatalf("%s 칸 목록 해석 실패: %v", table, err)
 		}
-		m := ledgerColumnLineRe.FindStringSubmatch(ln)
-		if m == nil {
-			continue // 제약 줄 · CHECK 목록의 값 · 빈 줄
+		n++
+		if notNull == 0 && pk == 0 && !secret[table+"."+name] {
+			out = append(out, name)
 		}
-		up := strings.ToUpper(ln)
-		if strings.Contains(up, "NOT NULL") || strings.Contains(up, "PRIMARY KEY") {
-			continue
-		}
-		out = append(out, m[1])
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("%s 칸 목록 순회 실패: %v", table, err)
+	}
+	if n == 0 {
+		t.Fatalf("%s 표가 원장에 없다 — 이 관문의 좌표가 틀렸다", table)
 	}
 	return out
 }

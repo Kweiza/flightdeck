@@ -17,8 +17,10 @@ const (
 	//
 	// 2: FK 폐포를 닫으며 machines·projects·sessions 셋이 늘었다. 버전 1 산출물로 복원하면
 	//    세션 걸린 판단(실측 85%)이 FK 위반으로 전부 롤백되므로, Read 가 그것을 거절하는 것이 맞다.
-	FormatVersion = 2
+	// 3: 스키마 20 의 행위자 칸(judgment.author · session.account_id · machine.account_id)이 가리키는 accounts 가 늘었다.
+	FormatVersion = 3
 
+	accountsFile  = "accounts.jsonl"
 	judgmentsFile = "judgments.jsonl"
 	linksFile     = "judgment_links.jsonl"
 	snapshotsFile = "snapshots.jsonl"
@@ -32,6 +34,7 @@ const (
 
 // Counts 는 내보낸 행 수다.
 type Counts struct {
+	Accounts  int `json:"accounts"`
 	Machines  int `json:"machines"`
 	Projects  int `json:"projects"`
 	Sessions  int `json:"sessions"`
@@ -46,6 +49,7 @@ type Counts struct {
 // 두 자리에 두면 "적은 수"와 "센 수"의 정의가 갈리고, 그러면 대조가 조용히 무의미해진다.
 func CountsOf(d store.LedgerDump) Counts {
 	return Counts{
+		Accounts:  len(d.Accounts),
 		Machines:  len(d.Machines),
 		Projects:  len(d.Projects),
 		Sessions:  len(d.Sessions),
@@ -74,6 +78,7 @@ func JudgeCounts(want, got Counts) error {
 		name      string
 		want, got int
 	}{
+		{"accounts", want.Accounts, got.Accounts},
 		{"machines", want.Machines, got.Machines},
 		{"projects", want.Projects, got.Projects},
 		{"sessions", want.Sessions, got.Sessions},
@@ -123,6 +128,10 @@ func Encode(d store.LedgerDump, schemaVersion int, exportedAt string) (map[strin
 		Counts:        CountsOf(d),
 	}
 
+	accounts, err := encodeLines(len(d.Accounts), func(i int) any { return d.Accounts[i] })
+	if err != nil {
+		return nil, m, fmt.Errorf("계정 인코딩 실패: %w", err)
+	}
 	machines, err := encodeLines(len(d.Machines), func(i int) any { return d.Machines[i] })
 	if err != nil {
 		return nil, m, fmt.Errorf("머신 인코딩 실패: %w", err)
@@ -148,7 +157,7 @@ func Encode(d store.LedgerDump, schemaVersion int, exportedAt string) (map[strin
 		return nil, m, fmt.Errorf("스냅숏 인코딩 실패: %w", err)
 	}
 
-	// 매니페스트는 사람이 열어 보는 파일이라 들여쓴다. JSONL 셋은 한 줄 한 행이라 안 들여쓴다.
+	// 매니페스트는 사람이 열어 보는 파일이라 들여쓴다. JSONL 들은 한 줄 한 행이라 안 들여쓴다.
 	manifest, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return nil, m, fmt.Errorf("매니페스트 인코딩 실패: %w", err)
@@ -156,6 +165,7 @@ func Encode(d store.LedgerDump, schemaVersion int, exportedAt string) (map[strin
 	manifest = append(manifest, '\n')
 
 	return map[string][]byte{
+		accountsFile:  accounts,
 		machinesFile:  machines,
 		projectsFile:  projects,
 		sessionsFile:  sessions,

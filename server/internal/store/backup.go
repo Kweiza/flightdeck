@@ -39,6 +39,9 @@ type LedgerJudgment struct {
 	Title      *string `json:"title"`
 	Body       string  `json:"body"`
 	Supersedes *string `json:"supersedes"`
+	// Author · Via 는 증분 020 의 행위자 칸이다. 그 증분 이전 행은 소유자 계정으로 귀속됐고, 지금 판의 쓰기는 아직 비워 둔다.
+	Author *string `json:"author"`
+	Via    *string `json:"via"`
 }
 
 // LedgerLink 는 judgment_link 표 한 행이다.
@@ -64,12 +67,31 @@ type LedgerSnapshot struct {
 	ComputedAt  string  `json:"computed_at"`
 }
 
-// LedgerMachine 은 machine 표 한 행의 원문이다. NULL 가능 컬럼이 없다.
+// LedgerMachine 은 machine 표 한 행의 원문이다. 기기 토큰의 지문(token_hash)은 싣지 않는다(ledgerSecretCols).
 type LedgerMachine struct {
-	ID        string `json:"id"`
-	Hostname  string `json:"hostname"`
-	FirstSeen string `json:"first_seen"`
-	LastSeen  string `json:"last_seen"`
+	ID          string  `json:"id"`
+	Hostname    string  `json:"hostname"`
+	FirstSeen   string  `json:"first_seen"`
+	LastSeen    string  `json:"last_seen"`
+	AccountID   *string `json:"account_id"`
+	Name        *string `json:"name"`
+	TokenPrefix *string `json:"token_prefix"`
+	TokenOrigin *string `json:"token_origin"`
+	IssuedAt    *string `json:"issued_at"`
+	RevokedAt   *string `json:"revoked_at"`
+	RevokedBy   *string `json:"revoked_by"`
+}
+
+// LedgerAccount 는 account 표 한 행의 원문이다. 증분 020 부터 폐포에 든다 - judgment.author · session.account_id ·
+// machine.account_id 가 이것을 가리킨다. 암호 지문(password_hash)은 싣지 않는다(ledgerSecretCols).
+type LedgerAccount struct {
+	ID          string  `json:"id"`
+	Login       string  `json:"login"`
+	DisplayName string  `json:"display_name"`
+	Email       *string `json:"email"`
+	Role        string  `json:"role"`
+	CreatedAt   string  `json:"created_at"`
+	DisabledAt  *string `json:"disabled_at"`
 }
 
 // LedgerProject 는 project 표 한 행의 원문이다.
@@ -108,13 +130,16 @@ type LedgerSession struct {
 	// Harness 는 013 이 더한 축이다. 포인터인 이유는 Label·BlockedWhy 와 같다 —
 	// NULL(「미상」)과 빈 문자열을 원장이 구별해야 한다.
 	Harness *string `json:"harness"`
+	// AccountID 는 020 이 더한 축(세션을 연 계정)이다.
+	AccountID *string `json:"account_id"`
 }
 
 // LedgerDump 는 한 순간의 FK 폐포 전량이다.
 //
-// 여섯 표다. 앞 셋(machine·project·session)이 뒤 셋의 FK 대상이고, machine·project 는
-// 아무것도 참조하지 않는 leaf 라 폐포가 여기서 닫힌다.
+// 일곱 표다. 앞 넷(account·machine·project·session)이 뒤 셋의 FK 대상이고, account·project 는
+// 아무것도 참조하지 않는 leaf 라 폐포가 여기서 닫힌다(machine 은 account 만 가리킨다).
 type LedgerDump struct {
+	Accounts  []LedgerAccount
 	Machines  []LedgerMachine
 	Projects  []LedgerProject
 	Sessions  []LedgerSession
@@ -127,10 +152,41 @@ type LedgerDump struct {
 // 상수가 없었고, 읽기와 쓰기가 각자 리터럴을 들고 있었다.
 const linkCols = `judgment_id, target_kind, target_id, target_project`
 
-// ledgerTables 는 판단 원장이 담는 FK 폐포 여섯 표다 — **표마다 컬럼 목록이 하나다.**
+// 원장이 담는 칸 목록 가운데 업무 조회 상수와 다른 넷이다. 증분 020 의 칸(계정 · 토큰 · 행위자)을 업무 조회(model)는 아직 안
+// 읽으므로 그 상수에 붙이지 않고, 원장만 그 뒤에 잇는다 - 표마다 목록은 여전히 하나다(ledgerTables).
+const (
+	accountLedgerCols  = `id, login, display_name, email, role, created_at, disabled_at`
+	machineLedgerCols  = machineCols + `, account_id, name, token_prefix, token_origin, issued_at, revoked_at, revoked_by`
+	sessionLedgerCols  = sessionCols + `, account_id`
+	judgmentLedgerCols = judgmentCols + `, author, via`
+)
+
+// ledgerSecretCols 는 원장이 일부러 안 담는 비밀 칸이다(표 → 칸). 원장은 매시간 기록 저장소(journal.git)에 쌓이고 그 이력은
+// 지우지 않으므로, 여기 실린 비밀은 바꾼 뒤에도 영구히 남는다 - 암호 지문(argon2id)은 약한 암호면 오프라인으로 풀린다. 되쓴
+// 계정은 암호 없이(옛 원장의 소유자 계정과 같은 상태), 기기는 토큰 없이 돌아오고 다시 로그인한다. 빠뜨린 칸이 이것뿐인지는
+// TestLedgerColumnListsMatchTheSchema 가 잰다.
+var ledgerSecretCols = map[string][]string{
+	"account": {"password_hash"},
+	"machine": {"token_hash"},
+}
+
+// LedgerSecretColumns 는 원장이 안 담는 비밀 칸(「표.칸」, 정렬)이다. 손실 목록(ledger.Losses)이 이것으로 적는다 - 손으로 한 벌 더
+// 적으면 칸이 늘 때 그 설명이 조용히 거짓이 된다(LedgerTableNames 와 같은 까닭).
+func LedgerSecretColumns() []string {
+	var out []string
+	for table, cols := range ledgerSecretCols {
+		for _, c := range cols {
+			out = append(out, table+"."+c)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ledgerTables 는 판단 원장이 담는 FK 폐포 일곱 표다 — **표마다 컬럼 목록이 하나다.**
 //
-// 순서는 되쓰기 순서다: machine·project·session 이 판단보다 먼저 들어가야 FK 가 닫힌다
-// (WriteLedger 의 그 주석 참고).
+// 순서는 되쓰기 순서다: account 가 machine·session 보다, machine·project·session 이 판단보다
+// 먼저 들어가야 FK 가 닫힌다(WriteLedger 의 그 주석 참고).
 //
 // ★ 왜 한 자리에 모으나. 예전에는 읽기가 상수를, 쓰기가 인라인 리터럴을 써서 같은 표에
 // 목록이 **둘**이었다. 스키마에 컬럼이 하나 들어오면 백업이 그것을 버리고(읽기 목록에
@@ -141,10 +197,11 @@ var ledgerTables = []struct {
 	name string
 	cols string
 }{
-	{"machine", machineCols},
+	{"account", accountLedgerCols},
+	{"machine", machineLedgerCols},
 	{"project", projectCols},
-	{"session", sessionCols},
-	{"judgment", judgmentCols},
+	{"session", sessionLedgerCols},
+	{"judgment", judgmentLedgerCols},
 	{"judgment_link", linkCols},
 	{"snapshot", snapshotCols},
 }
@@ -184,7 +241,7 @@ func ledgerInsert(name, cols string) string {
 		strings.TrimSuffix(strings.Repeat("?, ", n), ", ") + `)`
 }
 
-// ReadLedger 는 여섯 표(FK 폐포 전량)를 **한 트랜잭션 안에서** 읽는다.
+// ReadLedger 는 일곱 표(FK 폐포 전량)를 **한 트랜잭션 안에서** 읽는다.
 //
 // ★ 왜 트랜잭션인가. 표를 따로 읽으면 그 사이 서버가 커밋한 판단의 **링크만** 산출물에
 // 들어간다(judgment 를 읽은 뒤 link 를 읽으므로). 그 링크가 가리키는 판단이 없으니
@@ -194,7 +251,7 @@ func ledgerInsert(name, cols string) string {
 // ★ 왜 Store.Tx 를 안 쓰는가. 그 함수는 쓰기 트랜잭션이라 전역 쓰기 잠금을 잡는다(Tx 주석이
 // 그 대가를 적어 뒀다). 전량 읽기가 도는 동안 서버의 모든 쓰기가 잠금 대기 상한 안에서 줄을 선다.
 // 여기서는 읽기 트랜잭션(ReadTx)을 연다 - 잠그지 않고 한 스냅숏을 본다. 엔진 차이는 ReadTx 안에만 있다: SQLite 는
-// WAL 의 첫 읽기 스냅숏이고, Postgres 는 REPEATABLE READ READ ONLY 라 여섯 질의가 첫 질의의 스냅숏을 함께 본다(READ
+// WAL 의 첫 읽기 스냅숏이고, Postgres 는 REPEATABLE READ READ ONLY 라 일곱 질의가 첫 질의의 스냅숏을 함께 본다(READ
 // COMMITTED 면 질의마다 새 스냅숏이라 위의 창이 그대로 열린다). Postgres 에서도 쓰기를 세우지 않는다 - 전역 잠금은
 // 쓰기 트랜잭션만 잡는다. 그 창이 닫힌 것은 backup_test.go 의 TestPGReadLedgerReadsOneSnapshot 이 잰다.
 //
@@ -215,6 +272,9 @@ func (s *Store) ReadLedger(ctx context.Context) (LedgerDump, error) {
 func readLedger(ctx context.Context, tx Reader) (LedgerDump, error) {
 	var d LedgerDump
 	var err error
+	if d.Accounts, err = readLedgerAccounts(ctx, tx); err != nil {
+		return d, err
+	}
 	if d.Machines, err = readLedgerMachines(ctx, tx); err != nil {
 		return d, err
 	}
@@ -239,7 +299,7 @@ func readLedger(ctx context.Context, tx Reader) (LedgerDump, error) {
 // readLedgerJudgments 는 판단 전량을 id 순으로 읽는다.
 // id 는 ULID 라 정렬이 곧 생성순이고, 같은 DB 면 같은 바이트가 나오는 근거가 이것이다.
 func readLedgerJudgments(ctx context.Context, q Reader) ([]LedgerJudgment, error) {
-	rows, err := q.QueryContext(ctx, `SELECT `+judgmentCols+` FROM judgment ORDER BY id`)
+	rows, err := q.QueryContext(ctx, `SELECT `+judgmentLedgerCols+` FROM judgment ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("원장 판단 조회 실패: %w", err)
 	}
@@ -248,12 +308,14 @@ func readLedgerJudgments(ctx context.Context, q Reader) ([]LedgerJudgment, error
 	var out []LedgerJudgment
 	for rows.Next() {
 		var j LedgerJudgment
-		var project, session, title, supersedes sql.NullString
-		if err := rows.Scan(&j.ID, &project, &session, &j.At, &j.Kind, &title, &j.Body, &supersedes); err != nil {
+		var project, session, title, supersedes, author, via sql.NullString
+		if err := rows.Scan(&j.ID, &project, &session, &j.At, &j.Kind, &title, &j.Body, &supersedes,
+			&author, &via); err != nil {
 			return nil, fmt.Errorf("원장 판단 행 해석 실패: %w", err)
 		}
 		j.Project, j.SessionID = ptrOf(project), ptrOf(session)
 		j.Title, j.Supersedes = ptrOf(title), ptrOf(supersedes)
+		j.Author, j.Via = ptrOf(author), ptrOf(via)
 		out = append(out, j)
 	}
 	if err := rows.Err(); err != nil {
@@ -313,9 +375,33 @@ func readLedgerSnapshots(ctx context.Context, q Reader) ([]LedgerSnapshot, error
 	return out, nil
 }
 
+// readLedgerAccounts 는 계정 전량을 id 순으로 읽는다.
+func readLedgerAccounts(ctx context.Context, q Reader) ([]LedgerAccount, error) {
+	rows, err := q.QueryContext(ctx, `SELECT `+accountLedgerCols+` FROM account ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("원장 계정 조회 실패: %w", err)
+	}
+	defer rows.Close()
+
+	var out []LedgerAccount
+	for rows.Next() {
+		var a LedgerAccount
+		var email, disabled sql.NullString
+		if err := rows.Scan(&a.ID, &a.Login, &a.DisplayName, &email, &a.Role, &a.CreatedAt, &disabled); err != nil {
+			return nil, fmt.Errorf("원장 계정 행 해석 실패: %w", err)
+		}
+		a.Email, a.DisabledAt = ptrOf(email), ptrOf(disabled)
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("원장 계정 순회 실패: %w", err)
+	}
+	return out, nil
+}
+
 // readLedgerMachines 는 머신 전량을 id 순으로 읽는다.
 func readLedgerMachines(ctx context.Context, q Reader) ([]LedgerMachine, error) {
-	rows, err := q.QueryContext(ctx, `SELECT `+machineCols+` FROM machine ORDER BY id`)
+	rows, err := q.QueryContext(ctx, `SELECT `+machineLedgerCols+` FROM machine ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("원장 머신 조회 실패: %w", err)
 	}
@@ -324,9 +410,13 @@ func readLedgerMachines(ctx context.Context, q Reader) ([]LedgerMachine, error) 
 	var out []LedgerMachine
 	for rows.Next() {
 		var m LedgerMachine
-		if err := rows.Scan(&m.ID, &m.Hostname, &m.FirstSeen, &m.LastSeen); err != nil {
+		var account, name, prefix, origin, issued, revoked, revokedBy sql.NullString
+		if err := rows.Scan(&m.ID, &m.Hostname, &m.FirstSeen, &m.LastSeen,
+			&account, &name, &prefix, &origin, &issued, &revoked, &revokedBy); err != nil {
 			return nil, fmt.Errorf("원장 머신 행 해석 실패: %w", err)
 		}
+		m.AccountID, m.Name, m.TokenPrefix, m.TokenOrigin = ptrOf(account), ptrOf(name), ptrOf(prefix), ptrOf(origin)
+		m.IssuedAt, m.RevokedAt, m.RevokedBy = ptrOf(issued), ptrOf(revoked), ptrOf(revokedBy)
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -363,7 +453,7 @@ func readLedgerProjects(ctx context.Context, q Reader) ([]LedgerProject, error) 
 
 // readLedgerSessions 는 세션 전량을 id 순으로 읽는다.
 func readLedgerSessions(ctx context.Context, q Reader) ([]LedgerSession, error) {
-	rows, err := q.QueryContext(ctx, `SELECT `+sessionCols+` FROM session ORDER BY id`)
+	rows, err := q.QueryContext(ctx, `SELECT `+sessionLedgerCols+` FROM session ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("원장 세션 조회 실패: %w", err)
 	}
@@ -372,12 +462,13 @@ func readLedgerSessions(ctx context.Context, q Reader) ([]LedgerSession, error) 
 	var out []LedgerSession
 	for rows.Next() {
 		var x LedgerSession
-		var label, blockedWhy, harness sql.NullString
+		var label, blockedWhy, harness, account sql.NullString
 		if err := rows.Scan(&x.ID, &x.Project, &x.MachineID, &x.Worktree, &x.CCSessionID,
-			&label, &x.State, &blockedWhy, &x.OpenedAt, &harness); err != nil {
+			&label, &x.State, &blockedWhy, &x.OpenedAt, &harness, &account); err != nil {
 			return nil, fmt.Errorf("원장 세션 행 해석 실패: %w", err)
 		}
 		x.Label, x.BlockedWhy, x.Harness = ptrOf(label), ptrOf(blockedWhy), ptrOf(harness)
+		x.AccountID = ptrOf(account)
 		out = append(out, x)
 	}
 	if err := rows.Err(); err != nil {
@@ -440,7 +531,7 @@ func importSourceDSN(path string) string {
 // UPDATE·DELETE 가 물리적으로 금지돼 있어, 잘못 넣은 행을 고치거나 지울 수 없다.
 // 그래서 중복 id 를 건너뛰지 않고 거절한다 — 조용히 넘어가면 무엇이 반쯤 들어갔는지 모른다.
 //
-// ★ 폐포를 통째로 되쓴다. machine·project·session 이 판단보다 먼저 들어가고, 그 셋은
+// ★ 폐포를 통째로 되쓴다. account·machine·project·session 이 판단보다 먼저 들어가고, 그 넷은
 // 아무것도 참조하지 않거나 서로만 참조하므로 여기서 닫힌다. 빈 DB 에 되쓰면 미리 심어 둘
 // 것이 하나도 없다 — 그것이 이 함수가 증명하는 "무손실"의 실제 의미다.
 func (s *Store) WriteLedger(ctx context.Context, d LedgerDump) error {
@@ -481,13 +572,20 @@ type ledgerRow struct {
 	what string
 }
 
-// ledgerRows 는 원장 d 를 되쓰는 문장들이다(폐포 순서: 머신 · 프로젝트 · 세션 · 판단 · 링크 · 스냅숏). 순수 함수다 - WriteLedger
-// 가 실행하고 ScreenLedger 가 DB 없이 잰다(한 벌이라 예행과 적용이 갈릴 자리가 없다).
+// ledgerRows 는 원장 d 를 되쓰는 문장들이다(폐포 순서: 계정 · 머신 · 프로젝트 · 세션 · 판단 · 링크 · 스냅숏). 순수 함수다 -
+// WriteLedger 가 실행하고 ScreenLedger 가 DB 없이 잰다(한 벌이라 예행과 적용이 갈릴 자리가 없다).
 func ledgerRows(d LedgerDump) []ledgerRow {
-	out := make([]ledgerRow, 0, len(d.Machines)+len(d.Projects)+len(d.Sessions)+len(d.Judgments)+len(d.Links)+len(d.Snapshots))
-	machineStmt := ledgerInsert("machine", machineCols)
+	out := make([]ledgerRow, 0, len(d.Accounts)+len(d.Machines)+len(d.Projects)+len(d.Sessions)+len(d.Judgments)+
+		len(d.Links)+len(d.Snapshots))
+	accountStmt := ledgerInsert("account", accountLedgerCols)
+	for _, a := range d.Accounts {
+		out = append(out, ledgerRow{accountStmt, []any{a.ID, a.Login, a.DisplayName, a.Email, a.Role, a.CreatedAt, a.DisabledAt},
+			fmt.Sprintf("원장 계정 되쓰기 실패(id=%q)", clip(a.ID, 64))})
+	}
+	machineStmt := ledgerInsert("machine", machineLedgerCols)
 	for _, m := range d.Machines {
-		out = append(out, ledgerRow{machineStmt, []any{m.ID, m.Hostname, m.FirstSeen, m.LastSeen},
+		out = append(out, ledgerRow{machineStmt, []any{m.ID, m.Hostname, m.FirstSeen, m.LastSeen,
+			m.AccountID, m.Name, m.TokenPrefix, m.TokenOrigin, m.IssuedAt, m.RevokedAt, m.RevokedBy},
 			fmt.Sprintf("원장 머신 되쓰기 실패(id=%q)", clip(m.ID, 64))})
 	}
 	projectStmt := ledgerInsert("project", projectCols)
@@ -496,15 +594,16 @@ func ledgerRows(d LedgerDump) []ledgerRow {
 			p.Config, p.ConfigFromSHA, p.CreatedAt, p.PinnedAt, p.ArchivedAt},
 			fmt.Sprintf("원장 프로젝트 되쓰기 실패(id=%q)", clip(p.ID, 64))})
 	}
-	sessionStmt := ledgerInsert("session", sessionCols)
+	sessionStmt := ledgerInsert("session", sessionLedgerCols)
 	for _, x := range d.Sessions {
 		out = append(out, ledgerRow{sessionStmt, []any{x.ID, x.Project, x.MachineID, x.Worktree, x.CCSessionID,
-			x.Label, x.State, x.BlockedWhy, x.OpenedAt, x.Harness},
+			x.Label, x.State, x.BlockedWhy, x.OpenedAt, x.Harness, x.AccountID},
 			fmt.Sprintf("원장 세션 되쓰기 실패(id=%q project=%q)", clip(x.ID, 64), clip(x.Project, 64))})
 	}
-	judgmentStmt := ledgerInsert("judgment", judgmentCols)
+	judgmentStmt := ledgerInsert("judgment", judgmentLedgerCols)
 	for _, j := range d.Judgments {
-		out = append(out, ledgerRow{judgmentStmt, []any{j.ID, j.Project, j.SessionID, j.At, j.Kind, j.Title, j.Body, j.Supersedes},
+		out = append(out, ledgerRow{judgmentStmt, []any{j.ID, j.Project, j.SessionID, j.At, j.Kind, j.Title, j.Body, j.Supersedes,
+			j.Author, j.Via},
 			fmt.Sprintf("원장 판단 되쓰기 실패(id=%q kind=%q)", clip(j.ID, 64), clip(j.Kind, 32))})
 	}
 	linkStmt := ledgerInsert("judgment_link", linkCols)

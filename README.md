@@ -375,9 +375,10 @@ round, `migrate` with the override refuses while an unmarked `fd.db` remains. On
 This takes the ledger you built on SQLite into a Postgres ledger. The server is down during the move. For 72 hours afterwards
 you can go back to SQLite, carrying along what was written in Postgres ("Going back within 72 hours" below).
 
-**The ledger must be within the import version range (18-19).** The import only takes versions whose tables and columns match
-the last SQLite version (19) - 19 only added an index to 18. An older ledger is raised first on this version's default path:
-that is step 3 (step 3 always raises it to 19).
+**The ledger must be at the import version (20).** The import only takes versions whose tables and columns match the last
+SQLite version (20) - 20 added the account tables and actor columns to 19 and attributed the old rows to an owner account (it
+does more than add an index, so the range is one version). An older ledger is raised first on this version's default path:
+that is step 3 (step 3 always raises it to 20).
 
 **Step 0 is setup, step 1 reads values into this shell, steps 2-8 are one block.** Step 0 is setup steps 1-5 of "Running on
 Postgres" (volumes, places, pgpass, switched-off selection file, shell functions): do not switch it on or start it. Step 1
@@ -412,17 +413,17 @@ fdwhere
       names=$(docker ps -a --format '{{.Names}}')
       if printf '%s\n' "$names" | grep -qx flightdeck; then echo 'the server container (flightdeck) is still there - take it down in its project, then run again' >&2; exit 1; fi
       echo "2 done: it is down"
-      : '3. Build the image of this version and raise the SQLite ledger to this version (nothing happens at 19). selfcheck
+      : '3. Build the image of this version and raise the SQLite ledger to this version (nothing happens at 20). selfcheck
          must say ok.'
       fdc build
       fdc run --rm --no-deps migrate migrate --db /data/fd.db
       fdc run --rm --no-deps migrate selfcheck --db /data/fd.db
       echo "3 done: the SQLite ledger is at this version"
       : '4. Build the image of the Postgres layer from the switched-off selection file and lay only up to the import version
-         (the baseline and the steps above it - stops at version 19). db starts with it.'
+         (the baseline and the steps above it - stops at version 20). db starts with it.'
       export FDC_ENV="$off"; [ -f "$FDC_ENV" ]
       fdc build
-      fdc run --rm migrate migrate --to 19
+      fdc run --rm migrate migrate --to 20
       echo "4 done: laid up to the import version"
       : '5. Dry run, then move. After committing, the move leaves a move marker (fd.db.moved-to-postgres) next to the
          source. No marker, no further.'
@@ -596,10 +597,11 @@ the upgrade block again (step 3 carries the raise on).
 | any other run without a table | not measured (connection, image, version, side files) | fix the cause above and run A again. If the upgrade stopped before "4 done", choose as above without measuring A |
 | anything else (marker but no match; rows in the target but no match) | something wrote to one side separately | **Stop.** Delete neither ledger. Look at the rows that differ (primary keys) in the table; a person decides |
 
-**A move that stopped on an older version (18) goes on with this version.** The comparison, the import and the export take a
-ledger within the import version range (18-19): the tables and columns are the same. Even when step 6 of the resumed block
-raises the Postgres ledger to 19, step 7 compares it with the SQLite ledger still at 18 (the marker keeps the SQLite ledger
-from being raised).
+**A move that stopped on an older version (import version 19 or lower) does not go on with this version.** The comparison,
+the import and the export only take a ledger at the import version (20). Resuming with this version's block, step 6 raises the
+Postgres ledger to 20 while the marker keeps the SQLite ledger at the older version, and step 7 refuses that ledger with "raise
+it first" - and from there the older version cannot take over either (it refuses a version 20 ledger). Finish with the older
+version's block in its directory, or go back with B, and then update to this version.
 
 Run B only when A's table says "to go back, B", or when the upgrade stopped before "4 done". It takes this directory's
 Postgres layer (db and the one-shots) down, removes the marker (no server ever wrote to the Postgres ledger, and it matches
@@ -629,12 +631,12 @@ ledger, move them back next to it by hand if you need one for `fd migrate --roll
 
 #### Going back within 72 hours
 
-The 72 hours after the move are the rollback window. `export-sqlite` moves the Postgres ledger (import version range 18-19)
-into a **new** SQLite file at the last SQLite version (19), so the items, claims and judgments written in Postgres after the
+The 72 hours after the move are the rollback window. `export-sqlite` moves the Postgres ledger (import version 20)
+into a **new** SQLite file at the last SQLite version (20), so the items, claims and judgments written in Postgres after the
 move come back too. During the window, do not update to a flightdeck version that raises the Postgres schema past the last
-SQLite version: `export-sqlite` only takes a ledger within its own import version range. If you moved at version 18 and
-upgraded to this version inside the window, the Postgres ledger is raised to 19 too; go back with this version's
-`export-sqlite` (the older one refuses 19). Before the dump, that upgrade looks for rows over the index key limit and, if
+SQLite version: `export-sqlite` only takes a ledger at its own import version. If you moved on an older version (import
+version 19 or lower) and upgraded to this version inside the window, the Postgres ledger is raised to 20 too; go back with this
+version's `export-sqlite` (the older one refuses 20). Before the dump, that upgrade looks for rows over the index key limit and, if
 there are any, stops with their coordinates and leaves the ledger at its current version (the same limit as the pre-checks in
 "Moving a SQLite ledger to Postgres" below). Do not fix those rows - it is an append-only audit ledger, and cutting a value
 makes it differ from the SQLite source and the dumps. Report the coordinates in an issue.
@@ -745,18 +747,15 @@ fdwhere
   mount line from the upgrade's step 1 again.
 - The Postgres ledger (volume `flightdeck-pgdata`) stays. A later move needs an empty target: the import refuses otherwise.
 
-**Going back to SQLite is not going back to the version 18 image.** Step 7 starts this version's image, and the ledger put
-in place is at version 19 (the export always writes the last SQLite version). flightdeck version 18 refuses that ledger with
-"the database version is higher than this version knows". To run on the version 18 image, lower the version **with this version's
-image** while the server is down, then start from the old version's directory:
-
-```bash
-(cd "$w" && fdc -p "$p" run --rm --no-deps migrate migrate --db /data/fd.db --to 18)
-```
+**Going back to SQLite is not going back to an older version's image.** Step 7 starts this version's image, and the ledger
+put in place is at version 20 (the export always writes the last SQLite version). flightdeck at version 19 or lower refuses
+that ledger with "the database version is higher than this version knows", and version 20 is not lowered (`--to N` below) - the
+ledger put in place only runs on this version's image or a newer one.
 
 `--to N` (N below the current version) only lowers steps that just add indexes: it drops that index and the version row and
 keeps every record (version 19 → 18 is such a step). Below a step that changed tables or columns it refuses and changes
-nothing. Do not lower with `fd migrate --rollback`: that command **overwrites** the ledger with a pre-upgrade copy and loses
+nothing (version 20 → 19 is such a step - step 020 added the account tables and actor columns and wrote the owner account into
+the old rows). Do not lower with `fd migrate --rollback`: that command **overwrites** the ledger with a pre-upgrade copy and loses
 what was written after it. The rollback checks the copy before overwriting: it refuses a copy that is not complete (a
 `-journal` left next to it, a failing integrity_check) or that is not this ledger's pre-upgrade copy (its version history
 differs from the ledger's - an old copy left behind after the ledger was replaced by an export or a restore). It also
@@ -842,8 +841,8 @@ In a compose deployment, move with "Upgrade: SQLite ledger to Postgres" above. T
 themselves do and refuse; `<URL>` below connects as the superuser or a member of `fd_owner` (in the compose `migrate` service
 `FD_DB` is that URL, so leave out `--db`).
 
-`fd migrate import-sqlite` moves a ledger within the import version range (18-19 - versions whose tables and columns match
-the last SQLite version) into an **empty** Postgres ledger in one
+`fd migrate import-sqlite` moves a ledger at the import version (20 - the version whose tables and columns match the last
+SQLite version) into an **empty** Postgres ledger in one
 transaction. Inside that transaction it then compares the two ledgers and does not commit on any mismatch.
 `fd migrate verify` runs only that comparison again (it writes nothing). The comparison covers, per table, the row count and
 a fingerprint over every column, plus the identity sequences (the next number must exceed the highest number the source
@@ -854,8 +853,8 @@ ever issued); mismatched rows are listed by primary key. Exit codes: 0 = moved �
 : '1. Stop the server that writes the source. Pass the ledger file itself to --from, or, to keep a copy, take one with
    VACUUM INTO. Do not copy it with cp (see below).'
 sqlite3 fd.db "VACUUM INTO 'fd-copy.db'"
-: '2. Lay the target database up to the import version (the baseline and the steps above it), stopping at 19.'
-fd migrate --db <URL> --to 19
+: '2. Lay the target database up to the import version (the baseline and the steps above it), stopping at 20.'
+fd migrate --db <URL> --to 20
 : '3. Dry run: runs the same transaction as the real import to the end and rolls it back instead of committing.'
 fd migrate import-sqlite --from fd-copy.db --db <URL> --dry-run
 : '4. Move. On success it prints the comparison table and the number of rows moved.'
@@ -876,12 +875,16 @@ fd migrate verify --from fd-copy.db --db <URL>
   dry run refuses just as the real import does.
 - Run `fd migrate verify` with the same account. The app role has no privilege (SELECT) to read the identity sequences, so
   it cannot compare them.
-- A source older than version 18 is refused. First upgrade the copy with this version of fd (`fd migrate --db <copy>`). The
+- A source older than version 20 is refused. First upgrade the copy with this version of fd (`fd migrate --db <copy>`). The
   range comes from one place in the code (the steps that only add indexes), and the import, the comparison and the export
-  all use it.
+  all use it. It is one version (20) now - step 020 below it does more than add an index.
+- Above the comparison table the report prints the source's owner attribution: whether the owner account (`owner`) exists,
+  and per actor column (the account of machines and sessions, the author of items, judgments and revisions, the channel of
+  judgments) how many rows are empty. It is not part of the verdict - this version's writes do not fill the actor columns
+  yet, so rows written after the upgrade leave them empty.
 - A source whose tables or columns differ from the import version (a hand-edited ledger) is refused.
 - A target with even one row in a business table is refused, as is one whose identity sequence has ever issued a number
-  (even after the rows were deleted), one outside the import version range (18-19), or one that fails the locale gate.
+  (even after the rows were deleted), one not at the import version (20), or one that fails the locale gate.
 - If any connection other than this run is attached to the target database (a server, psql, ...), the dry run and the real
   import both refuse and list each remaining connection's pid · role · application_name. Some writes of an attached server
   (observation records) do not take the migration lock and would interleave with the moving transaction.
@@ -964,8 +967,8 @@ fd migrate verify --from fd-copy.db --db <URL>
 In a compose deployment, go back with "Going back within 72 hours" above ("Stopped before switching on" if the selection
 file was never switched on). This section covers what the command itself does and refuses.
 
-`fd migrate export-sqlite` is the reverse of the import. It moves a Postgres ledger within the import version range (18-19) into a **new** SQLite file
-(version 19) - the way back to the SQLite build, carrying the items, claims, events and judgments written on Postgres since
+`fd migrate export-sqlite` is the reverse of the import. It moves a Postgres ledger at the import version (20) into a **new** SQLite file
+(version 20) - the way back to the SQLite build, carrying the items, claims, events and judgments written on Postgres since
 the import. It runs the same transaction and the same comparison as the import (row counts, fingerprints over every column,
 sequences), writes into a temporary file next to the target, and gives it the `--to` name only when the comparison matches.
 On a mismatch or failure (and always on a dry run) no file is left behind. Exit codes are the same as the import's.
@@ -993,7 +996,7 @@ fd migrate verify --from fd-back.db --db <URL> --exported
 
 - If a file already sits at `--to`, or a `-wal` · `-shm` · `-journal` sits next to it, the export refuses. It never
   overwrites, and a leftover `-wal` cannot be replayed into the new file.
-- The source must be within the import version range (18-19). A Postgres ledger upgraded past it has no place in the SQLite
+- The source must be at the import version (20). A Postgres ledger upgraded past it has no place in the SQLite
   build and is refused. So is a ledger whose tables or columns differ from the import version (a hand-edited ledger). The version and the shape are measured in
   the snapshot the export copies from. The account is the same as for the import (a superuser or a member of `fd_owner` - it
   reads the sequences).

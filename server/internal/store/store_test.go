@@ -139,6 +139,27 @@ func undoNonIdempotentMigrations(t *testing.T, exec func(string) (sql.Result, er
 		`DROP TABLE IF EXISTS session_inbox`,
 		// 019 · event_by_project_kind(인덱스 하나)
 		`DROP INDEX IF EXISTS event_by_project_kind`,
+		// 020 · 계정 표 넷 · machine 넓힘 · 사람 칸. 계정을 가리키는 표 · 칸을 먼저 걷고 account 를 맨 끝에 지운다(FK 가 켜져
+		//       있어 거꾸로면 지우기가 선다). item_revision.author 는 위 016 줄의 DROP TABLE 이 함께 가져간다. 귀속이 다시 만든
+		//       judgment_no_update 는 v1 의 글과 같아서 걷지 않는다.
+		`DROP TABLE IF EXISTS device_code`,
+		`DROP TABLE IF EXISTS web_session`,
+		`DROP TABLE IF EXISTS invite`,
+		`DROP INDEX IF EXISTS machine_token_hash`,
+		`ALTER TABLE machine DROP COLUMN account_id`,
+		`ALTER TABLE machine DROP COLUMN name`,
+		`ALTER TABLE machine DROP COLUMN token_hash`,
+		`ALTER TABLE machine DROP COLUMN token_prefix`,
+		`ALTER TABLE machine DROP COLUMN token_origin`,
+		`ALTER TABLE machine DROP COLUMN issued_at`,
+		`ALTER TABLE machine DROP COLUMN revoked_at`,
+		`ALTER TABLE machine DROP COLUMN revoked_by`,
+		`ALTER TABLE session DROP COLUMN account_id`,
+		`ALTER TABLE item DROP COLUMN created_by`,
+		`ALTER TABLE item DROP COLUMN created_session`,
+		`ALTER TABLE judgment DROP COLUMN author`,
+		`ALTER TABLE judgment DROP COLUMN via`,
+		`DROP TABLE IF EXISTS account`,
 		// 011 · item_dependents 를 **되살린다**(schema.sql 의 v1 정의 그대로).
 		`CREATE TABLE IF NOT EXISTS item_dependents (
   project TEXT NOT NULL,

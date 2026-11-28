@@ -72,12 +72,15 @@ func declaredIn(t *testing.T, sources map[string]string) []string {
 // 표를 더하거나 지우는 단위는 **이 목록을 고친다.** SQLite 쪽 목록은 이것에 sqliteOnlyTables 를 더한 것으로
 // 얼어 있다(옮기는 동안만 산다).
 var wantTables = []string{
+	"account", // 증분 020 - 사람 계정(로그인 · 역할)
 	"change_set",
 	"claim",
 	"counter",
+	"device_code", // 증분 020 - 기기 코드 흐름(`fd login`) 한 번
 	"event",
 	"footprint",
 	"idempotency", // SQLite 증분 002
+	"invite",      // 증분 020 - 초대 링크
 	"item",
 	"item_after",
 	"item_revision", // SQLite 증분 016
@@ -98,6 +101,7 @@ var wantTables = []string{
 	"session_workspace",
 	"signal",
 	"snapshot",
+	"web_session", // 증분 020 - 웹 로그인 쿠키
 }
 
 // sqliteOnlyTables 는 SQLite 가 선언했고 PG 기준선이 일부러 안 옮긴 표와 그 까닭이다.
@@ -115,10 +119,10 @@ var sqliteOnlyTables = map[string]string{
 // 이름 목록을 통째로 못박는다(수만 세지 않는다). 표 하나를 지우고 하나를 더하면
 // 수는 그대로인데 데이터 모델은 달라지고, 그 변경이 리뷰에서 안 보이면 안 된다.
 //
-// 두 엔진을 함께 본다: PG 기준선의 선언 = wantTables(26), SQLite 의 선언 = wantTables + sqliteOnlyTables(28).
-// DESIGN 「데이터 모델」 절의 「테이블 N개」는 PG 기준선의 26 이다(SQLite 의 28 은 옮기는 동안만 사는 사본의 수다).
+// 두 엔진을 함께 본다: PG 사다리의 선언 = wantTables(30), SQLite 의 선언 = wantTables + sqliteOnlyTables(32).
+// DESIGN 「데이터 모델」 절의 「테이블 N개」는 PG 의 30 이다(SQLite 의 32 는 옮기는 동안만 사는 사본의 수다).
 //
-// SQLite 의 살아 있는 DB `sqlite_master` 는 28 보다 **4 큰** 수를 낸다(2026-09-16 운영 원장
+// SQLite 의 살아 있는 DB `sqlite_master` 는 SQLite 의 선언 수보다 **4 큰** 수를 낸다(2026-09-16 운영 원장
 // mode=ro 사본 실측: 판 16 에서 31). 축이 **둘** 어긋나기 때문이다:
 //
 //	⊕ SQLite 가 다섯을 더 만든다 — FTS5 가 judgment_fts 뒤에 자동 생성하는 그림자 표

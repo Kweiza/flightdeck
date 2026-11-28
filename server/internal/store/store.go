@@ -91,10 +91,13 @@ var migrationSessionInbox string
 //go:embed migrations/019_event_by_project_kind.sql
 var migrationEventByProjectKind string
 
+//go:embed migrations/020_accounts.sql
+var migrationAccounts string
+
 // SchemaVersion 은 **이 바이너리가 아는** 스키마 버전이다. 두 엔진이 같은 수를 쓴다(SQLite 는 migrations, Postgres 는
 // 기준선 위 pgMigrations 로 닿는다).
 // DB 가 이보다 높으면 연다는 것 자체가 조용히 망가지는 경로이므로 거절한다.
-const SchemaVersion = 19
+const SchemaVersion = 20
 
 // BaseSchemaVersion 은 schema.sql 하나가 만드는 버전이다.
 //
@@ -138,6 +141,7 @@ var migrations = []Migration{
 	{To: 17, Name: "개정 이력이 항목을 따라 옮겨 간다", SQL: migrationItemRevisionFollowsMove},
 	{To: 18, Name: "세션이 받는 곳(inbox 소켓)을 싣는다", SQL: migrationSessionInbox},
 	{To: 19, Name: "event 를 (project, kind, id) 로 찾는다", SQL: migrationEventByProjectKind},
+	{To: 20, Name: "계정 · 기기 토큰 · 행위자 칸, 옛 행을 소유자 계정에 귀속", SQL: migrationAccounts},
 }
 
 // pgBaseline 은 빈 Postgres DB 에 까는 기준선 단이다. 준비(초사용자) · 기준선(소유 역할) · 판 행이 한 트랜잭션이다 -

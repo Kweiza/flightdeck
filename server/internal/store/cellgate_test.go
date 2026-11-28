@@ -459,6 +459,7 @@ func TestStoreWriteStatementsHaveReadableShapes(t *testing.T) {
 func TestDynamicWriteStatementsHaveReadableShapes(t *testing.T) {
 	p, s := "p", "s"
 	dump := LedgerDump{
+		Accounts:  []LedgerAccount{{ID: "a"}},
 		Machines:  []LedgerMachine{{ID: "m"}},
 		Projects:  []LedgerProject{{ID: p}},
 		Sessions:  []LedgerSession{{ID: s}},
@@ -498,9 +499,9 @@ func TestDynamicWriteStatementsHaveReadableShapes(t *testing.T) {
 			}
 		}
 	}
-	// 되쓰기 여섯 표 · 옮기기 넷 · 줄 서기 · 자원 - 지은 문장이 빠짐없이 닿았다.
-	if len(tables) != 12 {
-		t.Errorf("잰 표 %d 개(%v), 바라는 것 12", len(tables), tables)
+	// 되쓰기 일곱 표 · 옮기기 넷 · 줄 서기 · 자원 - 지은 문장이 빠짐없이 닿았다.
+	if len(tables) != 13 {
+		t.Errorf("잰 표 %d 개(%v), 바라는 것 13", len(tables), tables)
 	}
 	for _, e := range []engine{engineSQLite, enginePG} {
 		if sh, err := shapeOf(e.deferForeignKeys()); err != nil || !sh.read {

@@ -170,12 +170,53 @@ func TestAppendOnlyRefusesUpdateDeleteTruncate(t *testing.T) {
 	}
 }
 
-// item_revision 은 내용 칼럼 여덟만 못 고친다(증분 017). project 는 항목을 옮길 때 함께 바뀌는 좌표다.
-// 옮기기는 FK 를 커밋까지 미뤄야 선다 — 항목의 키와 딸린 행의 키가 한 문장에 함께 못 바뀐다.
+// 행위자 칸(증분 020)은 추가 전용 트리거 밑에 있다: 판단의 author · via, 개정의 author 를 앱 역할도 주인도 못 고친다. 옛 행
+// 귀속은 소유 역할이 트리거를 끄고 돈다 - 앱 역할은 그 끄기부터 못 한다(표의 주인이 아니다). 새 표 넷의 행은 앱 역할이 쓴다.
+func TestActorColumnsStayAppendOnlyAndAccountTablesAreAppWritable(t *testing.T) {
+	db := openPG(t)
+	app, owner := as(t, db, pg.AppRole), as(t, db, pg.OwnerRole)
+	for _, who := range []*sql.Conn{app, owner} {
+		for _, q := range []string{"UPDATE judgment SET author = NULL", "UPDATE judgment SET via = 'cli'"} {
+			refused(t, who, q, "23000", "judgment_no_update", "judgment 는 추가 전용이다 — 정정은 새 행 + supersedes 로 남겨라")
+		}
+		refused(t, who, "UPDATE item_revision SET author = NULL", "23000", "item_revision_no_update",
+			"item_revision 은 추가 전용이다 — 개정은 새 rev 로 쌓아라")
+	}
+	for _, q := range []string{
+		"ALTER TABLE judgment DISABLE TRIGGER judgment_no_update",
+		"ALTER TABLE item_revision DISABLE TRIGGER item_revision_no_update",
+	} {
+		refused(t, app, q, "42501", "", "")
+	}
+
+	for _, q := range []string{
+		"INSERT INTO account(id, login, display_name, role, created_at) VALUES ('a1', 'alice', 'a', 'admin', " + at + ")",
+		"INSERT INTO invite(id, token_hash, created_by, role, created_at, expires_at) VALUES ('v1', 'th', 'a1', 'member', " + at + ", " + at + ")",
+		"INSERT INTO web_session(id_hash, account_id, created_at, expires_at, last_seen_at) VALUES ('w1', 'a1', " + at + ", " + at + ", " + at + ")",
+		"INSERT INTO device_code(code_hash, user_code, requested_name, requested_ip, requested_at, expires_at) VALUES ('d1', 'U', 'h', '192.0.2.1', " + at + ", " + at + ")",
+		"UPDATE account SET disabled_at = " + at,
+		"UPDATE invite SET revoked_at = " + at,
+		"UPDATE web_session SET last_seen_at = " + at,
+		"UPDATE device_code SET approved_by = 'a1', approved_at = " + at,
+		"UPDATE machine SET account_id = 'a1', token_hash = 'tk', token_prefix = 'fd_abcde', revoked_by = 'a1'",
+		"UPDATE session SET account_id = 'a1'",
+		"UPDATE item SET created_by = 'a1', created_session = 's1'",
+		"INSERT INTO judgment(id, at, kind, body, author, via) VALUES ('j2', " + at + ", 'decision', 'b', 'a1', 'cli')",
+		"DELETE FROM device_code", "DELETE FROM web_session", "DELETE FROM invite",
+	} {
+		mustExec(t, app, q)
+	}
+	if n := count(t, db, "SELECT count(*) FROM judgment WHERE author = 'a1' AND via = 'cli'"); n != 1 {
+		t.Errorf("앱 역할이 쓴 판단의 행위자 칸이 %d 행이다, 1 이어야 한다", n)
+	}
+}
+
+// item_revision 은 내용 칼럼 아홉만 못 고친다(증분 017 의 여덟에 증분 020 이 author 를 더했다). project 는 항목을 옮길 때 함께
+// 바뀌는 좌표다. 옮기기는 FK 를 커밋까지 미뤄야 선다 — 항목의 키와 딸린 행의 키가 한 문장에 함께 못 바뀐다.
 func TestItemRevisionFollowsMoveUnderDeferredForeignKeys(t *testing.T) {
 	db := openPG(t)
 	app := as(t, db, pg.AppRole)
-	for _, col := range []string{"item_id", "rev", "at", "session_id", "title", "body", "paths", "reason"} {
+	for _, col := range []string{"item_id", "rev", "at", "session_id", "title", "body", "paths", "reason", "author"} {
 		refused(t, app, "UPDATE item_revision SET "+col+" = "+col, "23000", "item_revision_no_update", "")
 	}
 	mustExec(t, app, "INSERT INTO item_after(project, item_id, dep_sha) VALUES ('p', 'i1', 'abc')")

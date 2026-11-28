@@ -19,7 +19,7 @@ import (
 // cmd/fd/outbox.go 가 같은 이유로 8MB 를 준다.
 const maxLineBytes = 8 << 20
 
-// Read 는 dir 의 원장 파일 일곱(manifest + JSONL 여섯)을 되읽는다.
+// Read 는 dir 의 원장 파일 여덟(manifest + JSONL 일곱)을 되읽는다.
 func Read(dir string) (store.LedgerDump, Manifest, error) {
 	var d store.LedgerDump
 	var m Manifest
@@ -39,6 +39,9 @@ func Read(dir string) (store.LedgerDump, Manifest, error) {
 			m.FormatVersion, FormatVersion)
 	}
 
+	if d.Accounts, err = readLines[store.LedgerAccount](dir, accountsFile); err != nil {
+		return d, m, err
+	}
 	if d.Machines, err = readLines[store.LedgerMachine](dir, machinesFile); err != nil {
 		return d, m, err
 	}

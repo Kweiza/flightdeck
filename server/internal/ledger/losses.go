@@ -1,4 +1,4 @@
-// Package ledger 는 판단의 FK 폐포(machine · project · session · judgment · judgment_link ·
+// Package ledger 는 판단의 FK 폐포(account · machine · project · session · judgment · judgment_link ·
 // snapshot)를 JSONL 로 내보내고 되읽는다.
 //
 // ★ 이름이 "backup" 이 아닌 이유: internal/store 에서 backup·BackupSuffix·<db>.bak-* 는
@@ -9,6 +9,8 @@ package ledger
 import (
 	"sort"
 	"strings"
+
+	"github.com/kweiza/flightdeck/internal/store"
 )
 
 // 링크가 가리키는 대상이 **복원된 DB 에서** 어떻게 되는가.
@@ -72,7 +74,9 @@ func Losses() []string {
 		"`rowid` — 복원 후 원본과 달라진다. 안정 식별자는 judgment.id 뿐이고 " +
 			"FTS 조인은 트리거가 같은 rowid 로 맞춘다",
 		"폐포 밖 표 전부(`item`·`job`·`counter`·`event`·`landing_queue` 등) — 원장은 판단의 FK 폐포 " +
-			"여섯 표만 담는다. `judgment_link.target_id` 는 FK 가 아니라(CHECK 만) 링크 자체는 " +
+			"일곱 표만 담는다. `judgment_link.target_id` 는 FK 가 아니라(CHECK 만) 링크 자체는 " +
 			"**언제나** 복원되고, 그것이 가리키는 대상은 종류마다 갈린다: " + linkFateSentence(),
+		"비밀 칸(`" + strings.Join(store.LedgerSecretColumns(), "`·`") + "`) - 원장은 매시간 지우지 않는 기록 저장소에 " +
+			"쌓이므로 싣지 않는다. 되쓴 계정은 암호 없이, 기기는 토큰 없이 돌아오고 다시 로그인한다",
 	}
 }

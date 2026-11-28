@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -15,6 +14,7 @@ import (
 // 사라지고 행은 그대로이며, 다시 올리면 같은 인덱스가 선다. 그 아래로는 거절하고 아무것도 안 바꾼다.
 
 // 내릴 수 있는 증분은 인덱스만 더한 것뿐이다. SQLite 증분 가운데 지금은 019 하나이고, 두 엔진의 019 가 같은 인덱스를 더한다.
+// 그 위의 020(계정 · 귀속)은 표 · 칸을 더하고 옛 행에 값을 쓰므로 내리지 않는다 - 판 20 원장은 19 로 못 내린다.
 func TestDownStepsLowerOnlyIndexOnlySteps(t *testing.T) {
 	var downable []int
 	for _, m := range migrations {
@@ -25,8 +25,17 @@ func TestDownStepsLowerOnlyIndexOnlySteps(t *testing.T) {
 	if !slices.Equal(downable, []int{19}) {
 		t.Fatalf("인덱스만 더한 SQLite 증분이 %v 다(기대 [19]) - 내림 · 이관 판 범위가 바뀐다", downable)
 	}
-	lite, _ := pg.IndexOnly(migrations[len(migrations)-1].SQL)
-	pgSide, _ := pg.IndexOnly(pg.Steps[len(pg.Steps)-1].SQL)
+	var lite, pgSide []string
+	for _, m := range migrations {
+		if m.To == 19 {
+			lite, _ = pg.IndexOnly(m.SQL)
+		}
+	}
+	for _, st := range pg.Steps {
+		if st.To == 19 {
+			pgSide, _ = pg.IndexOnly(st.SQL)
+		}
+	}
 	if !slices.Equal(lite, pgSide) || !slices.Equal(lite, []string{"event_by_project_kind"}) {
 		t.Fatalf("두 엔진의 019 가 더하는 인덱스가 다르다: SQLite %v · Postgres %v", lite, pgSide)
 	}
@@ -40,6 +49,8 @@ func TestDownStepsLowerOnlyIndexOnlySteps(t *testing.T) {
 		want     string
 	}{
 		{19, 17, "증분 18"},
+		{20, 19, "증분 20"},
+		{20, 18, "증분 20"},
 		{19, 19, "더 낮은 판으로만"},
 		{18, 19, "더 낮은 판으로만"},
 		{2, 1, "증분 2"},
@@ -73,24 +84,12 @@ func downFacts(t *testing.T, s *Store) (version int, row19 int, index bool, even
 }
 
 // 두 엔진에서: 판 19 원장을 18 로 내리면 그 인덱스와 판 19 행만 사라지고 행은 그대로다. 더 내리기(17)는 거절하고 아무것도 안
-// 바꾼다. 다시 올리면 같은 인덱스가 선다.
+// 바꾼다. 다시 올리면 같은 인덱스가 선다. 판 20 으로 올린 원장은 19 로도 못 내린다(증분 020 은 인덱스만 더한 것이 아니다).
 func TestMigrateDownIsLossless(t *testing.T) {
 	ctx := context.Background()
 	for _, eng := range []string{"sqlite", "postgres"} {
 		t.Run(eng, func(t *testing.T) {
-			var path string
-			var s *Store
-			if eng == "sqlite" {
-				path = filepath.Join(t.TempDir(), "fd.db")
-				mustMigrate(t, path)
-				var err error
-				if s, err = openSQLiteReader(ctx, path, ledgerDSN(path), quietLog()); err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { s.Close() })
-			} else {
-				path, s = pgMigrated(t)
-			}
+			path, s := ledgerAtVersion(t, eng, 19)
 			if _, err := s.db.ExecContext(ctx, `INSERT INTO event(at, project, kind, payload) VALUES (?, 'p', 'item.finish', '{}')`,
 				fmtTime(time.Now())); err != nil {
 				t.Fatal(err)
@@ -123,18 +122,25 @@ func TestMigrateDownIsLossless(t *testing.T) {
 				t.Fatalf("거절했는데 원장이 바뀌었다: 판 %d · 이벤트 %d", v, n)
 			}
 
-			// 다시 올린다. Postgres 는 판올림 전 덤프를 뜨므로 시험의 덤프 자리를 준다(덤프는 이 시험의 몫이 아니라 막는다).
-			if eng == "sqlite" {
-				mustMigrate(t, path)
-			} else {
-				m, run := pgMigrator(t, path, MigrateOptions{BackupDir: t.TempDir()})
-				run.backup = func(context.Context, *migrateSession, int) (string, error) { return "시험 덤프", nil }
-				if err := m.migrateTo(ctx, run); err != nil {
-					t.Fatalf("18→19 다시 올리기: %v", err)
+			// 다시 올린다.
+			up := func(target int) {
+				t.Helper()
+				if err := raiseLedger(t, path, target, nil); err != nil {
+					t.Fatalf("판 %d 로 다시 올리기: %v", target, err)
 				}
 			}
+			up(19)
 			if v, r, idx, n := downFacts(t, s); v != 19 || r != 1 || !idx || n != 1 {
 				t.Fatalf("다시 올린 뒤: 판 %d · 판 19 행 %d · 인덱스 %v · 이벤트 %d", v, r, idx, n)
+			}
+
+			// 판 20 은 내리지 않는다 - 거절하고 아무것도 안 바꾼다(인덱스 · 판 19 행 · 행 그대로).
+			up(SchemaVersion)
+			if err := MigrateTo(ctx, path, 19, quietLog()); err == nil || !strings.Contains(err.Error(), "증분 20") {
+				t.Fatalf("20→19 를 받았거나 사유가 다르다: %v", err)
+			}
+			if v, r, idx, n := downFacts(t, s); v != SchemaVersion || r != 1 || !idx || n != 1 {
+				t.Fatalf("20→19 를 거절했는데 원장이 바뀌었다: 판 %d · 판 19 행 %d · 인덱스 %v · 이벤트 %d", v, r, idx, n)
 			}
 		})
 	}

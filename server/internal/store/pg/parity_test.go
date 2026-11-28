@@ -280,10 +280,68 @@ func TestBothEnginesRefuseTheSameWrites(t *testing.T) {
 			reject(appendOnly, "DELETE FROM item_revision"),
 			// project 는 좌표라 트리거를 지나고, 옮긴 곳에 항목이 없어 FK 에 걸린다(증분 017).
 			reject(foreignKey, "UPDATE item_revision SET project = 'p2'"),
+			// 행위자 칸도 내용이다(증분 020): 판단은 칸을 가리지 않고, 개정은 갱신 금지 칸에 author 가 들었다.
+			reject(appendOnly, "UPDATE judgment SET author = NULL"),
+			reject(appendOnly, "UPDATE judgment SET via = 'cli'"),
+			reject(appendOnly, "UPDATE item_revision SET author = NULL"),
 			counted("SELECT count(*) FROM judgment", 1),
 			counted("SELECT count(*) FROM event", 1),
 			counted("SELECT count(*) FROM item_revision", 1),
 		}},
+		{"계정 · 초대 · 기기 코드 · 기기 토큰(증분 020)", slices.Concat(
+			[]step{
+				pass("INSERT INTO account(id, login, display_name, role, created_at) VALUES ('a1', 'alice', '앨리스', 'admin', " + at + ")"),
+				reject(unique, "INSERT INTO account(id, login, display_name, role, created_at) VALUES ('a2', 'alice', 'b', 'member', "+at+")"),
+				reject(check, "INSERT INTO account(id, login, display_name, role, created_at) VALUES ('a2', '', 'b', 'member', "+at+")"),
+				reject(notNull, "INSERT INTO account(id, display_name, role, created_at) VALUES ('a2', 'b', 'member', "+at+")"),
+				pass("INSERT INTO account(id, login, display_name, role, created_at) VALUES ('a2', 'bob', 'b', 'member', " + at + ")"),
+				reject(foreignKey, "INSERT INTO web_session(id_hash, account_id, created_at, expires_at, last_seen_at) VALUES ('w1', 'nope', "+at+", "+at+", "+at+")"),
+				pass("INSERT INTO web_session(id_hash, account_id, created_at, expires_at, last_seen_at) VALUES ('w1', 'a1', " + at + ", " + at + ", " + at + ")"),
+			},
+			each(check, "INSERT INTO account(id, login, display_name, role, created_at) VALUES ('a9', 'x', 'x', '%[1]s', "+at+")", "owner", "Admin", ""),
+			[]step{
+				pass("INSERT INTO invite(id, token_hash, created_by, role, created_at, expires_at) VALUES ('v1', 'th1', 'a1', 'member', " + at + ", " + at + ")"),
+				reject(unique, "INSERT INTO invite(id, token_hash, created_by, role, created_at, expires_at) VALUES ('v2', 'th1', 'a1', 'member', "+at+", "+at+")"),
+				reject(check, "INSERT INTO invite(id, token_hash, created_by, role, created_at, expires_at) VALUES ('v2', 'th2', 'a1', 'owner', "+at+", "+at+")"),
+				reject(foreignKey, "INSERT INTO invite(id, token_hash, created_by, role, created_at, expires_at) VALUES ('v2', 'th2', 'nope', 'member', "+at+", "+at+")"),
+				// 쓴 때와 쓴 계정은 함께 있거나 함께 없다. 쓴 초대는 철회하지 않는다.
+				reject(check, "UPDATE invite SET used_at = "+at+" WHERE id = 'v1'"),
+				reject(check, "UPDATE invite SET used_by = 'a2' WHERE id = 'v1'"),
+				pass("UPDATE invite SET used_at = " + at + ", used_by = 'a2' WHERE id = 'v1'"),
+				reject(check, "UPDATE invite SET revoked_at = "+at+" WHERE id = 'v1'"),
+				pass("INSERT INTO invite(id, token_hash, created_by, role, created_at, expires_at, revoked_at) VALUES ('v2', 'th2', 'a1', 'admin', " + at + ", " + at + ", " + at + ")"),
+
+				pass("INSERT INTO device_code(code_hash, user_code, requested_name, requested_ip, requested_at, expires_at) VALUES ('d1', 'ABCD-EFGH', 'h', '192.0.2.1', " + at + ", " + at + ")"),
+				reject(unique, "INSERT INTO device_code(code_hash, user_code, requested_name, requested_ip, requested_at, expires_at) VALUES ('d2', 'ABCD-EFGH', 'h', '192.0.2.1', "+at+", "+at+")"),
+				// 승인한 계정과 승인한 때는 함께 있거나 함께 없다. 낸 기기는 승인 뒤에만 있다.
+				reject(check, "UPDATE device_code SET approved_by = 'a1' WHERE code_hash = 'd1'"),
+				reject(check, "UPDATE device_code SET approved_at = "+at+" WHERE code_hash = 'd1'"),
+				reject(check, "UPDATE device_code SET issued_machine = 'm' WHERE code_hash = 'd1'"),
+				reject(foreignKey, "UPDATE device_code SET invite_id = 'nope' WHERE code_hash = 'd1'"),
+				pass("UPDATE device_code SET approved_by = 'a1', approved_at = " + at + ", issued_machine = 'm', invite_id = 'v1' WHERE code_hash = 'd1'"),
+				// machine_hint 는 FK 가 없다 - 클라이언트가 보낸 옛 id 라 없는 기기를 가리킬 수 있다.
+				pass("INSERT INTO device_code(code_hash, user_code, machine_hint, requested_name, requested_ip, requested_at, expires_at) VALUES ('d2', 'IJKL-MNOP', 'nope', 'h', '192.0.2.2', " + at + ", " + at + ")"),
+
+				// 토큰 지문은 기기마다 하나이고, 토큰 없는 기기(NULL)는 몇이든 된다.
+				pass("UPDATE machine SET account_id = 'a1', token_hash = 'tk1' WHERE id = 'm'"),
+				reject(unique, "INSERT INTO machine(id, hostname, first_seen, last_seen, token_hash) VALUES ('m2', 'h', "+at+", "+at+", 'tk1')"),
+				pass("INSERT INTO machine(id, hostname, first_seen, last_seen) VALUES ('m2', 'h', " + at + ", " + at + ")"),
+				pass("INSERT INTO machine(id, hostname, first_seen, last_seen) VALUES ('m3', 'h', " + at + ", " + at + ")"),
+				reject(foreignKey, "UPDATE machine SET revoked_by = 'nope' WHERE id = 'm2'"),
+				reject(foreignKey, "UPDATE session SET account_id = 'nope' WHERE id = 's1'"),
+				reject(foreignKey, "UPDATE item SET created_session = 'nope' WHERE id = 'i1'"),
+				pass("UPDATE item SET created_by = 'a1', created_session = 's1' WHERE id = 'i1'"),
+				// 계정을 가리키는 행이 있으면 계정을 못 지운다(CASCADE 가 없다).
+				reject(foreignKey, "DELETE FROM account WHERE id = 'a1'"),
+			},
+			each(okay, "INSERT INTO judgment(id, at, kind, body, author, via) VALUES ('jv%[1]s', "+at+", 'decision', 'b', 'a1', '%[1]s')", "session", "web", "cli"),
+			each(check, "INSERT INTO judgment(id, at, kind, body, via) VALUES ('jx', "+at+", 'decision', 'b', '%[1]s')", "mail", "Web", ""),
+			[]step{
+				reject(foreignKey, "INSERT INTO judgment(id, at, kind, body, author) VALUES ('jy', "+at+", 'decision', 'b', 'nope')"),
+				counted("SELECT count(*) FROM account", 2),
+				counted("SELECT count(*) FROM judgment WHERE author = 'a1'", 3),
+			},
+		)},
 		{"FK 와 함께 지우기", []step{
 			reject(foreignKey, "INSERT INTO session(id, project, machine_id, worktree, cc_session_id, opened_at) VALUES ('s3', 'nope', 'm', '/w3', 'c3', "+at+")"),
 			reject(foreignKey, "INSERT INTO judgment(id, at, kind, body, supersedes) VALUES ('j2', "+at+", 'decision', 'b', 'nope')"),

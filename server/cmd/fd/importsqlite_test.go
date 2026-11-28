@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -73,6 +74,10 @@ func TestMigrateImportSQLiteSurface(t *testing.T) {
 	if !strings.Contains(last(), "이관 표지를 남겼다: "+store.MovedMarker(src)) || !rewrote(last()) ||
 		!strings.Contains(last(), "바꾼 칸 전부(행 키 · 칸 · JSON 자리 · 원래 바이트)를 "+src+".rewritten-") {
 		t.Fatalf("옮긴 뒤 이관 표지나 바꿔 옮긴 칸 · 그 기록 파일을 말하지 않는다:\n%s", last())
+	}
+	// 원본의 소유자 귀속을 대조표 위에 적는다(판정에는 안 든다): 이 판의 서버가 쓴 기기는 계정 칸이 빈다.
+	if !strings.Contains(last(), "소유자 계정 없다 · 빈 행위자 칸 1") || !regexp.MustCompile(`machine\.account_id +빈 칸 1 / 1 행`).MatchString(last()) {
+		t.Fatalf("옮긴 보고가 원본의 소유자 귀속을 적지 않는다:\n%s", last())
 	}
 	step(1, "다시 옮기지 않는다", "import-sqlite", "--from", src, "--db", dsn)
 	step(0, "두 원장이 맞다", "verify", "--from", src, "--db", dsn)

@@ -528,8 +528,8 @@ func TestLedgerBackupBytesMatchAcrossEngines(t *testing.T) {
 		got[name] = files
 	}
 
-	if len(want) < 7 {
-		t.Fatalf("원장 파일이 %d개다 - 여섯 표 + 매니페스트여야 한다: %v", len(want), slices.Sorted(maps.Keys(want)))
+	if len(want) < 8 {
+		t.Fatalf("원장 파일이 %d개다 - 일곱 표 + 매니페스트여야 한다: %v", len(want), slices.Sorted(maps.Keys(want)))
 	}
 	for _, f := range slices.Sorted(maps.Keys(want)) {
 		lite, pg := got["sqlite"][f], got["postgres"][f]

@@ -4,7 +4,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"testing"
+
+	"github.com/kweiza/flightdeck/internal/store/storetest"
 )
 
 // mustMigrate 는 시험이 쓸 DB 를 이 바이너리의 스키마까지 올린다.
@@ -32,4 +35,38 @@ func mustMigrateTo(t *testing.T, path string, target int) {
 	if err := MigrateTo(context.Background(), path, target, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
 		t.Fatalf("DB 적용 실패(%s, target=%d): %v", path, target, err)
 	}
+}
+
+// ledgerAtVersion 은 eng("sqlite" · "postgres") 엔진의 빈 원장을 판 v 까지 올려 낸다: 원장 자리(SQLite 파일 경로 · Postgres 접속
+// URL)와 그 원장을 연 Store. 증분 하나의 앞뒤를 재는 시험이 그 판에서 행을 심고 raiseLedger 로 올린다.
+func ledgerAtVersion(t *testing.T, eng string, v int) (string, *Store) {
+	t.Helper()
+	ctx := context.Background()
+	if eng == "postgres" {
+		path := storetest.NewBare(t, "")
+		if err := MigrateTo(ctx, path, v, quietLog()); err != nil {
+			t.Fatalf("빈 Postgres 원장을 판 %d 로: %v", v, err)
+		}
+		return path, pgOpen(t, path)
+	}
+	path := filepath.Join(t.TempDir(), "fd.db")
+	mustMigrateTo(t, path, v)
+	s, err := openSQLiteReader(ctx, path, ledgerDSN(path), quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return path, s
+}
+
+// raiseLedger 는 path 원장(두 엔진)을 판 target 까지 올린다. 판올림 전 백업은 막는다 - 이 시험들의 몫이 아니고, Postgres 의
+// 덤프는 pg_dump 를 부른다. edit 가 nil 이 아니면 증분 목록을 바꿔 넣는다(증분 하나를 망가뜨려 보는 시험).
+func raiseLedger(t *testing.T, path string, target int, edit func([]Migration) []Migration) error {
+	t.Helper()
+	m, run := pgMigrator(t, path, MigrateOptions{Target: target, BackupDir: t.TempDir()})
+	run.backup = func(context.Context, *migrateSession, int) (string, error) { return "시험 덤프", nil }
+	if edit != nil {
+		run.steps = edit(run.steps)
+	}
+	return m.migrateTo(context.Background(), run)
 }

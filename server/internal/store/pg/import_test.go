@@ -519,8 +519,9 @@ func TestUniquesMatchTheBaseline(t *testing.T) {
 		}
 		n += len(got)
 	}
-	if n != len(pg.Tables())+4 { // 표마다 기본키 하나 + UNIQUE 제약 하나 + 부분 · UNIQUE 인덱스 셋
-		t.Fatalf("기준선의 유일 인덱스 %d 개, 기대 %d 개", n, len(pg.Tables())+4)
+	// 표마다 기본키 하나 + 기준선의 UNIQUE 제약 하나 · 부분 · UNIQUE 인덱스 셋 + 증분 020 의 UNIQUE 제약 셋 · UNIQUE 인덱스 하나
+	if n != len(pg.Tables())+8 {
+		t.Fatalf("기준선의 유일 인덱스 %d 개, 기대 %d 개", n, len(pg.Tables())+8)
 	}
 }
 
@@ -533,7 +534,9 @@ func TestIdentifierColumnsMatchTheBaseline(t *testing.T) {
 	// FK 가 없는 참조 칸: 다른 행(항목 · 작업 · 커밋 · 세션 · 프로젝트)을 이름으로 가리킨다.
 	byName := []string{"item_after.dep_item", "item_after.dep_job", "item_after.dep_sha", "item_after.dep_project",
 		"pick_eval.project", "pick_eval.session_id", "pick_eval.picked", "judgment_link.target_project",
-		"resource_hold.job_id", "job.item_id", "event.project", "event.session_id"}
+		"resource_hold.job_id", "job.item_id", "event.project", "event.session_id",
+		// 증분 020: 기기 코드 흐름에서 클라이언트가 보낸 옛 machine-id. 없는 기기일 수 있어 FK 가 없다.
+		"device_code.machine_hint"}
 	inBaseline := map[string]bool{}
 	for _, tb := range pg.Tables() {
 		for _, r := range strs(t, db, `SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid
@@ -762,19 +765,21 @@ func TestIndexOnly(t *testing.T) {
 }
 
 // 이관 판 범위는 ImportFloor 하나에서 온다: 이관 판에서 아래로 인덱스만 더한 증분을 거슬러 닿는 판이고 기준선 아래로는 안 간다. 지금
-// 증분은 019(인덱스 하나)뿐이라 범위는 기준선(18)부터 19 다.
+// 꼭대기 증분 020 이 표 · 칸을 더했으므로(계정 표 넷 · 행위자 칸) 범위는 판 20 하나다 - 그 아래 019 가 인덱스만 더한 것이어도
+// 020 에서 선다.
 func TestImportFloorFollowsTheIndexOnlySteps(t *testing.T) {
-	if got := pg.ImportFloor(); got != pg.BaselineVersion || pg.BaselineVersion != 18 || pg.ImportVersion != 19 {
-		t.Fatalf("ImportFloor = %d(기준선 %d, 이관 판 %d) - 판 18-19 이어야 한다", got, pg.BaselineVersion, pg.ImportVersion)
+	if got := pg.ImportFloor(); got != 20 || pg.BaselineVersion != 18 || pg.ImportVersion != 20 {
+		t.Fatalf("ImportFloor = %d(기준선 %d, 이관 판 %d) - 판 20 하나여야 한다", got, pg.BaselineVersion, pg.ImportVersion)
 	}
-	for v, want := range map[int]bool{17: false, 18: true, 19: true, 20: false} {
+	for v, want := range map[int]bool{18: false, 19: false, 20: true, 21: false} {
 		if got := pg.Transferable(v); got != want {
 			t.Errorf("Transferable(%d) = %v(기대 %v)", v, got, want)
 		}
 	}
 	for _, s := range pg.Steps {
-		if _, ok := pg.IndexOnly(s.SQL); !ok {
-			t.Errorf("증분 %d(%s)가 인덱스만 더한 것이 아니다 - 범위가 그 아래로 내려가지 않는다", s.To, s.Name)
+		_, ok := pg.IndexOnly(s.SQL)
+		if want := s.To == 19; ok != want {
+			t.Errorf("증분 %d(%s)의 「인덱스만」 판정이 %v 다(기대 %v)", s.To, s.Name, ok, want)
 		}
 	}
 

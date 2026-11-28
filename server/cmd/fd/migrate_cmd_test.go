@@ -110,31 +110,39 @@ func TestMigrateToStopsAtTheRequestedVersion(t *testing.T) {
 }
 
 // 지금보다 낮은 --to 는 인덱스만 더한 판을 내린다(기록을 잃지 않는다): 19→18 은 되고, 서버는 그 원장을 (판이 낮아) 거절하고, 다시
-// 올리면 연다. 표를 바꾼 판(18→17)은 거절하고 판올림 전 사본으로 되돌리는 길을 말한다.
+// 올리면 연다. 표를 바꾼 판(18→17, 20→19)은 거절하고 판올림 전 사본으로 되돌리는 길을 말한다.
+//
+// ★ 판 번호가 리터럴이다(SchemaVersion-1 이 아니다). 내릴 수 있는 증분은 019 하나이고(store.TestDownStepsLowerOnlyIndexOnlySteps),
+// 그 사실은 뒤에 증분이 더 붙어도 안 변한다 - 020 이 붙은 뒤로 지금 판에서 한 판 내리기는 거절이다.
 func TestMigrateToLowersAnIndexOnlyStep(t *testing.T) {
 	h := newHarness(t)
 	path := filepath.Join(t.TempDir(), "fd.db")
-	if rc, out := h.run("", "migrate", "--db", path); rc != 0 {
-		t.Fatalf("적용 실패(rc=%d): %s", rc, out)
+	if rc, out := h.run("", "migrate", "--db", path, "--to", "19"); rc != 0 {
+		t.Fatalf("판 19 적용 실패(rc=%d): %s", rc, out)
 	}
-	rc, out := h.run("", "migrate", "--db", path, "--to", itoa(int64(store.SchemaVersion-1)))
-	if rc != 0 || !strings.Contains(out, "맞췄다: 스키마 "+itoa(int64(store.SchemaVersion-1))+"판") {
+	rc, out := h.run("", "migrate", "--db", path, "--to", "18")
+	if rc != 0 || !strings.Contains(out, "맞췄다: 스키마 18판") {
 		t.Fatalf("내림이 rc=%d 로 끝났거나 판을 안 말한다: %s", rc, out)
 	}
 	if s, err := store.Open(path); err == nil {
 		s.Close()
 		t.Fatal("내렸다는데 서버가 그대로 연다")
 	}
-	rc, out = h.run("", "migrate", "--db", path, "--to", itoa(int64(store.SchemaVersion-2)))
-	if rc == 0 || !strings.Contains(out, "인덱스만 더한 것이 아니라") || !strings.Contains(out, "fd migrate --rollback") {
-		t.Fatalf("표를 바꾼 판을 내렸거나 사유가 없다(rc=%d): %s", rc, out)
+	refused := func(to string) {
+		t.Helper()
+		rc, out := h.run("", "migrate", "--db", path, "--to", to)
+		if rc == 0 || !strings.Contains(out, "인덱스만 더한 것이 아니라") || !strings.Contains(out, "fd migrate --rollback") {
+			t.Fatalf("--to %s: 표를 바꾼 판을 내렸거나 사유가 없다(rc=%d): %s", to, rc, out)
+		}
 	}
+	refused("17")
 	if rc, out := h.run("", "migrate", "--db", path); rc != 0 {
 		t.Fatalf("다시 올리기 실패(rc=%d): %s", rc, out)
 	}
+	refused("19")
 	s, err := store.Open(path)
 	if err != nil {
-		t.Fatalf("다시 올린 원장을 못 연다: %v", err)
+		t.Fatalf("다시 올린 원장을 못 연다(거절한 내림이 원장을 바꿨나): %v", err)
 	}
 	s.Close()
 }
@@ -253,7 +261,7 @@ func TestMigrateRollbackRemovesTheStaleJournal(t *testing.T) {
 // --db 로 준 원장의 판올림이 커밋된 단 뒤에서 서면, 실패 안내가 내는 되돌리기 명령은 **그 원장**을 되돌린다 - 이 환경의 기본 원장
 // (FD_DB)이 아니다. 안내의 명령을 셸이 읽는 그대로 갈라(공백 · 작은따옴표가 든 경로) 기본 원장이 따로 있는 환경에서 돌린다.
 //
-// ★ 증분 019 가 만들 인덱스 이름을 표로 먼저 차지해 둔다 - 018 은 커밋되고 019 가 선다(각 단은 자기 트랜잭션이다).
+// ★ 맨 위 증분(020)이 만들 표 이름을 먼저 차지해 둔다 - 그 아래 단(019)은 커밋되고 020 이 선다(각 단은 자기 트랜잭션이다).
 func TestFailedUpgradeHintRollsBackTheLedgerItNamed(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("안내의 명령을 POSIX 셸로 가른다")
@@ -295,7 +303,7 @@ func TestFailedUpgradeHintRollsBackTheLedgerItNamed(t *testing.T) {
 	if rc, out := h.runEnv(env, "", "migrate", "--db", a, "--to", itoa(store.SchemaVersion-2)); rc != 0 {
 		t.Fatalf("대상 원장 준비 실패(rc=%d): %s", rc, out)
 	}
-	selfcheckDBAt(t, a, `CREATE TABLE event_by_project_kind(x INTEGER)`)
+	selfcheckDBAt(t, a, `CREATE TABLE account(x INTEGER)`)
 
 	rc, out := h.runEnv(env, "", "migrate", "--db", a)
 	if rc != 1 {

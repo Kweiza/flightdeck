@@ -286,7 +286,7 @@ GHE push 도 이 구현 어디에도 없고, 그 셋을 어떻게 쪼갤지는 �
 
 ---
 
-## 3. 데이터 모델 — 원장 하나, 테이블 26개, 계층 셋
+## 3. 데이터 모델 — 원장 하나, 테이블 30개, 계층 셋
 
 계층이 곧 쓰기 권한이다.
 
@@ -296,6 +296,17 @@ GHE push 도 이 구현 어디에도 없고, 그 셋을 어떻게 쪼갤지는 �
 | **Q — 큐** | 항목·의존·선점·판정이력 | 사람은 `title`·`body`·`reason` 만. 나머지는 서버가 채운다 |
 | **J — 판단** | 핸드오프·결정·기각·스냅숏 | 사람만. **추가 전용**(UPDATE·DELETE 트리거로 차단) |
 
+계층 셋 밖에 **계정**이 있다(증분 020): `account`(사람 · 역할) · `invite`(초대 링크) · `web_session`(웹 로그인 쿠키) ·
+`device_code`(`fd login` 의 기기 코드 흐름), 그리고 행위자 칸: `machine` 의 계정 · 이름 · 토큰 지문(`token_hash`, 원문은
+어디에도 없다) · 토큰 주소(`token_origin`) · 철회, `session.account_id`, `item.created_by` · `created_session`,
+`judgment.author` · `via`(session · web · cli), `item_revision.author`. 판단 · 개정의 작성자 칸은 추가 전용 트리거가 덮는다
+(`item_revision_no_update` 의 갱신 금지 칸에 `author` 가 들었다). 칸은 아직 NULL 을 받는다. 쓰기가 행위자를 토큰에서 읽는
+단계가 NOT NULL 로 닫는다. 증분 020 은 옛 행을 소유자 계정(`owner`, admin, 암호 없음)에 귀속한다: 행이 있는 원장에만 그
+계정을 만들고, 한 트랜잭션 안에서 추가 전용 트리거를 끄고(SQLite 는 지웠다 같은 글로 다시 만들고) 칸을 채운 뒤 켜며, 표마다
+바꾼 행 수를 그 표의 행 수와 맞대 어긋나면 증분 전체를 되감는다. `judgment.via` 는 세션이 있으면 session, 세션 없이 제목
+머리가 `[fdboard]` 면 web(보드의 소유자 노트), 그 밖은 cli 다. 원장 백업(JSONL)의 폐포에 `account` 가 들었고, 비밀 칸
+(`account.password_hash` · `machine.token_hash`)은 싣지 않는다. 백업은 지워지지 않는 기록 저장소에 매시간 쌓인다.
+
 정본은 Postgres 기준선 `server/internal/store/pg/001_baseline.sql`(빈 DB 의 준비는 `pg/bootstrap.sql`)과 그 위 증분
 (`pg.Steps`, 019 부터)이다. 기준선은 SQLite 판 18 을 접어 넣고 그 판에서 얼었다. 옮기는 동안 SQLite 에 오르는 증분은
 같은 뜻 · 같은 판 번호의 PG 증분을 함께 둔다 — 짝이 없으면 `TestPGStepsFollowTheSQLiteVersion` 이, 뜻이 갈리면
@@ -303,21 +314,22 @@ GHE push 도 이 구현 어디에도 없고, 그 셋을 어떻게 쪼갤지는 �
 증분)은 옮기는 동안만 산다. 원장은 배포마다 둘 중 하나다(「배치」 절의
 Tier A). 아래는 그 요지와 **각 제약이 막는 사고**다.
 
-**★ 26 은 세는 축을 밝혀 둔다 — 안 밝히면 다음 사람이 다른 축을 세고 어긋났다고 판단한다.**
-PG 기준선이 선언한 것 = `pg/001_baseline.sql` 의 `CREATE TABLE` 26. SQLite 판은 둘을 더 선언해 28 이다
-(`schema.sql` 의 `CREATE TABLE` 21 + `CREATE VIRTUAL TABLE` 1 + 증분 6 — `idempotency` 002 · `landing_queue` 003 ·
-`landing_queue_resource` 008 · `project_member` 014 · `item_revision` 016 · `session_inbox` 018):
+**★ 30 은 세는 축을 밝혀 둔다 — 안 밝히면 다음 사람이 다른 축을 세고 어긋났다고 판단한다.**
+PG 가 선언한 것 = `pg/001_baseline.sql` 의 `CREATE TABLE` 26 + 증분 020 의 4(`account` · `invite` · `web_session` ·
+`device_code`) = 30. SQLite 판은 둘을 더 선언해 32 다
+(`schema.sql` 의 `CREATE TABLE` 21 + `CREATE VIRTUAL TABLE` 1 + 증분 10 — `idempotency` 002 · `landing_queue` 003 ·
+`landing_queue_resource` 008 · `project_member` 014 · `item_revision` 016 · `session_inbox` 018 · 계정 넷 020):
 
 - **`judgment_fts`** — FTS5 가상 표. PG 에서는 `judgment` 의 pg_trgm GIN 식 인덱스가 그 자리라 표가 아니다.
 - **`item_dependents`** — 증분 011 이 DROP 한 죽은 표. 선언은 `schema.sql` 에 그대로 남아 있지만
   (정의를 두 자리에 두지 않는다는 규율 — `BaseSchemaVersion` 주석) **어떤 DB 에도 그 표는
   없다.** 빈 DB 도 "schema.sql → 증분 전부"를 거치므로 만들었다가 지운다. 기준선은 옮기지 않았다.
 
-살아 있는 SQLite DB 에서 `sqlite_master` 를 그대로 세면 **32** 가 나온다: 28 − 1(`item_dependents`) + 4(FTS5 가
+살아 있는 SQLite DB 에서 `sqlite_master` 를 그대로 세면 **36** 이 나온다: 32 − 1(`item_dependents`) + 4(FTS5 가
 `judgment_fts` 뒤에 만드는 그림자 표 `judgment_fts_config`·`_data`·`_docsize`·`_idx`) + 1(`AUTOINCREMENT` 표가 공유하는
 `sqlite_sequence`). 다섯은 SQLite 엔진의 부산물이고 `item_dependents` 는 은퇴한 선언이라 **둘 다 이 절이 말하는 데이터
-모델이 아니다** — 그래서 이 절은 26 을 쓴다. 산식의 검산은 `store/schema_table_count_test.go` 가 두 엔진을 함께
-**이름 목록으로** 잠근다: PG 기준선 = `wantTables`(26), SQLite = 그것 + `sqliteOnlyTables`(28). 수만 맞추는 시험이
+모델이 아니다** — 그래서 이 절은 30 을 쓴다. 산식의 검산은 `store/schema_table_count_test.go` 가 두 엔진을 함께
+**이름 목록으로** 잠근다: PG = `wantTables`(30), SQLite = 그것 + `sqliteOnlyTables`(32). 수만 맞추는 시험이
 아니다 — 하나를 지우고 하나를 더하면 거기서 빨개진다.
 
 **실측(2026-09-16, 운영 원장 `mode=ro` 사본):** 판 15 에서 `sqlite_master` 30개
@@ -1861,7 +1873,8 @@ fail-open 기록은 없다. 압력이 실물로 관측된 적이 없고, 근거 
 N-1 까지만 올려 두고 옛 바이너리로 계속 도는 선택지를 준다 — 그것이 없으면 판올림은
 전부 아니면 전무다. N 이 지금 판보다 낮으면 **내림**이다(2026-11-27): 인덱스만 더한 증분(`pg.IndexOnly` - 본문이
 `CREATE INDEX` 뿐인 증분)만 그 인덱스를 지우고 판 행을 지워 내리고, 기록은 한 행도 안 건드린다(`store.DownSteps`). 표 · 칸을
-바꾼 증분과 Postgres 기준선 아래로는 거절하고 아무것도 안 바꾼다. 판 19 원장을 판 18 바이너리로 띄우는 길이 이것이다 -
+바꾼 증분과 Postgres 기준선 아래로는 거절하고 아무것도 안 바꾼다(판 20 → 19 가 그렇다 - 증분 020 은 표 · 칸을 더하고 옛
+행에 소유자 계정을 적었다). 판 19 원장을 판 18 바이너리로 띄우는 길이 이것이다 -
 `--rollback` 은 판올림 전 사본으로 덮어 그 뒤의 기록을 잃으므로, 인덱스만 더한 판을 물리는 데는 쓰지 않는다. `--rollback`
 이 그 증분을 스스로 내리게 하지 않은 까닭: 그 명령의 뜻은 「판올림 전 사본으로 돌아간다」이고, 사본이 없거나 거절된 자리에서
 다른 일을 하면 같은 명령이 두 뜻이 된다.
@@ -1917,8 +1930,8 @@ N-1 까지만 올려 두고 옛 바이너리로 계속 도는 선택지를 준�
 
 | 처방 | 상태 | 실제 |
 |---|---|---|
-| 판단을 DB 밖으로 내보내기 | 있음 | `fd export --judgments` 가 FK 폐포 여섯 표(`judgment`·`judgment_link`·`snapshot`·`session`·`project`·`machine`) 전량을 JSONL 로 낸다. 손으로 부른다 |
-| 매시간 자동 실행 | 있음 | `fd serve` 가 소유하는 티커다(`cmd/fd/ledgerbackup.go`). 기동 직후 한 번, 그 뒤 매시간. **안 바뀌었으면 안 쓴다** — 데이터 여섯이 바이트 동일하면 건너뛴다(매니페스트의 `exported_at` 은 회차마다 달라지므로 비교에서 뺀다) |
+| 판단을 DB 밖으로 내보내기 | 있음 | `fd export --judgments` 가 FK 폐포 일곱 표(`judgment`·`judgment_link`·`snapshot`·`session`·`project`·`machine`·`account` - 계정은 증분 020 부터, 비밀 칸 `password_hash`·`token_hash` 는 뺀다) 전량을 JSONL 로 낸다. 손으로 부른다 |
+| 매시간 자동 실행 | 있음 | `fd serve` 가 소유하는 티커다(`cmd/fd/ledgerbackup.go`). 기동 직후 한 번, 그 뒤 매시간. **안 바뀌었으면 안 쓴다** — 데이터 일곱이 바이트 동일하면 건너뛴다(매니페스트의 `exported_at` 은 회차마다 달라지므로 비교에서 뺀다) |
 | DB 와 다른 볼륨 | 있음 | `compose.yaml` 이 `$FD_LEDGER:/ledger` 를 따로 붙인다. **기본값은 여전히 같은 디스크다**(`~/.flightdeck-ledger` 는 `~/.flightdeck` 의 형제다) — 이 줄이 사는 것은 *가를 수 있는 자리*이지 분리 그 자체가 아니다. 진짜 분리는 `FD_LEDGER_HOST` 를 다른 매체로 겨눠야 성립한다 |
 | bare 레포 커밋(`journal.git`) | 있음 | `$FD_LEDGER/journal.git` 에 회차마다 한 커밋. **가드를 안 건드렸다** — `JudgeOutTarget` 이 막는 것은 판단 본문이 남의 레포 **작업본**에 쌓이는 사고인데, bare 레포에는 작업 트리가 없어 그 관심사가 성립하지 않는다. 작업 트리 없이 `hash-object`→`mktree`→`commit-tree`→`update-ref` 로만 쌓는다. **디스크에 실린 바이트를 쌓지 갓 인코딩한 것을 쌓지 않는다** — 매니페스트의 `exported_at` 이 회차마다 달라 후자면 안 바뀐 회차도 커밋이 생긴다 |
 | 6시간 `VACUUM INTO` | **없음** | `VACUUM INTO` 는 있지만 마이그레이션 직전 1회다(`Store.backup`). 정기 작업이 아니다 |
@@ -1933,7 +1946,7 @@ N-1 까지만 올려 두고 옛 바이너리로 계속 도는 선택지를 준�
 **사람이 손으로 만들었다.**
 
 **이 내보내기가 안 덮는 것.** 아웃박스에 갇힌 판단은 안 잡힌다(이 머신에 실제로 1건).
-무손실 복원의 FK 폐포는 여섯 표이고 **원장은 그것을 통째로 담는다** — 빈 DB 에 되쓰면
+무손실 복원의 FK 폐포는 일곱 표이고 **원장은 그것을 통째로 담는다** — 빈 DB 에 되쓰면
 미리 심어 둘 것이 하나도 없다. 대신 폐포 **밖** 표(`item`·`job`·`counter`·`event`·`landing_queue` 등)는
 안 담으므로, 복원된 DB 에서 `judgment_link` 가 가리키는 항목은 없다(링크 자체는 복원된다 —
 `target_id` 는 FK 가 아니라 CHECK 뿐이다). 코드가 `ledger.Losses()` 로 이 목록을 열거하고
@@ -2060,7 +2073,8 @@ compose 두 번째 서비스) 중 **티커**를 골랐다. `selfwatch` 가 정�
 `snapshot.project → project`, `judgment.supersedes → judgment` 가 전부 FK 이고
 `foreign_keys=1` 이 항상 걸린다. 그리고 **`session.id` 는 서버 발급 ULID 라 새 DB 에서 재현할 수
 없다** — `project`·`machine` 은 사람과 클라이언트가 정한 이름이라 다시 부를 수 있지만 세션은 아니고,
-판단의 85%가 그것을 가리킨다. 그래서 구현된 `fd export --judgments` 는 **폐포 여섯 표를 통째로 담는다.**
+판단의 85%가 그것을 가리킨다. 그래서 구현된 `fd export --judgments` 는 **폐포 여섯 표를 통째로 담는다**(증분 020 뒤로
+`judgment.author` · `machine.account_id` 가 가리키는 `account` 까지 일곱).
 그리고 형식은 마크다운이 아니라 **JSONL 하나**다.
 
 **열화 경로를 시험으로 강제한다** — 서버를 죽인 상태에서 `open → note(아웃박스) → pick(캐시 또는 거절) → finish(거절) → 재기동 → 재생`
@@ -2305,14 +2319,17 @@ YAML 전체를 들이면 그 파서가 읽는 모든 것(앵커·별칭·태그�
 
 - **기본은 그대로다.** 이 판까지 기본 배포는 SQLite 파일 원장이고, Postgres 는 소유자가 덮개 파일을 얹어 고를 때만
   켜진다(「배치」 절의 Tier A). 갱신이 원장을 바꾸지 않는다.
-- **옮기기는 한 트랜잭션이고 맞댄 뒤에만 커밋한다.** `fd migrate import-sqlite` 가 이관 판 범위(18-19)의 SQLite 원장을 **빈**
+- **옮기기는 한 트랜잭션이고 맞댄 뒤에만 커밋한다.** `fd migrate import-sqlite` 가 이관 판 범위(지금은 20 한 판)의 SQLite 원장을 **빈**
   Postgres 원장으로 옮기고, 같은 트랜잭션 안에서 표마다 행 수 · 전 칸 지문 · identity 순번을 맞대 어긋나면 되감는다.
   `--dry-run` 이 같은 길을 끝까지 돌고 되감는다. `fd migrate verify` 가 그 대조만 다시 한다. 이관 판 범위보다 옛 원장은
   먼저 SQLite 판에서 올린다 — 옛 판을 건너 옮기는 길은 만들지 않는다(옮기는 코드가 표 · 칸 목록 한 벌만 안다). 범위는 그
   목록이 그대로 맞는 판들이다: 이관 판에서 내려가며 인덱스만 더한 증분(`pg.IndexOnly`)을 걷어 낸 바닥(`pg.ImportFloor`)부터
   이관 판까지. 규칙은 `pg.Transferable` 하나이고 원본(이관 · 대조) · 대상 · 역이관 원본의 세 문이 `store.transferPlan` 으로
-  같은 규칙을 쓴다 - 증분마다 「이관 판 = 마지막 판」을 다시 맞추던 결박이 풀려, 옛 판(18)에서 옮기다 선 배포를 이 판으로
-  이어 가도 대조가 판 18 원본을 받는다. 사전 검사는 인덱스 키 칸의 바이트 상한(`pg.Column.MaxBytes` - event 의 project
+  같은 규칙을 쓴다 - 증분마다 「이관 판 = 마지막 판」을 다시 맞추던 결박이 풀려, 인덱스만 더한 증분 019 가 오른 동안은
+  옛 판(18)에서 옮기다 선 배포를 이어 가도 대조가 판 18 원본을 받았다. 증분 020(계정 · 귀속)은 인덱스만 더한 것이 아니라
+  범위가 다시 한 판(20)이 됐다 - 옛 판에서 옮기다 선 배포는 그 판으로 마저 가거나 되돌아간 뒤 갱신한다(README 「켜기 전에
+  섰을 때」). 이관의 보고는 원본의 소유자 귀속(소유자 계정이 있는가, 행위자 칸마다 빈 행 수)도 적지만 판정에는 넣지 않는다 -
+  이 판의 쓰기는 아직 행위자 칸을 채우지 않는다. 사전 검사는 인덱스 키 칸의 바이트 상한(`pg.Column.MaxBytes` - event 의 project
   2048 · kind 512)도 잰다: 증분 019 의 `(project, kind, id)` 인덱스는 Postgres B-tree 항목 상한(약 2.7KB)을 넘는 행 하나로
   `CREATE INDEX` 가 실패하고, 그 오류는 행을 대지 않는다. 같은 상한을 Postgres 판올림도 덤프 · 증분 전에 잰다(`keyLimitGate`)
   - 넘는 행이 있으면 행 좌표를 대고 판을 올리지 않는다. 행을 고치라고 하지 않는다: 추가 전용 감사 원장이라 자르면 SQLite
@@ -2447,7 +2464,7 @@ YAML 전체를 들이면 그 파서가 읽는 모든 것(앵커·별칭·태그�
 - **옮긴 SQLite 파일은 지우지 않는다.** 이관이 커밋한 뒤 그 옆에 이관 표지(`<원장>.moved-to-postgres`)를 남긴다. 한
   원장이 두 갈래로 쓰이는 길(갈린 원장)을 두 쪽 판올림이 막는다 - SQLite 쪽(`fd migrate` · `fd serve`)은 표지가 있으면 파일이
   있든 없든 열지도 새로 만들지도 않고(덮개 파일을 빼고 띄운 compose), Postgres 쪽 `fd migrate` 는 이 환경의 SQLite 원장
-  자리에 표지 없는 원장이 남아 있으면 거절한다(덮개 파일만 얹고 이관 없이 띄운 compose - 이관 판까지만 까는 `--to 19` 는
+  자리에 표지 없는 원장이 남아 있으면 거절한다(덮개 파일만 얹고 이관 없이 띄운 compose - 이관 판까지만 까는 `--to 20` 은
   받는다). 원본 디렉토리에 표지를 못 남기면 옮기기 전에 거절한다. 판정은 표지가 있는가뿐이고, 재지 못한 표지는 두 쪽 다
   거절이다. 표지를 지우는 길은 README 의 두 절차뿐이다(손으로 `rm`): 선택 파일을 켜기 전에 선 업그레이드를 거둘 때
   (「켜기 전에 섰을 때」 - 양쪽 서버를 내린 채 Postgres 원장을 맞대 본 뒤)와 72시간 되돌리기. 표지는 커밋 **뒤에** 쓰므로

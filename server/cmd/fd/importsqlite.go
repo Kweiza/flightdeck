@@ -139,6 +139,7 @@ func printTransferReport(out io.Writer, head string, rep store.TransferReport) {
 				fmt.Fprintf(out, "    %-24s %d\n", r.Table, r.Rows)
 			}
 		}
+		printAttribution(out, rep.Attribution)
 		printQuarantined(out, rep)
 		return
 	}
@@ -164,7 +165,37 @@ func printTransferReport(out io.Writer, head string, rep store.TransferReport) {
 			fmt.Fprintf(out, "    %-30s 다음 %d > %d  %s\n", c.Table+"."+c.Column, c.Next, c.Floor, mark)
 		}
 	}
+	printAttribution(out, rep.Attribution)
 	printQuarantined(out, rep)
+}
+
+// printAttribution 은 원본의 소유자 귀속 축(store.Attribution)을 낸다. 판정에는 안 든다 - 이 판의 쓰기는 아직 행위자를 안 싣는다.
+// 원본을 못 훑은 갈래(오류)는 칸이 없어 내지 않는다.
+func printAttribution(out io.Writer, a store.Attribution) {
+	if len(a.Columns) == 0 {
+		return
+	}
+	owner := "있다"
+	if !a.Owner {
+		owner = "없다"
+	}
+	fmt.Fprintf(out, "\n  소유자 귀속(원본 · 판정에는 안 든다 - 이 판의 쓰기는 아직 행위자를 안 싣는다): 소유자 계정 %s · 빈 행위자 칸 %d\n",
+		owner, a.Unattributed())
+	for _, c := range a.Columns {
+		fmt.Fprintf(out, "    %-24s 빈 칸 %d / %d 행\n", c.Table+"."+c.Column, c.Null, c.Rows)
+	}
+	if len(a.Via) == 0 {
+		return
+	}
+	via := make([]string, 0, len(a.Via))
+	for _, v := range a.Via {
+		name := v.Via
+		if name == "" {
+			name = "(빈 칸)"
+		}
+		via = append(via, fmt.Sprintf("%s %d", name, v.Rows))
+	}
+	fmt.Fprintf(out, "    judgment.via 갈래: %s\n", strings.Join(via, " · "))
 }
 
 // printQuarantined 는 SQLite 원장 자리의 판올림 전 사본을 옮긴 디렉토리를 말한다(store.TransferReport.Quarantined). 대조표가 없는

@@ -106,6 +106,9 @@ type TransferReport struct {
 	// Quarantined 는 SQLite 원장 자리의 판올림 전 사본(<원장>.bak-*)을 옮긴 디렉토리다(quarantineBackups). 옮길 것이 없었거나 예행이면
 	// 비었다. 이관은 원본 옆, 역이관은 --to 옆의 사본을 옮긴다.
 	Quarantined string
+	// Attribution 은 원본의 소유자 귀속 축이다(증분 020 의 행위자 칸 - account.go). 원본 훑기와 같은 스냅숏에서 잰다. 보고만 하고
+	// 판정(verdict)에는 넣지 않는다(Attribution 의 ★). 행위자 칸도 행 지문에 들므로 원본과 대상의 칸 값이 같은지는 대조표가 잰다.
+	Attribution Attribution
 }
 
 // Matched 는 대조가 돌았고 표 전부 · 순번 전부가 맞았는가다. 값 검사에 걸린 것까지 보는 판정은 verdict 다.
@@ -385,7 +388,7 @@ func transferPlan(hasTable bool, v, objects int) MigrationPlan {
 	return PlanMigration(hasTable, v, objects, want)
 }
 
-// transferRange 는 이관 판 범위를 사람에게 적는 꼴이다(「18-19」, 범위가 한 판이면 「19」).
+// transferRange 는 이관 판 범위를 사람에게 적는 꼴이다(「18-19」 꼴, 범위가 한 판이면 「20」 처럼 그 판만).
 func transferRange() string {
 	if f := pg.ImportFloor(); f < pg.ImportVersion {
 		return fmt.Sprintf("%d-%d", f, pg.ImportVersion)
@@ -814,6 +817,8 @@ type ledgerScan struct {
 	marks map[string][]pg.RowMark
 	// floors 는 identity 가 있는 표마다 원본에서 발급된 가장 큰 번호다(pg.Floor).
 	floors map[string]int64
+	// attribution 은 원본의 소유자 귀속 축이다(readAttribution).
+	attribution Attribution
 }
 
 // cellTally 는 훑기 한 번이 칸 규칙(cellRule)에서 센 것이다: 걸린 칸(faults), 바꿔 넣은 칸의 갈래(rewrites)와 그 칸 전부
@@ -885,6 +890,7 @@ func groupCount[R ~string](groups []CellGroup[R]) int {
 func (sc *ledgerScan) report(rep *TransferReport) {
 	rep.Faults, rep.Rewrites, rep.RewrittenRows, rep.Rows = sc.cells.faults.groups, sc.cells.rewrites.groups,
 		sc.cells.rewrittenRows, sc.rows
+	rep.Attribution = sc.attribution
 }
 
 // refusal 은 사전 검사에 걸린 것이 있으면 그 수와 다음 수를 담은 오류다.
@@ -944,6 +950,9 @@ func scanLedger(ctx context.Context, q Reader, from ledgerSide, cell cellRule) (
 		sc.rows = append(sc.rows, TableRows{Table: t.Name, Rows: len(marks)})
 	}
 	if err := from.orphans(ctx, q, &sc.cells.faults); err != nil {
+		return nil, err
+	}
+	if sc.attribution, err = readAttribution(ctx, q); err != nil {
 		return nil, err
 	}
 	return sc, nil
