@@ -376,12 +376,16 @@ func checkUpgrade(t *testing.T, shell procShell, procs readmeProcs) {
 			{"run --rm --no-deps migrate migrate --db /data/fd.db", r.work, ""},
 			{fmt.Sprintf("run --rm migrate migrate --to %d", pg.ImportVersion), r.work, r.off()},
 			{"run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db", r.work, r.off()},
+			{"run --rm migrate selfcheck", r.work, r.off()},
 			{"run --rm migrate migrate verify --from /data/fd.db", r.work, r.off()},
 			{"up -d --build", r.work, r.on()},
 		} {
 			if c := called(calls, want.args); !ran(c, want.pwd, want.env) {
 				t.Errorf("`%s` 가 자리 %s · 선택 파일 %q 로 안 돌았다: %q", want.args, want.pwd, want.env, c)
 			}
+		}
+		if s, d := calledAt(calls, "run --rm migrate selfcheck"), calledAt(calls, "up -d --build db-roles"); s < 0 || d < 0 || s > d {
+			t.Errorf("6 이 Postgres 원장의 판을 db-roles(그 앞의 migrate 가 원장을 올린다) 전에 재지 않았다:\n%s", strings.Join(calls, "\n"))
 		}
 		if c := called(calls, "up -d --build"); !strings.Contains(c, " REPOS=/repos/one,/repos/two,, ") {
 			t.Errorf("8 의 up 이 1 이 읽은 저장소 마운트로 안 돌았다: %q", c)
@@ -423,6 +427,24 @@ func checkUpgrade(t *testing.T, shell procShell, procs readmeProcs) {
 		}
 		if !r.exists(r.on()) || r.exists(r.off()) {
 			t.Fatal("다시 돈 덩이가 선택 파일을 켜지 않았다")
+		}
+	})
+	// 옛 판(이관 판 아래)으로 옮기다 선 자리: 표지가 SQLite 원장을 옛 판에 묶어 두므로, 6 의 db-roles 앞 migrate 가 Postgres 원장을
+	// 올리면 7 이 둘을 못 맞대고 옛 판으로도 못 돌아간다. 6 은 원장을 올리기 전에 판을 재고 처방을 대며 선다.
+	t.Run("표지가 있고 Postgres 원장이 이 판이 아니면 6 이 올리기 전에 선다", func(t *testing.T) {
+		r := upgradeRig(t, shell, procs)
+		r.write(r.data("fd.db.moved-to-postgres"), "")
+		r.env["FDT_FAIL"] = "run --rm migrate selfcheck$"
+		rc, calls, out := r.run(r.work, newShellRepos, procs.upgrade)
+		joined := strings.Join(calls, "\n")
+		if rc == "0" || strings.Contains(joined, "db-roles") || strings.Contains(joined, "verify") || called(calls, "run --rm migrate selfcheck") == "" {
+			t.Fatalf("판이 안 맞는 Postgres 원장에서 6 이 db-roles · 맞대기로 갔다(rc=%s):\n%s\n%s", rc, joined, out)
+		}
+		if !strings.Contains(out, "켜기 전에 섰을 때") && !strings.Contains(out, "Stopped before switching on") {
+			t.Fatalf("6 이 서면서 처방(「켜기 전에 섰을 때」)을 대지 않았다:\n%s", out)
+		}
+		if !r.exists(r.off()) || r.exists(r.on()) || !r.exists(r.data("fd.db.moved-to-postgres")) {
+			t.Fatal("6 이 섰는데 선택 파일이 켜졌거나 표지가 없다")
 		}
 	})
 	t.Run("옛 자리의 선택 파일이 남았으면 compose 를 안 부른다", func(t *testing.T) {
@@ -1154,6 +1176,18 @@ func TestUpdateSkillChainRunsInEveryShell(t *testing.T) {
 				}
 				if c := called(calls, "up -d --build"); !ran(c, dst, "") || !strings.Contains(c, " REPOS=/repos/one,/repos/two,, ") {
 					t.Errorf("올리기가 새 자리 · 읽은 저장소 마운트로 안 돌았다: %q\n%s", c, out)
+				}
+				if called(calls, "logs --no-log-prefix migrate") != "" {
+					t.Errorf("올리기가 됐는데 사슬이 migrate 의 기록을 냈다:\n%s", strings.Join(calls, "\n"))
+				}
+				// ★ 올리기가 서면(migrate 가 되돌리기 창 · 증분 실패로 섰다) 사슬이 새 자리의 migrate 기록으로 그 사유를 보이고 실패로
+				//   끝난다 - `up -d` 는 「migrate 가 성공하지 않았다」만 말한다.
+				r.serverUp("oldp", r.old)
+				r.env["FDT_UP_CREATE_ONLY"] = "1"
+				rc, calls, out = r.exec(r.work, script)
+				delete(r.env, "FDT_UP_CREATE_ONLY")
+				if c := called(calls, "logs --no-log-prefix migrate"); rc == "0" || !ran(c, dst, "") {
+					t.Errorf("올리기가 섰는데 사슬이 새 자리에서 migrate 의 기록을 보이지 않았거나 성공으로 끝났다(rc=%s): %q\n%s", rc, c, out)
 				}
 				// 서버가 없으면(마운트를 못 읽는다) 아무것도 내리지도 올리지도 않는다.
 				_ = os.Remove(filepath.Join(r.state, "created"))

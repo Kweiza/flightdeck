@@ -346,6 +346,12 @@ func TestImportSQLiteRefusesFaultsAndWritesNothing(t *testing.T) {
 			INSERT INTO item(project, id, title, body, created_at) VALUES ('p\x00', 'i1', 't', 'b', 'x');
 			INSERT INTO item_after(project, item_id, dep_item, dep_project) VALUES ('p', 'i2', 'i1', CAST(X'7000' AS TEXT))`,
 			"item_after", "dep_project", "seq=8", pg.FaultIdentNUL},
+		// 비밀 칸의 NUL 도 바꿔 넣지 않는다 - 바꾸면 바꾼 칸 기록이 그 원래 바이트를 담는다. 비밀 기본키의 행 좌표는 지문이다.
+		{"비밀 기본키의 NUL", `INSERT INTO web_session(id_hash, account_id, created_at, expires_at, last_seen_at) VALUES
+				(CAST(X'776800' AS TEXT), 'a1', 'x', 'x', 'x')`,
+			"web_session", "id_hash", "id_hash=" + pg.SecretMark("wh\x00"), pg.FaultSecretNUL},
+		{"암호 지문의 NUL", `UPDATE account SET password_hash = CAST(X'246100' AS TEXT) WHERE id = 'a1'`,
+			"account", "password_hash", `id="a1"`, pg.FaultSecretNUL},
 		// 옮기며 같아지는 기본키 · UNIQUE 칸: 글 칸의 BLOB 가 같은 바이트의 글과 같아진다(대상이 커밋 때 거절할 것을 좌표와 함께
 		// 먼저 낸다). 부분 인덱스는 그 조건 안의 행끼리만 잰다 - 놓은 점유는 살아 있는 점유와 겹쳐도 된다.
 		{"BLOB 로 겹치는 지문 키", `INSERT INTO snapshot(project, key, value, method, computed_at) VALUES ('p', X'6B31', 'v', 'command', 'x')`,
@@ -1170,5 +1176,53 @@ func TestImportSQLiteQuarantinesTheSourceBackups(t *testing.T) {
 	if !bytes.Equal(mustRead(t, filepath.Join(rep.Quarantined, filepath.Base(bak))), []byte("옛 판올림 전 사본")) ||
 		!bytes.Equal(mustRead(t, filepath.Join(rep.Quarantined, filepath.Base(bak)+"-journal")), []byte("옆")) {
 		t.Fatal("옮긴 사본 · 옆 파일이 그대로가 아니다")
+	}
+}
+
+// 비밀 기본키(web_session.id_hash)는 이관 보고 · 바꾼 칸 기록 · 대조의 어긋남 줄에 원값 대신 지문(pg.SecretMark)으로 적힌다 - 그
+// 셋은 터미널 · 로그 · 원본 옆 파일로 남는다. 대조 자체는 원값으로 해 한 칸만 바뀌어도 그 행을 짚는다.
+func TestTransferLabelsSecretKeysByFingerprint(t *testing.T) {
+	ctx := context.Background()
+	const raw = "c0ffee-cookie-sha256-raw-value"
+	fp := "id_hash=" + pg.SecretMark(raw)
+	src := importSource(t, importSeed)
+	liteExec(t, src, `INSERT INTO web_session(id_hash, account_id, created_at, expires_at, last_seen_at, user_agent) VALUES
+		('`+raw+`', 'a1', `+importAt+`, `+importAt+`, `+importAt+`, CAST(X'756100' AS TEXT))`)
+	dsn, dst := importTarget(t)
+	rep, err := importLedger(t, ctx, src, dsn, TransferOptions{})
+	if err != nil {
+		t.Fatalf("이관: %v", err)
+	}
+	var keys []string
+	for _, g := range rep.Rewrites {
+		if g.Table == "web_session" {
+			keys = g.Keys
+		}
+	}
+	if !slices.Equal(keys, []string{fp}) {
+		t.Fatalf("이관 보고의 web_session 좌표 %q, 기대 %q", keys, fp)
+	}
+	var found bool
+	for _, r := range readRecord(t, rep.RewriteRecord) {
+		if r.Table == "web_session" {
+			found = true
+			if r.Key["id_hash"] != pg.SecretMark(raw) || len(r.Key) != 1 || r.Column != "user_agent" || string(r.Original) != "ua\x00" {
+				t.Fatalf("바꾼 칸 기록 %+v", r)
+			}
+		}
+	}
+	if b, err := os.ReadFile(rep.RewriteRecord); err != nil || !found || bytes.Contains(b, []byte(raw)) {
+		t.Fatalf("바꾼 칸 기록에 web_session 줄이 있고(%v) 비밀 원값이 없어야 한다: %v", found, err)
+	}
+
+	pgExec(t, dst, `UPDATE web_session SET user_agent = 'x' WHERE id_hash = '`+raw+`'`)
+	vrep, err := VerifySQLite(ctx, src, dsn, VerifyOptions{}, quietLog())
+	if err == nil || strings.Contains(err.Error(), raw) {
+		t.Fatalf("바뀐 대상이 어긋나야 하고 오류에 비밀 원값이 없어야 한다: %v", err)
+	}
+	for _, tc := range vrep.Tables {
+		if tc.Table == "web_session" && (!slices.Equal(tc.OnlySource, []string{fp}) || !slices.Equal(tc.OnlyTarget, []string{fp})) {
+			t.Fatalf("대조의 어긋남 줄 %q · %q, 기대 %q", tc.OnlySource, tc.OnlyTarget, fp)
+		}
 	}
 }

@@ -1004,6 +1004,12 @@ type MigrateOptions struct {
 	// DumpTimeout 은 Postgres 판올림 전 덤프 한 번의 기한이다(FD_DUMP_TIMEOUT). 0 이면 DefaultDumpTimeout 이다. 같은 값이
 	// 스냅숏 트랜잭션의 서버 상한과 pg_dump 자식의 문맥에 걸린다(snapshotTxLimits · backupPG). SQLite 는 안 쓴다.
 	DumpTimeout time.Duration
+	// Moved 는 이 Postgres 원장으로 옮긴 SQLite 원장의 자리다. 그 옆 이관 표지가 연 되돌리기 창(RollbackWindow) 안이면 인덱스만
+	// 더한 것이 아닌 증분을 얹지 않는다(rollbackWindowGate). 비면 창을 재지 않는다. SQLite 는 안 쓴다.
+	Moved string
+	// AllowInRollbackWindow 는 그 창 안에서도 얹는다(`fd migrate --allow-in-rollback-window`) - 옛 판으로 되돌리지 않기로 한
+	// 사람의 선택이다.
+	AllowInRollbackWindow bool
 }
 
 // MigrateWith 는 원장을 opt 대로 올린다. 엔진은 path 로 가른다(ParseTarget).
@@ -1040,6 +1046,9 @@ func openMigrator(path string, opt MigrateOptions, log *slog.Logger) (*Store, mi
 			return nil, run, err
 		}
 		run.steps = pgMigrations
+		if opt.Moved != "" && !opt.AllowInRollbackWindow {
+			run.window = func(steps []Migration) error { return rollbackWindowGate(opt.Moved, steps, time.Now()) }
+		}
 		run.backup = func(ctx context.Context, sess *migrateSession, from int) (string, error) {
 			return s.backupPG(ctx, t, sess, from, opt.BackupDir, limit)
 		}
@@ -1211,6 +1220,9 @@ type migrateRun struct {
 	// backup 은 판올림 전 백업을 뜨고 그 자리를 낸다. sess 는 실행기 세션(잠금을 쥔 연결)이고 from 은 덤프를 뜨는 판이다 -
 	// 덤프는 최종 이름을 붙이기 전에 그 세션에서 잠금을 다시 잰다(sealDump).
 	backup func(ctx context.Context, sess *migrateSession, from int) (string, error)
+	// window 는 얹을 증분을 되돌리기 창이 막는 사유다(rollbackWindowGate). nil 이면 재지 않는다(SQLite · 표지 자리를 모르는
+	// 원장 · 플래그).
+	window func(steps []Migration) error
 }
 
 // migrateTo 는 run.target 까지 올린다. 두 엔진이 같은 길을 탄다:
@@ -1274,9 +1286,15 @@ func (s *Store) migrateTo(ctx context.Context, run migrateRun) error {
 			"path", s.path, "db_version", dbVersion, "code_version", run.target, "error", err.Error())
 		return fmt.Errorf("스키마 거절: %w", err)
 	}
-	// ★ 로케일과 인덱스 키 상한(keyLimitGate)은 백업 · 증분 전에 잰다 - 거절될 DB 의 덤프를 뜨고 증분을 얹을 까닭이 없다. 빈 DB 는
+	// ★ 되돌리기 창(run.window) · 로케일 · 인덱스 키 상한(keyLimitGate)은 백업 · 증분 전에 잰다 - 거절될 DB 의 덤프를 뜨고 증분을 얹을 까닭이 없다. 빈 DB 는
 	//   로케일을 기준선 단 안에서 잰다(pg_trgm 이 거기서 생긴다, stepBody).
 	if plan.Action == MigrateUpgrade {
+		if run.window != nil {
+			if err := run.window(steps); err != nil {
+				s.log.Error("되돌리기 창 안이라 DB 를 올리지 않는다", "path", s.path, "db_version", dbVersion, "error", err.Error())
+				return err
+			}
+		}
 		if err := localeGate(ctx, sess); err != nil {
 			return err
 		}
@@ -1586,7 +1604,7 @@ func (s *Store) backup(ctx context.Context, from int, at time.Time) (string, err
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("백업 디렉토리 생성 실패(dir=%q): %w", dir, err)
 	}
-	// VACUUM INTO 는 대상이 없거나 빈 파일이어야 한다. 겹치지 않는 빈 파일을 먼저 잡는다(모드는 원장과 같다).
+	// VACUUM INTO 는 대상이 없거나 빈 파일이어야 한다. 겹치지 않는 빈 파일을 먼저 잡는다(모드는 ledgerFileMode - 주인만 읽는다).
 	f, err := createExclusive(dir, "."+filepath.Base(name)+".partial-", ledgerFileMode)
 	if err != nil {
 		return "", fmt.Errorf("마이그레이션 전 백업의 임시 파일을 만들지 못했다(dir=%q): %w", dir, err)

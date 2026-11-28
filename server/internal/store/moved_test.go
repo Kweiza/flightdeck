@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -326,5 +327,135 @@ func TestLeaveMovedMarkSaysTheCommitHappened(t *testing.T) {
 	}
 	if _, err := os.Lstat(MovedMarker(src)); err == nil {
 		t.Fatal("실패했다면서 표지가 생겼다")
+	}
+}
+
+// movedNoteAt 는 SQLite 원장 path 옆에 at 에 옮겼다고 적은 표지를 남긴다(이관이 남기는 꼴).
+func movedNoteAt(t *testing.T, path string, at time.Time) {
+	t.Helper()
+	raw, err := json.Marshal(movedNote{MovedAt: at.UTC().Format(time.RFC3339), Schema: pg.ImportVersion})
+	must(t, err)
+	must(t, os.WriteFile(MovedMarker(path), raw, 0o644))
+}
+
+// stepsOf 는 Postgres 증분 가운데 인덱스만 더한 것(index)과 아닌 것(other) 하나씩이다.
+func stepsOf(t *testing.T) (index, other Migration) {
+	t.Helper()
+	var hasIndex, hasOther bool
+	for _, m := range pgMigrations {
+		if _, ok := pg.IndexOnly(m.SQL); ok && !hasIndex {
+			index, hasIndex = m, true
+		} else if !ok && !hasOther {
+			other, hasOther = m, true
+		}
+	}
+	if !hasIndex || !hasOther {
+		t.Fatalf("인덱스만 더한 증분(%v)과 아닌 증분(%v)이 다 있어야 한다", hasIndex, hasOther)
+	}
+	return index, other
+}
+
+// 되돌리기 창의 판정: 창을 연 때부터 RollbackWindow 동안 인덱스만 더한 것이 아닌 증분을 거절하고, 닫히는 때(그 순간 포함)부터는
+// 받는다. 인덱스만 더한 증분은 창 안에서도 받는다(내림으로 옛 판에 닿는다). 거절 문구는 닫히는 때(UTC)와 넘는 플래그를 댄다.
+func TestRollbackWindowRefusal(t *testing.T) {
+	index, other := stepsOf(t)
+	opened := time.Date(2026, 11, 27, 1, 2, 3, 0, time.FixedZone("KST", 9*3600))
+	for _, c := range []struct {
+		name   string
+		now    time.Time
+		steps  []Migration
+		refuse bool
+	}{
+		{"창을 연 때", opened, []Migration{other}, true},
+		{"닫히기 직전", opened.Add(RollbackWindow - time.Second), []Migration{index, other}, true},
+		{"닫히는 때", opened.Add(RollbackWindow), []Migration{other}, false},
+		{"창 밖", opened.Add(RollbackWindow + time.Hour), []Migration{other}, false},
+		{"창 안의 인덱스만 더한 증분", opened.Add(time.Hour), []Migration{index}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			err := rollbackWindowRefusal("/d/fd.db.moved-to-postgres", opened, c.now, c.steps)
+			if (err != nil) != c.refuse {
+				t.Fatalf("거절 %v 여야 한다: %v", c.refuse, err)
+			}
+			if err == nil {
+				return
+			}
+			for _, want := range []string{"2026-11-29T16:02:03Z(UTC)에 닫힌다", "판 " + fmt.Sprint(other.To) + " 의 증분",
+				"--allow-in-rollback-window", "README 「72시간 안에 되돌리기」"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("거절 문구에 %q 가 없다: %v", want, err)
+				}
+			}
+			if strings.Contains(err.Error(), "판 "+fmt.Sprint(index.To)+" ") {
+				t.Errorf("인덱스만 더한 증분까지 막는 판으로 댔다: %v", err)
+			}
+		})
+	}
+}
+
+// 창을 연 때는 표지 내용의 옮긴 때다. 못 읽으면(손으로 touch 한 빈 표지 · 깨진 내용) 표지 파일의 고친 때로 잰다. 표지가 없으면
+// 창이 없다.
+func TestMovedAtReadsTheNoteThenTheFileTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fd.db")
+	if _, ok, err := movedAt(path); ok || err != nil {
+		t.Fatalf("표지가 없는데 창이 열렸다: %v %v", ok, err)
+	}
+	at := time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
+	movedNoteAt(t, path, at)
+	if got, ok, err := movedAt(path); !ok || err != nil || !got.Equal(at) {
+		t.Fatalf("표지 내용의 옮긴 때를 안 읽었다: %v %v %v", got, ok, err)
+	}
+	mtime := time.Date(2026, 11, 21, 0, 0, 0, 0, time.UTC)
+	for _, body := range []string{"", `{"moved_at":"어제"}`} {
+		must(t, os.WriteFile(MovedMarker(path), []byte(body), 0o644))
+		must(t, os.Chtimes(MovedMarker(path), mtime, mtime))
+		if got, ok, err := movedAt(path); !ok || err != nil || !got.Equal(mtime) {
+			t.Fatalf("내용 %q 의 표지가 파일의 고친 때로 안 쟀다: %v %v %v", body, got, ok, err)
+		}
+	}
+}
+
+// Postgres 판올림이 이 환경의 SQLite 원장 자리(Moved)의 표지가 연 창 안이면 인덱스만 더한 것이 아닌 증분을 얹지 않고 원장을 그
+// 판에 둔다(덤프도 안 뜬다). 창 밖이거나 플래그를 주면 올린다. 인덱스만 더한 증분은 창 안에서도 얹는다.
+func TestPostgresUpgradeHoldsInTheRollbackWindow(t *testing.T) {
+	index, other := stepsOf(t)
+	for _, c := range []struct {
+		name   string
+		from   int
+		to     int
+		ago    time.Duration
+		allow  bool
+		refuse bool
+	}{
+		{"창 안", other.To - 1, other.To, time.Hour, false, true},
+		{"창 밖", other.To - 1, other.To, RollbackWindow + time.Hour, false, false},
+		{"창 안 · 플래그", other.To - 1, other.To, time.Hour, true, false},
+		{"창 안 · 인덱스만 더한 증분", index.To - 1, index.To, time.Hour, false, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path, s := ledgerAtVersion(t, "postgres", c.from)
+			lite := filepath.Join(t.TempDir(), "fd.db")
+			movedNoteAt(t, lite, time.Now().Add(-c.ago))
+			m, run := pgMigrator(t, path, MigrateOptions{Target: c.to, BackupDir: t.TempDir(), Moved: lite, AllowInRollbackWindow: c.allow})
+			dumped := false
+			run.backup = func(context.Context, *migrateSession, int) (string, error) {
+				dumped = true
+				return "시험 덤프", nil
+			}
+			err := m.migrateTo(context.Background(), run)
+			if (err != nil) != c.refuse {
+				t.Fatalf("거절 %v 여야 한다: %v", c.refuse, err)
+			}
+			want := c.to
+			if c.refuse {
+				want = c.from
+				if !strings.Contains(err.Error(), "되돌리기 창 안이다") || dumped {
+					t.Fatalf("창의 거절이 아니거나 거절 전에 덤프를 떴다(%v): %v", dumped, err)
+				}
+			}
+			if v := pgVersion(t, s); v != want {
+				t.Fatalf("판이 %d 다 - %d 여야 한다", v, want)
+			}
+		})
 	}
 }

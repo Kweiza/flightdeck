@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"slices"
 	"strconv"
@@ -85,15 +86,42 @@ func (t Table) Mark(vals []any) RowMark {
 }
 
 // KeyLabel 은 행을 가리키는 칸(Column.Key)의 값을 「칸=값」으로 이은 좌표다. 글은 따옴표로 감싸 NUL · 줄바꿈이 보이게 한다.
+// 비밀 칸(Column.Secret - web_session.id_hash 같은 비밀 기본키)은 지문으로 적는다(CoordLabel). 대조는 원값(Mark 의 Hash)으로 한다.
 func (t Table) KeyLabel(vals []any) string {
 	var parts []string
-	for i, c := range t.Cols {
-		if !c.Key || i >= len(vals) {
+	for i := range t.Cols {
+		if !t.Cols[i].Key || i >= len(vals) {
 			continue
 		}
-		parts = append(parts, c.Name+"="+LabelValue(vals[i]))
+		parts = append(parts, t.Cols[i].Name+"="+CoordLabel(&t.Cols[i], vals[i]))
 	}
 	return strings.Join(parts, " ")
+}
+
+// CoordLabel 은 행 좌표에 싣는 칸 c 의 값 v 하나다: 비밀 칸(Column.Secret)이면 원값 대신 지문(SecretMark), 그 밖은 LabelValue 다.
+// c 가 nil(칸을 모르는 조회 조건)이면 LabelValue 다. 이관의 행 좌표(KeyLabel)와 store 의 원장 칸 관문이 이것 하나로 적는다.
+func CoordLabel(c *Column, v any) string {
+	if c != nil && c.Secret && v != nil {
+		return SecretMark(v)
+	}
+	return LabelValue(v)
+}
+
+// SecretMark 는 비밀 칸 값의 지문이다: 「sha256:」 뒤에 값 바이트의 sha256 앞 12자(16진, 48비트). 같은 값이면 같은 지문이라
+// 보고의 두 줄이 같은 행인지 가리고, 원장에서는 `left(encode(sha256(convert_to(칸, 'UTF8')), 'hex'), 12)`(Postgres)로 그 행을
+// 찾는다. 원값을 되찾을 수는 없다(그 원값부터가 높은 엔트로피 토큰의 sha256 이거나 argon2id 다).
+func SecretMark(v any) string {
+	var b []byte
+	switch x := v.(type) {
+	case string:
+		b = []byte(x)
+	case []byte:
+		b = x
+	default:
+		b = []byte(fmt.Sprint(v))
+	}
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:])[:12]
 }
 
 // LabelValue 는 좌표에 싣는 값 하나의 꼴이다: 글 · 바이트는 따옴표로 감싸(NUL · 줄바꿈이 보이게) 80 바이트로 자르고, NULL 은

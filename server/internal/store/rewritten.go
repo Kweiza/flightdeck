@@ -28,7 +28,12 @@ const rewrittenSuffix = ".rewritten"
 // rewrittenCell 은 바꾼 칸 하나의 기록(기록 파일의 한 줄)이다.
 type rewrittenCell struct {
 	Table string `json:"table"`
-	// Key 는 그 행의 Key 칸(pg.Column.Key) → 옮긴 값이다. 옮긴 원장에서 그 행을 찾는 값이고 자르지 않는다.
+	// Key 는 그 행의 Key 칸(pg.Column.Key) → 옮긴 값이다. 옮긴 원장에서 그 행을 찾는 값이고 자르지 않는다. 비밀 키 칸
+	// (pg.Column.Secret - web_session.id_hash · device_code.code_hash)은 원값 대신 지문(pg.SecretMark)이다 - 이 파일은 원본 옆에
+	// 남는다. 그 행은 지문으로 찾는다: Postgres 에서 `left(encode(sha256(convert_to(id_hash, 'UTF8')), 'hex'), 12)` 가 지문의
+	// 「sha256:」 뒤와 같은 행이다. 다른 정보는 더 싣지 않는다 - 지문은 48비트라 그 표의 행 수로는 겹치지 않고, 겹쳐도 바꾼 칸
+	// (Column)의 옮긴 값이 Original 을 바꿔 넣은 글이라 둘이 갈린다. 비밀 칸 자체는 바꿔 넣지 않으므로(pg.FaultSecretNUL)
+	// Original 에 비밀이 실리는 일은 없다.
 	Key    map[string]any `json:"key"`
 	Column string         `json:"column"`
 	Rule   pg.Rewrite     `json:"rule"`
@@ -43,7 +48,10 @@ type rewrittenCell struct {
 func newRewrittenCell(t pg.Table, r cellRow, i int) rewrittenCell {
 	key := map[string]any{}
 	for k, c := range t.Cols {
-		if c.Key {
+		switch {
+		case c.Key && c.Secret:
+			key[c.Name] = pg.SecretMark(r.vals[k])
+		case c.Key:
 			key[c.Name] = r.vals[k]
 		}
 	}

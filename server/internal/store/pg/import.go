@@ -100,6 +100,12 @@ type Column struct {
 	// `\x00` 네 글자를 담은 다른 이름과 같아지면 그 이름을 가리키던 행이 다른 행을 가리킨다. 바꿔 넣기는 자유 글에만이다.
 	// 표시는 이 카탈로그 한 곳이고, 기준선의 기본키 · UNIQUE · FK 칸을 빠짐없이 덮는지는 import_test.go 가 Postgres 카탈로그로 잰다.
 	Identifier bool
+	// Secret 은 비밀 칸이다: 암호 지문(account.password_hash)과 토큰 · 쿠키 · 기기 코드의 sha256(invite.token_hash ·
+	// machine.token_hash · web_session.id_hash · device_code.code_hash). 대조 · 사전 검사는 원값으로 하지만, 사람이 읽는 행 좌표
+	// (KeyLabel · store 의 원장 칸 관문 · 바꾼 칸 기록의 키)에는 원값 대신 지문(SecretMark)을 싣는다 - 이관 보고 · 오류 · 기록
+	// 파일은 터미널 · 로그 · 원본 옆 파일로 남는다. NUL 은 바꿔 넣지 않고 거절한다(FaultSecretNUL) - 바꾸면 바꾼 칸 기록이 그
+	// 원래 바이트를 담는다. 표시는 이 카탈로그 한 곳이고, 원장 백업이 안 싣는 비밀 칸(store 의 LedgerSecretColumns)도 이것을 읽는다.
+	Secret bool
 	// JSON 은 서버가 JSON 문서로 쓰는 칸이다(json.Marshal). Postgres 에서는 text 그대로지만 jsonb 로 읽힐 수 있는 칸이라
 	// 깨진 문서 · 짝 없는 서로게이트 · 키 안의 \u0000 은 거절하고 글 값 안의 \u0000 은 그 글 토큰만 바꿔 넣는다(RewriteJSONNUL).
 	JSON bool
@@ -227,17 +233,17 @@ func Tables() []Table { return tables }
 
 var tables = []Table{
 	{Name: "account", Cols: []Column{key(txt("id")), ref(nn(txt("login"))), nn(txt("display_name")), txt("email"),
-		nn(txt("role")), txt("password_hash"), nn(txt("created_at")), txt("disabled_at")},
+		nn(txt("role")), secret(txt("password_hash")), nn(txt("created_at")), txt("disabled_at")},
 		unique: []Unique{{Name: "account_login_key", Cols: []string{"login"}}}},
-	{Name: "invite", Cols: []Column{key(txt("id")), ref(nn(txt("token_hash"))), ref(nn(txt("created_by"))), nn(txt("role")),
+	{Name: "invite", Cols: []Column{key(txt("id")), ref(nn(secret(txt("token_hash")))), ref(nn(txt("created_by"))), nn(txt("role")),
 		txt("email"), nn(txt("created_at")), nn(txt("expires_at")), txt("used_at"), ref(txt("used_by")), txt("revoked_at")},
 		unique: []Unique{{Name: "invite_token_hash_key", Cols: []string{"token_hash"}}}},
-	{Name: "web_session", Cols: []Column{key(txt("id_hash")), ref(nn(txt("account_id"))), nn(txt("created_at")),
+	{Name: "web_session", Cols: []Column{key(secret(txt("id_hash"))), ref(nn(txt("account_id"))), nn(txt("created_at")),
 		nn(txt("expires_at")), nn(txt("last_seen_at")), txt("user_agent")}},
 	{Name: "project", Cols: []Column{key(txt("id")), nn(txt("path")), txt("remote_url"), nn(txt("default_branch")),
 		txt("config"), txt("config_from_sha"), nn(txt("created_at")), txt("pinned_at"), txt("archived_at")}},
 	{Name: "machine", Cols: []Column{key(txt("id")), nn(txt("hostname")), nn(txt("first_seen")), nn(txt("last_seen")),
-		ref(txt("account_id")), txt("name"), ref(txt("token_hash")), txt("token_prefix"), txt("token_origin"), txt("issued_at"),
+		ref(txt("account_id")), txt("name"), ref(secret(txt("token_hash"))), txt("token_prefix"), txt("token_origin"), txt("issued_at"),
 		txt("revoked_at"), ref(txt("revoked_by"))},
 		unique: []Unique{{Name: "machine_token_hash", Cols: []string{"token_hash"}}}},
 	{Name: "session", Cols: []Column{key(txt("id")), ref(nn(txt("project"))), ref(nn(txt("machine_id"))),
@@ -291,7 +297,7 @@ var tables = []Table{
 	{Name: "session_inbox", Cols: []Column{key(txt("session_id")), ref(nn(txt("machine_id"))), ref(nn(txt("socket"))),
 		nn(txt("mode")), nn(txt("seen_at"))},
 		unique: []Unique{{Name: "session_inbox_socket", Cols: []string{"machine_id", "socket"}}}},
-	{Name: "device_code", Cols: []Column{key(txt("code_hash")), ref(nn(txt("user_code"))), ref(txt("machine_hint")),
+	{Name: "device_code", Cols: []Column{key(secret(txt("code_hash"))), ref(nn(txt("user_code"))), ref(txt("machine_hint")),
 		nn(txt("requested_name")), nn(txt("requested_ip")), nn(txt("requested_at")), ref(txt("invite_id")), nn(txt("expires_at")),
 		ref(txt("approved_by")), txt("approved_at"), ref(txt("issued_machine"))},
 		unique: []Unique{{Name: "device_code_user_code_key", Cols: []string{"user_code"}}}},
@@ -303,6 +309,7 @@ func blob(name string) Column { return Column{Name: name, Kind: Bytes} }
 func nn(c Column) Column      { c.NotNull = true; return c }
 func key(c Column) Column     { c.Key, c.NotNull = true, true; return ref(c) }
 func ref(c Column) Column     { c.Identifier = true; return c }
+func secret(c Column) Column  { c.Secret = true; return c }
 func doc(c Column) Column     { c.JSON = true; return c }
 func ident(c Column) Column   { c.Identity = true; return key(c) }
 func rowid(c Column) Column   { c.Rowid = true; return c }
@@ -329,6 +336,9 @@ const (
 	// (FaultUnique)로는 그것이 안 보인다. 그래서 이 갈래의 NUL 은 원천에서 거절한다 - 식별자는 서버가 짓거나 사람이 짓는 짧은
 	// 이름이라 NUL 이 든 값은 고장이다.
 	FaultIdentNUL Fault = "식별자 칸의 NUL"
+	// FaultSecretNUL: 이관의 SQLite 원본 · 쓰기에서 비밀 칸(Column.Secret)의 NUL 바이트. 바꿔 넣지 않는다 - 바꾼 칸은 원래 바이트를
+	// 기록 파일(원본 옆 .rewritten-*.jsonl)에 남기므로 그 비밀이 파일로 나간다. 비밀 칸은 서버가 짓는 해시라 NUL 이 든 값은 고장이다.
+	FaultSecretNUL Fault = "비밀 칸의 NUL"
 	// FaultUTF8: UTF8 DB 의 text 는 깨진 바이트열을 거절한다(SQLite 는 그대로 둔다).
 	FaultUTF8 Fault = "깨진 UTF-8"
 	// FaultStorage: 선언 타입으로 옮길 수 없는 값(정수 칸의 글, 글 칸의 실수 등). SQLite 는 칸 타입을 강제하지 않는다.
@@ -490,7 +500,7 @@ func storedAs(k Kind, v any) bool {
 
 // importText 는 이관의 SQLite 원본 글 칸에 든 글 s 를 잰다: 깨진 UTF-8 은 거절하고, JSON 칸은 jsonCell 이 잰다. NUL 이 든 글은
 // 식별자 칸(Column.Identifier)이면 거절하고(FaultIdentNUL) 자유 글 칸이면 nulesc.Escape 로 바꿔 넣는다(RewriteNUL). NUL 이 없는
-// 글은 한 바이트도 안 바뀐다.
+// 글은 한 바이트도 안 바뀐다. 비밀 칸(Column.Secret)의 NUL 도 거절한다(FaultSecretNUL).
 func importText(c Column, s string) (string, Fault, Rewrite) {
 	switch {
 	case !utf8.ValidString(s):
@@ -499,6 +509,8 @@ func importText(c Column, s string) (string, Fault, Rewrite) {
 		return jsonCell(s)
 	case strings.IndexByte(s, 0) < 0:
 		return s, "", ""
+	case c.Secret:
+		return s, FaultSecretNUL, ""
 	case c.Identifier:
 		return s, FaultIdentNUL, ""
 	}

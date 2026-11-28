@@ -559,3 +559,23 @@ func BenchmarkCellGate(b *testing.B) {
 		})
 	}
 }
+
+// 원장 칸 관문의 행 좌표도 비밀 칸(web_session.id_hash)을 지문으로 적는다 - 값을 쓰는 칸이든(INSERT) 조회 조건이든(UPDATE …
+// WHERE). 바꿔 넣은 칸의 기록 줄과 거절 오류가 이 좌표를 싣는다.
+func TestCellGateFingerprintsSecretCoords(t *testing.T) {
+	const raw = "c0ffee-cookie-sha256-raw-value"
+	fp := "id_hash=" + pg.SecretMark(raw)
+	_, pend, err := gateArgs(`INSERT INTO web_session(id_hash, account_id, created_at, expires_at, last_seen_at, user_agent)
+		VALUES (?, ?, ?, ?, ?, ?)`, []any{raw, "a1", "t", "t", "t", "ua\x00"})
+	if err != nil || len(pend) != 1 || pend[0].row != fp+` account_id="a1"` {
+		t.Fatalf("INSERT 좌표: %v, %+v", err, pend)
+	}
+	_, pend, err = gateArgs(`UPDATE web_session SET user_agent = ? WHERE id_hash = ?`, []any{"ua\x00", raw})
+	if err != nil || len(pend) != 1 || pend[0].row != fp {
+		t.Fatalf("UPDATE 조건 좌표: %v, %+v", err, pend)
+	}
+	_, _, err = gateArgs(`UPDATE web_session SET last_seen_at = ? WHERE id_hash = ? AND account_id = ?`, []any{"t", raw, "a\xff"})
+	if err == nil || strings.Contains(err.Error(), raw) || !strings.Contains(err.Error(), fp) {
+		t.Fatalf("거절 오류의 좌표: %v", err)
+	}
+}

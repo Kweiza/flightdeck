@@ -277,8 +277,9 @@ func TestExportSQLiteDryRunLeavesNoFile(t *testing.T) {
 	}
 	if fi, err := os.Stat(back); err != nil {
 		t.Fatal(err)
-	} else if want := umaskedMode(t, filepath.Dir(back)); fi.Mode().Perm() != want {
-		t.Fatalf("낸 원장의 모드 %v - 같은 디렉토리에 %v 로 만든 파일(umask 적용)과 같은 %v 여야 한다", fi.Mode().Perm(), ledgerFileMode, want)
+	} else if want := umaskedMode(t, filepath.Dir(back)); fi.Mode().Perm() != want || want&0o077 != 0 {
+		t.Fatalf("낸 원장의 모드 %v - 같은 디렉토리에 %v 로 만든 파일(umask 적용)과 같은 %v 이고 주인만 읽어야 한다",
+			fi.Mode().Perm(), ledgerFileMode, want)
 	}
 	if targetRows(t, dst) != rows || !maps.Equal(identityStates(t, dst), seqs) {
 		t.Fatalf("역이관이 원본을 바꿨다")
@@ -689,6 +690,23 @@ func TestCreateExclusiveRespectsUmask(t *testing.T) {
 	}
 	if fi.Mode().Perm()&^ledgerFileMode != 0 {
 		t.Fatalf("임시 파일 모드 %v 가 %v 보다 넓다", fi.Mode().Perm(), ledgerFileMode)
+	}
+}
+
+// 이 패키지가 내는 원장 파일(역이관 · 판올림 전 사본 · 바꾼 칸 기록)은 umask 와 무관하게 주인만 읽는다 - 판 20 원장은 암호 ·
+// 토큰 지문을 담는다. umask 022(흔한 기본값)에 0644 로 만들면 남이 읽는다.
+func TestLedgerFilesAreOwnerOnly(t *testing.T) {
+	f, err := createExclusive(t.TempDir(), ".x.export-", ledgerFileMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		t.Fatalf("원장 파일 모드 %v - 그룹 · 남이 읽는다", perm)
 	}
 }
 

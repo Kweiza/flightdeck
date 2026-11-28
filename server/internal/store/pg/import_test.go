@@ -807,3 +807,75 @@ func TestImportFloorFollowsTheIndexOnlySteps(t *testing.T) {
 		}
 	}
 }
+
+// 비밀 칸 표시(Column.Secret)는 이름이 `_hash` 로 끝나는 칸 전부이고 그것뿐이다 - 암호 지문 · 토큰 · 쿠키 · 기기 코드의 sha256.
+// 새 해시 칸이 표시 없이 들어오면 그 원값이 행 좌표 · 오류 · 바꾼 칸 기록으로 나간다.
+func TestSecretColumnsAreTheHashColumns(t *testing.T) {
+	var marked, hashes []string
+	for _, tb := range pg.Tables() {
+		for _, c := range tb.Cols {
+			if c.Secret {
+				marked = append(marked, tb.Name+"."+c.Name)
+			}
+			if strings.HasSuffix(c.Name, "_hash") {
+				hashes = append(hashes, tb.Name+"."+c.Name)
+			}
+		}
+	}
+	want := []string{"account.password_hash", "invite.token_hash", "machine.token_hash", "web_session.id_hash", "device_code.code_hash"}
+	if !slices.Equal(marked, hashes) || len(marked) != len(want) {
+		t.Fatalf("비밀 칸 %v, `_hash` 칸 %v (기대 %v)", marked, hashes, want)
+	}
+	for _, w := range want {
+		if !slices.Contains(marked, w) {
+			t.Errorf("%s 가 비밀 칸이 아니다", w)
+		}
+	}
+}
+
+// 행 좌표는 비밀 키 칸을 원값 대신 지문으로 적고, 그 밖의 칸은 원값 그대로다. 지문은 같은 값이면 같고, 원값의 어떤 조각도 싣지
+// 않는다. 대조의 행 지문(Mark 의 Hash)은 원값으로 잰다 - 키가 같고 내용이 다른 두 행은 지문이 다르다.
+func TestRowLabelsFingerprintSecretKeys(t *testing.T) {
+	var ws pg.Table
+	for _, tb := range pg.Tables() {
+		if tb.Name == "web_session" {
+			ws = tb
+		}
+	}
+	const raw = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+	row := []any{raw, "a1", "t", "t", "t", nil}
+	m := ws.Mark(row)
+	if want := "id_hash=" + pg.SecretMark(raw); m.Key != want || strings.Contains(m.Key, raw[:12]) {
+		t.Fatalf("web_session 행 좌표 %q, 기대 %q", m.Key, want)
+	}
+	if got := pg.SecretMark(raw); !strings.HasPrefix(got, "sha256:") || len(got) != len("sha256:")+12 || got != pg.SecretMark([]byte(raw)) {
+		t.Fatalf("지문 꼴 %q", got)
+	}
+	other := slices.Clone(row)
+	other[5] = "ua"
+	if o := ws.Mark(other); o.Key != m.Key || o.Hash == m.Hash {
+		t.Fatalf("키가 같고 내용이 다른 행: 좌표 %q · %q, 행 지문이 같다 %v", m.Key, o.Key, o.Hash == m.Hash)
+	}
+	if got := pg.CoordLabel(nil, raw); got != pg.LabelValue(raw) || !strings.Contains(got, raw) {
+		t.Fatalf("칸을 모르는 좌표는 원값 꼴이어야 한다: %q", got)
+	}
+	if got := pg.CoordLabel(&ws.Cols[1], "a1"); got != `"a1"` {
+		t.Fatalf("비밀 아닌 칸의 좌표 %q", got)
+	}
+}
+
+// 비밀 칸의 NUL 은 바꿔 넣지 않고 거절한다 - 바꾸면 바꾼 칸 기록이 그 원래 바이트를 담는다. 비밀이 아닌 자유 글(user_agent)은
+// 바꿔 넣는다.
+func TestSecretColumnsRefuseNUL(t *testing.T) {
+	for _, tb := range pg.Tables() {
+		for _, c := range tb.Cols {
+			_, fault, rw := pg.Cell(c, "a\x00b")
+			switch {
+			case c.Secret && (fault != pg.FaultSecretNUL || rw != ""):
+				t.Errorf("비밀 칸 %s.%s 의 NUL: 거절 %q · 바꿈 %q", tb.Name, c.Name, fault, rw)
+			case tb.Name == "web_session" && c.Name == "user_agent" && rw != pg.RewriteNUL:
+				t.Errorf("web_session.user_agent 의 NUL 을 바꿔 넣지 않았다: 거절 %q · 바꿈 %q", fault, rw)
+			}
+		}
+	}
+}

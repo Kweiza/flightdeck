@@ -137,9 +137,8 @@ func exportSourceRefusal(plan MigrationPlan) error {
 
 // newExportFile 은 to 와 같은 디렉토리에 임시 SQLite 파일을 만들어 판 pg.ImportVersion 스키마를 깐다. 실패하면 남기지 않는다.
 //
-// ★ 모드는 SQLite 가 새 원장을 만들 때와 같다 - ledgerFileMode(0644)를 만들 때 주고 umask 가 거른다(createExclusive).
-// os.CreateTemp 는 0600 고정이라 서버가 다른 uid 면 못 읽고, 만든 뒤 Chmod 하면 umask(예: 077)를 무시하고 넓힌다.
-// 스키마를 깔기 전에 정해진다 - SQLite 는 옆 파일(-wal · -shm)을 본 파일의 모드로 만든다.
+// ★ 모드는 ledgerFileMode(0600)를 만들 때 주고 umask 는 더 좁힐 수만 있다(createExclusive). 만든 뒤 Chmod 하지 않는다 -
+// umask(예: 077)를 무시하고 넓히게 된다. 스키마를 깔기 전에 정해진다 - SQLite 는 옆 파일(-wal · -shm)을 본 파일의 모드로 만든다.
 func newExportFile(ctx context.Context, to string, log *slog.Logger) (string, error) {
 	f, err := createExclusive(filepath.Dir(to), "."+filepath.Base(to)+".export-", ledgerFileMode)
 	if err != nil {
@@ -157,9 +156,11 @@ func newExportFile(ctx context.Context, to string, log *slog.Logger) (string, er
 	return tmp, nil
 }
 
-// ledgerFileMode 는 이 패키지가 내는 원장 파일(역이관이 낸 원장 · 판올림 전 사본)을 만들 때 주는 모드다 - SQLite 가 새 원장을
-// 만들 때와 같다(0644, umask 가 거른다).
-const ledgerFileMode fs.FileMode = 0o644
+// ledgerFileMode 는 이 패키지가 내는 원장 파일(역이관이 낸 원장 · 판올림 전 사본 · 바꾼 칸 기록)을 만들 때 주는 모드다. 주인만
+// 읽고 쓴다(0600): 판 20 원장은 암호 지문(account.password_hash)과 기기 토큰 지문(machine.token_hash)을 담고, 바꾼 칸 기록은
+// 원본 바이트를 담는다. umask 022 에 0644 로 만들면 같은 기계의 누구나 읽는다. 그 파일을 여는 서버 · `fd migrate` 는 그것을 낸
+// 것과 같은 uid(compose 의 FD_UID)로 돈다 - 다른 uid 의 서버는 0644 여도 원장에 못 써서 어차피 못 연다.
+const ledgerFileMode fs.FileMode = 0o600
 
 // createExclusive 는 dir 안에 prefix 로 시작하는 겹치지 않는 이름의 새 파일을 mode 로 만든다(O_EXCL - 있는 파일은 안 연다).
 // os.CreateTemp 와 같지만 모드를 받는다 - 프로세스 umask 가 그 모드를 거른다.

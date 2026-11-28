@@ -80,6 +80,7 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 	to := fs.Int("to", 0, "이 판으로 맞춘다: 지금보다 높으면 거기까지만 올리고, 낮으면 인덱스만 더한 판을 기록을 잃지 않고 내린다(0 이면 이 바이너리가 아는 최신)")
 	rollback := fs.Bool("rollback", false, "판올림 전 백업 중 최신 것으로 되돌린다(Postgres 는 복원 절차를 낸다)")
 	backupDir := fs.String("backup-dir", "", "Postgres 판올림 전 덤프 자리(비면 "+backupDirEnv+", 그것도 비면 "+defaultBackupDir+" 가 있을 때 그곳)")
+	allowWindow := fs.Bool("allow-in-rollback-window", false, "이관 뒤 되돌리기 창(72시간) 안에서도 인덱스만 더한 것이 아닌 증분을 Postgres 원장에 얹는다 - 옛 판으로 되돌리지 않기로 했을 때만")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -123,8 +124,12 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 	//   (store.UnmovedSQLiteRefusal) - 덮개 파일을 얹고 이관 없이 띄운 compose 가 빈 Postgres 원장을 새로 쓰기 시작하는 길을
 	//   여기서 막는다. 판이 맞아 아무것도 안 하는 날에도 잰다(그날 서버가 뜬다). --db 로 준 원장은 이 환경의 원장인지 모르므로
 	//   재지 않는다.
+	// ★ 같은 자리의 표지가 되돌리기 창도 연다(MigrateOptions.Moved - 창 안이면 인덱스만 더한 것이 아닌 증분을 얹지 않는다).
+	//   --db 로 준 원장은 그 표지의 원장인지 모르므로 창도 재지 않는다.
+	moved := ""
 	if strings.TrimSpace(*dbPath) == "" && store.ParseTarget(path).Postgres() {
-		if err := store.UnmovedSQLiteRefusal(sqliteLedgerPath(a.env), *to); err != nil {
+		moved = sqliteLedgerPath(a.env)
+		if err := store.UnmovedSQLiteRefusal(moved, *to); err != nil {
 			a.log.Error("적용 거절", "path", shown, "error", err.Error())
 			fmt.Fprintf(out, "적용하지 않는다: %s\n", err)
 			return 1
@@ -150,7 +155,8 @@ func (a *App) runMigrate(ctx context.Context, args []string, out io.Writer) int 
 		return 0
 	}
 
-	if err := store.MigrateWith(ctx, path, store.MigrateOptions{Target: target, BackupDir: dumps, DumpTimeout: dumpTimeout}, a.log); err != nil {
+	if err := store.MigrateWith(ctx, path, store.MigrateOptions{Target: target, BackupDir: dumps, DumpTimeout: dumpTimeout,
+		Moved: moved, AllowInRollbackWindow: *allowWindow}, a.log); err != nil {
 		a.log.Error("적용 실패", "path", shown, "target", target, "error", err.Error())
 		fmt.Fprintf(out, "적용 실패: %s\n", err)
 		return 1

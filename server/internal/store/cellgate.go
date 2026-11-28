@@ -89,7 +89,7 @@ func (e *CellRefusal) Error() string {
 // Unwrap 은 거절 갈래를 입력 규칙(nulesc)의 갈래로 옮긴다. 서버의 결함(깨진 JSON)이면 nil 이다.
 func (e *CellRefusal) Unwrap() error {
 	switch e.Fault {
-	case pg.FaultIdentNUL:
+	case pg.FaultIdentNUL, pg.FaultSecretNUL:
 		return nulesc.ErrNUL
 	case pg.FaultUTF8:
 		return nulesc.ErrUTF8
@@ -255,10 +255,12 @@ type cellShape struct {
 type cellSlot struct {
 	col   *pg.Column // 인자가 그대로 담기는 칸(`칸 = ?` · VALUES 의 `?` 하나). 조회 조건 · 식 · 옮기지 않는 관리 표면 nil
 	coord string     // 행 좌표 이름(식별자 칸 · 조회 조건 `이름 = ?`). 빈 것은 싣지 않는다
+	// coordCol 은 좌표 이름이 가리키는 표의 칸이다(모르면 nil). 비밀 칸이면 값 대신 지문을 싣는다(pg.CoordLabel).
+	coordCol *pg.Column
 }
 
 // row 는 인자 args 로 이 문장이 쓰는 행의 좌표를 적는다(「project="fd" id="x"」 - 이관의 행 좌표 pg.KeyLabel 과 같은 꼴). 글 내용이
-// 아니라 이름이다 - 식별자 칸과 조회 조건만 싣는다.
+// 아니라 이름이다 - 식별자 칸과 조회 조건만 싣는다. 비밀 칸(web_session.id_hash 등)은 지문이다.
 func (sh *cellShape) row(args []any) string {
 	var parts []string
 	for i, sl := range sh.slots {
@@ -269,7 +271,7 @@ func (sh *cellShape) row(args []any) string {
 		if dv, err := driverValue(v, true); err == nil {
 			v = dv
 		}
-		parts = append(parts, sl.coord+"="+pg.LabelValue(v))
+		parts = append(parts, sl.coord+"="+pg.CoordLabel(sl.coordCol, v))
 	}
 	return strings.Join(parts, " ")
 }
@@ -461,7 +463,7 @@ func (st *stmt) value(col string, from, to int) error {
 		return fmt.Errorf("표 %s 에 칸 %q 가 없다", st.tb.Name, col)
 	}
 	if to-from == 1 && st.marks[from] >= 0 {
-		st.sh.slots[st.marks[from]] = cellSlot{col: c, coord: coordOf(c)}
+		st.sh.slots[st.marks[from]] = cellSlot{col: c, coord: coordOf(c), coordCol: c}
 		return nil
 	}
 	for k := from; k < to; k++ {
@@ -505,7 +507,11 @@ func (st *stmt) assignments(stops ...string) error {
 func (st *stmt) conditions() {
 	for k := st.i; k < len(st.toks); k++ {
 		if st.marks[k] >= 0 && k >= 2 && st.text(k-1) == "=" && st.toks[k-2].kind == tokWord {
-			st.sh.slots[st.marks[k]].coord = st.text(k - 2)
+			sl := &st.sh.slots[st.marks[k]]
+			sl.coord = st.text(k - 2)
+			if st.tb != nil {
+				sl.coordCol = st.tb.Col(strings.ToLower(sl.coord))
+			}
 		}
 	}
 }

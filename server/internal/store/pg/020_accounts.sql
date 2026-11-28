@@ -10,6 +10,8 @@
 --   - item_revision_no_update 는 갱신 금지 칸에 author 를 더해 다시 만든다(귀속보다 먼저 - 귀속은 그것을 끈 채 돈다).
 --   - FK 는 기준선처럼 DEFERRABLE INITIALLY IMMEDIATE 다(옮기기 · 이관이 한 트랜잭션에서 순서 없이 쓸 때 미룰 수 있게).
 --   - 새 표 넷의 앱 역할 권한을 여기서 준다(기준선 끝 GRANT 는 그때 있던 표에만 들었다). 함수는 더하지 않는다.
+--   - 소유자 계정의 조건 · 만든 때는 SQLite 와 한 문장이다. 시각의 최솟값은 COLLATE "C" 로 바이트 순에 고정한다 - DB 의 기본
+--     정렬(예: 문장 부호를 건너뛰는 로캘)에 맡기면 SQLite(BINARY)와 다른 행을 고를 수 있다.
 
 CREATE TABLE account (
   id            text PRIMARY KEY,
@@ -97,11 +99,16 @@ DECLARE
   want bigint;
   got  bigint;
 BEGIN
-  IF EXISTS (SELECT 1 FROM machine) OR EXISTS (SELECT 1 FROM session) OR EXISTS (SELECT 1 FROM item)
-     OR EXISTS (SELECT 1 FROM judgment) OR EXISTS (SELECT 1 FROM item_revision) THEN
-    INSERT INTO account(id, login, display_name, role, created_at)
-    VALUES ('owner', 'owner', 'owner', 'admin', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
-  END IF;
+  INSERT INTO account(id, login, display_name, role, created_at)
+  SELECT 'owner', 'owner', 'owner', 'admin', first FROM (
+    SELECT min(at COLLATE "C") AS first FROM (
+                SELECT min(created_at COLLATE "C") AS at FROM project
+      UNION ALL SELECT min(first_seen COLLATE "C") FROM machine
+      UNION ALL SELECT min(at COLLATE "C") FROM judgment
+      UNION ALL SELECT min(at COLLATE "C") FROM pick_eval
+      UNION ALL SELECT min(at COLLATE "C") FROM event
+      UNION ALL SELECT min(at COLLATE "C") FROM idempotency) AS roots) AS earliest
+  WHERE first IS NOT NULL;
 
   ALTER TABLE judgment DISABLE TRIGGER judgment_no_update;
   ALTER TABLE item_revision DISABLE TRIGGER item_revision_no_update;

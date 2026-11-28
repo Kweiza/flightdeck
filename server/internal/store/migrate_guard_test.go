@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/kweiza/flightdeck/internal/store/pg"
 )
 
 // 이 파일이 지키는 것은 **설계 §7 의 판단이 뒤집히는 순간**이다.
@@ -74,39 +76,161 @@ func (o op) String() string {
 }
 
 func destructiveOps(sql string) []op {
-	s := strings.ToUpper(stripSQLComments(sql))
-
-	// ★ UPDATE 를 낱말 하나로 찾으면 안 된다. 이 스키마의 외래 키는 `ON UPDATE NO ACTION`
-	// 을 쓰고, 그러면 **제약을 적은 증분이 전부 데이터 이행으로 걸린다.**
-	// 그래서 `UPDATE <표> SET` 모양일 때만 센다.
-	checks := []struct {
-		op op
-		re *regexp.Regexp
-	}{
-		{opDropTable, regexp.MustCompile(`\bDROP\s+TABLE\b`)},
-		{opDropColumn, regexp.MustCompile(`\bDROP\s+COLUMN\b`)},
-		{opRename, regexp.MustCompile(`\bRENAME\s+(TO|COLUMN)\b`)},
-		{opDeleteFrom, regexp.MustCompile(`\bDELETE\s+FROM\b`)},
-		{opUpdateSet, regexp.MustCompile(`\bUPDATE\s+[A-Z_][A-Z0-9_]*\s+SET\b`)},
-		{opInsertSelect, regexp.MustCompile(`\bINSERT\s+INTO\b[\s\S]*?\bSELECT\b`)},
-	}
-
 	var found []op
-	for _, c := range checks {
-		if c.re.MatchString(s) {
-			found = append(found, c.op)
+	for _, st := range destructiveSites(sql) {
+		if !slices.Contains(found, st.op) {
+			found = append(found, st.op)
 		}
 	}
 	return found
 }
 
-// opLabels 는 표시용 라벨을 낸다. 오류 메시지 전용이다.
-func opLabels(ops []op) []string {
-	out := make([]string, 0, len(ops))
-	for _, o := range ops {
-		out = append(out, o.String())
+// opSite 는 증분 글에서 찾은 파괴적 조작 하나와 그 대상(소문자)이다: DROP TABLE · DELETE FROM · INSERT … SELECT 는 표, UPDATE … SET
+// 은 「표.칸」(SET 의 칸마다 하나), DROP COLUMN · RENAME 은 빈 대상이다(어차피 예외가 없다). 대상을 못 읽은 꼴(`SET (a, b) = …`
+// 등)도 빈 대상이라 대상을 적은 예외(exemption.only)에 안 맞는다 - 좁은 예외는 읽은 대상만 연다.
+type opSite struct {
+	op     op
+	target string
+}
+
+func (s opSite) String() string { return strings.TrimSpace(s.op.String() + " " + s.target) }
+
+var (
+	siteDropTable   = regexp.MustCompile(`\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([A-Z_][A-Z0-9_.]*)?`)
+	siteDropColumn  = regexp.MustCompile(`\bDROP\s+COLUMN\b`)
+	siteRename      = regexp.MustCompile(`\bRENAME\s+(?:TO|COLUMN)\b`)
+	siteDeleteFrom  = regexp.MustCompile(`\bDELETE\s+FROM\b\s*([A-Z_][A-Z0-9_.]*)?`)
+	siteUpdateSet   = regexp.MustCompile(`\bUPDATE\s+([A-Z_][A-Z0-9_]*)\s+SET\b`)
+	siteInsertInto  = regexp.MustCompile(`\bINSERT\s+INTO\b\s*([A-Z_][A-Z0-9_.]*)?`)
+	siteSelect      = regexp.MustCompile(`\bSELECT\b`)
+	siteIdent       = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
+	siteSetStopWord = []string{"WHERE", "FROM", "RETURNING"}
+)
+
+// destructiveSites 는 증분 SQL 하나의 파괴적 조작을 자리마다 낸다. 주석을 걷고(stripSQLComments) 글 상수를 비운 뒤(maskSQLStrings)
+// 대문자로 읽는다 - 글 안의 `;` · 낱말이 문장 끝이나 조작으로 안 읽힌다. INSERT … SELECT 는 그 INSERT 문장 안(깊이 0 의 `;` 까지)의
+// SELECT 만 본다 - 뒤 문장의 SELECT 를 이어 읽지 않는다.
+func destructiveSites(sql string) []opSite {
+	s := maskSQLStrings(strings.ToUpper(stripSQLComments(sql)))
+	var out []opSite
+	target := func(m []int) string {
+		if len(m) < 4 || m[2] < 0 {
+			return ""
+		}
+		return strings.ToLower(s[m[2]:m[3]])
+	}
+	for _, m := range siteDropTable.FindAllStringSubmatchIndex(s, -1) {
+		out = append(out, opSite{opDropTable, target(m)})
+	}
+	for range siteDropColumn.FindAllStringIndex(s, -1) {
+		out = append(out, opSite{opDropColumn, ""})
+	}
+	for range siteRename.FindAllStringIndex(s, -1) {
+		out = append(out, opSite{opRename, ""})
+	}
+	for _, m := range siteDeleteFrom.FindAllStringSubmatchIndex(s, -1) {
+		out = append(out, opSite{opDeleteFrom, target(m)})
+	}
+	for _, m := range siteUpdateSet.FindAllStringSubmatchIndex(s, -1) {
+		for _, col := range setColumns(s, m[1]) {
+			t := ""
+			if col != "" {
+				t = target(m) + "." + strings.ToLower(col)
+			}
+			out = append(out, opSite{opUpdateSet, t})
+		}
+	}
+	for _, m := range siteInsertInto.FindAllStringSubmatchIndex(s, -1) {
+		if siteSelect.MatchString(s[m[1]:statementEnd(s, m[1])]) {
+			out = append(out, opSite{opInsertSelect, target(m)})
+		}
 	}
 	return out
+}
+
+// maskSQLStrings 는 글 상수(작은따옴표 사이, 잇댄 작은따옴표 둘은 글 안의 따옴표 하나)의 내용을 비운다. 따옴표 쌍은 남긴다.
+func maskSQLStrings(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	in := false
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '\'' && in && i+1 < len(s) && s[i+1] == '\'':
+			i++
+		case c == '\'':
+			in = !in
+			b.WriteByte(c)
+		case !in:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// statementEnd 는 s[i:] 에서 괄호 깊이 0 의 `;` 자리다(없으면 끝).
+func statementEnd(s string, i int) int {
+	depth := 0
+	for j := i; j < len(s); j++ {
+		switch s[j] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ';':
+			if depth <= 0 {
+				return j
+			}
+		}
+	}
+	return len(s)
+}
+
+// setColumns 는 s[i:](UPDATE … SET 바로 뒤)의 SET 칸 이름들이다: 깊이 0 의 쉼표로 가른 「칸 = 식」마다 하나, 깊이 0 의 WHERE ·
+// FROM · RETURNING 낱말이나 `;` · 짝 없는 `)` 에서 멈춘다. 칸 자리가 이름 하나가 아니면 빈 이름이다.
+func setColumns(s string, i int) []string {
+	var cols []string
+	start := i
+	flush := func(end int) {
+		lhs, _, _ := strings.Cut(s[start:end], "=")
+		name := strings.TrimSpace(lhs)
+		if !siteIdent.MatchString(name) {
+			name = ""
+		}
+		cols = append(cols, name)
+	}
+	word := func(j int, w string) bool {
+		edge := func(k int) bool {
+			return k < 0 || k >= len(s) || !(s[k] == '_' || s[k] >= 'A' && s[k] <= 'Z' || s[k] >= '0' && s[k] <= '9')
+		}
+		return strings.HasPrefix(s[j:], w) && edge(j-1) && edge(j+len(w))
+	}
+	depth := 0
+	for j := i; j < len(s); j++ {
+		switch c := s[j]; {
+		case c == '(':
+			depth++
+		case c == ')' && depth > 0:
+			depth--
+		case depth > 0:
+		case c == ',':
+			flush(j)
+			start = j + 1
+		case c == ';' || c == ')' || slices.ContainsFunc(siteSetStopWord, func(w string) bool { return word(j, w) }):
+			flush(j)
+			return cols
+		}
+	}
+	flush(len(s))
+	return cols
+}
+
+// siteLabels 는 자리마다 표시용 라벨(조작 · 대상)을 쉼표로 잇는다. 오류 메시지 전용이다.
+func siteLabels(sites []opSite) string {
+	out := make([]string, 0, len(sites))
+	for _, st := range sites {
+		out = append(out, st.String())
+	}
+	return strings.Join(out, ", ")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +244,10 @@ func opLabels(ops []op) []string {
 // 사유를 선택 항목으로 두면 목록은 자라고 근거는 안 자란다.
 type exemption struct {
 	ops []op
-	why string
+	// only 는 조작 하나를 대상(site.target)으로 더 좁힌다: 조작이 여기 오르면 적힌 대상의 그 조작만 예외다. 오르지 않은 조작은
+	// ops 대로 그 증분 어디서든 예외다(옛 증분의 예외). 넓은 예외가 같은 증분 안의 다른 표 · 칸으로 새지 않게 한다.
+	only map[op][]string
+	why  string
 }
 
 // destructiveExempt 는 증분 번호 → 그 증분이 여는 예외다.
@@ -231,14 +358,21 @@ var destructiveExempt = map[int]exemption{
 	// 020 · 계정 표 · 행위자 칸을 더하고 옛 행을 소유자 계정에 귀속한다.
 	20: {
 		ops: []op{opUpdateSet, opInsertSelect, opDropTable},
+		only: map[op][]string{
+			opUpdateSet: {"machine.account_id", "machine.name", "session.account_id", "item.created_by", "judgment.author",
+				"judgment.via", "item_revision.author"},
+			opInsertSelect: {"account", "attribution_count"},
+			opDropTable:    {"temp.attribution_count"},
+		},
 		why: "UPDATE 는 이 증분이 **방금 더한 칸**(machine.account_id · name, session.account_id, item.created_by, " +
 			"judgment.author · via, item_revision.author)에만 쓴다 - 기존 칸은 읽기만 하므로 그 칸을 비우면 이 증분 이전 " +
-			"값과 같다. INSERT … SELECT 는 둘이다: 원장에 행이 있을 때만 소유자 계정 한 행을 넣는 조건부(빈 원장에는 " +
+			"값과 같다. INSERT … SELECT 는 둘이다: 원장에 업무 행이 있을 때만 소유자 계정 한 행을 넣는 조건부(빈 원장에는 " +
 			"안 넣어 이관 · 역이관 대상이 원본의 계정 행을 그대로 받는다)와, 표마다 바꾼 행 수(changes())를 그 표의 행 " +
 			"수와 함께 적는 대조 행이다. DROP TABLE 은 그 대조를 담은 TEMP 표(temp.attribution_count)를 같은 트랜잭션 " +
 			"끝에서 지우는 것뿐이고 영구 표는 하나도 안 지운다. 추가 전용 트리거 둘(judgment_no_update · " +
 			"item_revision_no_update)은 같은 트랜잭션에서 지웠다 다시 만든다(이 판정 밖의 DROP TRIGGER) - 되감기면 함께 " +
-			"되돌아온다. 판올림 전 VACUUM INTO 백업도 뜬다. 근거 전문은 020 머리말에 있다.",
+			"되돌아온다. 예외는 그 자리로 좁혔다(only) - 같은 증분의 다른 표 지우기 · 기존 칸 고치기는 막힌다" +
+			"(TestMigration020ExemptionIsNarrow, 두 엔진). 판올림 전 VACUUM INTO 백업도 뜬다. 근거 전문은 020 머리말에 있다.",
 	},
 }
 
@@ -274,22 +408,39 @@ var neverExempt = []op{opDropColumn, opRename}
 //
 // ★ 표를 인자로 받는다. 전역을 직접 읽으면 이 판정을 시험할 때 전역을 바꿔치기해야 하고,
 // 그렇게 얽힌 시험은 실행 순서에 따라 빨개진다.
-func exemptReason(table map[int]exemption, to int, o op) (why string, ok bool) {
-	for _, banned := range neverExempt {
-		if o == banned {
-			return "", false
-		}
-	}
-	ex, found := table[to]
-	if !found || strings.TrimSpace(ex.why) == "" {
+func exemptReason(table map[int]exemption, to int, st opSite) (why string, ok bool) {
+	if slices.Contains(neverExempt, st.op) {
 		return "", false
 	}
-	for _, allowed := range ex.ops {
-		if o == allowed {
-			return ex.why, true
+	ex, found := table[to]
+	if !found || strings.TrimSpace(ex.why) == "" || !slices.Contains(ex.ops, st.op) {
+		return "", false
+	}
+	if targets, narrowed := ex.only[st.op]; narrowed && (st.target == "" || !slices.Contains(targets, st.target)) {
+		return "", false
+	}
+	return ex.why, true
+}
+
+// unexcused 는 판 to 의 증분 글 sql 에서 예외(destructiveExempt)로 못 지나가는 파괴적 조작 자리다.
+func unexcused(to int, sql string) []opSite {
+	var out []opSite
+	for _, st := range destructiveSites(sql) {
+		if _, ok := exemptReason(destructiveExempt, to, st); !ok {
+			out = append(out, st)
 		}
 	}
-	return "", false
+	return out
+}
+
+// guardedMigrations 는 이 가드가 훑는 증분 전부다: SQLite 증분(migrations)과 Postgres 증분(pg.Steps - 기준선 위). 같은 판 번호는
+// 같은 뜻이라 예외 표 하나를 함께 쓴다. 기준선(pg/001_baseline.sql)은 SQLite 판 18 을 접은 빈 DB 의 정의라 훑지 않는다.
+func guardedMigrations() []Migration {
+	out := slices.Clone(migrations)
+	for _, st := range pg.Steps {
+		out = append(out, Migration{To: st.To, Name: "pg/" + st.Name, SQL: st.SQL})
+	}
+	return out
 }
 
 // stripSQLComments 는 `--` 줄 주석과 `/* */` 블록 주석을 걷어낸다. 순수 함수다.
@@ -413,18 +564,15 @@ func TestBundledMigrationsAreAdditive(t *testing.T) {
 		t.Fatal("전제가 깨졌다 — 번들된 증분이 0건이다. 볼 것이 없으면 지킬 것도 없다")
 	}
 
-	for _, m := range migrations {
+	if len(pg.Steps) == 0 {
+		t.Fatal("전제가 깨졌다 — Postgres 증분(pg.Steps)이 0건이다")
+	}
+	for _, m := range guardedMigrations() {
 		if strings.TrimSpace(m.SQL) == "" {
 			t.Fatalf("전제가 깨졌다 — 증분 %d(%s) 의 SQL 이 비었다(//go:embed 확인)", m.To, m.Name)
 		}
 		// 예외에 오른 조작은 사유와 함께 통과시킨다. 나머지는 그대로 만료 통지다.
-		var unexcused []op
-		for _, o := range destructiveOps(m.SQL) {
-			if _, ok := exemptReason(destructiveExempt, m.To, o); ok {
-				continue
-			}
-			unexcused = append(unexcused, o)
-		}
+		unexcused := unexcused(m.To, m.SQL)
 		if len(unexcused) > 0 {
 			t.Errorf("증분 %d(%s) 에 예외 없는 파괴적 조작이 있다: %s\n\n"+
 				"이것은 시험의 결함이 아니라 **판단의 만료 통지**다.\n"+
@@ -437,7 +585,7 @@ func TestBundledMigrationsAreAdditive(t *testing.T) {
 				"  (b) 이 증분이 왜 되돌릴 수 있는지를 destructiveExempt 에 **사유와 함께** 올린다.\n"+
 				"      사유가 비면 예외로 안 쳐 준다. neverExempt 에 오른 조작은 (b) 로도 못 연다.\n\n"+
 				"어느 쪽이든 **문서와 코드를 갈린 채로 두지 마라.**",
-				m.To, m.Name, strings.Join(opLabels(unexcused), ", "))
+				m.To, m.Name, siteLabels(unexcused))
 		}
 	}
 }
@@ -489,7 +637,7 @@ func TestExemptionMechanism(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			why, ok := exemptReason(c.table, c.to, c.o)
+			why, ok := exemptReason(c.table, c.to, opSite{op: c.o, target: "t"})
 			if ok != c.wantOK {
 				t.Fatalf("예외 판정이 %v 여야 하는데 %v 다 (증분 %d, 조작 %s, 사유 %q)",
 					c.wantOK, ok, c.to, c.o, why)
@@ -502,6 +650,71 @@ func TestExemptionMechanism(t *testing.T) {
 				t.Fatalf("거절하면서 사유를 냈다 %q — 거절의 사유를 통과의 사유 자리로 흘리면 호출부가 둘을 못 가른다", why)
 			}
 		})
+	}
+}
+
+// 대상으로 좁힌 예외(exemption.only)는 적힌 대상의 그 조작만 연다: 다른 표 · 칸, 대상을 못 읽은 자리는 막고, 좁히지 않은 조작은
+// 그 증분 어디서든 연다.
+func TestNarrowExemption(t *testing.T) {
+	narrow := map[int]exemption{5: {ops: []op{opDropTable, opDeleteFrom},
+		only: map[op][]string{opDropTable: {"temp.x"}}, why: "임시 표만 지운다"}}
+	for _, c := range []struct {
+		st     opSite
+		wantOK bool
+	}{
+		{opSite{opDropTable, "temp.x"}, true},
+		{opSite{opDropTable, "item"}, false},
+		{opSite{opDropTable, ""}, false},
+		{opSite{opDeleteFrom, "item"}, true},
+		{opSite{opUpdateSet, "item.title"}, false},
+	} {
+		if _, ok := exemptReason(narrow, 5, c.st); ok != c.wantOK {
+			t.Errorf("%s: 예외 %v, 기대 %v", c.st, ok, c.wantOK)
+		}
+	}
+}
+
+// 자리 읽기: DROP TABLE · INSERT 의 표, UPDATE 의 SET 칸마다 「표.칸」(식 안의 쉼표 · 괄호 · 글 상수는 칸을 안 가른다), INSERT …
+// SELECT 는 그 문장 안의 SELECT 만, 글 상수 안의 낱말 · `;` 는 조작이 아니다.
+func TestDestructiveSitesReadTheTarget(t *testing.T) {
+	got := destructiveSites(`DROP TABLE temp.attribution_count; DROP TABLE IF EXISTS item;
+		UPDATE judgment SET author = 'owner', via = CASE WHEN substr(coalesce(title, ''), 1, 9) = '[x;y]' THEN 'web' ELSE 'cli' END
+		WHERE author IS NULL;
+		UPDATE item SET (a, b) = (1, 2);
+		INSERT INTO t(a) VALUES ('x'); SELECT 1;
+		INSERT INTO c(a, n) VALUES ('m', (SELECT count(*) FROM m));
+		UPDATE machine SET name = 'DELETE FROM project' RETURNING id;`)
+	want := []opSite{{opDropTable, "temp.attribution_count"}, {opDropTable, "item"},
+		{opUpdateSet, "judgment.author"}, {opUpdateSet, "judgment.via"}, {opUpdateSet, ""}, {opUpdateSet, "machine.name"},
+		{opInsertSelect, "c"}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("자리\n  %v\n기대\n  %v", got, want)
+	}
+}
+
+// 증분 020 의 좁은 예외는 그 증분이 실제로 쓰는 자리만 연다. 같은 글에 영구 표 지우기나 기존 칸 고치기를 덧붙이면 두 엔진 모두
+// 막힌다 - 예외가 「020 의 DROP TABLE · UPDATE 전부」였을 때는 지나갔다.
+func TestMigration020ExemptionIsNarrow(t *testing.T) {
+	for _, m := range guardedMigrations() {
+		if m.To != 20 {
+			continue
+		}
+		if got := unexcused(m.To, m.SQL); len(got) != 0 {
+			t.Fatalf("%s 의 자리가 예외 밖이다: %s", m.Name, siteLabels(got))
+		}
+		for _, extra := range []struct {
+			sql  string
+			want opSite
+		}{
+			{"DROP TABLE item;", opSite{opDropTable, "item"}},
+			{"UPDATE judgment SET body = 'x';", opSite{opUpdateSet, "judgment.body"}},
+			{"UPDATE machine SET hostname = 'x';", opSite{opUpdateSet, "machine.hostname"}},
+			{"INSERT INTO project(id) SELECT id FROM item;", opSite{opInsertSelect, "project"}},
+		} {
+			if got := unexcused(m.To, m.SQL+"\n"+extra.sql); !slices.Equal(got, []opSite{extra.want}) {
+				t.Errorf("%s + %q: 예외 밖 자리 %v, 기대 %v", m.Name, extra.sql, got, extra.want)
+			}
+		}
 	}
 }
 

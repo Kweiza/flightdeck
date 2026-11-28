@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kweiza/flightdeck/internal/store/pg"
@@ -24,8 +25,11 @@ import (
 //   - Postgres 판올림(fd migrate)은 이 환경의 SQLite 원장 자리에 표지 없는 원장이 남아 있으면 거절한다(UnmovedSQLiteRefusal).
 //     덮개 파일을 얹고 이관 없이 띄운 compose 가 빈 Postgres 원장을 만들어 쓰기 시작하는 길이다.
 //
-// ★ 판정은 표지가 **있는가**뿐이다. 내용(movedNote)은 사람과 거절 문구를 위한 것이라 못 읽어도 표지다 - 손으로 `touch` 한 빈
-// 파일도 표지다(이관이 커밋 뒤 표지를 못 남겼을 때의 처방).
+// ★ 두 관문의 판정은 표지가 **있는가**뿐이다. 내용(movedNote)은 사람과 거절 문구를 위한 것이라 못 읽어도 표지다 - 손으로 `touch`
+// 한 빈 파일도 표지다(이관이 커밋 뒤 표지를 못 남겼을 때의 처방).
+//   - 내용을 읽는 판정은 하나다: Postgres 판올림의 되돌리기 창(rollbackWindowRefusal). 옮긴 때(moved_at)부터 RollbackWindow
+//     동안은 인덱스만 더한 것이 아닌 증분을 `--allow-in-rollback-window` 없이 얹지 않는다. 옮긴 때를 못 읽으면 표지 파일의 고친
+//     때로 잰다 - 손으로 남긴 표지는 이관이 커밋한 직후에 만든다.
 // ★ 표지 자리를 재지 못한 것(없음 말고 - 권한 · 입출력)은 두 관문 다 거절이다. 옮겼는지 모르는 채로 어느 쪽 원장도 열지 않는다.
 // ★ 지우는 길은 README 절차의 손 `rm` 뿐이고, 그 절차는 둘이다: 「72시간 안에 되돌리기」(`fd migrate export-sqlite` 가 낸 파일을
 // 원장 자리에 둔 뒤), 그리고 선택 파일을 켜기 전에 선 업그레이드를 거둘 때(「켜기 전에 섰을 때」 - 양쪽 서버를 내린 채 Postgres
@@ -39,7 +43,7 @@ const movedSuffix = ".moved-to-postgres"
 // MovedMarker 는 SQLite 원장 path 의 이관 표지 자리다. 순수 함수다.
 func MovedMarker(path string) string { return path + movedSuffix }
 
-// movedNote 는 표지 파일의 내용(JSON 한 덩이)이다. 판정에는 쓰지 않는다(머리말의 ★).
+// movedNote 는 표지 파일의 내용(JSON 한 덩이)이다. 여는 관문의 판정에는 쓰지 않고, 옮긴 때만 되돌리기 창이 읽는다(머리말의 ★).
 type movedNote struct {
 	Note    string `json:"note"`
 	MovedAt string `json:"moved_at"`
@@ -85,20 +89,30 @@ func movedRefusal(path string) error {
 		clip(path, 200), clip(mark, 200), describeMoved(mark, fi))
 }
 
-// describeMoved 는 표지 내용에서 옮긴 때 · 원장 · 행 수를 읽어 거절 문구에 붙일 꼬리를 낸다. 못 읽으면 빈 값이다 - 내용은
-// 판정이 아니다. 보통 파일만 연다(FIFO 를 열면 쓰는 쪽이 올 때까지 선다).
-func describeMoved(mark string, fi fs.FileInfo) string {
+// readMovedNote 는 표지 mark(그 정보 fi)의 내용이다. 못 읽었거나 옮긴 때가 비었으면 false 다. 보통 파일만 연다(FIFO 를 열면
+// 쓰는 쪽이 올 때까지 선다).
+func readMovedNote(mark string, fi fs.FileInfo) (movedNote, bool) {
+	var n movedNote
 	if !fi.Mode().IsRegular() {
-		return ""
+		return n, false
 	}
 	f, err := os.Open(mark)
 	if err != nil {
-		return ""
+		return n, false
 	}
 	defer f.Close()
 	raw, err := io.ReadAll(io.LimitReader(f, movedNoteLimit))
-	var n movedNote
 	if err != nil || json.Unmarshal(raw, &n) != nil || n.MovedAt == "" {
+		return movedNote{}, false
+	}
+	return n, true
+}
+
+// describeMoved 는 표지 내용에서 옮긴 때 · 원장 · 행 수를 읽어 거절 문구에 붙일 꼬리를 낸다. 못 읽으면 빈 값이다 - 내용은
+// 여는 관문의 판정이 아니다.
+func describeMoved(mark string, fi fs.FileInfo) string {
+	n, ok := readMovedNote(mark, fi)
+	if !ok {
 		return ""
 	}
 	s := " · " + clip(n.MovedAt, 40) + " 에 "
@@ -106,6 +120,66 @@ func describeMoved(mark string, fi fs.FileInfo) string {
 		s += "Postgres 원장 " + clip(n.Ledger, 40) + " 로 "
 	}
 	return s + strconv.Itoa(n.Rows) + " 행"
+}
+
+// RollbackWindow 는 이관 뒤 SQLite 로 되돌릴 수 있게 두는 창의 길이다(README 「72시간 안에 되돌리기」).
+const RollbackWindow = 72 * time.Hour
+
+// movedAt 은 SQLite 원장 path 의 표지가 연 되돌리기 창의 시작이다: 내용의 옮긴 때, 못 읽으면 표지 파일의 고친 때(머리말의 ★).
+// 표지가 없으면 false 이고, 재지 못한 것은 오류다.
+func movedAt(path string) (time.Time, bool, error) {
+	fi, err := statMoved(path)
+	if err != nil || fi == nil {
+		return time.Time{}, false, err
+	}
+	if n, ok := readMovedNote(MovedMarker(path), fi); ok {
+		if at, err := time.Parse(time.RFC3339, n.MovedAt); err == nil {
+			return at, true, nil
+		}
+	}
+	return fi.ModTime(), true, nil
+}
+
+// rollbackWindowRefusal 은 되돌리기 창 안에서 증분 steps 를 얹지 않는 사유다. 순수 함수다. opened 는 창을 연 때(movedAt), mark 는
+// 거절 문구에 실을 표지 자리다. 창 밖이거나 steps 가 모두 인덱스만 더한 증분이면 nil 이다.
+//
+// ★ 인덱스만 더한 증분은 기록을 잃지 않고 내릴 수 있어(DownSteps) 옛 판으로 가는 길이 남는다. 그 밖의 증분을 얹으면 내림이 서고
+// 옛 판의 export-sqlite 가 그 원장을 거절하며, 판올림 전 덤프로 덮는 `--rollback` 은 그 뒤의 쓰기를 잃는다 - 창 안의 되돌리기가
+// 이 판의 export-sqlite 하나로 줄어든다. 그 선택은 사람이 플래그로 한다(MigrateOptions.AllowInRollbackWindow).
+func rollbackWindowRefusal(mark string, opened, now time.Time, steps []Migration) error {
+	closes := opened.Add(RollbackWindow)
+	if !now.Before(closes) {
+		return nil
+	}
+	var held []string
+	for _, m := range steps {
+		if _, ok := pg.IndexOnly(m.SQL); !ok {
+			held = append(held, strconv.Itoa(m.To))
+		}
+	}
+	if len(held) == 0 {
+		return nil
+	}
+	return fmt.Errorf("이관 뒤 되돌리기 창 안이다 - 이관 표지 %s 가 %s 에 연 창은 %s(UTC)에 닫힌다. 판 %s 의 증분은 인덱스만 더한 "+
+		"것이 아니라, 얹으면 내림(--to)과 옛 판의 export-sqlite 가 이 원장을 거절해 창 안의 SQLite 되돌리기가 이 판의 export-sqlite "+
+		"하나로 줄어든다(README 「72시간 안에 되돌리기」). 원장은 지금 판 그대로다. 창이 닫힌 뒤 다시 올리거나, 옛 판으로 되돌리지 "+
+		"않기로 했으면 `fd migrate --allow-in-rollback-window` 로 올린다(compose 배포는 띄우던 compose 머리로 `run --rm migrate "+
+		"migrate --allow-in-rollback-window` 를 돈 뒤 다시 띄운다)",
+		clip(mark, 200), opened.UTC().Format(time.RFC3339), closes.UTC().Format(time.RFC3339), strings.Join(held, " · "))
+}
+
+// rollbackWindowGate 는 SQLite 원장 moved 의 표지가 연 되돌리기 창 안에서 증분 steps 를 얹지 않는 사유다(지금 시각 now). 표지가
+// 없으면 nil 이고, 표지를 재지 못한 것은 거절이다(머리말의 ★ - 옮겼는지 모르는 채로 올리지 않는다).
+func rollbackWindowGate(moved string, steps []Migration, now time.Time) error {
+	opened, ok, err := movedAt(moved)
+	switch {
+	case err != nil:
+		return fmt.Errorf("SQLite 원장 %s 의 이관 표지(%s)를 재지 못했다 - 되돌리기 창 안인지 모르므로 Postgres 원장을 올리지 "+
+			"않는다: %w", clip(moved, 200), clip(MovedMarker(moved), 200), err)
+	case !ok:
+		return nil
+	}
+	return rollbackWindowRefusal(MovedMarker(moved), opened, now, steps)
 }
 
 // UnmovedSQLiteRefusal 은 Postgres 원장을 판올림(fd migrate)하려는데 이 환경의 SQLite 원장 자리 sqlite 에 표지 없는 원장이

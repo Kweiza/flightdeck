@@ -588,3 +588,48 @@ func TestMigratePostgresRefusesBesideAnUnmovedSQLiteLedger(t *testing.T) {
 		}
 	}
 }
+
+// Postgres 판올림(--db 없이 FD_DB)은 이 환경의 SQLite 원장 자리의 이관 표지가 연 되돌리기 창 안이면 인덱스만 더한 것이 아닌 증분을
+// 얹지 않고, 닫히는 때와 넘는 플래그를 댄다. --allow-in-rollback-window 를 주거나 --db 로 원장을 주면(그 표지의 원장인지 모른다)
+// 창을 재지 않는다.
+func TestMigratePostgresHoldsInTheRollbackWindow(t *testing.T) {
+	if dataVolume() {
+		t.Skip("/data 가 있는 기계다 - 이 환경의 SQLite 원장 자리가 가짜 홈 밖이다")
+	}
+	ctx := context.Background()
+	h := newHarness(t)
+	dsn := storetest.NewBare(t, "")
+	if err := store.MigrateTo(ctx, dsn, pg.ImportVersion-1, quietLogger()); err != nil {
+		t.Fatal(err)
+	}
+	env := maps.Clone(h.env)
+	env[dbEnv] = dsn
+	lite := sqliteLedgerPath(envOf(env))
+	if err := ensureDBDir(lite); err != nil {
+		t.Fatal(err)
+	}
+	opened := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	note := fmt.Sprintf(`{"moved_at": %q}`, opened.Format(time.RFC3339))
+	if err := os.WriteFile(store.MovedMarker(lite), []byte(note), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	held := func() bool {
+		t.Helper()
+		p, err := store.ProbeMigration(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p.Action == store.MigrateUpgrade
+	}
+	rc, out := h.runEnv(env, "", "migrate")
+	closes := opened.Add(store.RollbackWindow).Format(time.RFC3339) + "(UTC)에 닫힌다"
+	if rc != 1 || !strings.Contains(out, "되돌리기 창 안이다") || !strings.Contains(out, closes) ||
+		!strings.Contains(out, "--allow-in-rollback-window") || !held() {
+		t.Fatalf("창 안의 판올림이 닫히는 때(%s) · 플래그를 대며 서지 않았다(rc=%d):\n%s", closes, rc, out)
+	}
+	for _, args := range [][]string{{"--allow-in-rollback-window"}, {"--db", dsn}} {
+		if _, out := h.runEnv(env, "", append([]string{"migrate"}, args...)...); strings.Contains(out, "되돌리기 창") {
+			t.Fatalf("fd migrate %v 가 되돌리기 창을 쟀다:\n%s", args, out)
+		}
+	}
+}

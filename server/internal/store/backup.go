@@ -163,12 +163,26 @@ const (
 
 // ledgerSecretCols 는 원장이 일부러 안 담는 비밀 칸이다(표 → 칸). 원장은 매시간 기록 저장소(journal.git)에 쌓이고 그 이력은
 // 지우지 않으므로, 여기 실린 비밀은 바꾼 뒤에도 영구히 남는다 - 암호 지문(argon2id)은 약한 암호면 오프라인으로 풀린다. 되쓴
-// 계정은 암호 없이(옛 원장의 소유자 계정과 같은 상태), 기기는 토큰 없이 돌아오고 다시 로그인한다. 빠뜨린 칸이 이것뿐인지는
-// TestLedgerColumnListsMatchTheSchema 가 잰다.
-var ledgerSecretCols = map[string][]string{
-	"account": {"password_hash"},
-	"machine": {"token_hash"},
-}
+// 계정은 암호 없이 돌아와 로그인할 수 없고(관리자가 내는 재설정 링크로 암호를 다시 단다 - 020 머리말), 기기는 토큰 없이 돌아와
+// 다시 로그인한다(토큰 유무는 token_hash 로만 가른다 - 되쓴 기기에도 token_prefix · issued_at 은 남는다). 빠뜨린 칸이 이것뿐인지는
+// TestLedgerColumnListsMatchTheSchema 가 잰다. 어느 칸이 비밀인지는 이관 카탈로그의 표시(pg.Column.Secret) 하나에서 읽는다 - 폐포
+// 표의 비밀 칸이 곧 이것이다(손으로 한 벌 더 적으면 비밀 칸이 늘 때 원장이 그것을 조용히 싣는다).
+var ledgerSecretCols = func() map[string][]string {
+	out := map[string][]string{}
+	for _, e := range ledgerTables {
+		for _, t := range pg.Tables() {
+			if t.Name != e.name {
+				continue
+			}
+			for _, c := range t.Cols {
+				if c.Secret {
+					out[e.name] = append(out[e.name], c.Name)
+				}
+			}
+		}
+	}
+	return out
+}()
 
 // LedgerSecretColumns 는 원장이 안 담는 비밀 칸(「표.칸」, 정렬)이다. 손실 목록(ledger.Losses)이 이것으로 적는다 - 손으로 한 벌 더
 // 적으면 칸이 늘 때 그 설명이 조용히 거짓이 된다(LedgerTableNames 와 같은 까닭).
