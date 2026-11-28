@@ -589,47 +589,143 @@ func TestMigratePostgresRefusesBesideAnUnmovedSQLiteLedger(t *testing.T) {
 	}
 }
 
-// Postgres 판올림(--db 없이 FD_DB)은 이 환경의 SQLite 원장 자리의 이관 표지가 연 되돌리기 창 안이면 인덱스만 더한 것이 아닌 증분을
-// 얹지 않고, 닫히는 때와 넘는 플래그를 댄다. --allow-in-rollback-window 를 주거나 --db 로 원장을 주면(그 표지의 원장인지 모른다)
-// 창을 재지 않는다.
+// Postgres 판올림은 되돌리기 창 안이면 인덱스만 더한 것이 아닌 증분을 얹지 않고, 닫히는 때와 넘는 플래그를 댄다. 길과 상관없다:
+// 기본 경로(FD_DB)로 부르든 --db 로 원장을 주든(FD_DB 없이) 같은 원장이면 같이 선다 - 그 원장의 판은 따로 잰다. 창의 정본은 원장에
+// 이관이 남긴 기록이고(깨진 표지의 오래된 고친 때로 닫히지 않는다), 기록이 없는 원장(옛 판이 옮겼다 - 운영이 그 경우다)은 이 환경의
+// 이관 표지로 잰다. 둘 다 없으면 창 밖으로 본다. 창 밖 · 플래그면 올리고, 인덱스만 더한 증분은 창 안에서도 얹는다.
 func TestMigratePostgresHoldsInTheRollbackWindow(t *testing.T) {
 	if dataVolume() {
 		t.Skip("/data 가 있는 기계다 - 이 환경의 SQLite 원장 자리가 가짜 홈 밖이다")
 	}
 	ctx := context.Background()
 	h := newHarness(t)
-	dsn := storetest.NewBare(t, "")
-	if err := store.MigrateTo(ctx, dsn, pg.ImportVersion-1, quietLogger()); err != nil {
-		t.Fatal(err)
-	}
-	env := maps.Clone(h.env)
-	env[dbEnv] = dsn
-	lite := sqliteLedgerPath(envOf(env))
+	lite := sqliteLedgerPath(envOf(h.env))
 	if err := ensureDBDir(lite); err != nil {
 		t.Fatal(err)
 	}
-	opened := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
-	note := fmt.Sprintf(`{"moved_at": %q}`, opened.Format(time.RFC3339))
-	if err := os.WriteFile(store.MovedMarker(lite), []byte(note), 0o644); err != nil {
+	mark := store.MovedMarker(lite)
+	index, other := pgSteps(t)
+	for _, c := range []struct {
+		name     string
+		from, to int           // to 가 0 이면 최신(--to 없음)
+		record   time.Duration // 원장의 이관 기록이 이만큼 앞이다(0 이면 없다)
+		markAgo  time.Duration // 표지(식별 없는 내용)가 이만큼 앞이다(0 이면 없다, 음수면 깨진 내용 · 그만큼 앞의 고친 때)
+		args     []string
+		refuse   bool
+	}{
+		{"기록이 창 안", other.To - 1, 0, time.Hour, 0, nil, true},
+		{"기록이 창 안 · 깨진 표지의 고친 때는 창 밖", other.To - 1, 0, time.Hour, -(store.RollbackWindow + 30*time.Hour), nil, true},
+		{"기록 없이 표지가 창 안", other.To - 1, 0, 0, time.Hour, nil, true},
+		{"기록이 창 안 · 플래그", other.To - 1, 0, time.Hour, 0, []string{"--allow-in-rollback-window"}, false},
+		{"기록이 창 밖(73시간)", other.To - 1, 0, store.RollbackWindow + time.Hour, 0, nil, false},
+		{"기록도 표지도 없다", other.To - 1, 0, 0, 0, nil, false},
+		{"기록이 창 안 · 인덱스만 더한 증분", index.To - 1, index.To, time.Hour, 0, nil, false},
+	} {
+		for _, viaDB := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/--db=%v", c.name, viaDB), func(t *testing.T) {
+				_ = os.Remove(mark)
+				dsn := storetest.NewBare(t, "")
+				if err := store.MigrateTo(ctx, dsn, c.from, quietLogger()); err != nil {
+					t.Fatal(err)
+				}
+				db, err := sql.Open("pgx", dsn)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				if c.record != 0 {
+					if _, err := db.Exec(store.MovedRecordSQL(time.Now().Add(-c.record))); err != nil {
+						t.Fatal(err)
+					}
+				}
+				switch {
+				case c.markAgo > 0:
+					note := fmt.Sprintf(`{"moved_at": %q}`, time.Now().UTC().Add(-c.markAgo).Format(time.RFC3339))
+					if err := os.WriteFile(mark, []byte(note), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				case c.markAgo < 0:
+					at := time.Now().Add(c.markAgo)
+					if err := os.WriteFile(mark, []byte(`{"moved_at":`), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Chtimes(mark, at, at); err != nil {
+						t.Fatal(err)
+					}
+				}
+				t.Cleanup(func() { _ = os.Remove(mark) })
+				env := maps.Clone(h.env)
+				env[backupDirEnv] = fakeDumpOnPath(t, dsn)
+				args := append([]string{"migrate"}, c.args...)
+				if viaDB {
+					delete(env, dbEnv)
+					args = append(args, "--db", dsn)
+				} else {
+					env[dbEnv] = dsn
+				}
+				if c.to != 0 {
+					args = append(args, "--to", fmt.Sprint(c.to))
+				}
+				rc, out := h.runEnv(env, "", args...)
+				want := c.to
+				if want == 0 {
+					want = store.SchemaVersion
+				}
+				if c.refuse {
+					want = c.from
+					if rc != 1 || !strings.Contains(out, "되돌리기 창 안이다") || !strings.Contains(out, "(UTC)에 닫힌다") ||
+						!strings.Contains(out, "--allow-in-rollback-window") {
+						t.Fatalf("창 안의 판올림이 닫히는 때 · 플래그를 대며 서지 않았다(rc=%d):\n%s", rc, out)
+					}
+				} else if rc != 0 {
+					t.Fatalf("올려야 하는데 섰다(rc=%d):\n%s", rc, out)
+				}
+				var v int
+				if err := db.QueryRow(`SELECT max(version) FROM schema_version`).Scan(&v); err != nil || v != want {
+					t.Fatalf("원장의 판이 %d 다(%v) - %d 여야 한다:\n%s", v, err, want, out)
+				}
+			})
+		}
+	}
+}
+
+// fakeDumpOnPath 는 PATH 앞에 원장 dsn 의 이름을 머리에 실은 가짜 pg_dump 를 두고 덤프 자리를 낸다 - 창을 지난 판올림이
+// 덤프에서 서지 않고 판까지 오르는지 재려는 것이다(덤프의 실행 경계는 store 의 시험이 잰다).
+func fakeDumpOnPath(t *testing.T, dsn string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("가짜 pg_dump 는 sh 스크립트다")
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
 		t.Fatal(err)
 	}
-	held := func() bool {
-		t.Helper()
-		p, err := store.ProbeMigration(ctx, dsn)
-		if err != nil {
-			t.Fatal(err)
+	bin := t.TempDir()
+	head := filepath.Join(bin, "head.dump")
+	if err := os.WriteFile(head, []byte(storetest.FakeDump(strings.TrimPrefix(u.Path, "/"), 16)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --file=*) out=\"${a#--file=}\";; esac; done\ncat '" + head + "' > \"$out\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "pg_dump"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return t.TempDir()
+}
+
+// pgSteps 는 Postgres 증분 가운데 인덱스만 더한 것과 아닌 것 하나씩이다(시험이 그 판으로 창의 두 갈래를 잰다).
+func pgSteps(t *testing.T) (index, other pg.Step) {
+	t.Helper()
+	var hasIndex, hasOther bool
+	for _, st := range pg.Steps {
+		if _, ok := pg.IndexOnly(st.SQL); ok && !hasIndex {
+			index, hasIndex = st, true
+		} else if !ok && !hasOther {
+			other, hasOther = st, true
 		}
-		return p.Action == store.MigrateUpgrade
 	}
-	rc, out := h.runEnv(env, "", "migrate")
-	closes := opened.Add(store.RollbackWindow).Format(time.RFC3339) + "(UTC)에 닫힌다"
-	if rc != 1 || !strings.Contains(out, "되돌리기 창 안이다") || !strings.Contains(out, closes) ||
-		!strings.Contains(out, "--allow-in-rollback-window") || !held() {
-		t.Fatalf("창 안의 판올림이 닫히는 때(%s) · 플래그를 대며 서지 않았다(rc=%d):\n%s", closes, rc, out)
+	if !hasIndex || !hasOther {
+		t.Fatalf("인덱스만 더한 증분(%v)과 아닌 증분(%v)이 다 있어야 한다", hasIndex, hasOther)
 	}
-	for _, args := range [][]string{{"--allow-in-rollback-window"}, {"--db", dsn}} {
-		if _, out := h.runEnv(env, "", append([]string{"migrate"}, args...)...); strings.Contains(out, "되돌리기 창") {
-			t.Fatalf("fd migrate %v 가 되돌리기 창을 쟀다:\n%s", args, out)
-		}
-	}
+	return index, other
 }

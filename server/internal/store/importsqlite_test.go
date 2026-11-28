@@ -616,12 +616,16 @@ func TestImportSQLiteDoesNotCommitWithoutTheRecord(t *testing.T) {
 	linkRecord = func(string, string) error { return errors.New("넣은 링크 실패") }
 	t.Cleanup(func() { linkRecord = os.Link })
 	rep, err := importLedger(t, ctx, src, dsn, TransferOptions{})
-	if err == nil || !strings.Contains(err.Error(), "바꾼 칸의 기록을 남기지 못했다 - 커밋하지 않는다") ||
+	if err == nil || !strings.Contains(err.Error(), "커밋 전 기록을 남기지 못했다 - 커밋하지 않는다") ||
+		!strings.Contains(err.Error(), "바꾼 칸의 기록을 남기지 못했다") ||
 		!strings.Contains(err.Error(), "넣은 링크 실패") || rep.Copied != 0 || rep.RewriteRecord != "" {
 		t.Fatalf("기록 없이 커밋했거나 다른 오류다: %v (옮긴 행 %d · 기록 %q)", err, rep.Copied, rep.RewriteRecord)
 	}
 	if n := targetRows(t, dst); n != 0 {
 		t.Fatalf("기록을 못 남겼는데 대상에 %d 행이 있다", n)
+	}
+	if _, ok := ledgerMovedAt(t, dst); ok {
+		t.Fatal("커밋하지 않았는데 대상 원장에 이관 기록이 남았다(기록 파일보다 먼저 단 주석이 함께 되감겨야 한다)")
 	}
 	for _, name := range dirNames(t, filepath.Dir(src)) {
 		if strings.Contains(name, rewrittenSuffix) || name == filepath.Base(MovedMarker(src)) {
@@ -1179,8 +1183,9 @@ func TestImportSQLiteQuarantinesTheSourceBackups(t *testing.T) {
 	}
 }
 
-// 비밀 기본키(web_session.id_hash)는 이관 보고 · 바꾼 칸 기록 · 대조의 어긋남 줄에 원값 대신 지문(pg.SecretMark)으로 적힌다 - 그
-// 셋은 터미널 · 로그 · 원본 옆 파일로 남는다. 대조 자체는 원값으로 해 한 칸만 바뀌어도 그 행을 짚는다.
+// 비밀 기본키(web_session.id_hash)는 이관 보고 · 대조의 어긋남 줄에 원값 대신 12자 지문(pg.SecretMark)으로, 바꾼 칸 기록에는
+// 전체 지문(pg.SecretDigest)으로 적힌다 - 그 셋은 터미널 · 로그 · 원본 옆 파일로 남는다. 대조 자체는 원값으로 해 한 칸만 바뀌어도
+// 그 행을 짚는다.
 func TestTransferLabelsSecretKeysByFingerprint(t *testing.T) {
 	ctx := context.Background()
 	const raw = "c0ffee-cookie-sha256-raw-value"
@@ -1206,7 +1211,7 @@ func TestTransferLabelsSecretKeysByFingerprint(t *testing.T) {
 	for _, r := range readRecord(t, rep.RewriteRecord) {
 		if r.Table == "web_session" {
 			found = true
-			if r.Key["id_hash"] != pg.SecretMark(raw) || len(r.Key) != 1 || r.Column != "user_agent" || string(r.Original) != "ua\x00" {
+			if r.Key["id_hash"] != pg.SecretDigest(raw) || len(r.Key) != 1 || r.Column != "user_agent" || string(r.Original) != "ua\x00" {
 				t.Fatalf("바꾼 칸 기록 %+v", r)
 			}
 		}
@@ -1224,5 +1229,50 @@ func TestTransferLabelsSecretKeysByFingerprint(t *testing.T) {
 		if tc.Table == "web_session" && (!slices.Equal(tc.OnlySource, []string{fp}) || !slices.Equal(tc.OnlyTarget, []string{fp})) {
 			t.Fatalf("대조의 어긋남 줄 %q · %q, 기대 %q", tc.OnlySource, tc.OnlyTarget, fp)
 		}
+	}
+}
+
+// 12자 지문(48비트)이 겹친 두 비밀 키 행 가운데 한쪽은 NUL 을 바꿔 넣었고 다른 쪽은 처음부터 `\x00` 네 글자면, 옮긴 뒤 두 행의
+// 그 칸이 같다. 바꾼 칸 기록의 키는 그래도 바꾼 행 하나를 고른다(전체 지문) - 화면 보고는 12자 그대로다. 두 키는 12자 지문이
+// 같은 실제 쌍이다(sha256 앞 48비트의 충돌을 찾아 박았다).
+func TestRewriteRecordPicksTheRowPastAMarkCollision(t *testing.T) {
+	ctx := context.Background()
+	const nul, lit = "2df0e1fc64ef", "d9fbb3ff5162"
+	if pg.SecretMark(nul) != pg.SecretMark(lit) {
+		t.Fatalf("시험의 두 키는 12자 지문이 같아야 한다: %s · %s", pg.SecretMark(nul), pg.SecretMark(lit))
+	}
+	src := importSource(t, importSeed)
+	liteExec(t, src, `INSERT INTO web_session(id_hash, account_id, created_at, expires_at, last_seen_at, user_agent) VALUES
+		('`+nul+`', 'a1', `+importAt+`, `+importAt+`, `+importAt+`, CAST(X'756100' AS TEXT)),
+		('`+lit+`', 'a1', `+importAt+`, `+importAt+`, `+importAt+`, 'ua\x00')`)
+	dsn, dst := importTarget(t)
+	rep, err := importLedger(t, ctx, src, dsn, TransferOptions{})
+	if err != nil {
+		t.Fatalf("이관: %v", err)
+	}
+	if n := pgCount(t, dst, `SELECT count(*) FROM web_session WHERE user_agent = 'ua\x00'`); n != 2 {
+		t.Fatalf("옮긴 두 행의 user_agent 가 같아야 시험이 선다 - %d 행", n)
+	}
+	for _, g := range rep.Rewrites {
+		if g.Table == "web_session" && !slices.Equal(g.Keys, []string{"id_hash=" + pg.SecretMark(nul)}) {
+			t.Fatalf("화면 보고의 web_session 좌표 %q - 12자 지문 하나여야 한다", g.Keys)
+		}
+	}
+	var lines []rewrittenCell
+	for _, r := range readRecord(t, rep.RewriteRecord) {
+		if r.Table == "web_session" {
+			lines = append(lines, r)
+		}
+	}
+	if len(lines) != 1 || lines[0].Column != "user_agent" || string(lines[0].Original) != "ua\x00" {
+		t.Fatalf("바꾼 칸 기록의 web_session 줄 %+v - 바꾼 칸 하나여야 한다", lines)
+	}
+	fp, _ := lines[0].Key["id_hash"].(string)
+	const find = `SELECT count(*) FROM web_session WHERE 'sha256:' || encode(sha256(convert_to(id_hash, 'UTF8')), 'hex') = ?`
+	if pgCount(t, dst, find, fp) != 1 || pgCount(t, dst, find+` AND id_hash = ?`, fp, nul) != 1 {
+		t.Fatalf("기록의 키 %q 가 옮긴 원장에서 바꾼 행 하나만 골라야 한다", fp)
+	}
+	if b, err := os.ReadFile(rep.RewriteRecord); err != nil || bytes.Contains(b, []byte(nul)) || bytes.Contains(b, []byte(lit)) {
+		t.Fatalf("바꾼 칸 기록에 비밀 원값이 실렸다(%v)", err)
 	}
 }

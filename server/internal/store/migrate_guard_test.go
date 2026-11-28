@@ -86,8 +86,9 @@ func destructiveOps(sql string) []op {
 }
 
 // opSite 는 증분 글에서 찾은 파괴적 조작 하나와 그 대상(소문자)이다: DROP TABLE · DELETE FROM · INSERT … SELECT 는 표, UPDATE … SET
-// 은 「표.칸」(SET 의 칸마다 하나), DROP COLUMN · RENAME 은 빈 대상이다(어차피 예외가 없다). 대상을 못 읽은 꼴(`SET (a, b) = …`
-// 등)도 빈 대상이라 대상을 적은 예외(exemption.only)에 안 맞는다 - 좁은 예외는 읽은 대상만 연다.
+// 은 「표.칸」(SET 의 칸마다 하나 - 표는 적힌 이름 그대로라 한정 이름 `s.t` 는 「s.t.칸」이다), DROP COLUMN · RENAME 은 빈 대상이다
+// (어차피 예외가 없다). 대상을 못 읽은 꼴(`SET (a, b) = …`, 꼴을 모르는 UPDATE 등)도 빈 대상이라 대상을 적은 예외(exemption.only)에
+// 안 맞는다 - 좁은 예외는 읽은 대상만 연다.
 type opSite struct {
 	op     op
 	target string
@@ -100,12 +101,27 @@ var (
 	siteDropColumn  = regexp.MustCompile(`\bDROP\s+COLUMN\b`)
 	siteRename      = regexp.MustCompile(`\bRENAME\s+(?:TO|COLUMN)\b`)
 	siteDeleteFrom  = regexp.MustCompile(`\bDELETE\s+FROM\b\s*([A-Z_][A-Z0-9_.]*)?`)
-	siteUpdateSet   = regexp.MustCompile(`\bUPDATE\s+([A-Z_][A-Z0-9_]*)\s+SET\b`)
+	siteUpdate      = regexp.MustCompile(`\bUPDATE\b`)
+	siteUpdateSet   = regexp.MustCompile(`^UPDATE\s+(?:OR\s+[A-Z]+\s+)?(?:ONLY\s+)?([A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)?)(?:\s+(?:AS\s+)?[A-Z_][A-Z0-9_]*)?\s+SET\b`)
 	siteInsertInto  = regexp.MustCompile(`\bINSERT\s+INTO\b\s*([A-Z_][A-Z0-9_.]*)?`)
 	siteSelect      = regexp.MustCompile(`\bSELECT\b`)
 	siteIdent       = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
 	siteSetStopWord = []string{"WHERE", "FROM", "RETURNING"}
+	// siteNotDML 은 UPDATE 바로 앞에 오면 그 UPDATE 가 문장이 아닌 낱말이다: 트리거 사건(BEFORE · AFTER · INSTEAD OF UPDATE), 외래 키
+	// 동작(ON UPDATE), 행 잠금(FOR [NO KEY] UPDATE), 권한(GRANT · REVOKE UPDATE, 목록 안의 `, UPDATE`). 그 밖의 UPDATE 는 다
+	// 문장으로 보고, 꼴(siteUpdateSet)을 못 읽으면 빈 대상으로 낸다 - `DO UPDATE SET`(upsert) · `THEN UPDATE`(MERGE) 도 그렇다.
+	siteNotDML = []string{"BEFORE", "AFTER", "OF", "ON", "FOR", "KEY", "GRANT", "REVOKE", ","}
 )
+
+// updateNotDML 은 s[i:] 의 UPDATE 가 문장이 아닌 낱말인가다(siteNotDML).
+func updateNotDML(s string, i int) bool {
+	head := strings.TrimRight(s[:i], " \t\r\n")
+	if strings.HasSuffix(head, ",") {
+		return true
+	}
+	words := strings.Fields(head)
+	return len(words) > 0 && slices.Contains(siteNotDML, words[len(words)-1])
+}
 
 // destructiveSites 는 증분 SQL 하나의 파괴적 조작을 자리마다 낸다. 주석을 걷고(stripSQLComments) 글 상수를 비운 뒤(maskSQLStrings)
 // 대문자로 읽는다 - 글 안의 `;` · 낱말이 문장 끝이나 조작으로 안 읽힌다. INSERT … SELECT 는 그 INSERT 문장 안(깊이 0 의 `;` 까지)의
@@ -131,7 +147,18 @@ func destructiveSites(sql string) []opSite {
 	for _, m := range siteDeleteFrom.FindAllStringSubmatchIndex(s, -1) {
 		out = append(out, opSite{opDeleteFrom, target(m)})
 	}
-	for _, m := range siteUpdateSet.FindAllStringSubmatchIndex(s, -1) {
+	for _, at := range siteUpdate.FindAllStringIndex(s, -1) {
+		if updateNotDML(s, at[0]) {
+			continue
+		}
+		m := siteUpdateSet.FindStringSubmatchIndex(s[at[0]:])
+		if m == nil {
+			out = append(out, opSite{opUpdateSet, ""}) // 꼴을 모르는 UPDATE - 대상을 못 읽었다
+			continue
+		}
+		for k := range m {
+			m[k] += at[0]
+		}
 		for _, col := range setColumns(s, m[1]) {
 			t := ""
 			if col != "" {
@@ -675,7 +702,9 @@ func TestNarrowExemption(t *testing.T) {
 }
 
 // 자리 읽기: DROP TABLE · INSERT 의 표, UPDATE 의 SET 칸마다 「표.칸」(식 안의 쉼표 · 괄호 · 글 상수는 칸을 안 가른다), INSERT …
-// SELECT 는 그 문장 안의 SELECT 만, 글 상수 안의 낱말 · `;` 는 조작이 아니다.
+// SELECT 는 그 문장 안의 SELECT 만, 글 상수 안의 낱말 · `;` 는 조작이 아니다. UPDATE 는 별칭(`AS m` · `m`) · ONLY · `OR IGNORE` 를
+// 건너 표를 읽고, 한정 이름은 적힌 그대로다. 꼴을 모르는 UPDATE(`DO UPDATE SET`)는 빈 대상이다. 문장이 아닌 UPDATE(트리거 사건 ·
+// 외래 키 동작 · 행 잠금 · 권한)는 조작이 아니다.
 func TestDestructiveSitesReadTheTarget(t *testing.T) {
 	got := destructiveSites(`DROP TABLE temp.attribution_count; DROP TABLE IF EXISTS item;
 		UPDATE judgment SET author = 'owner', via = CASE WHEN substr(coalesce(title, ''), 1, 9) = '[x;y]' THEN 'web' ELSE 'cli' END
@@ -683,9 +712,21 @@ func TestDestructiveSitesReadTheTarget(t *testing.T) {
 		UPDATE item SET (a, b) = (1, 2);
 		INSERT INTO t(a) VALUES ('x'); SELECT 1;
 		INSERT INTO c(a, n) VALUES ('m', (SELECT count(*) FROM m));
-		UPDATE machine SET name = 'DELETE FROM project' RETURNING id;`)
+		UPDATE machine SET name = 'DELETE FROM project' RETURNING id;
+		UPDATE machine AS m SET hostname = 'x'; UPDATE machine m SET hostname = 'x', name = 'y';
+		UPDATE public.machine SET account_id = 'x'; UPDATE ONLY machine SET name = 'x'; UPDATE OR IGNORE item SET title = 'x';
+		INSERT INTO machine(id) VALUES ('x') ON CONFLICT (id) DO UPDATE SET hostname = 'y';
+		CREATE TRIGGER t1 BEFORE UPDATE ON judgment BEGIN SELECT 1; END;
+		CREATE TRIGGER t2 AFTER UPDATE OF project ON item_revision BEGIN SELECT 1; END;
+		CREATE TRIGGER t3 INSTEAD OF UPDATE ON v BEGIN SELECT 1; END;
+		CREATE TABLE f(a TEXT REFERENCES g(id) ON UPDATE CASCADE);
+		SELECT 1 FROM item FOR UPDATE; SELECT 1 FROM item FOR NO KEY UPDATE;
+		GRANT SELECT, INSERT, UPDATE, DELETE ON account TO fd_app; REVOKE UPDATE ON schema_version FROM fd_app;`)
 	want := []opSite{{opDropTable, "temp.attribution_count"}, {opDropTable, "item"},
 		{opUpdateSet, "judgment.author"}, {opUpdateSet, "judgment.via"}, {opUpdateSet, ""}, {opUpdateSet, "machine.name"},
+		{opUpdateSet, "machine.hostname"}, {opUpdateSet, "machine.hostname"}, {opUpdateSet, "machine.name"},
+		{opUpdateSet, "public.machine.account_id"}, {opUpdateSet, "machine.name"}, {opUpdateSet, "item.title"},
+		{opUpdateSet, ""},
 		{opInsertSelect, "c"}}
 	if !slices.Equal(got, want) {
 		t.Fatalf("자리\n  %v\n기대\n  %v", got, want)
@@ -693,7 +734,8 @@ func TestDestructiveSitesReadTheTarget(t *testing.T) {
 }
 
 // 증분 020 의 좁은 예외는 그 증분이 실제로 쓰는 자리만 연다. 같은 글에 영구 표 지우기나 기존 칸 고치기를 덧붙이면 두 엔진 모두
-// 막힌다 - 예외가 「020 의 DROP TABLE · UPDATE 전부」였을 때는 지나갔다.
+// 막힌다 - 예외가 「020 의 DROP TABLE · UPDATE 전부」였을 때는 지나갔다. 별칭을 단 UPDATE(`UPDATE machine AS m SET …`)는 예전에
+// 자리 읽기에서 빠져 막히지 않았다. 한정 이름 · 꼴을 모르는 UPDATE 는 예외에 안 맞아 막힌다.
 func TestMigration020ExemptionIsNarrow(t *testing.T) {
 	for _, m := range guardedMigrations() {
 		if m.To != 20 {
@@ -709,6 +751,10 @@ func TestMigration020ExemptionIsNarrow(t *testing.T) {
 			{"DROP TABLE item;", opSite{opDropTable, "item"}},
 			{"UPDATE judgment SET body = 'x';", opSite{opUpdateSet, "judgment.body"}},
 			{"UPDATE machine SET hostname = 'x';", opSite{opUpdateSet, "machine.hostname"}},
+			{"UPDATE machine AS m SET hostname = 'x';", opSite{opUpdateSet, "machine.hostname"}},
+			{"UPDATE machine m SET hostname = 'x';", opSite{opUpdateSet, "machine.hostname"}},
+			{"UPDATE public.machine SET account_id = 'x';", opSite{opUpdateSet, "public.machine.account_id"}},
+			{"INSERT INTO machine(id) VALUES ('x') ON CONFLICT (id) DO UPDATE SET hostname = 'y';", opSite{opUpdateSet, ""}},
 			{"INSERT INTO project(id) SELECT id FROM item;", opSite{opInsertSelect, "project"}},
 		} {
 			if got := unexcused(m.To, m.SQL+"\n"+extra.sql); !slices.Equal(got, []opSite{extra.want}) {

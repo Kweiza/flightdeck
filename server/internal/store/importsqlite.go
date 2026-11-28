@@ -188,10 +188,19 @@ func ImportSQLite(ctx context.Context, from, to string, opt TransferOptions, log
 	defer tgt.Close()
 	rep.TargetChecked = true
 	start := time.Now()
-	// 바꾼 칸의 기록은 커밋 **전에** 남긴다 - 못 남기면 커밋하지 않는다. 원래 바이트를 잃은 채 옮긴 원장이 남는 길이 없다.
-	seal := func(sc *ledgerScan) (err error) {
-		rep.RewriteRecord, err = writeRewriteRecord(from, sc.cells.rewritten, start)
-		return err
+	// 커밋 직전에 둘을 남긴다 - 못 남기면 커밋하지 않는다. 대상 원장에는 옮긴 때의 이관 기록(MovedRecordSQL - 되돌리기 창의 정본, 같은
+	// 트랜잭션이라 되감기면 함께 사라진다), 원본 옆에는 바꾼 칸의 기록 파일(원래 바이트를 잃은 채 옮긴 원장이 남는 길이 없다). 표지는
+	// 커밋 뒤에 같은 때로 남긴다.
+	var movedAt time.Time
+	seal := func(ctx context.Context, tx *txConn, sc *ledgerScan) (err error) {
+		movedAt = time.Now().UTC().Truncate(time.Second)
+		if _, err := tx.ExecContext(ctx, MovedRecordSQL(movedAt)); err != nil {
+			return fmt.Errorf("대상 원장에 이관 기록을 남기지 못했다: %w", err)
+		}
+		if rep.RewriteRecord, err = writeRewriteRecord(from, sc.cells.rewritten, start); err != nil {
+			return fmt.Errorf("바꾼 칸의 기록을 남기지 못했다: %w", err)
+		}
+		return nil
 	}
 	if err := tgt.transferInto(ctx, src, "SQLite 이관", opt.DryRun, seal, &rep); err != nil {
 		// 남긴 기록은 오류가 댄다. 보고의 기록 칸은 커밋한 이관의 것만 싣는다(TransferReport.RewriteRecord).
@@ -204,7 +213,7 @@ func ImportSQLite(ctx context.Context, from, to string, opt TransferOptions, log
 	if opt.DryRun {
 		return rep, nil
 	}
-	if err := tgt.leaveMovedMark(ctx, mark, rep.Copied, rep.RewriteRecord); err != nil {
+	if err := tgt.leaveMovedMark(ctx, mark, movedAt, rep.Copied, rep.RewriteRecord); err != nil {
 		return rep, err
 	}
 	if rep.Quarantined, err = quarantineBackups(from, "import", time.Now()); err != nil {
@@ -220,16 +229,16 @@ func ImportSQLite(ctx context.Context, from, to string, opt TransferOptions, log
 var errDryRun = errors.New("예행 - 커밋하지 않고 되감는다")
 
 // transferInto 는 이 원장(대상)에 src 를 옮긴다(dryRun 이면 끝에 되감는다). what 은 오류 문구의 머리다. seal 이 있으면 대조가
-// 맞은 뒤 커밋 직전에 원본 훑기를 넘겨 부르고, 그것이 실패하면 커밋하지 않는다(예행은 부르지 않는다 - 이관이 바꾼 칸의 기록을
-// 남기는 자리다). 이관(SQLite → Postgres)과 역이관(Postgres → SQLite)이 이 하나를 탄다 - 엔진마다 다른 몫은 두 원장의
+// 맞은 뒤 커밋 직전에 그 트랜잭션과 원본 훑기를 넘겨 부르고, 그것이 실패하면 커밋하지 않는다(예행은 부르지 않는다 - 이관이 이관
+// 기록과 바꾼 칸의 기록을 남기는 자리다). 이관(SQLite → Postgres)과 역이관(Postgres → SQLite)이 이 하나를 탄다 - 엔진마다 다른 몫은 두 원장의
 // ledgerSide 가 진다. 실행기 세션이
 // 대상 확인부터 커밋까지 잠금 둘을 쥔다(Postgres 대상) - 다른 실행기와 업무 쓰기가 그 사이에 이 원장을 바꾸지 못하므로
 // 확인한 「빈 원장」이 커밋 때도 그대로다. SQLite 대상(역이관이 만든 임시 파일)은 쓰기 트랜잭션(BEGIN IMMEDIATE)이 그 자리다.
 //
 // ★ 세션은 원본을 다 훑은 뒤에 연다. 전역 업무 잠금은 대상 트랜잭션 동안만 쥔다 - 잘못 고른 대상(서버가 쓰는 원장)이면
 // 「비어 있지 않다」로 곧장 놓는다. 원본을 훑는 동안 그 서버의 쓰기를 세워 두지 않는다.
-func (s *Store) transferInto(ctx context.Context, src *Store, what string, dryRun bool, seal func(*ledgerScan) error,
-	rep *TransferReport) error {
+func (s *Store) transferInto(ctx context.Context, src *Store, what string, dryRun bool,
+	seal func(context.Context, *txConn, *ledgerScan) error, rep *TransferReport) error {
 	if dryRun {
 		what += " 예행"
 	}
@@ -273,8 +282,8 @@ func (s *Store) transferInto(ctx context.Context, src *Store, what string, dryRu
 				return errDryRun
 			}
 			if seal != nil {
-				if err := seal(sc); err != nil {
-					return fmt.Errorf("바꾼 칸의 기록을 남기지 못했다 - 커밋하지 않는다: %w", err)
+				if err := seal(ctx, tx, sc); err != nil {
+					return fmt.Errorf("커밋 전 기록을 남기지 못했다 - 커밋하지 않는다: %w", err)
 				}
 			}
 			copied = n

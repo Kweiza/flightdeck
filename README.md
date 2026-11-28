@@ -437,13 +437,15 @@ fdwhere
       echo "5 done: moved"
     fi
     : '6. On the switched-off selection file, create and check the login accounts (db-roles), then connect as the server
-       account to the ledger of the server: the moved tables must be readable and TEMPORARY must be gone. Before that, check
-       that the Postgres ledger is at this version (selfcheck) - if it is lower (a move that stopped on an older version), the
-       migrate that runs before db-roles would raise it, and 7 could not compare it with the SQLite ledger the marker holds back.'
+       account to the ledger of the server: the moved tables must be readable and TEMPORARY must be gone. Before that, read the
+       versions of both the SQLite ledger and the Postgres ledger and compare them (verify) - both must be at the import version
+       (20) and match. If either is not (a move that stopped on an older version), stop without changing the accounts - once
+       the migrate that runs before db-roles raises a lower Postgres ledger and the accounts change, 7 cannot compare it with the
+       SQLite ledger the marker holds back.'
     export FDC_ENV="$off"; [ -f "$FDC_ENV" ]
     fdc build
-    if ! fdc run --rm migrate selfcheck; then
-      echo '6: this version cannot open the Postgres ledger (line above) - stopping without raising it. If the line above says (upgrade), the move stopped on an older version: do not go on with this version, follow "A move that stopped on an older version" under "Stopped before switching on"' >&2; exit 1
+    if ! fdc run --rm migrate migrate verify --from /data/fd.db; then
+      echo '6: the two ledgers do not match at the import version (20), or could not be compared (line above) - stopping without creating the accounts. If the line above names the version of the source or the target, the move stopped on an older version: do not go on with this version, follow "A move that stopped on an older version" under "Stopped before switching on". Otherwise measure with A in the same section' >&2; exit 1
     fi
     fdc up -d --build db-roles
     [ "$(docker wait "$(fdc ps -aq db-roles)")" = 0 ]
@@ -606,9 +608,12 @@ the upgrade block again (step 3 carries the raise on).
 **A move that stopped on an older version (import version 19 or lower) does not go on with this version.** The comparison,
 the import and the export only take a ledger at the import version (20). Raising that Postgres ledger leaves the SQLite ledger
 at the older version behind the marker, so step 7 refuses it with "raise it first", and from there the older version cannot
-take over either (it refuses a version 20 ledger). So this version's block checks the Postgres ledger's version first at step 6
-(selfcheck) and, if it is lower, stops without raising it and points here. Finish with the older version's block in its
-directory, or go back with B, and then update to this version.
+take over either (it refuses a version 20 ledger). So at step 6, before the accounts change (db-roles), this version's block
+reads the versions of both the SQLite ledger and the Postgres ledger and compares them (verify), and if either is not at the
+import version it stops without raising anything and points here. If the Postgres ledger is on the older version, finish with
+the older version's block in its directory, or go back with B, and then update to this version. If only the Postgres ledger
+has been raised to this version (the marker held the SQLite ledger back on the older version), no version's block can go on -
+**stop.** Delete neither ledger; a person decides.
 
 Run B only when A's table says "to go back, B", or when the upgrade stopped before "4 done". It takes this directory's
 Postgres layer (db and the one-shots) down, removes the marker (no server ever wrote to the Postgres ledger, and it matches
@@ -642,8 +647,11 @@ The 72 hours after the move are the rollback window. `export-sqlite` moves the P
 into a **new** SQLite file at the last SQLite version (20), so the items, claims and judgments written in Postgres after the
 move come back too. During the window, do not update to a flightdeck version that raises the Postgres schema past the last
 SQLite version: `export-sqlite` only takes a ledger at its own import version. **`migrate` holds upgrades inside the
-window:** for 72 hours from the move time in the move marker it does not apply a migration that does more than add indexes,
-and stops naming when the window closes (UTC) - the server does not start either. Bringing this version up inside the window
+window:** for 72 hours from the move time it does not apply a migration that does more than add indexes, and stops naming
+when the window closes (UTC) - the server does not start either. The move time comes from the record the import leaves in the
+Postgres ledger when it commits, whichever way the ledger is opened (`--db`, `FD_DB` or the container). A ledger without that
+record (moved by an older version) is measured by the move time in this environment's move marker (`fd.db.moved-to-postgres`;
+only for that ledger when the marker names a ledger id), and with neither record nor marker the window counts as closed. Bringing this version up inside the window
 after a move on an older version (import version 19 or lower) is that case - migration 020 does more than add indexes, so once
 applied, going down (`--to`) is refused, the older version's `export-sqlite` refuses 20, and `--rollback`, which restores the
 pre-upgrade dump, loses the writes after it. That ledger stays at version 19, so go back with the older version's copy of this
@@ -939,7 +947,10 @@ fd migrate verify --from fd-copy.db --db <URL>
     The record file below says which columns and strings were changed - the values in the moved ledger alone cannot tell a
     changed column from one that always held the four characters `\x00`.
   - **The record of changed columns.** Before it commits, the move writes `<source>.rewritten-<time>.jsonl` next to the
-    source: one JSON line per changed column with `table`, `key` (the row's primary key columns → moved values, never cut),
+    source: one JSON line per changed column with `table`, `key` (the row's primary key columns → moved values, never cut;
+    the secret key columns `web_session.id_hash` and `device_code.code_hash` carry `sha256:` and the value's whole sha256
+    (64 characters) instead of the value, and the row is the one where `encode(sha256(convert_to(id_hash, 'UTF8')), 'hex')`
+    in Postgres equals what follows - the row coordinates on screen and in errors carry only the first 12 of them),
     `column`, `rule` (the rule in the screen report), `paths` (for a JSON column, where the fixed string values are - a list
     of RFC 6901 JSON Pointers with the original document's keys; absent for text columns) and `original` (the column's bytes as read from the source, base64). There is no limit on the number of lines.
     **That file is the authority on the original bytes of those columns** - do not delete it; keep it with the source copy.

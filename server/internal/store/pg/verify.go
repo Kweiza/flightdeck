@@ -107,10 +107,20 @@ func CoordLabel(c *Column, v any) string {
 	return LabelValue(v)
 }
 
-// SecretMark 는 비밀 칸 값의 지문이다: 「sha256:」 뒤에 값 바이트의 sha256 앞 12자(16진, 48비트). 같은 값이면 같은 지문이라
-// 보고의 두 줄이 같은 행인지 가리고, 원장에서는 `left(encode(sha256(convert_to(칸, 'UTF8')), 'hex'), 12)`(Postgres)로 그 행을
-// 찾는다. 원값을 되찾을 수는 없다(그 원값부터가 높은 엔트로피 토큰의 sha256 이거나 argon2id 다).
+// SecretMark 는 사람이 읽는 자리(행 좌표 · 화면 보고 · 오류)에 싣는 비밀 칸 값의 지문이다: SecretDigest 의 앞 12자(16진,
+// 48비트). 같은 값이면 같은 지문이라 보고의 두 줄이 같은 행인지 가린다. 48비트는 겹칠 수 있으므로 행을 되찾는 기록(바꾼 칸
+// 기록의 키)은 이것이 아니라 SecretDigest 를 싣는다. 원값을 되찾을 수는 없다(그 원값부터가 높은 엔트로피 토큰의 sha256 이거나
+// argon2id 다).
 func SecretMark(v any) string {
+	return SecretDigest(v)[:len(secretDigestPrefix)+12]
+}
+
+// secretDigestPrefix 는 비밀 칸 지문의 머리다.
+const secretDigestPrefix = "sha256:"
+
+// SecretDigest 는 비밀 칸 값의 전체 지문이다: 「sha256:」 뒤에 값 바이트의 sha256 전부(16진 64자). 원장에서는
+// `encode(sha256(convert_to(칸, 'UTF8')), 'hex')`(Postgres)가 「sha256:」 뒤와 같은 행 하나가 그 행이다.
+func SecretDigest(v any) string {
 	var b []byte
 	switch x := v.(type) {
 	case string:
@@ -121,7 +131,7 @@ func SecretMark(v any) string {
 		b = []byte(fmt.Sprint(v))
 	}
 	sum := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(sum[:])[:12]
+	return secretDigestPrefix + hex.EncodeToString(sum[:])
 }
 
 // LabelValue 는 좌표에 싣는 값 하나의 꼴이다: 글 · 바이트는 따옴표로 감싸(NUL · 줄바꿈이 보이게) 80 바이트로 자르고, NULL 은

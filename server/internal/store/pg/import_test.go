@@ -4,6 +4,8 @@ package pg_test
 // importsqlite_test.go 다.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -850,6 +852,11 @@ func TestRowLabelsFingerprintSecretKeys(t *testing.T) {
 	}
 	if got := pg.SecretMark(raw); !strings.HasPrefix(got, "sha256:") || len(got) != len("sha256:")+12 || got != pg.SecretMark([]byte(raw)) {
 		t.Fatalf("지문 꼴 %q", got)
+	}
+	sum := sha256.Sum256([]byte(raw))
+	if got := pg.SecretDigest(raw); got != "sha256:"+hex.EncodeToString(sum[:]) || got != pg.SecretDigest([]byte(raw)) ||
+		!strings.HasPrefix(got, pg.SecretMark(raw)) {
+		t.Fatalf("전체 지문 꼴 %q - 「sha256:」 뒤 sha256 전부여야 하고 12자 지문이 그 앞부분이어야 한다", got)
 	}
 	other := slices.Clone(row)
 	other[5] = "ua"

@@ -24,8 +24,10 @@
 --     (TestMigration020OwnerRootsHoldEveryOtherTable).
 --   - 계정의 created_at 은 그 여섯 표의 시각 칸(project.created_at · machine.first_seen · judgment.at · pick_eval.at · event.at ·
 --     idempotency.at) 가운데 가장 이른 값이다. 지금 시각을 쓰면 같은 판 19 원장을 따로 올린 둘이 대조에서 갈린다. 바이트 순으로
---     고른다(Postgres 는 COLLATE "C") - 두 엔진이 같은 값을 고르게. 여섯 표가 모두 비면 그 값이 NULL 이고, 그것이 곧 「계정을 안
---     만든다」다(조건과 값이 한 식이다).
+--     고른다(Postgres 는 COLLATE "C") - 두 엔진이 같은 값을 고르게. 그래서 SQLite 는 min 전에 값을 글(CAST … AS TEXT)로 통일한다:
+--     저장형이 섞이면 SQLite 의 min 은 저장형 순(INTEGER · REAL < TEXT < BLOB)으로 먼저 갈라, 1월 BLOB 과 2월 TEXT 에서 2월을
+--     고른다. 이관은 그 BLOB 을 Postgres 의 글로 옮기므로 Postgres 는 1월을 고른다. 여섯 표가 모두 비면 그 값이 NULL 이고, 그것이
+--     곧 「계정을 안 만든다」다(조건과 값이 한 식이다).
 --   - 암호 없는 계정은 로그인할 수 없다. 암호를 다는 길은 관리자가 내는 재설정 링크뿐이고(그 화면은 관리자 화면 단계다),
 --     「암호가 없다」를 「먼저 온 사람이 받는다」로 읽는 자리는 없다 - 원장 백업 되쓰기는
 --     password_hash 를 빼고 돌아오므로 복원된 관리자도 암호 없는 계정이다. 기기 토큰의 유무도 token_hash 로만 가른다
@@ -127,12 +129,12 @@ ALTER TABLE item_revision ADD COLUMN author TEXT REFERENCES account(id);
 INSERT INTO account(id, login, display_name, role, created_at)
 SELECT 'owner', 'owner', 'owner', 'admin', first FROM (
   SELECT min(at) AS first FROM (
-              SELECT min(created_at) AS at FROM project
-    UNION ALL SELECT min(first_seen) FROM machine
-    UNION ALL SELECT min(at) FROM judgment
-    UNION ALL SELECT min(at) FROM pick_eval
-    UNION ALL SELECT min(at) FROM event
-    UNION ALL SELECT min(at) FROM idempotency))
+              SELECT min(CAST(created_at AS TEXT)) AS at FROM project
+    UNION ALL SELECT min(CAST(first_seen AS TEXT)) FROM machine
+    UNION ALL SELECT min(CAST(at AS TEXT)) FROM judgment
+    UNION ALL SELECT min(CAST(at AS TEXT)) FROM pick_eval
+    UNION ALL SELECT min(CAST(at AS TEXT)) FROM event
+    UNION ALL SELECT min(CAST(at AS TEXT)) FROM idempotency))
 WHERE first IS NOT NULL;
 
 CREATE TEMP TABLE attribution_count (

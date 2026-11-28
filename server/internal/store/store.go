@@ -1004,8 +1004,9 @@ type MigrateOptions struct {
 	// DumpTimeout 은 Postgres 판올림 전 덤프 한 번의 기한이다(FD_DUMP_TIMEOUT). 0 이면 DefaultDumpTimeout 이다. 같은 값이
 	// 스냅숏 트랜잭션의 서버 상한과 pg_dump 자식의 문맥에 걸린다(snapshotTxLimits · backupPG). SQLite 는 안 쓴다.
 	DumpTimeout time.Duration
-	// Moved 는 이 Postgres 원장으로 옮긴 SQLite 원장의 자리다. 그 옆 이관 표지가 연 되돌리기 창(RollbackWindow) 안이면 인덱스만
-	// 더한 것이 아닌 증분을 얹지 않는다(rollbackWindowGate). 비면 창을 재지 않는다. SQLite 는 안 쓴다.
+	// Moved 는 이 환경의 SQLite 원장 자리다. Postgres 원장의 되돌리기 창(RollbackWindow - 그 안이면 인덱스만 더한 것이 아닌 증분을
+	// 얹지 않는다, rollbackWindowGate)은 원장의 이관 기록으로 재고, 기록이 없는 원장(옛 판이 옮겼다)만 이 자리 옆 이관 표지로 잰다.
+	// 비면 표지를 안 본다(원장의 기록은 잰다). SQLite 는 안 쓴다.
 	Moved string
 	// AllowInRollbackWindow 는 그 창 안에서도 얹는다(`fd migrate --allow-in-rollback-window`) - 옛 판으로 되돌리지 않기로 한
 	// 사람의 선택이다.
@@ -1046,8 +1047,10 @@ func openMigrator(path string, opt MigrateOptions, log *slog.Logger) (*Store, mi
 			return nil, run, err
 		}
 		run.steps = pgMigrations
-		if opt.Moved != "" && !opt.AllowInRollbackWindow {
-			run.window = func(steps []Migration) error { return rollbackWindowGate(opt.Moved, steps, time.Now()) }
+		if !opt.AllowInRollbackWindow {
+			run.window = func(ctx context.Context, q Reader, steps []Migration) error {
+				return rollbackWindowGate(ctx, q, opt.Moved, steps, time.Now())
+			}
 		}
 		run.backup = func(ctx context.Context, sess *migrateSession, from int) (string, error) {
 			return s.backupPG(ctx, t, sess, from, opt.BackupDir, limit)
@@ -1220,9 +1223,9 @@ type migrateRun struct {
 	// backup 은 판올림 전 백업을 뜨고 그 자리를 낸다. sess 는 실행기 세션(잠금을 쥔 연결)이고 from 은 덤프를 뜨는 판이다 -
 	// 덤프는 최종 이름을 붙이기 전에 그 세션에서 잠금을 다시 잰다(sealDump).
 	backup func(ctx context.Context, sess *migrateSession, from int) (string, error)
-	// window 는 얹을 증분을 되돌리기 창이 막는 사유다(rollbackWindowGate). nil 이면 재지 않는다(SQLite · 표지 자리를 모르는
-	// 원장 · 플래그).
-	window func(steps []Migration) error
+	// window 는 얹을 증분 steps 를 되돌리기 창이 막는 사유다(rollbackWindowGate - q 는 판을 읽은 실행기 세션이다). nil 이면 재지
+	// 않는다(SQLite · 플래그).
+	window func(ctx context.Context, q Reader, steps []Migration) error
 }
 
 // migrateTo 는 run.target 까지 올린다. 두 엔진이 같은 길을 탄다:
@@ -1290,7 +1293,7 @@ func (s *Store) migrateTo(ctx context.Context, run migrateRun) error {
 	//   로케일을 기준선 단 안에서 잰다(pg_trgm 이 거기서 생긴다, stepBody).
 	if plan.Action == MigrateUpgrade {
 		if run.window != nil {
-			if err := run.window(steps); err != nil {
+			if err := run.window(ctx, sess, steps); err != nil {
 				s.log.Error("되돌리기 창 안이라 DB 를 올리지 않는다", "path", s.path, "db_version", dbVersion, "error", err.Error())
 				return err
 			}

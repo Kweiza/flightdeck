@@ -210,11 +210,14 @@ func TestImportSQLiteLeavesTheMovedMarker(t *testing.T) {
 	ctx := context.Background()
 	src := importSource(t, importSeed)
 	dir := filepath.Dir(src)
-	dsn, _ := importTarget(t)
+	dsn, tgt := importTarget(t)
 	before := dirNames(t, dir)
 
 	if _, err := importLedger(t, ctx, src, dsn, TransferOptions{DryRun: true}); err != nil {
 		t.Fatalf("예행: %v", err)
+	}
+	if _, ok := ledgerMovedAt(t, tgt); ok {
+		t.Fatal("예행이 대상 원장에 이관 기록을 남겼다")
 	}
 	// 읽기 전용으로 열어도 SQLite 가 빈 옆 파일(-wal · -shm)을 만든다 - 그것 말고는 그대로여야 한다.
 	if got := slices.DeleteFunc(dirNames(t, dir), func(n string) bool { return slices.Contains(pg.Sidecars(src), filepath.Join(dir, n)) }); !slices.Equal(got, before) {
@@ -251,6 +254,10 @@ func TestImportSQLiteLeavesTheMovedMarker(t *testing.T) {
 	if err != nil || at.Before(start) || at.After(time.Now().UTC().Add(time.Second)) {
 		t.Errorf("표지의 옮긴 때 %q 가 이관 시각이 아니다(%v)", note.MovedAt, err)
 	}
+	// 대상 원장의 이관 기록(되돌리기 창의 정본)이 표지의 옮긴 때와 같다.
+	if rec, ok := ledgerMovedAt(t, tgt); !ok || !rec.Equal(at) {
+		t.Errorf("대상 원장의 이관 기록 %v(%v)이 표지의 옮긴 때 %v 와 다르다", rec, ok, at)
+	}
 	if note.Schema != pg.ImportVersion || note.Rows != rep.Copied || rep.Copied == 0 {
 		t.Errorf("표지의 판 %d · 행 %d, 옮긴 행 %d", note.Schema, note.Rows, rep.Copied)
 	}
@@ -278,6 +285,9 @@ func TestImportSQLiteLeavesTheMovedMarker(t *testing.T) {
 	}
 	if n := targetRows(t, dst); n != 0 {
 		t.Fatalf("거절했는데 새 대상에 %d 행", n)
+	}
+	if _, ok := ledgerMovedAt(t, dst); ok {
+		t.Fatal("거절했는데 새 대상에 이관 기록이 남았다")
 	}
 }
 
@@ -321,7 +331,7 @@ func TestLeaveMovedMarkSaysTheCommitHappened(t *testing.T) {
 	}
 	defer mark.release(quietLog())
 	must(t, os.Remove(mark.tmp)) // 잡아 둔 자리가 사라졌다
-	err = dst.leaveMovedMark(context.Background(), mark, 7, "")
+	err = dst.leaveMovedMark(context.Background(), mark, time.Now(), 7, "")
 	if err == nil || !strings.Contains(err.Error(), "7 행, 커밋했다") || !strings.Contains(err.Error(), "touch "+shellQuote(MovedMarker(src))) {
 		t.Fatalf("표지를 못 남긴 실패가 커밋 · 손 처방을 안 말한다: %v", err)
 	}
@@ -330,12 +340,20 @@ func TestLeaveMovedMarkSaysTheCommitHappened(t *testing.T) {
 	}
 }
 
-// movedNoteAt 는 SQLite 원장 path 옆에 at 에 옮겼다고 적은 표지를 남긴다(이관이 남기는 꼴).
-func movedNoteAt(t *testing.T, path string, at time.Time) {
+// movedNoteAt 는 SQLite 원장 path 옆에 at 에 원장 ledger(빈 값이면 식별 없이)로 옮겼다고 적은 표지를 남긴다(이관이 남기는 꼴).
+func movedNoteAt(t *testing.T, path string, at time.Time, ledger string) {
 	t.Helper()
-	raw, err := json.Marshal(movedNote{MovedAt: at.UTC().Format(time.RFC3339), Schema: pg.ImportVersion})
+	raw, err := json.Marshal(movedNote{MovedAt: at.UTC().Format(time.RFC3339), Ledger: ledger, Schema: pg.ImportVersion})
 	must(t, err)
 	must(t, os.WriteFile(MovedMarker(path), raw, 0o644))
+}
+
+// ledgerMovedAt 은 Postgres 원장 s 의 이관 기록이다(없으면 false).
+func ledgerMovedAt(t *testing.T, s *Store) (time.Time, bool) {
+	t.Helper()
+	at, ok, err := readMovedRecord(context.Background(), s.db)
+	must(t, err)
+	return at, ok
 }
 
 // stepsOf 는 Postgres 증분 가운데 인덱스만 더한 것(index)과 아닌 것(other) 하나씩이다.
@@ -373,14 +391,15 @@ func TestRollbackWindowRefusal(t *testing.T) {
 		{"창 안의 인덱스만 더한 증분", opened.Add(time.Hour), []Migration{index}, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			err := rollbackWindowRefusal("/d/fd.db.moved-to-postgres", opened, c.now, c.steps)
+			err := rollbackWindowRefusal("이관 표지 /d/fd.db.moved-to-postgres", opened, c.now, c.steps)
 			if (err != nil) != c.refuse {
 				t.Fatalf("거절 %v 여야 한다: %v", c.refuse, err)
 			}
 			if err == nil {
 				return
 			}
-			for _, want := range []string{"2026-11-29T16:02:03Z(UTC)에 닫힌다", "판 " + fmt.Sprint(other.To) + " 의 증분",
+			for _, want := range []string{"2026-11-26T16:02:03Z 에 열렸고(이관 표지 /d/fd.db.moved-to-postgres)",
+				"2026-11-29T16:02:03Z(UTC)에 닫힌다", "판 " + fmt.Sprint(other.To) + " 의 증분",
 				"--allow-in-rollback-window", "README 「72시간 안에 되돌리기」"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("거절 문구에 %q 가 없다: %v", want, err)
@@ -393,56 +412,124 @@ func TestRollbackWindowRefusal(t *testing.T) {
 	}
 }
 
-// 창을 연 때는 표지 내용의 옮긴 때다. 못 읽으면(손으로 touch 한 빈 표지 · 깨진 내용) 표지 파일의 고친 때로 잰다. 표지가 없으면
-// 창이 없다.
+// 표지가 연 창은 표지 내용의 옮긴 때 · 원장 식별이다. 못 읽으면(손으로 touch 한 빈 표지 · 깨진 내용) 표지 파일의 고친 때로 재고
+// 식별은 비운다. 표지가 없으면 창이 없다.
 func TestMovedAtReadsTheNoteThenTheFileTime(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fd.db")
-	if _, ok, err := movedAt(path); ok || err != nil {
+	if _, _, ok, err := movedAt(path); ok || err != nil {
 		t.Fatalf("표지가 없는데 창이 열렸다: %v %v", ok, err)
 	}
 	at := time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
-	movedNoteAt(t, path, at)
-	if got, ok, err := movedAt(path); !ok || err != nil || !got.Equal(at) {
-		t.Fatalf("표지 내용의 옮긴 때를 안 읽었다: %v %v %v", got, ok, err)
+	movedNoteAt(t, path, at, "0123456789abcdef")
+	if got, led, ok, err := movedAt(path); !ok || err != nil || !got.Equal(at) || led != "0123456789abcdef" {
+		t.Fatalf("표지 내용의 옮긴 때 · 식별을 안 읽었다: %v %q %v %v", got, led, ok, err)
 	}
 	mtime := time.Date(2026, 11, 21, 0, 0, 0, 0, time.UTC)
 	for _, body := range []string{"", `{"moved_at":"어제"}`} {
 		must(t, os.WriteFile(MovedMarker(path), []byte(body), 0o644))
 		must(t, os.Chtimes(MovedMarker(path), mtime, mtime))
-		if got, ok, err := movedAt(path); !ok || err != nil || !got.Equal(mtime) {
-			t.Fatalf("내용 %q 의 표지가 파일의 고친 때로 안 쟀다: %v %v %v", body, got, ok, err)
+		if got, led, ok, err := movedAt(path); !ok || err != nil || !got.Equal(mtime) || led != "" {
+			t.Fatalf("내용 %q 의 표지가 파일의 고친 때로 안 쟀다: %v %q %v %v", body, got, led, ok, err)
 		}
 	}
 }
 
-// Postgres 판올림이 이 환경의 SQLite 원장 자리(Moved)의 표지가 연 창 안이면 인덱스만 더한 것이 아닌 증분을 얹지 않고 원장을 그
-// 판에 둔다(덤프도 안 뜬다). 창 밖이거나 플래그를 주면 올린다. 인덱스만 더한 증분은 창 안에서도 얹는다.
+// 이관 기록은 판 표의 주석이다: 다는 문장이 단 때를 읽고, 머리가 다른 주석 · 주석 없음은 기록이 아니며, 머리는 맞는데 때가 깨졌으면
+// 오류다(정본이 깨졌다 - 창 밖으로 보지 않는다).
+func TestMovedRecordRoundTrips(t *testing.T) {
+	_, s := ledgerAtVersion(t, "postgres", pg.ImportVersion)
+	if _, ok := ledgerMovedAt(t, s); ok {
+		t.Fatal("기록을 안 단 원장에 기록이 있다")
+	}
+	pgExec(t, s, `COMMENT ON TABLE schema_version IS '사람이 단 설명'`)
+	if _, ok := ledgerMovedAt(t, s); ok {
+		t.Fatal("머리가 다른 주석을 기록으로 읽었다")
+	}
+	at := time.Date(2026, 11, 27, 1, 2, 3, 0, time.FixedZone("KST", 9*3600))
+	pgExec(t, s, MovedRecordSQL(at))
+	if got, ok := ledgerMovedAt(t, s); !ok || !got.Equal(at) {
+		t.Fatalf("기록 %v %v, 기대 %v", got, ok, at)
+	}
+	pgExec(t, s, `COMMENT ON TABLE schema_version IS '`+movedRecordPrefix+`어제'`)
+	if _, _, err := readMovedRecord(context.Background(), s.db); err == nil || !strings.Contains(err.Error(), "옮긴 때를 읽지 못했다") {
+		t.Fatalf("깨진 기록이 오류가 아니다: %v", err)
+	}
+}
+
+// Postgres 판올림이 되돌리기 창 안이면 인덱스만 더한 것이 아닌 증분을 얹지 않고 원장을 그 판에 둔다(덤프도 안 뜬다 - 판은 따로
+// 잰다). 창의 정본은 원장의 이관 기록이다: 이 환경의 표지 자리(Moved)를 안 줘도(--db) 재고, 깨진 표지의 오래된 고친 때나 다른 때를
+// 적은 표지로 닫히지 않는다. 기록이 없는 원장(옛 판이 옮겼다)만 표지로 잰다 - 표지가 적은 원장 식별이 이 원장일 때 · 식별이 없을
+// 때만이다. 둘 다 없거나 창 밖이거나 플래그를 주면 올린다. 인덱스만 더한 증분은 창 안에서도 얹는다.
 func TestPostgresUpgradeHoldsInTheRollbackWindow(t *testing.T) {
+	ctx := context.Background()
 	index, other := stepsOf(t)
+	// 표지의 꼴: 없음 · 식별 없는 내용 · 이 원장 식별 · 다른 원장 식별 · 깨진 내용(고친 때만 남는다).
+	const (
+		noMark = iota
+		markBare
+		markSame
+		markOther
+		markBroken
+	)
 	for _, c := range []struct {
-		name   string
-		from   int
-		to     int
-		ago    time.Duration
-		allow  bool
-		refuse bool
+		name     string
+		from, to int
+		record   time.Duration // 원장의 이관 기록이 이만큼 앞이다(0 이면 기록이 없다)
+		mark     int
+		markAgo  time.Duration
+		moved    bool // 이 환경의 표지 자리를 준다(--db 로 열어도 준다 - false 는 표지 자리를 모르는 실행기다)
+		allow    bool
+		refuse   bool
 	}{
-		{"창 안", other.To - 1, other.To, time.Hour, false, true},
-		{"창 밖", other.To - 1, other.To, RollbackWindow + time.Hour, false, false},
-		{"창 안 · 플래그", other.To - 1, other.To, time.Hour, true, false},
-		{"창 안 · 인덱스만 더한 증분", index.To - 1, index.To, time.Hour, false, false},
+		{"기록 · 창 안 · 표지 자리 없음", other.To - 1, other.To, time.Hour, noMark, 0, false, false, true},
+		{"기록 · 창 안 · 표지 없음", other.To - 1, other.To, time.Hour, noMark, 0, true, false, true},
+		{"기록 · 창 안 · 깨진 표지의 고친 때는 창 밖", other.To - 1, other.To, time.Hour, markBroken, RollbackWindow + 30*time.Hour, true, false, true},
+		{"기록 · 창 안 · 표지는 창 밖", other.To - 1, other.To, time.Hour, markBare, RollbackWindow + time.Hour, true, false, true},
+		{"기록 · 창 밖 · 표지는 창 안", other.To - 1, other.To, RollbackWindow + time.Hour, markBare, time.Hour, true, false, false},
+		{"기록 · 창 밖", other.To - 1, other.To, RollbackWindow + time.Hour, noMark, 0, false, false, false},
+		{"기록 · 창 안 · 플래그", other.To - 1, other.To, time.Hour, noMark, 0, true, true, false},
+		{"기록 · 창 안 · 인덱스만 더한 증분", index.To - 1, index.To, time.Hour, noMark, 0, true, false, false},
+		{"기록 없음 · 표지 창 안", other.To - 1, other.To, 0, markBare, time.Hour, true, false, true},
+		{"기록 없음 · 이 원장의 표지 창 안", other.To - 1, other.To, 0, markSame, time.Hour, true, false, true},
+		{"기록 없음 · 다른 원장의 표지 창 안", other.To - 1, other.To, 0, markOther, time.Hour, true, false, false},
+		{"기록 없음 · 깨진 표지의 고친 때 창 안", other.To - 1, other.To, 0, markBroken, time.Hour, true, false, true},
+		{"기록 없음 · 표지 창 밖", other.To - 1, other.To, 0, markBare, RollbackWindow + time.Hour, true, false, false},
+		{"기록 없음 · 표지 창 안 · 플래그", other.To - 1, other.To, 0, markBare, time.Hour, true, true, false},
+		{"기록 없음 · 표지 없음", other.To - 1, other.To, 0, noMark, 0, true, false, false},
+		{"기록 없음 · 표지 창 안 · 표지 자리 없음", other.To - 1, other.To, 0, markBare, time.Hour, false, false, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			path, s := ledgerAtVersion(t, "postgres", c.from)
+			if c.record != 0 {
+				pgExec(t, s, MovedRecordSQL(time.Now().Add(-c.record)))
+			}
 			lite := filepath.Join(t.TempDir(), "fd.db")
-			movedNoteAt(t, lite, time.Now().Add(-c.ago))
-			m, run := pgMigrator(t, path, MigrateOptions{Target: c.to, BackupDir: t.TempDir(), Moved: lite, AllowInRollbackWindow: c.allow})
+			at := time.Now().Add(-c.markAgo)
+			switch c.mark {
+			case markBare:
+				movedNoteAt(t, lite, at, "")
+			case markSame, markOther:
+				led, err := readLedgerFacts(ctx, s.db)
+				must(t, err)
+				if c.mark == markOther {
+					led.ID = "fedcba9876543210"
+				}
+				movedNoteAt(t, lite, at, led.ID)
+			case markBroken:
+				must(t, os.WriteFile(MovedMarker(lite), []byte(`{"moved_at":`), 0o644))
+				must(t, os.Chtimes(MovedMarker(lite), at, at))
+			}
+			opt := MigrateOptions{Target: c.to, BackupDir: t.TempDir(), AllowInRollbackWindow: c.allow}
+			if c.moved {
+				opt.Moved = lite
+			}
+			m, run := pgMigrator(t, path, opt)
 			dumped := false
 			run.backup = func(context.Context, *migrateSession, int) (string, error) {
 				dumped = true
 				return "시험 덤프", nil
 			}
-			err := m.migrateTo(context.Background(), run)
+			err := m.migrateTo(ctx, run)
 			if (err != nil) != c.refuse {
 				t.Fatalf("거절 %v 여야 한다: %v", c.refuse, err)
 			}
@@ -452,10 +539,38 @@ func TestPostgresUpgradeHoldsInTheRollbackWindow(t *testing.T) {
 				if !strings.Contains(err.Error(), "되돌리기 창 안이다") || dumped {
 					t.Fatalf("창의 거절이 아니거나 거절 전에 덤프를 떴다(%v): %v", dumped, err)
 				}
+				src := "이 원장에 이관이 남긴 기록"
+				if c.record == 0 {
+					src = "이관 표지 " + MovedMarker(lite)
+				}
+				if !strings.Contains(err.Error(), src) {
+					t.Fatalf("창을 연 출처(%s)를 안 댔다: %v", src, err)
+				}
 			}
 			if v := pgVersion(t, s); v != want {
 				t.Fatalf("판이 %d 다 - %d 여야 한다", v, want)
 			}
 		})
+	}
+}
+
+// 원장의 이관 기록이 깨졌으면(머리는 맞는데 때를 못 읽는다) 창 안인지 모르므로 올리지 않는다 - 표지로 물러서지 않는다. 플래그는 넘는다.
+func TestPostgresUpgradeHoldsOnABrokenMovedRecord(t *testing.T) {
+	_, other := stepsOf(t)
+	for _, allow := range []bool{false, true} {
+		path, s := ledgerAtVersion(t, "postgres", other.To-1)
+		pgExec(t, s, `COMMENT ON TABLE schema_version IS '`+movedRecordPrefix+`어제'`)
+		m, run := pgMigrator(t, path, MigrateOptions{Target: other.To, BackupDir: t.TempDir(), AllowInRollbackWindow: allow})
+		run.backup = func(context.Context, *migrateSession, int) (string, error) { return "시험 덤프", nil }
+		err := m.migrateTo(context.Background(), run)
+		if allow {
+			if err != nil || pgVersion(t, s) != other.To {
+				t.Fatalf("플래그로도 안 올렸다: %v", err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), "되돌리기 창 안인지 모르므로") || pgVersion(t, s) != other.To-1 {
+			t.Fatalf("깨진 기록 위에서 올렸거나 다른 오류다(판 %d): %v", pgVersion(t, s), err)
+		}
 	}
 }

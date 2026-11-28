@@ -102,8 +102,8 @@ type Column struct {
 	Identifier bool
 	// Secret 은 비밀 칸이다: 암호 지문(account.password_hash)과 토큰 · 쿠키 · 기기 코드의 sha256(invite.token_hash ·
 	// machine.token_hash · web_session.id_hash · device_code.code_hash). 대조 · 사전 검사는 원값으로 하지만, 사람이 읽는 행 좌표
-	// (KeyLabel · store 의 원장 칸 관문 · 바꾼 칸 기록의 키)에는 원값 대신 지문(SecretMark)을 싣는다 - 이관 보고 · 오류 · 기록
-	// 파일은 터미널 · 로그 · 원본 옆 파일로 남는다. NUL 은 바꿔 넣지 않고 거절한다(FaultSecretNUL) - 바꾸면 바꾼 칸 기록이 그
+	// (KeyLabel · store 의 원장 칸 관문)에는 원값 대신 12자 지문(SecretMark)을, 바꾼 칸 기록의 키에는 전체 지문(SecretDigest)을
+	// 싣는다 - 이관 보고 · 오류 · 기록 파일은 터미널 · 로그 · 원본 옆 파일로 남는다. NUL 은 바꿔 넣지 않고 거절한다(FaultSecretNUL) - 바꾸면 바꾼 칸 기록이 그
 	// 원래 바이트를 담는다. 표시는 이 카탈로그 한 곳이고, 원장 백업이 안 싣는 비밀 칸(store 의 LedgerSecretColumns)도 이것을 읽는다.
 	Secret bool
 	// JSON 은 서버가 JSON 문서로 쓰는 칸이다(json.Marshal). Postgres 에서는 text 그대로지만 jsonb 로 읽힐 수 있는 칸이라

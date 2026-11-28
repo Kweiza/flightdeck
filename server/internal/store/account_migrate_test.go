@@ -247,6 +247,61 @@ func TestMigration020CreatesTheOwnerForAnyBusinessRow(t *testing.T) {
 	}
 }
 
+// 소유자 계정의 만든 때는 시각 칸의 저장형과 상관없이 가장 이른 시각이다. SQLite 원장에는 앞 판이 쓴 BLOB 시각이 TEXT 시각과 섞여
+// 있을 수 있고, 저장형을 통일하지 않으면 SQLite 의 min 은 저장형 순(TEXT < BLOB)으로 먼저 갈라 2월 TEXT 를 1월 BLOB 보다 앞에 둔다 -
+// 표 사이(판단의 1월 BLOB · 프로젝트의 2월 TEXT)에서도 한 표 안(사건 두 행)에서도. Postgres 에는 저장형이 없고 이관이 그 BLOB 을
+// 글로 옮기므로, 같은 시각을 글로 심은 Postgres 원장과 같은 값이어야 한다.
+func TestMigration020OwnerTimeIgnoresStorageClass(t *testing.T) {
+	ctx := context.Background()
+	const jan, feb = "2026-01-05T00:00:00.000000Z", "2026-02-01T00:00:00.000000Z"
+	for _, eng := range []string{"sqlite", "postgres"} {
+		blob := func(v string) string {
+			if eng == "sqlite" {
+				return "CAST('" + v + "' AS BLOB)"
+			}
+			return "'" + v + "'" // 이관이 옮긴 꼴(글)
+		}
+		for _, c := range []struct {
+			name string
+			seed []string
+		}{
+			{"표 사이", []string{
+				`INSERT INTO project(id, path, default_branch, created_at) VALUES ('p', '/r/p', 'main', '` + feb + `')`,
+				`INSERT INTO judgment(id, project, session_id, at, kind, title, body) VALUES ('j', NULL, NULL, ` + blob(jan) + `, 'decision', NULL, 'b')`,
+			}},
+			{"한 표 안", []string{
+				`INSERT INTO event(at, kind) VALUES (` + blob(jan) + `, 'project.add')`,
+				`INSERT INTO event(at, kind) VALUES ('` + feb + `', 'project.add')`,
+			}},
+		} {
+			t.Run(eng+"/"+c.name, func(t *testing.T) {
+				path, s := ledgerAtVersion(t, eng, 19)
+				for _, q := range c.seed {
+					if _, err := s.db.ExecContext(ctx, q); err != nil {
+						t.Fatalf("심기(%s): %v", q, err)
+					}
+				}
+				if eng == "sqlite" {
+					if got := scanStrings(t, s, `SELECT typeof(at) FROM (SELECT at FROM judgment UNION ALL SELECT at FROM event) ORDER BY 1`); !slices.Contains(got, "blob") {
+						t.Fatalf("BLOB 시각이 안 심겼다: %v", got)
+					}
+				}
+				if err := raiseLedger(t, path, 20, nil); err != nil {
+					t.Fatalf("19→20: %v", err)
+				}
+				if got := scanStrings(t, s, `SELECT id || '/' || created_at FROM account`); !slices.Equal(got, []string{OwnerAccountID + "/" + jan}) {
+					t.Errorf("소유자 계정이 %v 다(기대: 만든 때 %s - 가장 이른 시각)", got, jan)
+				}
+				if eng == "sqlite" {
+					if got := scanStrings(t, s, `SELECT typeof(created_at) FROM account`); !slices.Equal(got, []string{"text"}) {
+						t.Errorf("소유자 계정의 만든 때 저장형이 %v 다(기대 text)", got)
+					}
+				}
+			})
+		}
+	}
+}
+
 // ownerRoots 밖의 판 19 표는 모두 NOT NULL FK 칸을 가진다 - 그 행이 있으면 FK 가 가리키는 행도 있으므로, 뿌리 여섯만 보아도
 // 「업무 행이 하나라도 있다」를 놓치지 않는다. 판 19 에 뿌리 표가 늘면 여기서 선다(020 의 조건에도 그 표를 더해야 한다).
 func TestMigration020OwnerRootsHoldEveryOtherTable(t *testing.T) {

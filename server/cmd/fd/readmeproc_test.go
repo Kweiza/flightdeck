@@ -15,15 +15,20 @@ package main
 //   자리로 준다.
 
 import (
+	"context"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/kweiza/flightdeck/internal/store"
 	"github.com/kweiza/flightdeck/internal/store/pg"
+	"github.com/kweiza/flightdeck/internal/store/storetest"
 )
 
 // readmeProcs 는 README 하나에서 뗀 절차 덩이다.
@@ -79,7 +84,7 @@ func loadReadmeProcs(t *testing.T, readme string) readmeProcs {
 		}
 	}
 	p.upgrade = one("업그레이드 2-8", "import-sqlite --from /data/fd.db --dry-run")
-	p.measure = one("켜기 전에 섰을 때 - 재기", "migrate verify --from /data/fd.db; then")
+	p.measure = one("켜기 전에 섰을 때 - 재기", "if fdc run --rm migrate migrate verify --from /data/fd.db; then")
 	p.back = one("켜기 전에 섰을 때 - 돌아가기", `rm -f "$HOME/.flightdeck/fd.db.moved-to-postgres"`)
 	p.rollback = one("72시간 되돌리기 2-7", "export-sqlite --to /data/fd-back.db --dry-run")
 	// 두 절차의 1 은 fdwhere 한 줄이다 - 시험의 「처음 돌기」가 그 줄을 그대로 앞에 붙인다.
@@ -313,13 +318,25 @@ func called(calls []string, args string) string {
 
 // calledAt 은 compose 호출 가운데 인자가 args 로 끝나는 첫 줄의 차례다(없으면 -1).
 func calledAt(calls []string, args string) int {
-	for i, c := range composeCalls(calls) {
-		if strings.HasSuffix(c, " "+args) {
-			return i
-		}
+	if at := calledAll(calls, args); len(at) > 0 {
+		return at[0]
 	}
 	return -1
 }
+
+// calledAll 은 compose 호출 가운데 인자가 args 로 끝나는 줄의 차례 전부다.
+func calledAll(calls []string, args string) []int {
+	var at []int
+	for i, c := range composeCalls(calls) {
+		if strings.HasSuffix(c, " "+args) {
+			at = append(at, i)
+		}
+	}
+	return at
+}
+
+// upgradeVerify 는 업그레이드의 6(계정을 바꾸기 전) · 7(켜기 전)이 SQLite 원장과 Postgres 원장을 맞대는 compose 호출이다.
+const upgradeVerify = "run --rm migrate migrate verify --from /data/fd.db"
 
 // ran 은 기록 줄이 자리 pwd · 선택 파일 env 로 돌았는지다.
 func ran(c, pwd, env string) bool { return strings.HasPrefix(c, "PWD="+pwd+" ENV="+env+" REPOS=") }
@@ -337,6 +354,72 @@ func TestREADMEProceduresStopWhole(t *testing.T) {
 				t.Run("72시간 되돌리기", func(t *testing.T) { checkRollback(t, shell, procs) })
 			})
 		}
+	}
+}
+
+// step6Check 는 업그레이드 덩이의 6 이 계정을 바꾸기(db-roles) 전에 migrate 컨테이너로 돌리는 fd 명령의 인자다(컨테이너의 진입점이
+// fd 다). 원장 자리 /data/fd.db 는 from 으로 바꾼다. 6 의 그 자리에 fd 명령이 하나가 아니면 시험이 선다.
+func step6Check(t *testing.T, upgrade, from string) []string {
+	t.Helper()
+	i, j := strings.Index(upgrade, ": '6."), strings.Index(upgrade, "fdc up -d --build db-roles")
+	if i < 0 || j < i {
+		t.Fatalf("업그레이드 덩이에서 6 의 db-roles 앞 자리를 못 찾았다")
+	}
+	m := regexp.MustCompile(`fdc run --rm migrate (migrate [^;\n]*)`).FindAllStringSubmatch(upgrade[i:j], -1)
+	if len(m) != 1 {
+		t.Fatalf("6 의 db-roles 앞에 migrate 컨테이너로 도는 fd 명령이 %d 개다 - 두 원장을 맞대는 하나여야 한다: %q", len(m), m)
+	}
+	args := strings.Fields(m[0][1])
+	for k, a := range args {
+		if a == "/data/fd.db" {
+			args[k] = from
+		}
+	}
+	return args
+}
+
+// TestUpgradeStep6RefusesMixedVersions 는 업그레이드 6 의 db-roles 앞 명령을 README(정본 · 번역본)에서 글자 그대로 떼어, 판이 섞인
+// 진짜 두 원장에 돌린다: SQLite 원장이 이관 판 아래(옛 판에서 옮겨 표지가 묶어 둔 원장)이고 Postgres 원장이 이관 판이거나, 그
+// 반대면 거절해 덩이가 계정을 바꾸기 전에 선다. 둘 다 이관 판이고 맞으면 지난다. 컨테이너의 migrate 는 Postgres 원장을 FD_DB 로
+// 받는다(compose.postgres.yaml).
+func TestUpgradeStep6RefusesMixedVersions(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	old := pg.ImportFloor() - 1
+	for _, c := range []struct {
+		name      string
+		lite, pgv int
+		rc        int
+		want      string
+	}{
+		{"SQLite 가 옛 판 · Postgres 가 이관 판", old, pg.ImportVersion, 1, fmt.Sprintf("원본이 SQLite 판 %d 이다", old)},
+		{"SQLite 가 이관 판 · Postgres 가 옛 판", pg.ImportVersion, old, 1, "대상이 이관 판 범위"},
+		{"둘 다 이관 판", pg.ImportVersion, pg.ImportVersion, 0, "두 원장이 맞다"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			src := filepath.Join(t.TempDir(), "fd.db")
+			if err := store.MigrateTo(ctx, src, c.lite, quietLogger()); err != nil {
+				t.Fatalf("SQLite 원장을 판 %d 로: %v", c.lite, err)
+			}
+			dsn := storetest.NewBare(t, "")
+			if err := store.MigrateTo(ctx, dsn, c.pgv, quietLogger()); err != nil {
+				t.Fatalf("Postgres 원장을 판 %d 로: %v", c.pgv, err)
+			}
+			env := maps.Clone(h.env)
+			env[dbEnv] = dsn
+			var ran [][]string
+			for _, readme := range []string{"README.ko.md", "README.md"} {
+				args := step6Check(t, loadReadmeProcs(t, readme).upgrade, src)
+				if len(ran) > 0 && !slices.Equal(ran[0], args) {
+					t.Fatalf("두 README 의 6 명령이 다르다: %q · %q", ran[0], args)
+				}
+				ran = append(ran, args)
+				rc, out := h.runEnv(env, "", args...)
+				if rc != c.rc || !strings.Contains(out, c.want) {
+					t.Fatalf("%s 의 6 명령 fd %q: rc=%d(기대 %d), %q 가 없다:\n%s", readme, args, rc, c.rc, c.want, out)
+				}
+			}
+		})
 	}
 }
 
@@ -376,16 +459,16 @@ func checkUpgrade(t *testing.T, shell procShell, procs readmeProcs) {
 			{"run --rm --no-deps migrate migrate --db /data/fd.db", r.work, ""},
 			{fmt.Sprintf("run --rm migrate migrate --to %d", pg.ImportVersion), r.work, r.off()},
 			{"run --rm --no-deps migrate migrate import-sqlite --from /data/fd.db", r.work, r.off()},
-			{"run --rm migrate selfcheck", r.work, r.off()},
-			{"run --rm migrate migrate verify --from /data/fd.db", r.work, r.off()},
+			{upgradeVerify, r.work, r.off()},
 			{"up -d --build", r.work, r.on()},
 		} {
 			if c := called(calls, want.args); !ran(c, want.pwd, want.env) {
 				t.Errorf("`%s` 가 자리 %s · 선택 파일 %q 로 안 돌았다: %q", want.args, want.pwd, want.env, c)
 			}
 		}
-		if s, d := calledAt(calls, "run --rm migrate selfcheck"), calledAt(calls, "up -d --build db-roles"); s < 0 || d < 0 || s > d {
-			t.Errorf("6 이 Postgres 원장의 판을 db-roles(그 앞의 migrate 가 원장을 올린다) 전에 재지 않았다:\n%s", strings.Join(calls, "\n"))
+		if v, d := calledAll(calls, upgradeVerify), calledAt(calls, "up -d --build db-roles"); len(v) != 2 || d < 0 || v[0] > d || v[1] < d {
+			t.Errorf("6 이 두 원장의 판을 db-roles(그 앞의 migrate 가 원장을 올린다) 전에 맞대고 7 이 그 뒤에 다시 맞대야 한다(맞대기 %v · db-roles %d):\n%s",
+				v, d, strings.Join(calls, "\n"))
 		}
 		if c := called(calls, "up -d --build"); !strings.Contains(c, " REPOS=/repos/one,/repos/two,, ") {
 			t.Errorf("8 의 up 이 1 이 읽은 저장소 마운트로 안 돌았다: %q", c)
@@ -409,8 +492,8 @@ func checkUpgrade(t *testing.T, shell procShell, procs readmeProcs) {
 		r := upgradeRig(t, shell, procs)
 		r.env["FDT_WAIT"] = "1"
 		rc, calls, out := r.run(r.work, "fdwhere", procs.upgrade)
-		if rc == "0" || strings.Contains(strings.Join(calls, "\n"), "verify") {
-			t.Fatalf("db-roles 가 섰는데 덩이가 맞대기로 갔다(rc=%s):\n%s\n%s", rc, strings.Join(calls, "\n"), out)
+		if v, d := calledAll(calls, upgradeVerify), calledAt(calls, "up -d --build db-roles"); rc == "0" || len(v) != 1 || d < 0 || v[0] > d {
+			t.Fatalf("db-roles 가 섰는데 덩이가 7 의 맞대기로 갔다(rc=%s · 맞대기 %v · db-roles %d):\n%s\n%s", rc, v, d, strings.Join(calls, "\n"), out)
 		}
 		if !r.exists(r.off()) || r.exists(r.on()) || !r.exists(r.data("fd.db.moved-to-postgres")) {
 			t.Fatal("db-roles 가 섰는데 선택 파일이 켜졌거나 표지가 없다")
@@ -430,15 +513,17 @@ func checkUpgrade(t *testing.T, shell procShell, procs readmeProcs) {
 		}
 	})
 	// 옛 판(이관 판 아래)으로 옮기다 선 자리: 표지가 SQLite 원장을 옛 판에 묶어 두므로, 6 의 db-roles 앞 migrate 가 Postgres 원장을
-	// 올리면 7 이 둘을 못 맞대고 옛 판으로도 못 돌아간다. 6 은 원장을 올리기 전에 판을 재고 처방을 대며 선다.
-	t.Run("표지가 있고 Postgres 원장이 이 판이 아니면 6 이 올리기 전에 선다", func(t *testing.T) {
+	// 올리거나 이미 올라 있으면 7 이 둘을 못 맞대고 옛 판으로도 못 돌아간다. 6 은 계정을 바꾸기 전에 두 원장을 맞대고 처방을 대며
+	// 선다. 그 맞대기가 판이 섞인 두 원장(SQLite 19 · Postgres 20 따위)을 실제로 거절하는지는 TestUpgradeStep6RefusesMixedVersions
+	// 가 6 의 그 명령을 진짜 원장에 돌려 잰다 - 여기서는 대역 docker 로 그 거절 뒤 덩이의 갈래만 본다.
+	t.Run("표지가 있고 두 원장이 이관 판에서 맞지 않으면 6 이 계정을 바꾸기 전에 선다", func(t *testing.T) {
 		r := upgradeRig(t, shell, procs)
 		r.write(r.data("fd.db.moved-to-postgres"), "")
-		r.env["FDT_FAIL"] = "run --rm migrate selfcheck$"
+		r.env["FDT_FAIL"] = "verify --from /data/fd.db$"
 		rc, calls, out := r.run(r.work, newShellRepos, procs.upgrade)
 		joined := strings.Join(calls, "\n")
-		if rc == "0" || strings.Contains(joined, "db-roles") || strings.Contains(joined, "verify") || called(calls, "run --rm migrate selfcheck") == "" {
-			t.Fatalf("판이 안 맞는 Postgres 원장에서 6 이 db-roles · 맞대기로 갔다(rc=%s):\n%s\n%s", rc, joined, out)
+		if rc == "0" || strings.Contains(joined, "db-roles") || len(calledAll(calls, upgradeVerify)) != 1 {
+			t.Fatalf("판이 안 맞는 두 원장에서 6 이 db-roles · 7 의 맞대기로 갔다(rc=%s):\n%s\n%s", rc, joined, out)
 		}
 		if !strings.Contains(out, "켜기 전에 섰을 때") && !strings.Contains(out, "Stopped before switching on") {
 			t.Fatalf("6 이 서면서 처방(「켜기 전에 섰을 때」)을 대지 않았다:\n%s", out)

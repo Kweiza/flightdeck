@@ -11,7 +11,8 @@
 --   - FK 는 기준선처럼 DEFERRABLE INITIALLY IMMEDIATE 다(옮기기 · 이관이 한 트랜잭션에서 순서 없이 쓸 때 미룰 수 있게).
 --   - 새 표 넷의 앱 역할 권한을 여기서 준다(기준선 끝 GRANT 는 그때 있던 표에만 들었다). 함수는 더하지 않는다.
 --   - 소유자 계정의 조건 · 만든 때는 SQLite 와 한 문장이다. 시각의 최솟값은 COLLATE "C" 로 바이트 순에 고정한다 - DB 의 기본
---     정렬(예: 문장 부호를 건너뛰는 로캘)에 맡기면 SQLite(BINARY)와 다른 행을 고를 수 있다.
+--     정렬(예: 문장 부호를 건너뛰는 로캘)에 맡기면 SQLite(BINARY)와 다른 행을 고를 수 있다. 칸이 모두 text 라 SQLite 쪽의 저장형
+--     통일(CAST … AS TEXT)은 여기에 필요 없다 - 이관이 SQLite 의 BLOB 시각을 글로 옮긴다.
 
 CREATE TABLE account (
   id            text PRIMARY KEY,
