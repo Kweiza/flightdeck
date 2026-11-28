@@ -105,6 +105,9 @@ server starts from an old image built earlier.
 
 - **Server on another machine?** Give sessions `FD_URL=https://<server>:7420` (and `FD_TOKEN` if you set one).
   A token never leaves loopback over plain `http` - open the server with `FD_TLS=files` or `proxy`, or set `FD_INSECURE_HTTP=1` if you trust the network itself.
+  **Drain the outbox before you change the token** (`fd doctor` shows what is left). Idempotency keys are scoped per principal, so a judgment
+  that reached the server under the old token without an answer is recorded twice when the new token resends it. `fd setup --token` replays
+  with the current token before saving and says so when it cannot drain.
 - **Without Docker:** `cd server && go run ./cmd/fd serve --addr :7420 --db ~/.flightdeck/fd.db`.
   It points at the same database as the container, so **never run both.**
 - **Already installed as `flightdeck@kweiza-cc-plugins`?** Keep it — it fetches this repository. Do not enable both.

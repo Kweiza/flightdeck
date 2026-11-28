@@ -73,6 +73,14 @@ type ProjectRemoval struct {
 	Refusal string         `json:"refusal,omitempty"`
 }
 
+// Actor 는 쓰기 기록의 「누가」다. ID 는 인증 주체에서 고른 행위자(api.ActorOf)이고, Claimed 는 요청 본문의 자기 신고다. 둘을 한
+// 칸에 섞지 않는다 - 자기 신고는 아무나 아무 이름이나 적을 수 있어 행위자 칸에 들면 감사 기록이 거짓 계정 행위를 말한다. 그래도
+// 버리지 않는다: 계정이 없는 주체(공유 토큰 · 무인증)가 누구였는지는 그것밖에 말해 주지 않는다.
+type Actor struct {
+	ID      string
+	Claimed string
+}
+
 // RemoveProject 는 프로젝트를 지운다. confirm 이 false 면 세기만 한다.
 //
 // ★ 세는 것과 지우는 것이 같은 함수인 이유: 다른 함수로 세면 세고 나서 지우기 전에 바뀐
@@ -85,7 +93,7 @@ type ProjectRemoval struct {
 // 두 번째 판정을 별도 오류(500 류)로 흘리지 않는 이유는, 그것은 사용자 잘못이 아니라
 // 서버가 정직하게 다시 확인한 결과이기 때문이다 — 처음부터 --yes 없이 불렀을 때와 같은
 // 모양(ProjectRemoval.Refusal)으로 보여야 CLI 가 문구를 새로 안 만든다.
-func (s *Service) RemoveProject(ctx context.Context, id, actor, reason string,
+func (s *Service) RemoveProject(ctx context.Context, id string, who Actor, reason string,
 	confirm bool) (ProjectRemoval, error) {
 
 	if strings.TrimSpace(reason) == "" {
@@ -124,9 +132,11 @@ func (s *Service) RemoveProject(ctx context.Context, id, actor, reason string,
 		}
 		return ProjectRemoval{}, err
 	}
-	s.st.LogEvent(ctx, "project.removed", id, "", map[string]any{
-		"actor": clip(actor, 120), "reason": clip(reason, 400), "counts": counts,
-	})
+	payload := map[string]any{"actor": clip(who.ID, 120), "reason": clip(reason, 400), "counts": counts}
+	if who.Claimed != "" {
+		payload["claimed_actor"] = clip(who.Claimed, 120)
+	}
+	s.st.LogEvent(ctx, "project.removed", id, "", payload)
 	out.Removed = true
 	return out, nil
 }

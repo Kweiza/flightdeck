@@ -360,6 +360,8 @@ func (s *server) handleNotices(w http.ResponseWriter, r *http.Request) {
 // 판정과 Subscribe 사이에 그 커밋 · Cut 이 끼면 Cut 은 아직 없는 구독을 못 고르고 이 스트림은 철회된 자격증명으로 계속 받는다.
 // 구독 뒤에 다시 재면 철회 커밋이 재기 전이면 여기서 거절되고, 잰 뒤면 Cut 이 이미 걸린 구독을 고른다 - 틈이 없다.
 // 화면 세션은 만료 시각에 스스로 닫는다(Principal.ExpiresAt) - 열린 스트림에는 게이트가 만료를 다시 볼 다음 요청이 없다.
+//
+// ★ 무엇을 쓰든 쓰기 직전에 종료 · 철회 · 만료를 먼저 본다(streamEnding). 끝낼 사유가 선 뒤에는 데이터를 한 줄도 안 낸다.
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	project := strings.TrimSpace(r.URL.Query().Get("project"))
 
@@ -372,9 +374,10 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		s.refuseAuth(w, r, d)
 		return
 	}
+	expiresAt := d.Principal.ExpiresAt
 	var expired <-chan time.Time
-	if !d.Principal.ExpiresAt.IsZero() {
-		t := time.NewTimer(d.Principal.ExpiresAt.Sub(s.now()))
+	if !expiresAt.IsZero() {
+		t := time.NewTimer(expiresAt.Sub(s.now()))
 		defer t.Stop()
 		expired = t.C
 	}
@@ -405,44 +408,25 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	defer beat.Stop()
 
 	for {
-		// ★ 종료 통지를 **먼저** 본다. select 는 준비된 갈래 중 무작위로 고르므로,
-		// 구독자 버퍼에 프레임이 남아 있으면 통지를 받고도 최대 버퍼 길이(기본 32)만큼
-		// 더 쓴다 — 그러면 종료 시간이 버퍼 길이만큼 흔들리고, 읽지 않는 피어에 쓰면
-		// 그 자리에서 막힌다.
-		select {
-		case <-s.draining:
-			s.byeAndReturn(w, rc)
-			return
-		default:
-		}
-
+		var out []byte
 		select {
 		case <-s.draining:
 			// 서버가 종료 중이다 — 클라이언트 절단과 **다른 사실**이고, 그래서
 			// 다른 채널로 온다(api.go 의 draining 주석).
-			s.byeAndReturn(w, rc)
+			sayBye(w, rc, byeDraining)
 			return
 		case <-r.Context().Done():
 			return // 클라이언트가 끊었다
 		case <-subscriber.Cut():
 			// 이 주체의 자격증명이 철회됐다(기기 철회 · 계정 끄기 · 로그아웃). 다시 붙으면 게이트가 401 을 낸다.
-			if _, err := io.WriteString(w, ": bye 자격증명이 철회됐다 - 다시 로그인해라\n\n"); err == nil {
-				_ = rc.Flush()
-			}
+			sayBye(w, rc, byeRevoked)
 			return
 		case <-expired:
 			// 화면 세션이 만료됐다. 다시 붙으면 게이트가 401(로그인 폼)을 낸다.
-			if _, err := io.WriteString(w, ": bye 세션이 만료됐다 - 다시 로그인해라\n\n"); err == nil {
-				_ = rc.Flush()
-			}
+			sayBye(w, rc, byeExpired)
 			return
 		case <-beat.C:
-			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil {
-				return
-			}
-			if err := rc.Flush(); err != nil {
-				return
-			}
+			out = heartbeatLine
 		case frame, ok := <-subscriber.ch:
 			if !ok {
 				// ★ **도달 불가다.** 이 채널을 닫는 자리는 Hub.Unsubscribe 하나뿐이고 그
@@ -452,17 +436,52 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				// 접으면 !ok 하나가 "허브가 닫혔다"와 "내 구독이 해지됐다" 둘의 신호가 된다.
 				return
 			}
-			if _, err := w.Write(frame); err != nil {
-				return
-			}
-			if err := rc.Flush(); err != nil {
-				return
-			}
+			out = frame
+		}
+		// ★ 쓰기 직전에 끝낼 사유를 **먼저** 본다(streamEnding). select 는 준비된 갈래 중 무작위로 고르므로, 종료 · 철회 · 만료와
+		// 프레임이 함께 준비돼 있으면 프레임을 고르기도 한다 - 그러면 철회된(만료된) 자격증명으로 데이터가 한 번 더 나가고, 버퍼에
+		// 프레임이 쌓여 있으면 종료 통지를 받고도 버퍼 길이(기본 32)만큼 더 쓴다(읽지 않는 피어면 그 자리에서 막힌다).
+		if bye := s.streamEnding(subscriber, expiresAt); bye != "" {
+			sayBye(w, rc, bye)
+			return
+		}
+		if _, err := w.Write(out); err != nil {
+			return
+		}
+		if err := rc.Flush(); err != nil {
+			return
 		}
 	}
 }
 
-// byeAndReturn 은 종료 사유를 와이어에 한 줄 남기고 나간다.
+// 스트림을 닫는 작별 줄들이다. 주석 줄(`:`)이라 소비자는 무시하고 재연결한다(sayBye 의 ★).
+const (
+	byeDraining = ": bye 서버가 종료한다 — 재연결하면 이어진다\n\n"
+	byeRevoked  = ": bye 자격증명이 철회됐다 - 다시 로그인해라\n\n"
+	byeExpired  = ": bye 세션이 만료됐다 - 다시 로그인해라\n\n"
+)
+
+var heartbeatLine = []byte(": heartbeat\n\n")
+
+// streamEnding 은 이 스트림을 지금 닫아야 하는 사유의 작별 줄이다. 없으면 빈 글이다. 막지 않는다.
+//
+// 셋을 본다: 서버 종료(draining) · 자격증명 철회(Cut) · 화면 세션 만료(만료 시각). 만료는 타이머가 아니라 **시각**으로 잰다 -
+// 타이머가 아직 안 울린 찰나에 프레임이 먼저 오면 타이머 채널만 봐서는 만료를 못 본다.
+func (s *server) streamEnding(sub *Sub, expiresAt time.Time) string {
+	select {
+	case <-s.draining:
+		return byeDraining
+	case <-sub.Cut():
+		return byeRevoked
+	default:
+	}
+	if !expiresAt.IsZero() && !s.now().Before(expiresAt) {
+		return byeExpired
+	}
+	return ""
+}
+
+// sayBye 는 종료 사유를 와이어에 한 줄 남긴다.
 //
 // ★ **이 줄이 닿는 곳을 정확히 적는다 — 대시보드가 아니다.** SSE 규약상 `:` 로 시작하는
 // 줄은 파서가 버리므로 `EventSource` 의 어떤 핸들러에도 안 간다. 유일한 프로덕션 소비자인
@@ -472,8 +491,8 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 // 와이어 계약은 안 바뀐다(주석 줄이라 소비자가 안전하게 무시하고 재연결한다).
 //
 // 오류는 삼킨다. 이미 나가는 길이고, 여기서 할 수 있는 다른 일이 없다.
-func (s *server) byeAndReturn(w io.Writer, rc *http.ResponseController) {
-	if _, err := io.WriteString(w, ": bye 서버가 종료한다 — 재연결하면 이어진다\n\n"); err != nil {
+func sayBye(w io.Writer, rc *http.ResponseController, line string) {
+	if _, err := io.WriteString(w, line); err != nil {
 		return
 	}
 	_ = rc.Flush()

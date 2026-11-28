@@ -305,9 +305,10 @@ func TestWriteNULComposedCellsAreOneImportCellOnBothEngines(t *testing.T) {
 				t.Fatalf("project.removed payload: %v", err)
 			}
 			// 이 이벤트는 사유를 clip(제어 문자를 공백으로)해 싣는다 - NUL 이 칸에 닿지 않는 갈래다. 재는 것은 지우기가 두 엔진
-			// 모두 끝까지 가고(500 이 아니다) 행위자의 `\x00` 네 글자가 그대로라는 것이다.
-			if doc["actor"] != actor {
-				t.Errorf("project.removed payload = %s, 행위자는 그대로 %q 여야 한다", p, actor)
+			// 모두 끝까지 가고(500 이 아니다) 본문의 자기 신고(claimed_actor)의 `\x00` 네 글자가 그대로라는 것이다. 행위자 칸은
+			// 주체(무인증)다(api.ActorOf).
+			if doc["claimed_actor"] != actor || doc["actor"] != "anonymous" {
+				t.Errorf("project.removed payload = %s, 자기 신고는 그대로 %q · 행위자는 anonymous 여야 한다", p, actor)
 			}
 		})
 	}

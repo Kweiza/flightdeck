@@ -97,6 +97,8 @@ curl -s localhost:7420/healthz
 
 - **서버가 다른 머신이면** 세션 쪽에 `FD_URL=https://<서버>:7420` 을 준다(토큰을 쓰면 `FD_TOKEN` 도).
   토큰은 평문 `http` 로 루프백 밖에 안 나간다 - 서버를 `FD_TLS=files` · `proxy` 로 열거나, 망 자체를 믿으면 `FD_INSECURE_HTTP=1`.
+  **토큰을 바꾸기 전에 아웃박스를 비운다**(`fd doctor` 가 남은 건수를 낸다). 멱등 키는 주체마다 따로라, 옛 토큰으로 닿았는데
+  답을 못 받은 판단을 새 토큰이 다시 보내면 두 번 남는다. `fd setup --token` 은 저장 전에 지금 토큰으로 먼저 보내고, 못 비우면 그렇다고 말한다.
 - **도커 없이** 돌리려면 `cd server && go run ./cmd/fd serve --addr :7420 --db ~/.flightdeck/fd.db`.
   컨테이너와 같은 DB 를 가리키므로 **둘을 같이 돌리지 마라.**
 - **이미 `flightdeck@kweiza-cc-plugins` 로 깔았다면** 그대로 둬라 — 같은 저장소를 받는다. 둘을 함께 켜지는 마라.

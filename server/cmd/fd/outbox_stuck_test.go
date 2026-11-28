@@ -75,11 +75,19 @@ func TestJudgeReplayFailureSeparatesPermanentFromTransient(t *testing.T) {
 		{"500 도 오래 실패하면 영구로 접는다", &APIError{Status: 500}, maxReplayTries - 1, true},
 		{"모르는 실패는 남긴다", errors.New("무언가"), 0, false},
 		{"모르는 실패도 오래면 접는다", errors.New("무언가"), maxReplayTries - 1, true},
+		// ★ 전송 거절(보내기 전에 클라이언트가 막았다)은 서버가 그 줄을 못 본 것이다 - 오래 돼도 접지 않는다(고침 2 의 중요 3).
+		{"전송 거절은 남긴다", &TransportRefusal{Reason: "평문 원격"}, 0, false},
+		{"전송 거절은 오래돼도 안 접는다", fmt.Errorf("재생: %w", &TransportRefusal{Reason: "평문 원격"}), maxReplayTries - 1, false},
 	}
 	for _, c := range cases {
 		v := JudgeReplayFailure(c.err, c.tries)
 		if v.Permanent != c.want {
 			t.Errorf("%s: Permanent=%v 여야 하는데 %v 다 (사유: %s)", c.name, c.want, v.Permanent, v.Reason)
+		}
+		// 세는 축: 서버에 닿아 그 줄에 대해 답한 실패만 센다. 미도달 · 전송 거절은 그 줄에 대한 정보가 아니다.
+		var refused *TransportRefusal
+		if counts := !Unreachable(c.err, 0) && !errors.As(c.err, &refused); v.Counts != counts {
+			t.Errorf("%s: Counts=%v 여야 하는데 %v 다", c.name, counts, v.Counts)
 		}
 		if strings.TrimSpace(v.Reason) == "" {
 			t.Errorf("%s: 사유가 비었다 — 사유 없는 판정은 다음 사람이 못 뒤집는다", c.name)

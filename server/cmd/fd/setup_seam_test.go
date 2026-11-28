@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/kweiza/flightdeck/internal/model"
 )
 
 // `fd setup` 의 **이음매** — 저장한 값이 실제로 다음 실행에 실리는가.
@@ -110,5 +112,79 @@ func TestSetupCanClearTheToken(t *testing.T) {
 	_, out := h.runEnv(env, "", "doctor") // 미도달이라 코드는 0이 아니다 — 볼 것은 토큰 줄이다
 	if !strings.Contains(out, "서버 토큰 없음") {
 		t.Errorf("토큰을 지웠는데 doctor 가 아직 설정됐다고 한다:\n%s", out)
+	}
+}
+
+// 토큰을 바꾸는 자리는 아웃박스를 **옛 자격증명으로** 먼저 비운다. 멱등 표의 키는 주체 범위가 붙어서, 옛 토큰으로
+// 서버에 닿았는데 답을 못 받은 줄을 새 토큰이 다시 보내면 서버는 다른 키로 읽고 판단을 한 번 더 남긴다.
+// 줄을 쌓을 때의 자격증명은 설정 파일에서 오게 한다 - 환경의 FD_TOKEN 이면 setup 이 바꾸는 값이 실행에 안 닿는다.
+func setupSwitchHarness(t *testing.T) (h *harness, env map[string]string, cfgPath string, ob *Outbox) {
+	t.Helper()
+	const oldTok = "old-shared-token-before-the-switch"
+	h = newHarnessAuth(t, oldTok)
+	env = map[string]string{}
+	for k, v := range h.env {
+		env[k] = v
+	}
+	delete(env, "FD_TOKEN")
+	cfgPath, _ = ConfigPath(envOf(env), h.home)
+	if err := SaveConfig(cfgPath, Config{Token: oldTok}); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := h.runEnv(env, "", "open"); code != 0 {
+		t.Fatalf("옛 토큰으로 세션 열기 실패(%d): %s", code, out)
+	}
+	h.down()
+	if code, out := h.runEnv(env, "", "note", "--kind", "decision", "--body", "토큰을 바꾸기 전에 쓴 판단"); code != 0 {
+		t.Fatalf("오프라인 note 실패(%d): %s", code, out)
+	}
+	ob = newOutbox(envOf(env), h.home)
+	if pend, err := ob.List(); err != nil || len(pend) != 1 {
+		t.Fatalf("전제가 깨졌다 - 아웃박스가 %d건이다(err=%v)", len(pend), err)
+	}
+	return h, env, cfgPath, ob
+}
+
+const switchedToken = "new-shared-token-after-the-switch"
+
+func TestSetupDrainsTheOutboxWithTheOldTokenBeforeSwitching(t *testing.T) {
+	h, env, cfgPath, ob := setupSwitchHarness(t)
+	h.up()
+	if got := len(h.judgments(model.JudgmentDecision)); got != 0 {
+		t.Fatalf("전제가 깨졌다 - 바꾸기 전인데 판단이 %d건이다", got)
+	}
+
+	code, out := h.runEnv(env, "", "setup", "--token", switchedToken)
+	if code != 0 {
+		t.Fatalf("setup --token 이 %d 로 끝났다:\n%s", code, out)
+	}
+	if pend, err := ob.List(); err != nil || len(pend) != 0 {
+		t.Fatalf("토큰을 바꿨는데 아웃박스 %d건이 남았다(err=%v) - 새 토큰의 재생이 두 번 남길 수 있다:\n%s", len(pend), err, out)
+	}
+	if got := len(h.judgments(model.JudgmentDecision)); got != 1 {
+		t.Fatalf("옛 토큰으로 보낸 판단이 서버에 %d건이다(1건이어야 한다):\n%s", got, out)
+	}
+	if !strings.Contains(out, "옛 자격증명으로 비웠다") {
+		t.Errorf("바꾸기 전에 비운 사실을 안 말한다:\n%s", out)
+	}
+	if cfg, _, _ := LoadConfig(cfgPath); cfg.Token != switchedToken {
+		t.Fatal("비운 뒤 새 토큰이 저장되지 않았다")
+	}
+}
+
+func TestSetupWarnsWhenTheOutboxCannotDrainBeforeSwitching(t *testing.T) {
+	h, env, cfgPath, ob := setupSwitchHarness(t) // 서버는 내려간 채다
+	code, out := h.runEnv(env, "", "setup", "--token", switchedToken)
+	if code != 0 {
+		t.Fatalf("못 비웠다고 새 토큰 저장까지 막았다(%d) - 옛 토큰이 철회된 큐면 영영 못 바꾼다:\n%s", code, out)
+	}
+	if !strings.Contains(out, "1건이 남은 채 토큰을 바꾼다") || !strings.Contains(out, "한 번 더 남긴다") {
+		t.Errorf("남은 줄이 두 번 남을 수 있다는 것을 안 말한다:\n%s", out)
+	}
+	if pend, err := ob.List(); err != nil || len(pend) != 1 {
+		t.Fatalf("못 비운 줄이 사라졌다(%d건, err=%v)", len(pend), err)
+	}
+	if cfg, _, _ := LoadConfig(cfgPath); cfg.Token != switchedToken {
+		t.Fatal("새 토큰이 저장되지 않았다")
 	}
 }

@@ -359,6 +359,22 @@ func roleLabel(r Role) string {
 	}
 }
 
+// reportCredentialSwitchFlush 는 토큰을 바꾸기 직전 재생의 결과를 낸다. 빈 큐면 아무 말도 안 한다.
+//
+// ★ 남은 줄이 있어도 저장은 막지 않는다. 옛 토큰이 철회돼 401 을 받는 큐는 옛 자격증명으로 영영 못 비우는데,
+// 그런 줄은 서버가 기록하지 않았으니 새 토큰으로 보내도 두 번 남지 않는다. 막으면 그 사람이 새 토큰으로 가는
+// 길만 끊긴다. 대신 두 번 남을 수 있는 경우(닿았는데 답을 못 받은 줄)를 말하고 판단은 사람에게 둔다.
+func reportCredentialSwitchFlush(out io.Writer, res ReplayResult) {
+	switch {
+	case res.Remaining > 0:
+		fmt.Fprintf(out, "★ 아웃박스에 %d건이 남은 채 토큰을 바꾼다. 옛 토큰으로 서버에 닿았는데 답을 못 받은 줄이면 "+
+			"새 토큰의 재생이 그 판단을 한 번 더 남긴다(멱등 키는 주체마다 따로다). 옛 토큰으로 서버에 닿을 수 있으면 "+
+			"먼저 비우고 바꿔라: %s\n", res.Remaining, clip(res.Detail, 300))
+	case res.Sent > 0 || res.Rejected > 0:
+		fmt.Fprintf(out, "토큰을 바꾸기 전에 아웃박스를 옛 자격증명으로 비웠다: %s\n", clip(res.Detail, 300))
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // `fd setup` — 관측하고 판정을 낸다. **아무것도 설치하지 않고 아무것도 띄우지 않는다.**
 //
@@ -396,6 +412,7 @@ func (a *App) runSetup(ctx context.Context, args []string, out io.Writer) int {
 	// ── 저장 갈래 ───────────────────────────────────────────────────────────
 	if strings.TrimSpace(*setURL) != "" || strings.TrimSpace(*setToken) != "" || *clearToken {
 		cfg, _, _ := LoadConfig(path)
+		oldToken := cfg.Token
 		if v := strings.TrimSpace(*setURL); v != "" {
 			cfg.URL = strings.TrimRight(v, "/")
 		}
@@ -403,6 +420,13 @@ func (a *App) runSetup(ctx context.Context, args []string, out io.Writer) int {
 			cfg.Token = ""
 		} else if v := strings.TrimSpace(*setToken); v != "" {
 			cfg.Token = v
+		}
+		// ★ 토큰을 바꾸기 전에 아웃박스를 **지금 자격증명으로** 비운다. 멱등 표의 키는 주체 범위가 붙어서
+		//   (`ScopeIdempotencyKey`), 옛 토큰으로 서버에 닿았는데 답을 못 받은 줄을 새 토큰이 다시 보내면 서버는
+		//   다른 키로 읽고 판단을 한 번 더 남긴다. 서버가 원문 키로 되돌아가 찾으면 주체 경계가 무너지므로 그 틈은
+		//   자격증명을 바꾸는 이 자리에서 닫는다. a.cli 는 기동 때 읽은 자격증명을 들고 있어 저장 전후와 무관하게 옛 것이다.
+		if cfg.Token != oldToken {
+			reportCredentialSwitchFlush(out, a.cli.Flush(ctx))
 		}
 		if err := SaveConfig(path, cfg); err != nil {
 			fmt.Fprintf(out, "설정을 저장하지 못했다: %v\n", err)

@@ -89,7 +89,14 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	next := JudgeNext(r.PostFormValue("next"))
 	got := strings.TrimSpace(r.PostFormValue("token"))
-	if k, ok := auth.KindOf(got); ok && k == auth.LoginCode {
+	// ★ FD_TOKEN 과 정확히 같은 값을 꼴보다 먼저 가른다(auth.SecretOf - 헤더의 pick 과 같은 한 자리). 예약 접두(fdl_)로 시작하는
+	// 옛 FD_TOKEN 을 꼴로 먼저 보면 로그인 코드 교환으로 빠져 401 이다 - 헤더로는 통하는 같은 값이 폼에서만 막힌다.
+	switch k := auth.SecretOf(s.opt.Token, got); {
+	case k == auth.SharedSecret && s.opt.AuthMode != auth.ModeAccounts:
+		s.grantLoginCookie(w, r, LoginCookieName, s.opt.Token, loginCookieMaxAge)
+		s.seeOther(w, r, next)
+		return
+	case k == auth.LoginCode:
 		s.exchangeLoginCode(w, r, got, next)
 		return
 	}
@@ -111,12 +118,7 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.loginRefused(w, r, "토큰이나 로그인 코드를 적어라", next)
 		return
 	}
-	if !auth.SharedTokenMatches(s.opt.Token, got) {
-		s.loginRefused(w, r, "토큰이 일치하지 않는다", next)
-		return
-	}
-	s.grantLoginCookie(w, r, LoginCookieName, s.opt.Token, loginCookieMaxAge)
-	s.seeOther(w, r, next)
+	s.loginRefused(w, r, "토큰이 일치하지 않는다", next)
 }
 
 // grantLoginCookie 는 로그인 성공이 굽는 쿠키 한 벌이다: 고른 쿠키를 굽고 다른 하나를 지운다. 두 로그인 갈래(FD_TOKEN · 로그인

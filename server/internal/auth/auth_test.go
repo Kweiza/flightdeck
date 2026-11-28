@@ -167,6 +167,19 @@ func TestPickReadsTheExactSharedTokenFirst(t *testing.T) {
 		if !SharedTokenCollides(v) {
 			t.Errorf("SharedTokenCollides(%s 꼴) 가 거짓이다", k)
 		}
+		// 두 입구(헤더 · 로그인 폼)가 함께 쓰는 가르기다: FD_TOKEN 과 같으면 꼴보다 먼저 SharedSecret, 아니면 꼴 그대로.
+		if got := SecretOf(v, v); got != SharedSecret {
+			t.Errorf("SecretOf: %s 꼴 FD_TOKEN 이 %q 다", k, got)
+		}
+		if got := SecretOf(v, other); got != k {
+			t.Errorf("SecretOf: %s 꼴의 다른 값이 %q 다", k, got)
+		}
+		if got := SecretOf("", v); got != k {
+			t.Errorf("SecretOf: 토큰 없는 서버에서 %s 꼴이 %q 다", k, got)
+		}
+	}
+	if got := SecretOf("plain-shared-secret", "plain-other"); got != "" {
+		t.Errorf("SecretOf: 어느 꼴도 아닌 값이 %q 다", got)
 	}
 	// 서버에 토큰이 없으면 빈 헤더 값과 맞대지 않는다.
 	if got, _ := pick(Request{Authorization: "Bearer "}, ""); got.kind == credShared {

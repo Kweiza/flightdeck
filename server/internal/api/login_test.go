@@ -492,3 +492,33 @@ func TestLoginRedirectsLandInsideProxyPrefix(t *testing.T) {
 		})
 	}
 }
+
+// TestLoginTakesAReservedShapeSharedTokenBeforeTheCodeShape 는 고침 2 의 중요 4 다: 이 판이 예약한 로그인 코드 꼴(fdl_)로 시작하는
+// 옛 FD_TOKEN 을 전환 단계의 로그인 폼에 넣으면 FD_TOKEN 으로 로그인된다(헤더의 pick 과 같은 순서 - auth.SecretOf). 고치기 전에는 꼴을
+// 먼저 봐 로그인 코드 교환으로 빠지고 401 이었다. 계정 단계에서는 같은 값이 코드 교환으로 안 빠지고 「FD_TOKEN 은 화면 로그인에 못
+// 쓴다」로 거절된다.
+func TestLoginTakesAReservedShapeSharedTokenBeforeTheCodeShape(t *testing.T) {
+	tok, err := auth.NewToken(auth.LoginCode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k, _ := auth.KindOf(tok); k != auth.LoginCode {
+		t.Fatalf("전제가 깨졌다 - FD_TOKEN 이 로그인 코드 꼴이 아니다(%s)", k)
+	}
+	rec := httptest.NewRecorder()
+	NewServer(nil, Options{Token: tok}).ServeHTTP(rec, loginPost(t, "/login", url.Values{"token": {tok}}))
+	if set, _ := grantedCookies(rec); rec.Code != http.StatusSeeOther || set[LoginCookieName] == nil || set[LoginCookieName].Value != tok {
+		t.Fatalf("로그인 코드 꼴의 FD_TOKEN 으로 전환 단계 로그인이 %d 다(쿠키 %v): %s", rec.Code, rec.Result().Cookies(), rec.Body.String())
+	}
+
+	var view LoginView
+	h := NewServer(nil, Options{Token: tok, AuthMode: auth.ModeAccounts, LoginScreen: func(w http.ResponseWriter, _ *http.Request, v LoginView) {
+		view = v
+		w.WriteHeader(http.StatusUnauthorized)
+	}})
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, loginPost(t, "/login", url.Values{"token": {tok}}))
+	if rec.Code != http.StatusUnauthorized || len(rec.Result().Cookies()) != 0 || !strings.Contains(view.Error, "FD_TOKEN 은 화면 로그인에 못 쓴다") {
+		t.Fatalf("계정 단계에서 FD_TOKEN 이 %d · 사유 %q 다 - 코드 교환이 아니라 FD_TOKEN 거절이어야 한다", rec.Code, view.Error)
+	}
+}

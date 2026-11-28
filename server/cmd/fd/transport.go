@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -166,19 +167,77 @@ func pinnedTLS(certFile string) (*tls.Config, error) {
 	return &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: name}, nil
 }
 
-// newHTTPClient 는 클라이언트의 HTTP 한 벌이다. 리다이렉트 판정은 늘 걸고, pinCert 가 있으면 그 인증서만 믿는다. 인증서를 못
-// 읽으면 고정 없이 만들고 사유를 낸다 - 그때 TLS 검증은 기본 신뢰로 돌아 실패가 미도달로 보이므로 fd doctor 가 사유를 찍는다.
+// newHTTPClient 는 클라이언트의 HTTP 한 벌이다. 셋을 늘 건다: 출처를 넘는 리다이렉트 거절(checkRedirect), 루프백 직결
+// (proxyUnlessLoopback · loopbackDial), pinCert 가 있으면 그 인증서만 믿기(pinnedTLS).
+//
+// ★ 고정 인증서를 못 읽으면 **보내기 전에 거절하는 전송**을 단다(refusingTransport). 고정 없이 기본 신뢰로 돌면 그 주소에서
+// 다른 공인 인증서를 내는 상대에도 붙고 토큰을 싣는다 - 사람이 고른 신뢰 앵커가 조용히 사라진다. 사유는 둘째 반환값으로도
+// 내 fd doctor 가 주소 출처와 함께 찍는다.
 func newHTTPClient(timeout time.Duration, pinCert string) (*http.Client, string) {
-	c := &http.Client{Timeout: timeout, CheckRedirect: checkRedirect}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.Proxy = proxyUnlessLoopback(http.ProxyFromEnvironment)
+	tr.DialContext = loopbackDial(tr.DialContext)
+	c := &http.Client{Timeout: timeout, CheckRedirect: checkRedirect, Transport: tr}
 	if pinCert == "" {
 		return c, ""
 	}
 	cfg, err := pinnedTLS(pinCert)
 	if err != nil {
+		c.Transport = refusingTransport{reason: err.Error() + " - 지정한 인증서 없이 기본 신뢰로 붙지 않는다. 경로 · 권한을 고쳐라"}
 		return c, err.Error()
 	}
-	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSClientConfig = cfg
-	c.Transport = tr
 	return c, ""
+}
+
+// refusingTransport 는 모든 요청을 망에 내기 전에 거절하는 전송이다. Client.do 가 *url.Error 를 풀어 TransportRefusal 로 낸다 -
+// 미도달이 아니라 아웃박스에 안 쌓이고 재생 횟수도 안 먹는다.
+type refusingTransport struct{ reason string }
+
+func (t refusingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		req.Body.Close() // RoundTripper 는 실패해도 본문을 닫는다(net/http 계약)
+	}
+	return nil, &TransportRefusal{Reason: t.reason}
+}
+
+// proxyUnlessLoopback 은 루프백 주소(IsLoopbackHost)로 가는 요청을 프록시에 안 태운다. 그 밖은 base(환경 프록시)가 고른다.
+//
+// ★ net/http 의 환경 프록시(HTTP_PROXY)는 `localhost` 와 루프백 IP 만 빼고 `localhost.` 같은 표기는 프록시로 보낸다. 이 판정은 그
+// 표기도 루프백으로 믿고 토큰을 평문 http 로 싣게 두므로(CredentialTransportRefusal), 프록시를 타면 그 토큰이 프록시까지 망을 평문으로
+// 건넌다. 루프백 판정을 두 규칙(net/http 의 것 · 이 파일의 것)에 나눠 두지 않는다 - 루프백이면 늘 곧장 잇는다. 루프백 목적지를 프록시에
+// 맡기는 것은 애초에 뜻이 없다(프록시가 자기 머신의 루프백을 친다).
+func proxyUnlessLoopback(base func(*http.Request) (*url.URL, error)) func(*http.Request) (*url.URL, error) {
+	return func(req *http.Request) (*url.URL, error) {
+		if IsLoopbackHost(req.URL.Hostname()) {
+			return nil, nil
+		}
+		return base(req)
+	}
+}
+
+// loopbackDial 은 이름(`localhost`)으로 적은 루프백 주소를 해석하지 않고 루프백 IP(127.0.0.1, 안 되면 ::1)로 곧장 잇는다. IP 로
+// 적은 주소와 다른 이름은 그대로 잇는다.
+//
+// ★ IsLoopbackHost 는 이름을 보고 루프백이라 믿는다. 이름을 해석에 맡기면 hosts · DNS 가 그 이름을 다른 곳으로 돌릴 때 그 믿음이
+// 거짓이 되고, 평문 http 로 실은 토큰이 망을 건넌다. 그래서 연결도 그 믿음대로 루프백 IP 로만 한다.
+func loopbackDial(dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || !IsLoopbackHost(host) {
+			return dial(ctx, network, addr)
+		}
+		if _, perr := netip.ParseAddr(host); perr == nil {
+			return dial(ctx, network, addr)
+		}
+		var errs []error
+		for _, ip := range []string{"127.0.0.1", "::1"} {
+			conn, derr := dial(ctx, network, net.JoinHostPort(ip, port))
+			if derr == nil {
+				return conn, nil
+			}
+			errs = append(errs, derr)
+		}
+		return nil, errors.Join(errs...)
+	}
 }

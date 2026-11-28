@@ -121,10 +121,10 @@ func (s *server) withRateLimit(next http.Handler) http.Handler {
 
 // withTransport 는 전송 정책(FD_TLS=proxy)을 건다: 신뢰 프록시 밖에서 곧장 온 연결과, 신뢰 프록시가 평문으로 받아 넘긴
 // 요청(X-Forwarded-Proto 가 https 가 아니다)은 자격증명을 보기 전에 거절한다. 판정은 auth.JudgeTransport 다. 루프백 · 신뢰
-// 프록시에서 온 /healthz 만 그 표지 없이 통한다 - 컨테이너 헬스체크는 안에서 루프백 평문으로 친다(HealthPath).
+// 프록시에서 온 헬스체크(JudgeHealthProbe)만 그 표지 없이 통한다 - 컨테이너 헬스체크는 안에서 루프백 평문으로 친다.
 func (s *server) withTransport(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if v := auth.JudgeTransport(r.RemoteAddr, r.Header.Values("X-Forwarded-Proto"), r.URL.Path == HealthPath, s.opt.TLS); !v.OK {
+		if v := auth.JudgeTransport(r.RemoteAddr, r.Header.Values("X-Forwarded-Proto"), JudgeHealthProbe(r.Method, r.URL.Path), s.opt.TLS); !v.OK {
 			s.writeError(w, r, Classified{
 				Status: http.StatusForbidden, Code: "transport_refused",
 				Message:  v.Reason,
@@ -141,7 +141,7 @@ func (s *server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// /healthz 는 게이트 앞에 둔다. 배너 훅이 "서버가 살아 있나 · 인증이 어떤 단계인가"를
 		// 묻는 유일한 창인데, 그것을 인증 뒤에 두면 토큰 오설정 시 아무것도 알 수 없다.
-		if r.URL.Path == HealthPath {
+		if JudgeHealthProbe(r.Method, r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -162,6 +162,15 @@ func (s *server) withAuth(next http.Handler) http.Handler {
 // HealthPath 는 헬스체크 경로다. 인증 게이트 앞이고(배너 훅 · 컨테이너 헬스체크가 토큰 오설정 때도 읽는다), FD_TLS=proxy 의
 // X-Forwarded-Proto 판정에서도 빠진다(auth.JudgeTransport 의 ③).
 const HealthPath = "/healthz"
+
+// JudgeHealthProbe 는 이 요청이 헬스체크인가다. 순수 함수다. GET · HEAD 의 정확한 HealthPath 하나다. 두 관문 - 게이트 앞 통과
+// (withAuth)와 전송 표지 면제(withTransport) - 이 이 한 판정을 함께 쓴다.
+//
+// ★ 메서드를 본다. 경로만 보면 POST /healthz 같은 다른 메서드도 두 관문을 다 건너고, mux 의 GET /healthz 가 안 받는 그 요청은
+// "/" 로 떨어져 Fallback(화면)에 주체 없이 닿는다 - 면제가 헬스체크가 아닌 표면을 연다.
+func JudgeHealthProbe(method, path string) bool {
+	return (method == http.MethodGet || method == http.MethodHead) && path == HealthPath
+}
 
 // refuseAuth 는 통과 못 한 판정을 응답으로 옮긴다. 게이트와 스트림의 재확인(handleEvents)이 같은 자리를 쓴다 - 같은 판정이
 // 두 자리에서 다른 응답(폼 · 상태코드 · 지표)으로 나가지 않게 한다.

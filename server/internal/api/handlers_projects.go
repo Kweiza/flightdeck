@@ -1,6 +1,10 @@
 package api
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/kweiza/flightdeck/internal/service"
+)
 
 // handleListProjects 는 프로젝트 요약 전부를 낸다.
 //
@@ -20,7 +24,8 @@ func (s *server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 // 않는다. 두 벌이 되면 반드시 표류한다).
 //
 // ★ 관리자만 한다. 프로젝트는 모든 계정이 함께 보는 원장 행이라 한 회원의 기기 토큰이 남의 판단 · 항목째 지우게 두지 않는다.
-// 행위자는 본문이 아니라 인증 주체에서 고른다(ActorOf) - 본문 칸은 계정이 없는 옛 주체의 자기 신고로만 남는다.
+// 행위자는 본문이 아니라 인증 주체에서 고른다(ActorOf). 본문의 actor 는 자기 신고로 따로 남는다(claimed_actor) - 공유 토큰 ·
+// 무인증이 적은 이름도 행위자 칸에 안 섞인다.
 func (s *server) handleRemoveProject(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
 	if !p.Admin() {
@@ -35,7 +40,8 @@ func (s *server) handleRemoveProject(w http.ResponseWriter, r *http.Request) {
 	if !s.decode(w, r, &req) {
 		return
 	}
-	res, err := s.svc.RemoveProject(r.Context(), r.PathValue("id"), ActorOf(p, req.Actor), req.Reason, req.Confirm)
+	who := service.Actor{ID: ActorOf(p), Claimed: req.Actor}
+	res, err := s.svc.RemoveProject(r.Context(), r.PathValue("id"), who, req.Reason, req.Confirm)
 	if err != nil {
 		s.fail(w, r, err)
 		return

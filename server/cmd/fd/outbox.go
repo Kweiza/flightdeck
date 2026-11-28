@@ -67,7 +67,10 @@ const maxReplayTries = 5
 // ReplayVerdict 는 실패 하나를 어떻게 다룰지다. 사유는 항상 채운다.
 type ReplayVerdict struct {
 	Permanent bool
-	Reason    string
+	// Counts 는 이 실패가 그 줄의 시도 횟수(OutboxEntry.Tries)를 올리는가다 - 서버에 닿아 그 줄에 대해 답한 실패만 센다.
+	// Replay 는 이 값으로만 센다(세는 판정을 이 함수 밖에 두 번 두지 않는다).
+	Counts bool
+	Reason string
 }
 
 // JudgeReplayFailure 는 재생 실패 하나를 분류한다. 순수 함수다.
@@ -89,9 +92,17 @@ func JudgeReplayFailure(err error, tries int) ReplayVerdict {
 	if Unreachable(err, 0) {
 		return ReplayVerdict{Reason: "서버에 못 닿았다 — 다음 재생에서 다시 보낸다(미도달은 횟수에 안 센다)"}
 	}
+	// ★ **전송 거절도 횟수에 안 센다.** 클라이언트가 보내기 전에(또는 출처를 넘는 리다이렉트를 따라가기 전에) 스스로 막은 것이라
+	// 서버는 그 줄을 못 봤다 - 거절의 원인은 설정(주소 · 토큰 · 고정 인증서)이지 그 줄이 아니다. 세면 올리기 전에 쌓인 판단이
+	// 설정을 고치기 전의 명령 다섯 번만으로 「서버에 닿았는데 실패했다」는 거짓 사유와 함께 격리된다(되돌릴 길이 없다).
+	var refused *TransportRefusal
+	if errors.As(err, &refused) {
+		return ReplayVerdict{Reason: "보내기 전에 전송을 거절했다(설정 문제라 서버는 이 줄을 못 봤다) - 횟수에 안 세고 남긴다. " +
+			"설정을 고치면 다음 재생이 보낸다: " + clip(refused.Reason, 300)}
+	}
 	// 여기부터는 **서버에 닿았는데 실패한** 것이다. 그때만 횟수가 뜻을 갖는다.
 	if tries+1 >= maxReplayTries {
-		return ReplayVerdict{Permanent: true, Reason: fmt.Sprintf(
+		return ReplayVerdict{Permanent: true, Counts: true, Reason: fmt.Sprintf(
 			"서버에 닿았는데 %d번 연속 실패했다 — 일시 장애로 보기에는 너무 오래다. 마지막 오류: %s",
 			tries+1, clip(err.Error(), 300))}
 	}
@@ -99,14 +110,14 @@ func JudgeReplayFailure(err error, tries int) ReplayVerdict {
 	if errors.As(err, &ae) {
 		switch {
 		case ae.Status == http.StatusRequestTimeout || ae.Status == http.StatusTooManyRequests:
-			return ReplayVerdict{Reason: fmt.Sprintf("서버가 %d 로 되물렀다 — 다시 보낸다", ae.Status)}
+			return ReplayVerdict{Counts: true, Reason: fmt.Sprintf("서버가 %d 로 되물렀다 — 다시 보낸다", ae.Status)}
 		case ae.Status >= 400 && ae.Status < 500:
-			return ReplayVerdict{Permanent: true, Reason: fmt.Sprintf(
+			return ReplayVerdict{Permanent: true, Counts: true, Reason: fmt.Sprintf(
 				"서버가 %d 로 거절했다 — 같은 요청은 몇 번을 보내도 같은 답이다: %s",
 				ae.Status, clip(ae.Message, 300))}
 		}
 	}
-	return ReplayVerdict{Reason: "분류할 수 없는 실패 — 판단을 잃지 않으려고 남긴다: " +
+	return ReplayVerdict{Counts: true, Reason: "분류할 수 없는 실패 — 판단을 잃지 않으려고 남긴다: " +
 		clip(err.Error(), 200)}
 }
 
@@ -978,9 +989,9 @@ func (o *Outbox) Replay(ctx context.Context, send func(context.Context, OutboxEn
 		// 일시 실패는 **그 자리에서 멈춘다** — 뒤엣것을 계속 시도하면 순서가 뒤집히고
 		// (판단은 시간축이 의미다) 매번 전량 재시도로 실패 폭풍이 난다.
 		//
-		// ★ 미도달은 **세지 않는다.** 못 보낸 것은 그 줄에 대한 정보가 아니다
+		// ★ 미도달 · 전송 거절은 **세지 않는다**(v.Counts). 못 보낸 것은 그 줄에 대한 정보가 아니다
 		// (JudgeReplayFailure 의 같은 주석). 세면 오프라인이 길다는 이유만으로 격리된다.
-		if !Unreachable(err, 0) {
+		if v.Counts {
 			e.Tries++
 			bumpedKey = e.Key
 		}

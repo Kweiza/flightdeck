@@ -135,6 +135,23 @@ func SharedTokenMatches(serverToken, got string) bool {
 	return serverToken != "" && sameSecret(got, serverToken)
 }
 
+// SharedSecret 은 SecretOf 가 FD_TOKEN 과 정확히 같은 값에 내는 종류다. 접두가 아니다 - NewToken · KindOf 의 종류가 아니다.
+const SharedSecret TokenKind = "FD_TOKEN"
+
+// SecretOf 는 내민 비밀 값의 종류다. 순수 함수다. 어느 꼴도 아니면 빈 글이다. sharedToken 은 서버의 FD_TOKEN 이다(비면 없다).
+//
+// ★ **FD_TOKEN 과 정확히 같으면 꼴과 무관하게 SharedSecret 이다.** 접두(fdd_ · fds_ · fdl_)는 이 판이 새로 예약한 것이라 그보다
+// 먼저 정한 FD_TOKEN 이 우연히 그 꼴일 수 있다. 꼴을 먼저 보면 그 배포는 갱신하는 순간 그 입구에서 401 이다. 자격증명이 들어오는
+// 두 입구 - 헤더(pick)와 화면 로그인 폼(api 의 handleLogin) - 가 이 한 자리로 가른다. 따로 가르면 한쪽만 꼴을 먼저 본다(헤더는
+// 통하는데 같은 FD_TOKEN 을 폼에 넣으면 로그인 코드 교환으로 빠져 401 이던 결함이 그 모양이다).
+func SecretOf(sharedToken, v string) TokenKind {
+	if SharedTokenMatches(sharedToken, v) {
+		return SharedSecret
+	}
+	k, _ := KindOf(v)
+	return k
+}
+
 // SharedTokenCollides 는 FD_TOKEN 이 이 판이 예약한 접두(fdd_ · fds_ · fdl_)로 시작하는가다. 순수 함수다. 겹쳐도 통한다(pick 의
 // ②가 정확히 같은 값을 먼저 FD_TOKEN 으로 읽는다) - 기동이 경고만 한다. 거절하면 그 FD_TOKEN 으로 붙던 배포가 갱신하는 순간
 // 서버째 못 뜬다.
@@ -312,9 +329,8 @@ const (
 //
 // 순서가 계약이다.
 //  1. **헤더가 있으면 헤더만 본다.** 쿠키는 안 본다 - 무엇이 인증했는지가 요청마다 달라지면 안 된다.
-//  2. **헤더 값이 FD_TOKEN 과 정확히 같으면 접두와 무관하게 FD_TOKEN 이다.** 접두(fdd_ · fds_ · fdl_)는 이 판이 새로 예약한
-//     것이라 그보다 먼저 정한 FD_TOKEN 이 우연히 그 접두로 시작할 수 있다. 접두를 먼저 보면 그 배포의 훅 · MCP 가 갱신하는
-//     순간 전부 401 이다. 기동이 그 FD_TOKEN 을 경고한다(fd serve).
+//  2. **헤더 값이 FD_TOKEN 과 정확히 같으면 접두와 무관하게 FD_TOKEN 이다**(SecretOf - 로그인 폼과 같은 한 자리). 접두를 먼저
+//     보면 그 배포의 훅 · MCP 가 갱신하는 순간 전부 401 이다. 기동이 그 FD_TOKEN 을 경고한다(fd serve).
 //  3. 헤더의 세션 쿠키 · 로그인 코드는 거절이다. 코드는 로그인 폼에서 한 번 바꾸는 값이고, 헤더로 받으면 일회용이 아니게 된다.
 //  4. 쿠키는 화면 경로에서만 본다. 세션 쿠키가 옛 토큰 쿠키보다 먼저다(둘 다 있으면 로그인한 계정이 이긴다).
 func pick(req Request, sharedToken string) (credential, *Decision) {
@@ -327,10 +343,9 @@ func pick(req Request, sharedToken string) (credential, *Decision) {
 			return credential{}, &Decision{Reason: "Authorization 인증 방식이 Bearer 가 아니다"}
 		}
 		v := parts[1]
-		if SharedTokenMatches(sharedToken, v) {
+		switch SecretOf(sharedToken, v) {
+		case SharedSecret:
 			return credential{credShared, v}, nil
-		}
-		switch k, _ := KindOf(v); k {
 		case DeviceToken:
 			return credential{credDevice, v}, nil
 		case SessionToken, LoginCode:
