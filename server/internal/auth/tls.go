@@ -140,11 +140,19 @@ type TransportVerdict struct {
 	Reason string
 }
 
-// JudgeTransport 는 원격 주소(RemoteAddr)가 이 정책으로 받을 연결인가다. 순수 함수다.
+// JudgeTransport 는 연결 하나가 이 정책으로 받을 요청인가다. 순수 함수다. forwardedProto 는 X-Forwarded-Proto 헤더 줄 전부
+// (r.Header.Values)이고, healthProbe 는 이 요청이 헬스체크 경로(/healthz)인가다 - 경로의 뜻은 표면이 판정해 싣는다.
 //
-// proxy 에서만 거절이 난다: 루프백도 신뢰 프록시도 아닌 곳에서 곧장 온 연결은 TLS 를 건너뛴 평문이다. files 는 듣는 소켓이
-// TLS 라 평문이 여기까지 못 오고, off 는 bind 판정이 이미 정했다. 못 읽은 주소는 거절한다(통과시키지 않는다).
-func JudgeTransport(remoteAddr string, p TLSPolicy) TransportVerdict {
+// proxy 에서만 거절이 난다. files 는 듣는 소켓이 TLS 라 평문이 여기까지 못 오고, off 는 bind 판정이 이미 정했다.
+//
+//  1. 루프백도 신뢰 프록시도 아닌 곳에서 곧장 온 연결은 TLS 를 건너뛴 평문이다 - 경로와 무관하게 거절한다. 못 읽은 주소도 거절한다.
+//  2. 루프백 · 신뢰 프록시에서 왔어도 **프록시가 덮어쓴 X-Forwarded-Proto 가 https 여야 한다.** 원격 주소만 보면 프록시가
+//     고객의 http:// 요청을 그대로 전달한 것(프록시의 평문 리스너)까지 통과해, 토큰이 평문으로 망을 건넌 요청을 받는다. 줄이
+//     여럿이거나 쉼표로 사슬이 오면 전부 https 여야 한다 - 한 구간이라도 평문이면 그 구간에서 비밀이 샜다. 루프백도 같다(같은
+//     호스트의 프록시가 루프백으로 붙는 배포가 정확히 그 모양이다).
+//  3. 예외는 헬스체크 하나다: 컨테이너 안의 fd doctor 는 프록시를 안 거치고 루프백 평문으로 /healthz 를 친다. 그 경로는 자격증명을
+//     요구하지 않는 읽기 하나다(게이트 앞). 신뢰 밖 연결에는 이 예외도 없다(1).
+func JudgeTransport(remoteAddr string, forwardedProto []string, healthProbe bool, p TLSPolicy) TransportVerdict {
 	if p.Mode != TLSProxy {
 		return TransportVerdict{OK: true}
 	}
@@ -152,15 +160,40 @@ func JudgeTransport(remoteAddr string, p TLSPolicy) TransportVerdict {
 	if !ok {
 		return TransportVerdict{Reason: "원격 주소를 못 읽었다 - FD_TLS=proxy 는 신뢰 프록시에서 온 연결만 받는다"}
 	}
-	if a.IsLoopback() {
+	if !a.IsLoopback() && !trusted(a, p.Trusted) {
+		return TransportVerdict{Reason: "신뢰 프록시(FD_TRUSTED_PROXY) 밖에서 곧장 온 연결이다 - TLS 프록시의 주소로 붙어라"}
+	}
+	if healthProbe {
 		return TransportVerdict{OK: true}
 	}
-	for _, t := range p.Trusted {
+	if !ForwardedHTTPS(forwardedProto) {
+		return TransportVerdict{Reason: "신뢰 프록시에서 왔지만 X-Forwarded-Proto 가 https 가 아니다 - 프록시가 평문(http://)으로 받은 " +
+			"요청을 넘겼거나 그 머리를 안 덮어쓴다. 프록시의 https 주소로 붙고, 프록시가 X-Forwarded-Proto 를 덮어쓰게 해라"}
+	}
+	return TransportVerdict{OK: true}
+}
+
+func trusted(a netip.Addr, ps []netip.Prefix) bool {
+	for _, t := range ps {
 		if t.Contains(a) {
-			return TransportVerdict{OK: true}
+			return true
 		}
 	}
-	return TransportVerdict{Reason: "신뢰 프록시(FD_TRUSTED_PROXY) 밖에서 곧장 온 연결이다 - TLS 프록시의 주소로 붙어라"}
+	return false
+}
+
+// ForwardedHTTPS 는 X-Forwarded-Proto 줄 전부가 https 인가다. 순수 함수다. 줄이 없거나 빈 값 · 다른 값이 하나라도 섞이면 거짓이다.
+func ForwardedHTTPS(lines []string) bool {
+	seen := false
+	for _, line := range lines {
+		for _, v := range strings.Split(line, ",") {
+			if !strings.EqualFold(strings.TrimSpace(v), "https") {
+				return false
+			}
+			seen = true
+		}
+	}
+	return seen
 }
 
 // remoteIP 는 RemoteAddr(host:port)의 IP 다.

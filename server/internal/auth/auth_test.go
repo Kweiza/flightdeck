@@ -137,7 +137,7 @@ func TestPickPrecedence(t *testing.T) {
 		{"아무것도 없음", Request{}, credNone, "", ""},
 	}
 	for _, c := range cases {
-		got, refused := pick(c.req)
+		got, refused := pick(c.req, "shared")
 		if c.refusal != "" {
 			if refused == nil || !strings.Contains(refused.Reason, c.refusal) {
 				t.Errorf("%s: 거절 %q 여야 하는데 %+v / %+v", c.name, c.refusal, got, refused)
@@ -146,6 +146,71 @@ func TestPickPrecedence(t *testing.T) {
 		}
 		if refused != nil || got.kind != c.kind || got.value != c.value {
 			t.Errorf("%s: (%v, %q) 여야 하는데 (%v, %q) / %+v", c.name, c.kind, c.value, got.kind, got.value, refused)
+		}
+	}
+}
+
+// TestPickReadsTheExactSharedTokenFirst 는 예약 접두와 겹치는 옛 FD_TOKEN 의 계약이다: 헤더 값이 서버의 FD_TOKEN 과 정확히 같으면
+// 꼴(fdd_ · fds_ · fdl_)을 보기 전에 공유 토큰이다. 아니면 그런 FD_TOKEN 으로 붙던 훅 · MCP 가 판을 올린 순간 401 이다.
+func TestPickReadsTheExactSharedTokenFirst(t *testing.T) {
+	for _, k := range []TokenKind{DeviceToken, SessionToken, LoginCode} {
+		v := mustToken(t, k)
+		got, refused := pick(Request{Authorization: "Bearer " + v}, v)
+		if refused != nil || got.kind != credShared || got.value != v {
+			t.Errorf("%s 꼴 FD_TOKEN: 공유 토큰이어야 하는데 (%v, %q) / %+v", k, got.kind, got.value, refused)
+		}
+		// 같은 꼴의 다른 값은 그대로 그 꼴로 읽는다(먼저 보는 것은 정확히 같은 값 하나다).
+		other := mustToken(t, k)
+		if got, refused := pick(Request{Authorization: "Bearer " + other}, v); got.kind == credShared && refused == nil {
+			t.Errorf("%s 꼴의 다른 값이 공유 토큰으로 읽혔다", k)
+		}
+		if !SharedTokenCollides(v) {
+			t.Errorf("SharedTokenCollides(%s 꼴) 가 거짓이다", k)
+		}
+	}
+	// 서버에 토큰이 없으면 빈 헤더 값과 맞대지 않는다.
+	if got, _ := pick(Request{Authorization: "Bearer "}, ""); got.kind == credShared {
+		t.Errorf("빈 FD_TOKEN 이 빈 헤더와 맞았다")
+	}
+	if SharedTokenCollides("plain-shared-secret") {
+		t.Errorf("예약 접두가 없는 값이 겹친다고 나왔다")
+	}
+	ctx := context.Background()
+	dev := mustToken(t, DeviceToken)
+	for _, mode := range []Mode{ModeTransition} {
+		d := NewGate(mode, dev, &fakeDir{}, nil).Authenticate(ctx, Request{Authorization: "Bearer " + dev})
+		if !d.OK || d.Principal.Kind != KindShared {
+			t.Errorf("%s: fdd_ 꼴 FD_TOKEN 이 통해야 한다: %+v", mode, d)
+		}
+	}
+}
+
+// TestSameSecretAgreesWithEquality 는 지문으로 맞댄 결과가 원값의 같음과 맞는가다(길이가 다른 쌍 · 빈 값 포함). 지문 위에서
+// 맞대는 것 자체(길이가 시간으로 새지 않는 것)는 결과로 못 가르고 시간은 재지 않는다 - 원값을 곧장 맞대는 변이도 이 시험을
+// 지난다. 그 축은 sameSecret 의 주석과 리뷰가 지킨다.
+func TestSameSecretAgreesWithEquality(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		want bool
+	}{{"abc", "abc", true}, {"abc", "abcd", false}, {"", "", true}, {"", "x", false}, {"long-secret-value", "long-secret-valuf", false}} {
+		if got := sameSecret(c.a, c.b); got != c.want {
+			t.Errorf("sameSecret(%q, %q) = %v", c.a, c.b, got)
+		}
+	}
+}
+
+// TestJudgeFirstAdmin 은 첫 관리자를 만들 길이 없는 설정의 기동 거절이다.
+func TestJudgeFirstAdmin(t *testing.T) {
+	if refuse, why := JudgeFirstAdmin(ModeAccounts, false, 0); !refuse || !strings.Contains(why, "FD_TOKEN") {
+		t.Errorf("accounts · 토큰 없음 · 관리자 0: 거절해야 한다: %v %q", refuse, why)
+	}
+	for _, c := range []struct {
+		m      Mode
+		token  bool
+		admins int
+	}{{ModeAccounts, true, 0}, {ModeAccounts, false, 1}, {ModeTransition, false, 0}, {ModeTransition, true, 0}} {
+		if refuse, _ := JudgeFirstAdmin(c.m, c.token, c.admins); refuse {
+			t.Errorf("%+v: 거절하면 안 된다", c)
 		}
 	}
 }
@@ -225,7 +290,7 @@ func TestDeviceAndSessionCredentials(t *testing.T) {
 			t.Errorf("%s: 기기 토큰 %+v", mode, d)
 		}
 		d = g.Authenticate(ctx, Request{SessionCookie: ses, ScreenPath: true})
-		if !d.OK || d.Principal != (Principal{Kind: KindWeb, AccountID: "a1", Role: RoleAdmin, WebSession: Hash(ses)}) {
+		if !d.OK || d.Principal != (Principal{Kind: KindWeb, AccountID: "a1", Role: RoleAdmin, WebSession: Hash(ses), ExpiresAt: t0.Add(time.Hour)}) {
 			t.Errorf("%s: 세션 쿠키 %+v", mode, d)
 		}
 	}

@@ -370,7 +370,8 @@ func roleLabel(r Role) string {
 // runSetup 은 `fd setup` 이다.
 func (a *App) runSetup(ctx context.Context, args []string, out io.Writer) int {
 	fs := newFlagSet("setup")
-	setURL := fs.String("url", "", "서버 주소를 정한다(예: http://10.0.0.5:7420). 이 머신이 서버면 "+DefaultURL)
+	setURL := fs.String("url", "", "서버 주소를 정한다(예: https://fd.example.internal:7420). 이 머신이 서버면 "+DefaultURL+
+		". 원격은 https 다 - 토큰은 평문 http 로 루프백 밖에 안 나간다("+InsecureHTTPEnv+"=1 이 탈출구)")
 	setToken := fs.String("token", "", "서버 토큰. --url 과 함께 쓴다")
 	clearToken := fs.Bool("clear-token", false, "저장된 토큰을 지운다")
 	installCodex := fs.Bool("install-codex", false,

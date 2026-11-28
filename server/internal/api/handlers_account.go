@@ -27,6 +27,19 @@ func principal(r *http.Request) auth.Principal {
 	return p
 }
 
+// ActorOf 는 쓰기 기록에 남길 행위자다. 순수 함수다. 계정이 정해진 주체(기기 토큰 · 화면 세션)는 그 계정(과 기기)이고 본문이
+// 무엇을 주장하든 그것을 쓰지 않는다. 계정이 없는 주체(공유 토큰 · 무인증)는 누구인지 모르므로 옛 판처럼 본문의 자기 신고를
+// 그대로 쓴다 - 그 주체는 옛 판의 유일한 주체라 바뀌는 것이 없다. 모든 쓰기의 행위자를 주체에서 채우는 일은 뒤 카드의 몫이다.
+func ActorOf(p auth.Principal, claimed string) string {
+	switch {
+	case p.AccountID != "" && p.MachineID != "":
+		return "account:" + p.AccountID + " machine:" + p.MachineID
+	case p.AccountID != "":
+		return "account:" + p.AccountID
+	}
+	return claimed
+}
+
 // BootstrapGrant 는 부트스트랩 응답이다. LoginCode 는 여기 한 번 보이고 서버 어디에도 원값으로 안 남는다.
 type BootstrapGrant struct {
 	AccountID string    `json:"account_id"`

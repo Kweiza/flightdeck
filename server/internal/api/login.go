@@ -115,12 +115,26 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.loginRefused(w, r, "토큰이 일치하지 않는다", next)
 		return
 	}
-	s.putCookie(w, r, LoginCookieName, s.opt.Token, loginCookieMaxAge)
+	s.grantLoginCookie(w, r, LoginCookieName, s.opt.Token, loginCookieMaxAge)
 	s.seeOther(w, r, next)
 }
 
-// exchangeLoginCode 는 로그인 코드를 화면 세션으로 바꾼다. 옛 쿠키는 지운다 - 둘 다 있으면 세션이 이기지만(auth.pick), 남은 옛
-// 쿠키는 FD_TOKEN 원값을 브라우저에 둔 채다.
+// grantLoginCookie 는 로그인 성공이 굽는 쿠키 한 벌이다: 고른 쿠키를 굽고 다른 하나를 지운다. 두 로그인 갈래(FD_TOKEN · 로그인
+// 코드)가 이 한 자리를 쓴다.
+//
+// ★ 둘 다 남기지 않는다. auth.pick 은 세션 쿠키를 옛 쿠키보다 먼저 집으므로, 낡은(철회 · 만료된) 세션 쿠키가 남은 브라우저는
+// FD_TOKEN 으로 로그인해도 그 세션 쿠키에 가려 303 뒤 다시 401 이다. 반대로 세션 로그인 뒤 남은 옛 쿠키는 FD_TOKEN 원값을
+// 브라우저에 둔 채다.
+func (s *server) grantLoginCookie(w http.ResponseWriter, r *http.Request, name, value string, maxAge int) {
+	other := SessionCookieName
+	if name == SessionCookieName {
+		other = LoginCookieName
+	}
+	s.putCookie(w, r, name, value, maxAge)
+	s.putCookie(w, r, other, "", -1)
+}
+
+// exchangeLoginCode 는 로그인 코드를 화면 세션으로 바꾼다. 옛 쿠키는 지운다(grantLoginCookie).
 func (s *server) exchangeLoginCode(w http.ResponseWriter, r *http.Request, code, next string) {
 	if s.st == nil {
 		s.loginRefused(w, r, "이 서버는 계정 원장이 없어 로그인 코드를 못 바꾼다", next)
@@ -135,8 +149,7 @@ func (s *server) exchangeLoginCode(w http.ResponseWriter, r *http.Request, code,
 		s.fail(w, r, err)
 		return
 	}
-	s.putCookie(w, r, SessionCookieName, got.Cookie, int(auth.SessionTTL/time.Second))
-	s.putCookie(w, r, LoginCookieName, "", -1)
+	s.grantLoginCookie(w, r, SessionCookieName, got.Cookie, int(auth.SessionTTL/time.Second))
 	s.seeOther(w, r, next)
 }
 
@@ -164,7 +177,11 @@ func (s *server) refusedCrossSite(w http.ResponseWriter, r *http.Request, what, 
 // putCookie 는 이 요청의 전송에 맞는 쿠키를 굽는다. 지우는 것도 같은 자리다
 // (값 없음 · MaxAge<0). Secure 판정이 두 자리에 살면 한쪽만 고쳐지고, 그러면
 // 로그아웃이 로그인과 **다른 속성**의 쿠키를 내 브라우저가 원본을 안 지운다.
+//
+// ★ 쿠키를 싣는 응답은 캐시에 남기지 않는다(Cache-Control: no-store). 공유 캐시 · 프록시가 Set-Cookie 를 실은 303 을 담아 두면
+// 다른 사람이 같은 응답(자격증명)을 받거나, 지우는 응답 대신 옛 응답이 재생된다. 부트스트랩 응답과 같은 규율이다.
 func (s *server) putCookie(w http.ResponseWriter, r *http.Request, name, value string, maxAge int) {
+	w.Header().Set("Cache-Control", "no-store")
 	http.SetCookie(w, LoginCookie(name, value, maxAge,
 		auth.CookieSecure(s.opt.TLS, r.TLS != nil, r.Header.Get("X-Forwarded-Proto"))))
 }

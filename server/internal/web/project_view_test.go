@@ -2,11 +2,14 @@ package web
 
 import (
 	"context"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kweiza/flightdeck/internal/auth"
 )
 
 // TestParseProjectAxis 는 버튼 값의 해석이다. 순수 함수라 표로 본다.
@@ -107,6 +110,37 @@ func TestProjectViewWritePinsAndRedirects(t *testing.T) {
 	}
 	if strings.Contains(before, "dead") {
 		t.Fatal("핀이 아닌 dead 가 펴진 쪽에 있다")
+	}
+}
+
+// TestProjectViewIsAdminOnly 는 핀 · 보관이 관리자만의 일인가다. 프로젝트 행은 모든 계정의 프로젝트 줄이 함께 읽으므로 회원의 클릭이
+// 남의 화면에서 프로젝트를 빼거나 되살리면 안 된다. 핀이 보관을 풀므로 네 축 모두 막혀야 한다(보관만 막으면 핀이 뒷문이다).
+func TestProjectViewIsAdminOnly(t *testing.T) {
+	f := newFixture(t).withRepo("feat")
+	f.addProject(testProject)
+	if rec := f.post("/actions/project-view", url.Values{"project": {testProject}, "axis": {"archive:" + testProject}}); rec.Code != 303 {
+		t.Fatalf("관리자의 보관이 %d 다", rec.Code)
+	}
+	ctx := context.Background()
+	before, err := f.st.GetProject(ctx, testProject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member := auth.Principal{Kind: auth.KindDevice, AccountID: "a-member", Role: auth.RoleMember, MachineID: "m1"}
+	for _, who := range []auth.Principal{member, {}} {
+		for _, axis := range []string{"pin", "unpin", "archive", "unarchive"} {
+			rec := f.postAs(who, "/actions/project-view", url.Values{"project": {testProject}, "axis": {axis + ":" + testProject}})
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("%+v 의 %s 가 %d 다 - 403 이어야 한다", who, axis, rec.Code)
+			}
+		}
+	}
+	after, err := f.st.GetProject(ctx, testProject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ArchivedAt.Equal(before.ArchivedAt) || !after.PinnedAt.Equal(before.PinnedAt) {
+		t.Fatalf("거절했는데 표시 축이 바뀌었다: %+v → %+v", before, after)
 	}
 }
 

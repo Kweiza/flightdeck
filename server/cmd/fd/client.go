@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -119,11 +120,13 @@ func parseAPIError(status int, path string, raw []byte) *APIError {
 // 다섯 축을 재현하는 내내 DATA RACE 는 0건이었다. 이 축의 관문은 -race 가 아니라
 // **큐 내용에 대한 바이트 단정**이다(outbox_concurrency_test.go).
 type Client struct {
-	URL    string
-	Token  string
-	HTTP   *http.Client
-	Cache  *Cache
-	Outbox *Outbox
+	URL   string
+	Token string
+	// AllowInsecureHTTP 는 비루프백 평문 http 로도 토큰을 싣는 명시 탈출구다(FD_INSECURE_HTTP=1). 기본은 거절이다.
+	AllowInsecureHTTP bool
+	HTTP              *http.Client
+	Cache             *Cache
+	Outbox            *Outbox
 	// Legacy 는 아웃박스가 채널마다 갈려 있던 시절의 큐다. **옮기지 않는다** —
 	// 재생이 제자리에서 돌려 전송으로 비우고, 마지막 줄까지 나가면 keep() 이 파일을 지운다.
 	// (os.Rename 청구로 고정 자리에 흡수하려던 앞선 설계는 반증됐다 — 스펙 §4.)
@@ -181,16 +184,22 @@ func newClient(sd StateDir, get func(string) (string, bool), home string, log *s
 	for _, d := range LegacyOutboxDirs(get, home, ob.Dir()) {
 		legacy = append(legacy, newOutboxAt(d).withLogger(log))
 	}
+	hc, pinWarn := newHTTPClient(timeout, ep.PinCert)
+	if pinWarn != "" {
+		ep.Warn = strings.TrimSpace(ep.Warn + " " + pinWarn)
+	}
+	insecure, _ := get(InsecureHTTPEnv)
 	return &Client{
-		Endpoint: ep, // 출처를 들고 있는다 — fd doctor·fd setup 이 '왜 저 주소인가'를 찍는다
-		URL:      url,
-		Token:    token,
-		HTTP:     &http.Client{Timeout: timeout},
-		Cache:    newCache(sd),
-		Outbox:   ob,
-		Legacy:   legacy,
-		Log:      log,
-		Now:      func() time.Time { return time.Now().UTC() },
+		Endpoint:          ep, // 출처를 들고 있는다 — fd doctor·fd setup 이 '왜 저 주소인가'를 찍는다
+		URL:               url,
+		Token:             token,
+		AllowInsecureHTTP: strings.TrimSpace(insecure) == "1",
+		HTTP:              hc,
+		Cache:             newCache(sd),
+		Outbox:            ob,
+		Legacy:            legacy,
+		Log:               log,
+		Now:               func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -219,6 +228,10 @@ func (c *Client) do(ctx context.Context, method, path string, body any, idem str
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if c.Token != "" {
+		// 보내기 전에 거절한다 - 서버가 평문 요청을 거절해도 이 헤더는 이미 망을 건넌 뒤다(CredentialTransportRefusal).
+		if why := CredentialTransportRefusal(c.URL, true, c.AllowInsecureHTTP); why != "" {
+			return nil, false, &TransportRefusal{Reason: why}
+		}
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
 	if idem != "" {
@@ -226,6 +239,12 @@ func (c *Client) do(ctx context.Context, method, path string, body any, idem str
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
+		// 리다이렉트 거절(checkRedirect)은 *url.Error 에 싸여 오는데 그 꼴은 미도달로 읽힌다(Unreachable). 풀어서 낸다 -
+		// 미도달로 접으면 쓰기가 아웃박스에 쌓여 같은 거절만 재생된다.
+		var refused *TransportRefusal
+		if errors.As(err, &refused) {
+			return nil, false, refused
+		}
 		return nil, false, fmt.Errorf("%w: %s: %v", ErrUnreachable, clip(c.URL+path, 200), err)
 	}
 	defer resp.Body.Close()

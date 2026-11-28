@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/kweiza/flightdeck/internal/auth"
 )
 
 func TestLoginCookieAttributes(t *testing.T) {
@@ -54,9 +56,71 @@ func TestLoginSetsCookieAndRedirects(t *testing.T) {
 	if loc := rec.Header().Get("Location"); loc != "./?project=Kweiza" {
 		t.Fatalf("Location 이 %q 다", loc)
 	}
-	cookies := rec.Result().Cookies()
-	if len(cookies) != 1 || cookies[0].Name != LoginCookieName || cookies[0].Value != "s3cret" {
-		t.Fatalf("쿠키를 안 구웠다: %+v", cookies)
+	set, cleared := grantedCookies(rec)
+	if len(set) != 1 || set[LoginCookieName] == nil || set[LoginCookieName].Value != "s3cret" {
+		t.Fatalf("쿠키를 안 구웠다: %+v", rec.Result().Cookies())
+	}
+	// 낡은 세션 쿠키가 남아 있으면 그것이 방금 구운 옛 쿠키를 가린다(auth.pick 이 세션을 먼저 집는다) - 함께 지운다.
+	if !cleared[SessionCookieName] {
+		t.Fatalf("FD_TOKEN 로그인이 세션 쿠키를 안 지웠다: %+v", rec.Result().Cookies())
+	}
+	assertNoStore(t, rec)
+}
+
+// grantedCookies 는 응답이 구운 쿠키(이름 → 쿠키)와 지운 쿠키 이름이다.
+func grantedCookies(rec *httptest.ResponseRecorder) (set map[string]*http.Cookie, cleared map[string]bool) {
+	set, cleared = map[string]*http.Cookie{}, map[string]bool{}
+	for _, c := range rec.Result().Cookies() {
+		if c.MaxAge < 0 {
+			cleared[c.Name] = true
+			continue
+		}
+		set[c.Name] = c
+	}
+	return set, cleared
+}
+
+// assertNoStore 는 쿠키를 싣는 응답이 캐시에 안 남는가다(공유 캐시가 Set-Cookie 를 실은 303 을 담아 두면 남이 그 자격증명을 받는다).
+func assertNoStore(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("쿠키를 싣는 응답의 Cache-Control 이 %q 다 - no-store 여야 한다", got)
+	}
+}
+
+// TestSharedTokenLoginReplacesAStaleSessionCookie 는 낡은 세션 쿠키가 남은 브라우저의 FD_TOKEN 로그인이다: 로그인 뒤 다음 화면
+// 요청이 다시 401 이면 안 된다. 브라우저의 쿠키 단지를 손으로 굴린다(구운 것은 넣고 지운 것은 뺀다).
+func TestSharedTokenLoginReplacesAStaleSessionCookie(t *testing.T) {
+	h := NewServer(nil, Options{Token: "s3cret"})
+	stale, err := auth.NewToken(auth.SessionToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar := map[string]string{SessionCookieName: stale}
+	req := loginPost(t, "/login", url.Values{"token": {"s3cret"}})
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: stale})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("로그인이 %d 다", rec.Code)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.MaxAge < 0 {
+			delete(jar, c.Name)
+		} else {
+			jar[c.Name] = c.Value
+		}
+	}
+	next := httptest.NewRequest("GET", "/", nil)
+	next.RemoteAddr = "203.0.113.9:1"
+	next.Header.Set("Accept", "text/html")
+	for k, v := range jar {
+		next.AddCookie(&http.Cookie{Name: k, Value: v})
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, next)
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("FD_TOKEN 으로 로그인했는데 다음 화면이 401 이다 - 남은 세션 쿠키 %v 가 옛 쿠키를 가린다", jar)
 	}
 }
 
@@ -146,6 +210,7 @@ func TestLogoutClearsCookie(t *testing.T) {
 	if len(cookies) != 2 || !cleared[LoginCookieName] || !cleared[SessionCookieName] {
 		t.Fatalf("두 쿠키를 다 지워야 한다: %+v", cookies)
 	}
+	assertNoStore(t, rec)
 }
 
 func TestLoginGetRedirectsHome(t *testing.T) {
@@ -207,7 +272,7 @@ func TestLoginRetryAfterWrongTokenIsNotConflated(t *testing.T) {
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("둘째 시도가 %d 다 — 303 이어야 한다", rec.Code)
 	}
-	if len(rec.Result().Cookies()) != 1 {
+	if set, _ := grantedCookies(rec); len(set) != 1 {
 		t.Fatal("둘째 시도가 쿠키를 안 구웠다")
 	}
 }
@@ -317,7 +382,7 @@ func TestLoginFormActionReachesLoginRoute(t *testing.T) {
 			if rec.Code != http.StatusSeeOther {
 				t.Fatalf("폼이 가리킨 %q 에 제출했더니 %d 다 — 303 이어야 한다", target.Path, rec.Code)
 			}
-			if len(rec.Result().Cookies()) != 1 {
+			if set, _ := grantedCookies(rec); len(set) != 1 {
 				t.Fatal("제출이 통했는데 쿠키를 안 구웠다")
 			}
 		})

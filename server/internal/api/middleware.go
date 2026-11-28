@@ -119,11 +119,12 @@ func (s *server) withRateLimit(next http.Handler) http.Handler {
 	})
 }
 
-// withTransport 는 전송 정책(FD_TLS=proxy)을 건다: 신뢰 프록시 밖에서 곧장 온 연결은 TLS 를 건너뛴 평문이라 자격증명을 보기
-// 전에 거절한다. 판정은 auth.JudgeTransport 다. /healthz 도 예외가 아니다 - 컨테이너 헬스체크는 안에서 루프백으로 친다.
+// withTransport 는 전송 정책(FD_TLS=proxy)을 건다: 신뢰 프록시 밖에서 곧장 온 연결과, 신뢰 프록시가 평문으로 받아 넘긴
+// 요청(X-Forwarded-Proto 가 https 가 아니다)은 자격증명을 보기 전에 거절한다. 판정은 auth.JudgeTransport 다. 루프백 · 신뢰
+// 프록시에서 온 /healthz 만 그 표지 없이 통한다 - 컨테이너 헬스체크는 안에서 루프백 평문으로 친다(HealthPath).
 func (s *server) withTransport(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if v := auth.JudgeTransport(r.RemoteAddr, s.opt.TLS); !v.OK {
+		if v := auth.JudgeTransport(r.RemoteAddr, r.Header.Values("X-Forwarded-Proto"), r.URL.Path == HealthPath, s.opt.TLS); !v.OK {
 			s.writeError(w, r, Classified{
 				Status: http.StatusForbidden, Code: "transport_refused",
 				Message:  v.Reason,
@@ -140,7 +141,7 @@ func (s *server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// /healthz 는 게이트 앞에 둔다. 배너 훅이 "서버가 살아 있나 · 인증이 어떤 단계인가"를
 		// 묻는 유일한 창인데, 그것을 인증 뒤에 두면 토큰 오설정 시 아무것도 알 수 없다.
-		if r.URL.Path == "/healthz" {
+		if r.URL.Path == HealthPath {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -150,47 +151,57 @@ func (s *server) withAuth(next http.Handler) http.Handler {
 			return
 		}
 		d := s.gate.Authenticate(r.Context(), authRequest(r))
-		if d.Unavailable {
-			// ★ 401 로 접지 않는다. 원장 장애가 "토큰이 틀렸다"로 읽히면 사람은 멀쩡한 토큰을 갈아 치운다.
-			s.log.WarnContext(r.Context(), "인증 판정 실패 - 원장에 붙지 못했다", "reason", d.Reason)
-			s.writeError(w, r, Classified{
-				Status: http.StatusServiceUnavailable, Code: "auth_unavailable",
-				Message:  d.Reason,
-				Guidance: "잠시 뒤에 다시 불러라 - 원장 상태는 /healthz 의 db_ok 가 낸다.",
-			})
-			return
-		}
 		if !d.OK {
-			s.met.incUnauthorized()
-			// 로그 줄 없음(위 규율). 사유는 응답에만 싣는다. 사유에는 자격증명 값이 없다(auth.Decision).
-			//
-			// ★ HTML 을 읽는 소비자에게는 폼을 낸다. **상태코드는 401 그대로다** —
-			// 리다이렉트로 덮으면 인증 실패가 지표에서 사라지고, /metrics 의
-			// unauthorized 카운터가 "아무도 막히지 않았다"고 거짓말한다.
-			// ★ Action 은 **여기서** 계산한다. 이 401 은 뿌리가 아닌 경로에서도 뜨는데
-			// (JudgeLoginScreen 이 메서드도 경로도 안 본다) 폼 action 은 상대경로라,
-			// 문서 URL 의 깊이만큼 거슬러 올라가지 않으면 /actions/login 처럼 없는 자리를
-			// 가리키고 그 자리도 다시 401 이다 — 무한 폼이다.
-			//
-			// ★ Next 는 JudgeNext 가 아니라 JudgeNextFrom 이다. 이 요청이 GET 이 아니면
-			// 그 URI 로 되돌아갈 수 없다 — 로그인 성공은 303 이고 303 은 GET 으로 재생된다.
-			if s.opt.LoginScreen != nil && JudgeLoginScreen(r.Header.Get("Accept")) {
-				s.opt.LoginScreen(w, r, LoginView{
-					Error:  d.Reason,
-					Next:   JudgeNextFrom(r.Method, r.URL.RequestURI()),
-					Action: JudgeLoginAction(r.URL.Path),
-				})
-				return
-			}
-			w.Header().Set("WWW-Authenticate", `Bearer realm="flightdeck"`)
-			s.writeError(w, r, Classified{
-				Status: http.StatusUnauthorized, Code: "unauthorized",
-				Message:  d.Reason,
-				Guidance: UnauthorizedGuidance(s.opt.AuthMode),
-			})
+			s.refuseAuth(w, r, d)
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), d.Principal)))
+	})
+}
+
+// HealthPath 는 헬스체크 경로다. 인증 게이트 앞이고(배너 훅 · 컨테이너 헬스체크가 토큰 오설정 때도 읽는다), FD_TLS=proxy 의
+// X-Forwarded-Proto 판정에서도 빠진다(auth.JudgeTransport 의 ③).
+const HealthPath = "/healthz"
+
+// refuseAuth 는 통과 못 한 판정을 응답으로 옮긴다. 게이트와 스트림의 재확인(handleEvents)이 같은 자리를 쓴다 - 같은 판정이
+// 두 자리에서 다른 응답(폼 · 상태코드 · 지표)으로 나가지 않게 한다.
+func (s *server) refuseAuth(w http.ResponseWriter, r *http.Request, d auth.Decision) {
+	if d.Unavailable {
+		// ★ 401 로 접지 않는다. 원장 장애가 "토큰이 틀렸다"로 읽히면 사람은 멀쩡한 토큰을 갈아 치운다.
+		s.log.WarnContext(r.Context(), "인증 판정 실패 - 원장에 붙지 못했다", "reason", d.Reason)
+		s.writeError(w, r, Classified{
+			Status: http.StatusServiceUnavailable, Code: "auth_unavailable",
+			Message:  d.Reason,
+			Guidance: "잠시 뒤에 다시 불러라 - 원장 상태는 /healthz 의 db_ok 가 낸다.",
+		})
+		return
+	}
+	s.met.incUnauthorized()
+	// 로그 줄 없음(위 규율). 사유는 응답에만 싣는다. 사유에는 자격증명 값이 없다(auth.Decision).
+	//
+	// ★ HTML 을 읽는 소비자에게는 폼을 낸다. **상태코드는 401 그대로다** —
+	// 리다이렉트로 덮으면 인증 실패가 지표에서 사라지고, /metrics 의
+	// unauthorized 카운터가 "아무도 막히지 않았다"고 거짓말한다.
+	// ★ Action 은 **여기서** 계산한다. 이 401 은 뿌리가 아닌 경로에서도 뜨는데
+	// (JudgeLoginScreen 이 메서드도 경로도 안 본다) 폼 action 은 상대경로라,
+	// 문서 URL 의 깊이만큼 거슬러 올라가지 않으면 /actions/login 처럼 없는 자리를
+	// 가리키고 그 자리도 다시 401 이다 — 무한 폼이다.
+	//
+	// ★ Next 는 JudgeNext 가 아니라 JudgeNextFrom 이다. 이 요청이 GET 이 아니면
+	// 그 URI 로 되돌아갈 수 없다 — 로그인 성공은 303 이고 303 은 GET 으로 재생된다.
+	if s.opt.LoginScreen != nil && JudgeLoginScreen(r.Header.Get("Accept")) {
+		s.opt.LoginScreen(w, r, LoginView{
+			Error:  d.Reason,
+			Next:   JudgeNextFrom(r.Method, r.URL.RequestURI()),
+			Action: JudgeLoginAction(r.URL.Path),
+		})
+		return
+	}
+	w.Header().Set("WWW-Authenticate", `Bearer realm="flightdeck"`)
+	s.writeError(w, r, Classified{
+		Status: http.StatusUnauthorized, Code: "unauthorized",
+		Message:  d.Reason,
+		Guidance: UnauthorizedGuidance(s.opt.AuthMode),
 	})
 }
 
@@ -296,8 +307,8 @@ func (s *server) withIdempotency(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-		v := JudgeIdempotencyKey(r.Method, key)
+		raw := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		v := JudgeIdempotencyKey(r.Method, raw)
 		if v.Bad != nil {
 			s.writeError(w, r, classifyInput(v.Bad, "Idempotency-Key 헤더"))
 			return
@@ -308,6 +319,8 @@ func (s *server) withIdempotency(next http.Handler) http.Handler {
 					"이 키가 없으면 같은 신호·항목이 조용히 두 번 들어간다."))
 			return
 		}
+		// 표의 키는 주체 범위를 붙인 것이다 - 주체마다 따로 재생한다(ScopeIdempotencyKey). 게이트 뒤라 주체가 늘 있다.
+		key := ScopeIdempotencyKey(principal(r), raw)
 
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.opt.MaxBodyBytes))
 		if err != nil {

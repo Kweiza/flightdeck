@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kweiza/flightdeck/internal/auth"
 	"github.com/kweiza/flightdeck/internal/model"
 	"github.com/kweiza/flightdeck/internal/service"
 	"github.com/kweiza/flightdeck/internal/store"
@@ -159,10 +160,20 @@ func (f *fixture) get(query string) (int, string) {
 	return rec.Code, rec.Body.String()
 }
 
+// post 는 관리자로 폼을 낸다. 실제 배치에서는 화면 앞의 인증 게이트(api.withAuth)가 주체를 싣는다 - 이 픽스처는 게이트 없이 화면만
+// 세우므로 주체를 손으로 싣는다. 관리자인 이유: 이 시험들은 옛 판의 한 사람(전권)이 누르는 화면을 잰다.
 func (f *fixture) post(path string, form url.Values) *httptest.ResponseRecorder {
+	return f.postAs(auth.Principal{Kind: auth.KindShared, Role: auth.RoleAdmin}, path, form)
+}
+
+// postAs 는 그 주체로 폼을 낸다. 영값 주체는 게이트를 안 지난 요청이다.
+func (f *fixture) postAs(p auth.Principal, path string, form url.Values) *httptest.ResponseRecorder {
 	f.t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if p != (auth.Principal{}) {
+		req = req.WithContext(auth.WithPrincipal(req.Context(), p))
+	}
 	rec := httptest.NewRecorder()
 	f.h.ServeHTTP(rec, req)
 	return rec

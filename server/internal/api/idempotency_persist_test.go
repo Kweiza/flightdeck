@@ -22,7 +22,8 @@ import (
 // 메모리 멱등 표가 비고, 남는 것은 DB 뿐이다.
 func (e *env) restart() {
 	e.t.Helper()
-	srv := newServer(e.svc, Options{Log: e.srv.opt.Log})
+	// 같은 선택지(토큰 · 단계)로 다시 세운다 - 메모리 표만 비고 인증은 그대로다.
+	srv := newServer(e.svc, e.srv.opt)
 	// ── 대조 전제: 새 서버의 메모리 표가 정말 비었는가 ──
 	// 이것이 성립하지 않으면 아래의 "재생됐다"는 DB 가 아니라 메모리가 낸 것이고,
 	// 그러면 이 시험은 자기가 지킨다는 축을 원리적으로 못 본다.

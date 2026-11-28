@@ -95,7 +95,8 @@ curl -s localhost:7420/healthz
 > 1·2 단계는 `/fd-setup` 스킬이 대신 해 준다 — 이 머신이 서버인지 클라이언트인지 묻고,
 > 없는 것만 승인받아 설치한다.
 
-- **서버가 다른 머신이면** 세션 쪽에 `FD_URL=http://<서버>:7420` 을 준다(토큰을 쓰면 `FD_TOKEN` 도).
+- **서버가 다른 머신이면** 세션 쪽에 `FD_URL=https://<서버>:7420` 을 준다(토큰을 쓰면 `FD_TOKEN` 도).
+  토큰은 평문 `http` 로 루프백 밖에 안 나간다 - 서버를 `FD_TLS=files` · `proxy` 로 열거나, 망 자체를 믿으면 `FD_INSECURE_HTTP=1`.
 - **도커 없이** 돌리려면 `cd server && go run ./cmd/fd serve --addr :7420 --db ~/.flightdeck/fd.db`.
   컨테이너와 같은 DB 를 가리키므로 **둘을 같이 돌리지 마라.**
 - **이미 `flightdeck@kweiza-cc-plugins` 로 깔았다면** 그대로 둬라 — 같은 저장소를 받는다. 둘을 함께 켜지는 마라.
@@ -179,7 +180,8 @@ codex                      # 한 번은 TUI 로 띄워 "Hooks need review" 를 �
 | `FD_PG_INSTANCE` | 서버 | Postgres 겹의 배포 이름(기본 `flightdeck`). db 컨테이너(`<이름>-db`)와 두 볼륨(`<이름>-pgdata` · `<이름>-pgrun`)의 이름이 여기서 함께 나온다. **선택 파일에만 적는다** - 셸에서 주면(빈 값도) `fdc` · `fd setup` 의 기동 · `fd-update` 의 관문이 compose 를 부르기 전에 선다. 셸 값은 선택 파일보다 먼저라 그 값이 빠진 새 셸에서 다른 볼륨(빈 원장)을 고르기 때문이다. 운영은 기본값 그대로 두고, 예행 · 시험만 그 환경의 선택 파일에 다른 값을 적는다(아래 「업그레이드: SQLite 원장을 Postgres 로」의 예행) |
 | `FD_PG_SERVER_PGPASS_HOST` · `FD_PG_BACKUP_PGPASS_HOST` | 서버 | Postgres 겹의 접속 계정 둘(서버 · 매일 덤프)의 pgpass 파일. **기본값이 없다** - 비면 Postgres 겹의 `up` 이 선다. 주인 `FD_UID`, 권한 `0600`, 줄 `db:5432:<DB>:<계정>:<비밀번호>`. 비밀번호가 들어가는 유일한 자리다(환경 변수 · 명령줄 · URL 에 두지 않는다). **서버 마운트 밖에 둔다** - 서버는 `FD_REPOS`(기본 홈 전체)를 읽는다(아래 「Postgres 로 띄우기」) |
 | `FD_PG_DATABASE` · `FD_PG_SERVER_USER` · `FD_PG_BACKUP_USER` | 서버 | Postgres 겹의 DB 와 접속 계정 이름(기본 `flightdeck` · `fd_server` · `fd_backup`, 소문자 · 숫자 · `_` 만). 바꾸면 선택 파일에 적는다 - `FD_PG_DATABASE` 는 어느 원장인지를 정해 `FD_PG_INSTANCE` 처럼 셸에서 주면 관문이 선다. 계정은 `db-roles` 가 만들고 잰다 - 서버 계정은 `fd_app`, 덤프 계정은 `pg_read_all_data` 의 구성원이고 특권 속성이 없다. 덤프 자리는 DB 마다 따로라(`daily/<DB>/`) DB 를 바꿔도 옛 DB 의 덤프를 새 DB 가 세거나 지우지 않는다 |
-| `FD_URL` | 세션 | 서버 주소(기본 `http://127.0.0.1:7420`) |
+| `FD_URL` | 세션 | 서버 주소(기본 `http://127.0.0.1:7420`, 같은 환경에 `FD_ADDR` · `FD_TLS` 가 있으면 그 서버를 친다) |
+| `FD_INSECURE_HTTP` | 세션 | `1` 이면 루프백 밖 평문 `http` 주소로도 토큰을 보낸다(기본은 보내기 전에 거절) |
 | `FD_STATE_DIR` | 세션 | 상태 파일(아웃박스·캐시·머신 id)을 한 자리로 모은다 |
 | `FD_LANG` | 서버 · 세션 | 출력 언어. `en` 이면 영어로 낸다(기본 한국어). 서버 쪽은 대시보드, 세션 쪽은 CLI·훅·MCP 결과다 |
 

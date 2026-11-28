@@ -62,9 +62,10 @@ COPY --from=build /out/fd /usr/local/bin/fd
 VOLUME ["/data"]
 EXPOSE 7420
 
+# FD_URL 은 일부러 안 준다. 헬스체크(fd doctor)는 서버와 같은 환경(FD_ADDR · FD_TLS)에서 칠 주소를 고른다 - 고정 주소를 따로 적어
+# 두면 FD_TLS=files 로 띄운 서버를 평문으로 쳐서 unhealthy 가 된다.
 ENV FD_ADDR=":7420" \
-    FD_DB="/data/fd.db" \
-    FD_URL="http://127.0.0.1:7420"
+    FD_DB="/data/fd.db"
 
 # 저장소는 읽기 전용으로 마운트된다. `status` 는 인덱스를 갱신하려 락을 잡는데,
 # 그 자리가 못 쓰면 관측이 통째로 실패한다 — 갱신을 아예 포기시킨다(읽기만 한다).

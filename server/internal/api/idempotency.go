@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/kweiza/flightdeck/internal/auth"
 	"github.com/kweiza/flightdeck/internal/nulesc"
 	"github.com/kweiza/flightdeck/internal/store"
 )
@@ -65,6 +66,31 @@ func JudgeIdempotencyKey(method, key string) IdemVerdict {
 		}
 	}
 	return IdemVerdict{OK: true, Reason: "키가 있다"}
+}
+
+// ScopeIdempotencyKey 는 검사를 지난 키에 그 요청 주체의 범위를 붙인다. 순수 함수다. 멱등 표(메모리 · 원장)의 키는 이 결과다.
+//
+// ★ 키는 클라이언트가 고르는 글이라 주체를 안 가르면, 관리자가 쓴 키를 멤버가 다시 보내 관리자 응답을 재생받고(인가를 거치지
+// 않은 응답이다) 그 반대로 멤버가 먼저 쓴 키가 관리자 요청을 409 로 막는다. 재생은 핸들러 앞이라 인가 판정이 그 응답에 닿지
+// 않는다 - 그래서 범위는 인가가 아니라 키 자체에서 가른다.
+//
+// 범위의 축은 자격증명 하나다: 기기 토큰은 (계정, 기기), 화면 세션은 (계정, 세션 지문), 부트스트랩은 그 하나. 공유 토큰과 무인증은
+// 빈 범위(원문 그대로)다 - 두 갈래는 계정이 없던 옛 판의 유일한 주체라, 올리기 전에 원장에 남은 재생 기록이 올린 뒤에도 그대로
+// 맞는다. 범위를 붙인 키에는 공백이 있고 검사를 지난 원문에는 공백이 없으므로(JudgeIdempotencyKey) 빈 범위 키와 범위 키는
+// 겹칠 수 없다. 칸은 %q 로 싸서 계정 · 기기 이름에 무엇이 와도 경계가 흐려지지 않는다.
+func ScopeIdempotencyKey(p auth.Principal, key string) string {
+	switch p.Kind {
+	case auth.KindDevice:
+		return fmt.Sprintf("d %q %q %s", p.AccountID, p.MachineID, key)
+	case auth.KindWeb:
+		return fmt.Sprintf("w %q %q %s", p.AccountID, p.WebSession, key)
+	case auth.KindBootstrap:
+		return "b " + key
+	case auth.KindShared, auth.KindAnonymous:
+		return key
+	}
+	// 모르는 갈래는 빈 범위에 넣지 않는다 - 새 주체가 생기면 옛 주체의 재생 기록을 받는 쪽이 아니라 자기 칸에 갇히는 쪽으로 넘어진다.
+	return fmt.Sprintf("? %q %q %q %s", p.Kind, p.AccountID, p.MachineID+p.WebSession, key)
 }
 
 // PersistVerdict 는 이 쓰기의 멱등 기억을 **재기동 너머로** 남길지의 판정이다.

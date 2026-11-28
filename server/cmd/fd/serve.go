@@ -256,6 +256,12 @@ func runServe(args []string, env func(string) (string, bool), log *slog.Logger) 
 	case v.Warn != "":
 		log.Warn("평문 HTTP 로 루프백 밖에서 듣는다", "route", clip(*addr, 120), "reason", v.Warn)
 	}
+	token := envOr(env, "FD_TOKEN", "")
+	if auth.SharedTokenCollides(token) {
+		// 값은 안 싣는다. 통하기는 한다(auth.pick 이 정확히 같은 값을 먼저 FD_TOKEN 으로 읽는다).
+		log.Warn("FD_TOKEN 이 기기 토큰 · 세션 · 로그인 코드의 예약 접두(fdd_ · fds_ · fdl_)로 시작한다",
+			"reason", "그대로 통하지만 같은 꼴의 다른 값은 계정 자격증명으로 읽힌다 - 예약 접두가 없는 새 값으로 바꿔라")
+	}
 
 	home, _ := os.UserHomeDir()
 	// ★ path 는 store 에만 넘긴다. 로그에는 shown 이다 - 접속 URL 이면 비밀번호가 든 원문이다.
@@ -280,12 +286,24 @@ func runServe(args []string, env func(string) (string, bool), log *slog.Logger) 
 			log.Error("DB 닫기 실패", "error", cerr.Error())
 		}
 	}()
+	// ★ 원장을 연 뒤 · 포트를 열기 전이다. 관리자 수는 원장에만 있고, 첫 관리자를 만들 길이 없는 서버는 듣기 전에 선다.
+	// transition 은 관리자 수와 무관하게 뜬다(JudgeFirstAdmin) - 그 단계는 원장을 묻지 않는다.
+	if ac.Mode == auth.ModeAccounts {
+		n, cerr := st.AdminCount(context.Background())
+		if cerr != nil {
+			log.Error("관리자 수를 읽지 못해 기동을 중단한다", "db_path", shown, "error", cerr.Error())
+			return 1
+		}
+		if refuse, why := auth.JudgeFirstAdmin(ac.Mode, token != "", n); refuse {
+			log.Error("첫 관리자를 만들 길이 없어 기동을 중단한다", "reason", why)
+			return 1
+		}
+	}
 
 	// ★ 화면(보드)은 워크트리 미커밋 관측의 보관본을 쓰고 뒤에서 새로 읽는다, 요청마다 카드 수만큼
 	//   git 을 다시 돌면 보드가 카드 수에 비례해 느려진다(service/derive_cache.go 머리말의 실측).
 	//   판정 자리(pick · amend · finish)는 이 설정과 무관하게 언제나 지금 읽는다.
 	svc := service.New(st, log, service.WithScreenSnapshots(service.ScreenRefreshAfter, service.ScreenMaxAge, service.ScreenWait))
-	token := envOr(env, "FD_TOKEN", "")
 	// 화면 옵션 한 벌 — 대시보드와 로그인 화면이 함께 쓴다(serveAPIOptions 의 screenOpts).
 	screenOpts := []web.Option{web.WithLogger(log), web.WithLang(lang.FromEnv(env))}
 	webH := web.New(svc, screenOpts...)

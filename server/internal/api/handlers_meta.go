@@ -355,8 +355,29 @@ func (s *server) handleNotices(w http.ResponseWriter, r *http.Request) {
 // ★ 클라이언트가 끊으면 이 핸들러가 **반드시 반환한다**. 반환 경로가 하나뿐이도록
 // 구독 해제를 defer 에 두고, 쓰기 실패도 전부 반환으로 접는다 —
 // 여기서 새는 고루틴은 세션 수만큼 누적되고 그 사실은 어디에도 안 남는다.
+//
+// ★ 자격증명은 **구독을 건 뒤에 한 번 더** 잰다. 철회 · 끄기 · 로그아웃은 커밋한 뒤 Hub.Cut 으로 열린 스트림을 고르는데, 게이트의
+// 판정과 Subscribe 사이에 그 커밋 · Cut 이 끼면 Cut 은 아직 없는 구독을 못 고르고 이 스트림은 철회된 자격증명으로 계속 받는다.
+// 구독 뒤에 다시 재면 철회 커밋이 재기 전이면 여기서 거절되고, 잰 뒤면 Cut 이 이미 걸린 구독을 고른다 - 틈이 없다.
+// 화면 세션은 만료 시각에 스스로 닫는다(Principal.ExpiresAt) - 열린 스트림에는 게이트가 만료를 다시 볼 다음 요청이 없다.
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	project := strings.TrimSpace(r.URL.Query().Get("project"))
+
+	// 주체는 게이트가 실었다. 철회 · 끄기 · 로그아웃이 이 열쇠로 이 스트림을 고른다(Hub.Cut).
+	who, _ := auth.FromContext(r.Context())
+	subscriber := s.hub.Subscribe(project, OwnerOf(who))
+	defer s.hub.Unsubscribe(subscriber)
+	d := s.gate.Authenticate(r.Context(), authRequest(r))
+	if !d.OK {
+		s.refuseAuth(w, r, d)
+		return
+	}
+	var expired <-chan time.Time
+	if !d.Principal.ExpiresAt.IsZero() {
+		t := time.NewTimer(d.Principal.ExpiresAt.Sub(s.now()))
+		defer t.Stop()
+		expired = t.C
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -365,10 +386,6 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	rc := http.NewResponseController(w)
-	// 주체는 게이트가 실었다. 철회 · 끄기 · 로그아웃이 이 열쇠로 이 스트림을 고른다(Hub.Cut).
-	who, _ := auth.FromContext(r.Context())
-	subscriber := s.hub.Subscribe(project, OwnerOf(who))
-	defer s.hub.Unsubscribe(subscriber)
 
 	// 첫 줄을 즉시 보낸다 — 구독이 성립했다는 사실 자체가 소비자에게 필요한 신호다.
 	//
@@ -410,6 +427,12 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-subscriber.Cut():
 			// 이 주체의 자격증명이 철회됐다(기기 철회 · 계정 끄기 · 로그아웃). 다시 붙으면 게이트가 401 을 낸다.
 			if _, err := io.WriteString(w, ": bye 자격증명이 철회됐다 - 다시 로그인해라\n\n"); err == nil {
+				_ = rc.Flush()
+			}
+			return
+		case <-expired:
+			// 화면 세션이 만료됐다. 다시 붙으면 게이트가 401(로그인 폼)을 낸다.
+			if _, err := io.WriteString(w, ": bye 세션이 만료됐다 - 다시 로그인해라\n\n"); err == nil {
 				_ = rc.Flush()
 			}
 			return

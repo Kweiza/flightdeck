@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kweiza/flightdeck/internal/auth"
 	"github.com/kweiza/flightdeck/internal/judge"
 	"github.com/kweiza/flightdeck/internal/model"
 	"github.com/kweiza/flightdeck/internal/nulesc"
@@ -475,7 +476,15 @@ func JudgeProjectView(in ProjectViewInput, known []string) ActionVerdict {
 }
 
 // projectView 는 표시 축을 바꾼다. 사유가 없으므로 formInput 을 안 탄다.
+//
+// ★ 관리자만 한다. 핀 · 보관은 프로젝트 행 하나에 걸리고 그 행은 모든 계정의 프로젝트 줄이 함께 읽는다 - 한 회원의 클릭이 남의
+// 화면에서 프로젝트를 빼거나 되살린다. 핀이 보관을 풀므로 네 축을 한꺼번에 막는다(보관만 막으면 핀이 풀기의 뒷문이 된다).
+// 판정은 API 의 프로젝트 지우기와 같은 주체 축(auth.Principal.Admin)이다.
 func (h *handler) projectView(w http.ResponseWriter, r *http.Request) {
+	if p, _ := auth.FromContext(r.Context()); !p.Admin() {
+		http.Error(w, "핀 · 보관은 관리자만 바꾼다 - 프로젝트 줄은 모든 계정이 함께 본다.", http.StatusForbidden)
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "폼을 읽지 못했다: "+Clip(err.Error(), 200), http.StatusBadRequest)
 		return

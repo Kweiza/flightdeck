@@ -11,7 +11,7 @@
 #
 # 띄우는 법:  docker compose up -d
 # 보는 법:    http://<서버머신>:7420
-# 세션 쪽:    export FD_URL=http://<서버머신>:7420
+# 세션 쪽:    export FD_URL=https://<서버머신>:7420   (원격은 https - 토큰은 평문 http 로 루프백 밖에 안 나간다)
 #
 # ★ **되돌리는 법(컨테이너)**. 적용이 깨져 서버가 안 뜨면 사유는 `docker compose logs migrate`
 #   에 있고, 그 줄이 백업 파일명까지 적는다. 되돌리기는:

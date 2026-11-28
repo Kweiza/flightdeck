@@ -73,19 +73,51 @@ func TestJudgeBindKeepsTransitionDeploymentUp(t *testing.T) {
 
 func TestJudgeTransportOnlyRefusesInProxyMode(t *testing.T) {
 	p := TLSPolicy{Mode: TLSProxy, Trusted: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}}
+	https := []string{"https"}
 	for _, ra := range []string{"10.2.3.4:5555", "127.0.0.1:1", "[::1]:1", "[::ffff:10.0.0.1]:1"} {
-		if v := JudgeTransport(ra, p); !v.OK {
+		if v := JudgeTransport(ra, https, false, p); !v.OK {
 			t.Errorf("%s: 받아야 한다: %+v", ra, v)
 		}
 	}
 	for _, ra := range []string{"192.168.0.9:5555", "[2001:db8::1]:1", "garbage"} {
-		if v := JudgeTransport(ra, p); v.OK || v.Reason == "" {
-			t.Errorf("%s: 거절해야 한다: %+v", ra, v)
+		// 신뢰 밖은 https 표지를 달아도 · 헬스체크여도 거절이다 - 표지는 프록시가 덮어쓴 것만 믿는다.
+		for _, health := range []bool{false, true} {
+			if v := JudgeTransport(ra, https, health, p); v.OK || v.Reason == "" {
+				t.Errorf("%s(헬스체크 %v): 거절해야 한다: %+v", ra, health, v)
+			}
 		}
 	}
 	for _, m := range []TLSMode{TLSOff, TLSFiles} {
-		if v := JudgeTransport("192.168.0.9:5555", TLSPolicy{Mode: m}); !v.OK {
+		if v := JudgeTransport("192.168.0.9:5555", nil, false, TLSPolicy{Mode: m}); !v.OK {
 			t.Errorf("%s 는 전송 판정이 거절하지 않는다: %+v", m, v)
+		}
+	}
+}
+
+// TestJudgeTransportRequiresForwardedHTTPSFromTrustedProxy 는 신뢰 프록시가 평문으로 받아 넘긴 요청의 거절이다. 원격 주소만 보면
+// 프록시의 http 리스너로 들어온 토큰(이미 평문으로 망을 건넜다)까지 받는다. 헬스체크 경로만 표지 없이 통한다.
+func TestJudgeTransportRequiresForwardedHTTPSFromTrustedProxy(t *testing.T) {
+	p := TLSPolicy{Mode: TLSProxy, Trusted: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}}
+	for name, xfp := range map[string][]string{
+		"없음":           nil,
+		"빈 값":          {""},
+		"http":         {"http"},
+		"사슬의 한 구간이 평문": {"https, http"},
+		"줄 둘 중 하나가 평문": {"https", "http"},
+		"모르는 값":        {"wss"},
+	} {
+		for _, ra := range []string{"10.2.3.4:5555", "127.0.0.1:1"} {
+			if v := JudgeTransport(ra, xfp, false, p); v.OK || !strings.Contains(v.Reason, "X-Forwarded-Proto") {
+				t.Errorf("%s · %s: 거절해야 한다: %+v", name, ra, v)
+			}
+			if v := JudgeTransport(ra, xfp, true, p); !v.OK {
+				t.Errorf("%s · %s: 헬스체크는 표지 없이 통해야 한다: %+v", name, ra, v)
+			}
+		}
+	}
+	for name, xfp := range map[string][]string{"https": {"https"}, "대문자": {"HTTPS"}, "사슬 전부": {"https, https"}} {
+		if v := JudgeTransport("10.2.3.4:5555", xfp, false, p); !v.OK {
+			t.Errorf("%s: 받아야 한다: %+v", name, v)
 		}
 	}
 }

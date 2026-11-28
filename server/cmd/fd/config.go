@@ -52,6 +52,9 @@ type Endpoint struct {
 	URLSource   string
 	TokenSource string
 	Warn        string // 설정을 못 읽었거나 권한이 이상할 때. 비어 있을 수 있다
+	// PinCert 는 주소를 이 머신의 서버 설정에서 골랐고 그 서버가 FD_TLS=files 일 때의 서버 인증서 경로다(LocalServerURL).
+	// 이때만 그 인증서를 신뢰 앵커로 쓴다 - 사람이 적은 주소(config.json · FD_URL)는 기본 신뢰로 검증한다.
+	PinCert string
 }
 
 // ConfigPath 는 설정 파일 자리를 고른다. 순수 함수다.
@@ -126,7 +129,8 @@ func SaveConfig(path string, cfg Config) error {
 
 // ResolveEndpoint 는 이번 실행이 쓸 주소·토큰을 정한다.
 //
-// 우선순위: **환경변수 > 설정 파일 > 기본값.**
+// 우선순위: **환경변수 > 설정 파일 > 기본값.** 기본값은 이 머신의 서버 설정(FD_ADDR · FD_TLS)에서 고른다(LocalServerURL) -
+// 서버와 같은 환경을 받는 헬스체크가 서버가 실제로 듣는 체계 · 포트를 친다.
 // 환경변수가 이기는 것이 이 레포의 기존 규율이다 — 사람이 그 자리에서 명시 지정한 축은
 // 저장된 값을 이긴다(FD_STATE_DIR·FD_PROJECT 가 같은 규칙을 쓴다).
 //
@@ -136,12 +140,13 @@ func ResolveEndpoint(get func(string) (string, bool), home string) Endpoint {
 	path, _ := ConfigPath(get, home)
 	cfg, found, warn := LoadConfig(path)
 
-	ep := Endpoint{URL: DefaultURL, URLSource: "기본값 " + DefaultURL, Warn: warn}
+	ep := Endpoint{Warn: warn}
+	ep.URL, ep.URLSource, ep.PinCert = LocalServerURL(get)
 	if found && cfg.URL != "" {
-		ep.URL, ep.URLSource = cfg.URL, "config.json ("+clip(path, 200)+")"
+		ep.URL, ep.URLSource, ep.PinCert = cfg.URL, "config.json ("+clip(path, 200)+")", ""
 	}
 	if v, ok := get("FD_URL"); ok && strings.TrimSpace(v) != "" {
-		ep.URL, ep.URLSource = strings.TrimRight(strings.TrimSpace(v), "/"), "FD_URL 환경변수"
+		ep.URL, ep.URLSource, ep.PinCert = strings.TrimRight(strings.TrimSpace(v), "/"), "FD_URL 환경변수", ""
 	}
 
 	ep.TokenSource = "없음 - 서버가 토큰 없이 도는 전환 단계일 때만 통한다(루프백도 같다)"

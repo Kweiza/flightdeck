@@ -313,6 +313,23 @@ func TestRevokeDisableLogoutCutOpenStreams(t *testing.T) {
 		return strings.Contains(e.do(http.MethodGet, "/metrics", nil, bearer(adminTok)).Body.String(), "\nflightdeck_sse_subscribers 4\n")
 	})
 
+	// 끊기는 커밋한 철회 · 끄기 뒤에만 돈다. 거절된 철회(403) · 마지막 관리자 끄기(409) · 켜기는 아무 스트림도 안 끊는다 - Cut 을
+	// 판정 · 커밋 앞으로 옮기거나 켜기에도 걸면 여기서 남의 스트림이 끊긴다.
+	if w := e.write(http.MethodPost, "/api/v1/devices/m-admin/revoke", map[string]any{}, bearer(kimTok)); w.Code != http.StatusForbidden {
+		t.Fatalf("회원의 남의 기기 철회가 %d 다", w.Code)
+	}
+	if w := e.write(http.MethodPatch, "/api/v1/admin/accounts/"+g.AccountID, map[string]any{"disabled": true}, bearer(adminTok)); w.Code != http.StatusConflict {
+		t.Fatalf("마지막 관리자 끄기가 %d 다", w.Code)
+	}
+	for _, id := range []string{g.AccountID, "kim"} {
+		if w := e.write(http.MethodPatch, "/api/v1/admin/accounts/"+id, map[string]any{"disabled": false}, bearer(adminTok)); w.Code != http.StatusOK {
+			t.Fatalf("켜기(%s)가 %d 다", id, w.Code)
+		}
+	}
+	for name, s := range map[string]*stream{"관리자 기기": admin, "관리자 화면": screen, "kim": kim, "kim2": kim2} {
+		s.stillOpen(t, "거절 · 409 · 켜기 뒤 "+name)
+	}
+
 	w := e.write(http.MethodPost, "/api/v1/devices/m-kim/revoke", map[string]any{}, bearer(adminTok))
 	if w.Code != http.StatusOK || decodeBody(t, w)["streams_cut"] != float64(1) {
 		t.Fatalf("철회 %d %s", w.Code, w.Body.String())
@@ -348,19 +365,32 @@ func TestProxyTransportRefusesDirectConnections(t *testing.T) {
 	if w.Code != http.StatusForbidden || errorOf(t, w)["code"] != "transport_refused" {
 		t.Fatalf("프록시를 건너뛴 연결이 %d 다: %s", w.Code, w.Body.String())
 	}
+	https := withHeader("X-Forwarded-Proto", "https")
 	for _, ra := range []string{"10.9.8.7:1234", "127.0.0.1:1"} {
-		if w := e.do(http.MethodGet, dash, nil, bearer(sharedToken), withRemote(ra)); w.Code != http.StatusOK {
+		if w := e.do(http.MethodGet, dash, nil, bearer(sharedToken), withRemote(ra), https); w.Code != http.StatusOK {
 			t.Fatalf("%s 가 %d 다", ra, w.Code)
 		}
+		// 신뢰 프록시에서 왔어도 프록시가 평문으로 받은 요청(표지가 http · 없음)은 거절한다 - 그 토큰은 이미 평문으로 망을 건넜다.
+		for _, xfp := range []reqOpt{withHeader("X-Forwarded-Proto", "http"), func(*http.Request) {}} {
+			w := e.do(http.MethodGet, dash, nil, bearer(sharedToken), withRemote(ra), xfp)
+			if w.Code != http.StatusForbidden || errorOf(t, w)["code"] != "transport_refused" {
+				t.Fatalf("%s 의 평문 전달이 %d 다: %s", ra, w.Code, w.Body.String())
+			}
+		}
 	}
-	if w := e.do(http.MethodGet, "/healthz", nil, withRemote("10.9.8.7:1")); !strings.Contains(w.Body.String(), `"tls":"proxy"`) {
-		t.Fatalf("/healthz 가 전송 정책을 안 말한다: %s", w.Body.String())
+	// 헬스체크만 표지 없이 통한다(컨테이너 안 fd doctor 는 루프백 평문으로 친다). 신뢰 밖에는 이 예외도 없다.
+	if w := e.do(http.MethodGet, HealthPath, nil, withRemote("127.0.0.1:1")); !strings.Contains(w.Body.String(), `"tls":"proxy"`) {
+		t.Fatalf("/healthz 가 전송 정책을 안 말한다: %d %s", w.Code, w.Body.String())
+	}
+	if w := e.do(http.MethodGet, HealthPath, nil, withRemote("192.0.2.7:1234")); w.Code != http.StatusForbidden {
+		t.Fatalf("신뢰 밖의 /healthz 가 %d 다", w.Code)
 	}
 	// proxy 뒤의 세션 쿠키는 언제나 Secure 다.
-	g := e.bootstrapOn("admin", withRemote("10.9.8.7:1"))
+	g := e.bootstrapOn("admin", withRemote("10.9.8.7:1"), https)
 	rec := httptest.NewRecorder()
 	req := loginPost(t, "/login", url.Values{"token": {g.LoginCode}})
 	req.RemoteAddr = "10.9.8.7:1"
+	req.Header.Set("X-Forwarded-Proto", "https")
 	e.h.ServeHTTP(rec, req)
 	found := false
 	for _, c := range rec.Result().Cookies() {

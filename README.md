@@ -103,7 +103,8 @@ server starts from an old image built earlier.
 > The `/fd-setup` skill can do steps 1 and 2 for you — it asks whether this machine is the server or a
 > client, and installs only what is missing, after your approval.
 
-- **Server on another machine?** Give sessions `FD_URL=http://<server>:7420` (and `FD_TOKEN` if you set one).
+- **Server on another machine?** Give sessions `FD_URL=https://<server>:7420` (and `FD_TOKEN` if you set one).
+  A token never leaves loopback over plain `http` - open the server with `FD_TLS=files` or `proxy`, or set `FD_INSECURE_HTTP=1` if you trust the network itself.
 - **Without Docker:** `cd server && go run ./cmd/fd serve --addr :7420 --db ~/.flightdeck/fd.db`.
   It points at the same database as the container, so **never run both.**
 - **Already installed as `flightdeck@kweiza-cc-plugins`?** Keep it — it fetches this repository. Do not enable both.
@@ -187,7 +188,8 @@ The server reads environment variables through compose; sessions read `~/.flight
 | `FD_PG_INSTANCE` | server | The deployment name of the Postgres layer (default `flightdeck`). The db container's name (`<name>-db`) and both volumes' names (`<name>-pgdata`, `<name>-pgrun`) all come from it. **Write it only in the selection file**: if the shell gives it (even empty), the gate of `fdc`, of the start step of `fd setup` and of `fd-update` stops before calling compose, because shell values win over the selection file and a new shell without the value would pick another volume (an empty ledger). Production keeps the default; only rehearsals and tests write another value in that environment's selection file (the rehearsal in "Upgrade: SQLite ledger to Postgres" below) |
 | `FD_PG_SERVER_PGPASS_HOST` · `FD_PG_BACKUP_PGPASS_HOST` | server | The pgpass files of the Postgres layer's two login accounts (server and daily dump). **No default**: if one is empty, `up` with the Postgres layer stops. Owner `FD_UID`, mode `0600`, line `db:5432:<db>:<account>:<password>`. They are the only place the passwords live (never in environment variables, command lines or URLs). **Keep them outside the server's mounts**: the server reads `FD_REPOS` (the whole home by default) (see "Running on Postgres" below) |
 | `FD_PG_DATABASE` · `FD_PG_SERVER_USER` · `FD_PG_BACKUP_USER` | server | Database and login account names of the Postgres layer (default `flightdeck`, `fd_server` and `fd_backup`; lowercase letters, digits and `_` only). To change them, write them in the selection file: `FD_PG_DATABASE` decides which ledger it is, so like `FD_PG_INSTANCE` the gate stops if the shell gives it. `db-roles` creates and checks the accounts: the server account is a member of `fd_app`, the dump account of `pg_read_all_data`, and neither has privileged attributes. Each database gets its own dump directory (`daily/<db>/`), so after switching databases the new one neither counts nor deletes the old one's dumps |
-| `FD_URL` | session | Server address (default `http://127.0.0.1:7420`) |
+| `FD_URL` | session | Server address (default `http://127.0.0.1:7420`; with `FD_ADDR` · `FD_TLS` in the same environment it targets that server) |
+| `FD_INSECURE_HTTP` | session | `1` sends the token to a non-loopback plain `http` address too (by default it is refused before sending) |
 | `FD_STATE_DIR` | session | Put the state files (outbox, caches, machine id) in one place |
 | `FD_LANG` | server · session | Output language. `en` for English (default Korean). The server side covers the dashboard; the session side covers the CLI, hooks and MCP replies |
 

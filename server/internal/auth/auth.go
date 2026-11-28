@@ -122,12 +122,42 @@ func Prefix(v string) string {
 	return v[:8]
 }
 
-// sameSecret 은 두 비밀을 상수 시간으로 맞댄다. 길이가 다르면 즉시 거짓이다(길이는 비밀이 아니다 - 형식이 정한다).
-func sameSecret(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
+// sameSecret 은 두 비밀을 상수 시간으로 맞댄다. 양쪽을 sha256 으로 먼저 접어 같은 길이(32바이트)로 맞댄다 -
+// subtle.ConstantTimeCompare 는 길이가 다르면 곧장 거짓을 내므로, 원값을 그대로 주면 FD_TOKEN 처럼 형식이 안 정한 비밀의
+// 길이가 응답 시간으로 샌다.
+func sameSecret(a, b string) bool {
+	ha, hb := sha256.Sum256([]byte(a)), sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(ha[:], hb[:]) == 1
+}
 
 // SharedTokenMatches 는 받은 값이 서버의 FD_TOKEN 인가다. 서버에 토큰이 없으면 언제나 거짓이다.
 func SharedTokenMatches(serverToken, got string) bool {
 	return serverToken != "" && sameSecret(got, serverToken)
+}
+
+// SharedTokenCollides 는 FD_TOKEN 이 이 판이 예약한 접두(fdd_ · fds_ · fdl_)로 시작하는가다. 순수 함수다. 겹쳐도 통한다(pick 의
+// ②가 정확히 같은 값을 먼저 FD_TOKEN 으로 읽는다) - 기동이 경고만 한다. 거절하면 그 FD_TOKEN 으로 붙던 배포가 갱신하는 순간
+// 서버째 못 뜬다.
+func SharedTokenCollides(token string) bool {
+	for _, k := range []TokenKind{DeviceToken, SessionToken, LoginCode} {
+		if strings.HasPrefix(token, string(k)) {
+			return true
+		}
+	}
+	return false
+}
+
+// JudgeFirstAdmin 은 이 설정으로 첫 관리자를 만들 길이 있는가다. 순수 함수다. 참이면 기동을 거절한다.
+//
+// accounts 단계에서 관리자가 0명이면 첫 관리자는 FD_TOKEN 으로 여는 POST /admin/bootstrap 으로만 생긴다(fd admin recover 는
+// 이미 있는 관리자의 코드를 낼 뿐이다). 그때 FD_TOKEN 까지 비면 그 서버는 누구도 로그인할 수 없는 채로 뜬다 - 아무 요청에도
+// 401 만 내는 서버를 띄우지 않는다. transition 은 토큰이 비면 옛 동작(무인증 전권)이라 막지 않는다.
+func JudgeFirstAdmin(m Mode, tokenSet bool, admins int) (refuse bool, reason string) {
+	if m != ModeAccounts || tokenSet || admins > 0 {
+		return false, ""
+	}
+	return true, "FD_AUTH=accounts 인데 관리자가 0명이고 FD_TOKEN 이 비었다 - 첫 관리자를 만들 길(FD_TOKEN 으로 여는 " +
+		"POST /admin/bootstrap)이 없다. FD_TOKEN 을 주고 띄워 fd admin bootstrap 으로 첫 관리자를 만들어라"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -146,7 +176,9 @@ const (
 	KindShared Kind = "shared"
 	// KindBootstrap 은 accounts 단계에서 관리자 0명일 때 /admin/bootstrap 에 온 FD_TOKEN 이다. 첫 관리자를 만드는 일만 한다.
 	KindBootstrap Kind = "bootstrap"
-	// KindAnonymous 는 FD_TOKEN 이 빈 transition 서버의 무인증 통과다(옛 동작). accounts 에는 없다.
+	// KindAnonymous 는 FD_TOKEN 이 빈 transition 서버의 무인증 통과다(옛 동작). accounts 에는 없다. 옛 동작 그대로 전권이다
+	// (Admin) - 무인증이 항목 · 판단 · 선점 쓰기를 다 받는 서버에서 프로젝트 지우기 · 계정 끄기만 막으면 경계가 아니라 막다른
+	// 길이다(그 서버에서는 부트스트랩도 못 해 관리자가 될 길이 없다). 경계가 필요하면 FD_TOKEN 을 켜거나 accounts 로 좁힌다.
 	KindAnonymous Kind = "anonymous"
 )
 
@@ -160,10 +192,13 @@ const (
 type Principal struct {
 	Kind      Kind
 	AccountID string // 기기 · 세션이면 그 계정. 공유 토큰 · 부트스트랩 · 무인증이면 빈 글
-	Role      string // 계정의 역할. 공유 토큰은 admin(전권), 부트스트랩 · 무인증은 빈 글
+	Role      string // 계정의 역할. 공유 토큰 · 무인증은 admin(전권), 부트스트랩은 빈 글
 	MachineID string // 기기 토큰이면 그 기기
 	// WebSession 은 세션 쿠키의 원장 지문(web_session.id_hash)이다. 원값이 아니다.
 	WebSession string
+	// ExpiresAt 은 이 자격증명이 스스로 끝나는 시각이다(화면 세션의 expires_at). 영값이면 끝이 없다(기기 토큰 · FD_TOKEN).
+	// 열린 스트림은 다음 요청이 없어 게이트가 만료를 다시 못 보므로, 스트림이 이 시각에 스스로 닫는다.
+	ExpiresAt time.Time
 }
 
 // Admin 은 관리자 일을 해도 되는가다.
@@ -272,13 +307,17 @@ const (
 	credShared // 헤더의 기기 토큰 아닌 값 · 옛 토큰 쿠키
 )
 
-// pick 은 요청이 내민 자격증명 하나를 고른다. 순수 함수다. 못 고르면 거절 판정을 함께 낸다.
+// pick 은 요청이 내민 자격증명 하나를 고른다. 순수 함수다. 못 고르면 거절 판정을 함께 낸다. sharedToken 은 서버의 FD_TOKEN 이다
+// (비면 없다).
 //
 // 순서가 계약이다.
 //  1. **헤더가 있으면 헤더만 본다.** 쿠키는 안 본다 - 무엇이 인증했는지가 요청마다 달라지면 안 된다.
-//  2. 헤더의 세션 쿠키 · 로그인 코드는 거절이다. 코드는 로그인 폼에서 한 번 바꾸는 값이고, 헤더로 받으면 일회용이 아니게 된다.
-//  3. 쿠키는 화면 경로에서만 본다. 세션 쿠키가 옛 토큰 쿠키보다 먼저다(둘 다 있으면 로그인한 계정이 이긴다).
-func pick(req Request) (credential, *Decision) {
+//  2. **헤더 값이 FD_TOKEN 과 정확히 같으면 접두와 무관하게 FD_TOKEN 이다.** 접두(fdd_ · fds_ · fdl_)는 이 판이 새로 예약한
+//     것이라 그보다 먼저 정한 FD_TOKEN 이 우연히 그 접두로 시작할 수 있다. 접두를 먼저 보면 그 배포의 훅 · MCP 가 갱신하는
+//     순간 전부 401 이다. 기동이 그 FD_TOKEN 을 경고한다(fd serve).
+//  3. 헤더의 세션 쿠키 · 로그인 코드는 거절이다. 코드는 로그인 폼에서 한 번 바꾸는 값이고, 헤더로 받으면 일회용이 아니게 된다.
+//  4. 쿠키는 화면 경로에서만 본다. 세션 쿠키가 옛 토큰 쿠키보다 먼저다(둘 다 있으면 로그인한 계정이 이긴다).
+func pick(req Request, sharedToken string) (credential, *Decision) {
 	if h := strings.TrimSpace(req.Authorization); h != "" {
 		parts := strings.Fields(h)
 		if len(parts) != 2 {
@@ -288,6 +327,9 @@ func pick(req Request) (credential, *Decision) {
 			return credential{}, &Decision{Reason: "Authorization 인증 방식이 Bearer 가 아니다"}
 		}
 		v := parts[1]
+		if SharedTokenMatches(sharedToken, v) {
+			return credential{credShared, v}, nil
+		}
 		switch k, _ := KindOf(v); k {
 		case DeviceToken:
 			return credential{credDevice, v}, nil
@@ -320,7 +362,7 @@ func pick(req Request) (credential, *Decision) {
 
 // Authenticate 는 요청 하나를 판정한다.
 func (g *Gate) Authenticate(ctx context.Context, req Request) Decision {
-	c, refused := pick(req)
+	c, refused := pick(req, g.token)
 	if refused != nil {
 		return *refused
 	}
@@ -333,18 +375,21 @@ func (g *Gate) Authenticate(ctx context.Context, req Request) Decision {
 		return g.shared(ctx, c.value, req.BootstrapPath)
 	}
 	if g.mode == ModeTransition && g.token == "" {
-		return Decision{OK: true, Principal: Principal{Kind: KindAnonymous},
+		return Decision{OK: true, Principal: anonymous,
 			Reason: "서버에 토큰이 설정되지 않았다 - 전환 단계라 무인증으로 통과했다"}
 	}
 	return Decision{Reason: "자격증명이 없다 - Authorization: Bearer <기기 토큰> 을 실어라(루프백도 같다)"}
 }
+
+// anonymous 는 토큰 없는 전환 서버의 무인증 주체다(KindAnonymous 의 ★ - 옛 동작 그대로 전권).
+var anonymous = Principal{Kind: KindAnonymous, Role: RoleAdmin}
 
 // shared 는 FD_TOKEN 갈래다.
 func (g *Gate) shared(ctx context.Context, v string, bootstrapPath bool) Decision {
 	if g.token == "" {
 		if g.mode == ModeTransition {
 			// 옛 동작: 토큰이 없는 서버는 무엇을 내밀든 무인증으로 통과한다(클라이언트에 토큰이 남은 채 서버만 끈 배포).
-			return Decision{OK: true, Principal: Principal{Kind: KindAnonymous},
+			return Decision{OK: true, Principal: anonymous,
 				Reason: "서버에 토큰이 설정되지 않아 대조할 기준이 없다 - 전환 단계라 무인증으로 통과했다"}
 		}
 		return Decision{Reason: "이 값은 기기 토큰이 아니고 이 서버에는 FD_TOKEN 이 없다 - fd login 으로 기기 토큰을 받아라"}
@@ -426,7 +471,7 @@ func judgeSession(want string, f SessionFact, err error, now time.Time) Decision
 		return Decision{Reason: "이 계정이 꺼져 있다 - 관리자에게 물어라"}
 	}
 	return Decision{OK: true, Reason: "로그인 쿠키가 일치한다",
-		Principal: Principal{Kind: KindWeb, AccountID: f.AccountID, Role: f.Role, WebSession: f.IDHash}}
+		Principal: Principal{Kind: KindWeb, AccountID: f.AccountID, Role: f.Role, WebSession: f.IDHash, ExpiresAt: f.ExpiresAt}}
 }
 
 func clip(s string, n int) string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/url"
 	"strings"
 
 	"github.com/kweiza/flightdeck/internal/mcpsrv"
@@ -36,7 +37,7 @@ func MCPDBNotice(fdURL, token string) string {
 	if u == "" || strings.TrimSpace(token) != "" {
 		return ""
 	}
-	if strings.Contains(u, "127.0.0.1") || strings.Contains(u, "localhost") || strings.Contains(u, "[::1]") {
+	if p, err := url.Parse(u); err == nil && IsLoopbackHost(p.Hostname()) {
 		return ""
 	}
 	return "FD_URL 이 원격(" + clip(u, 120) + ")인데 FD_TOKEN 이 비어 있다 — " +
